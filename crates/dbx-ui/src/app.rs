@@ -1516,6 +1516,35 @@ impl DbxApp {
         self.run_query(cx);
     }
 
+    fn refresh_tables_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+
+        let Some(engine) = session.engine.clone() else {
+            return;
+        };
+
+        let runtime = self.runtime.clone();
+
+        cx.spawn(async move |this, cx| {
+            let tables = runtime
+                .spawn(async move { engine.list_tables().await })
+                .await??;
+
+            this.update(cx, |this, cx| {
+                if let Some(session) = this.session_mut(session_id) {
+                    session.tables = tables;
+                }
+
+                cx.notify();
+            })?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     fn refresh_action(&mut self, _: &RefreshData, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_table(cx);
     }
@@ -3558,18 +3587,40 @@ impl DbxApp {
                             )
                             .child(
                                 div()
-                                    .id("create-table")
-                                    .size(px(24.))
-                                    .rounded(px(5.))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(THEME.panel_raised))
-                                    .child(icon(Icon::Add, THEME.accent))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.create_table_template_for(session_id, window, cx)
-                                    })),
+                                    .child(
+                                        div()
+                                            .id("refresh-tables")
+                                            .size(px(24.))
+                                            .rounded(px(5.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(THEME.panel_raised))
+                                            .child(icon(Icon::Refresh, THEME.accent))
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                this.refresh_tables_for(session_id, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("create-table")
+                                            .size(px(24.))
+                                            .rounded(px(5.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(THEME.panel_raised))
+                                            .child(icon(Icon::Add, THEME.accent))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.create_table_template_for(
+                                                    session_id, window, cx,
+                                                )
+                                            })),
+                                    ),
                             ),
                     )
                     .when(kind == DatabaseKind::PostgreSQL, |view| {
