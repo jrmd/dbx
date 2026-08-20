@@ -39,7 +39,7 @@ fn main() {
                         title: Some(SharedString::from(APP_NAME)),
                         ..Default::default()
                     }),
-                    app_id: Some("dev.dbx.app".into()),
+                    app_id: Some("dbx.jrmd.app".into()),
                     ..Default::default()
                 },
                 |window, cx| cx.new(|cx| DbxApp::new(window, cx)),
