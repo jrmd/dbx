@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-20T00:00:00+01:00",
+  "title": "Design System: DBX Native Data Console",
+  "extensions": {
+    "colorMeta": {
+      "canvas": { "role": "neutral", "displayName": "Black Canvas", "canonical": "#0a0c10", "tonalRamp": ["#030405", "#0a0c10", "#171a20", "#2b3039", "#454c59", "#687282", "#94a3b8", "#f1f5f9"] },
+      "panel": { "role": "neutral", "displayName": "Instrument Panel", "canonical": "#111318", "tonalRamp": ["#050608", "#111318", "#252a33", "#3b424f", "#586272", "#7d899a", "#adb8c8", "#f0f4f8"] },
+      "panel-raised": { "role": "neutral", "displayName": "Raised Utility Surface", "canonical": "#171a20", "tonalRamp": ["#070809", "#171a20", "#2b3039", "#434a57", "#626d7d", "#8994a4", "#b8c2d0", "#f3f6f9"] },
+      "rail": { "role": "neutral", "displayName": "Navigation Rail", "canonical": "#0d1016", "tonalRamp": ["#040506", "#0d1016", "#222732", "#39414f", "#566171", "#7c889a", "#adb9c9", "#f0f4f8"] },
+      "grid-alternate": { "role": "neutral", "displayName": "Alternating Grid Ink", "canonical": "#0e1116", "tonalRamp": ["#040506", "#0e1116", "#232833", "#3a424f", "#586272", "#7e8999", "#adb8c8", "#f0f4f8"] },
+      "border": { "role": "neutral", "displayName": "Hairline Divider", "canonical": "#1f232b", "tonalRamp": ["#0a0b0d", "#1f232b", "#343b47", "#4c5665", "#6a7586", "#919cad", "#bec7d4", "#f3f6fa"] },
+      "border-strong": { "role": "neutral", "displayName": "Assertive Divider", "canonical": "#343b47", "tonalRamp": ["#111319", "#343b47", "#4c5665", "#687485", "#8995a6", "#adb8c8", "#d1d8e1", "#f5f7fa"] },
+      "text": { "role": "neutral", "displayName": "Operational White", "canonical": "#f1f5f9", "tonalRamp": ["#26303a", "#4a5968", "#6d7d8d", "#94a3b8", "#b8c4d0", "#d1d9e1", "#e2e8ef", "#f1f5f9"] },
+      "text-muted": { "role": "neutral", "displayName": "Muted Metadata", "canonical": "#94a3b8", "tonalRamp": ["#1b2128", "#35414d", "#526271", "#718395", "#94a3b8", "#b1bdca", "#cbd4dd", "#e9eef3"] },
+      "accent": { "role": "primary", "displayName": "Command Blue", "canonical": "#3b82f6", "tonalRamp": ["#071a3a", "#0d326f", "#1552ae", "#2871dc", "#3b82f6", "#6ca7ff", "#a3c8ff", "#e5f0ff"] },
+      "accent-soft": { "role": "primary", "displayName": "Blue Selection Well", "canonical": "#10294d", "tonalRamp": ["#061226", "#10294d", "#194275", "#245fa9", "#337edb", "#65a3ff", "#a1c7ff", "#e3efff"] },
+      "focus-ring": { "role": "primary", "displayName": "Focus Blue", "canonical": "#60a5fa", "tonalRamp": ["#0b2145", "#16447e", "#246bc0", "#4490ed", "#60a5fa", "#8dc0ff", "#b9d9ff", "#e9f4ff"] },
+      "success": { "role": "tertiary", "displayName": "Connection Green", "canonical": "#22c55e", "tonalRamp": ["#052413", "#0c5529", "#12873d", "#1ba84f", "#22c55e", "#65df8d", "#a4efb8", "#e0fae6"] },
+      "warning": { "role": "tertiary", "displayName": "Caution Amber", "canonical": "#f59e0b", "tonalRamp": ["#3a2103", "#764303", "#ac6505", "#d98308", "#f59e0b", "#ffc45c", "#ffdfa6", "#fff3dd"] },
+      "danger": { "role": "tertiary", "displayName": "Destructive Red", "canonical": "#ef4444", "tonalRamp": ["#39080a", "#741416", "#ad2427", "#d93638", "#ef4444", "#ff8181", "#ffb6b6", "#ffe4e4"] },
+      "sql-keyword": { "role": "tertiary", "displayName": "SQL Keyword Violet", "canonical": "#c792ea", "tonalRamp": ["#281334", "#54266c", "#8141a3", "#ab68cf", "#c792ea", "#daaff5", "#ebccfb", "#f8ebff"] },
+      "sql-string": { "role": "tertiary", "displayName": "SQL String Green", "canonical": "#c3e88d", "tonalRamp": ["#1e3010", "#496f24", "#759f41", "#a1c863", "#c3e88d", "#d7f3b6", "#e8fad2", "#f5ffeb"] },
+      "sql-comment": { "role": "neutral", "displayName": "SQL Comment Grey", "canonical": "#6b7482", "tonalRamp": ["#111419", "#293039", "#454e5a", "#5d6775", "#6b7482", "#929ba8", "#bec5ce", "#eaedf1"] },
+      "sql-number": { "role": "tertiary", "displayName": "SQL Number Coral", "canonical": "#f78c6c", "tonalRamp": ["#3d1209", "#7a2e1d", "#b34f36", "#dc704f", "#f78c6c", "#ffb29d", "#ffd0c3", "#ffebe6"] },
+      "sql-parameter": { "role": "tertiary", "displayName": "SQL Parameter Gold", "canonical": "#ffcb6b", "tonalRamp": ["#3a2504", "#755006", "#ad7d12", "#dba62f", "#ffcb6b", "#ffe09a", "#ffedc7", "#fff8e9"] },
+      "sql-identifier": { "role": "tertiary", "displayName": "SQL Identifier Sky", "canonical": "#82aaff", "tonalRamp": ["#0d1b42", "#203a80", "#4164c1", "#638ae9", "#82aaff", "#adc8ff", "#d0dfff", "#eef3ff"] },
+      "sql-type": { "role": "tertiary", "displayName": "SQL Type Cyan", "canonical": "#89ddff", "tonalRamp": ["#062b3b", "#115972", "#2788a9", "#56b7d7", "#89ddff", "#b3ebff", "#d3f4ff", "#effcff"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Connection Title", "purpose": "Connection-screen title." },
+      "title": { "displayName": "Product Mark", "purpose": "DBX wordmark in the top bar." },
+      "body": { "displayName": "Operational Body", "purpose": "Controls, fields, table labels, tabs, and editor text." },
+      "label": { "displayName": "Operational Label", "purpose": "Metadata, panel detail, captions, and status." }
+    },
+    "shadows": [],
+    "motion": [],
+    "breakpoints": [
+      { "name": "narrow-workspace", "value": "1180px" },
+      { "name": "compact-layout", "value": "900px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary commits such as Connect, Run, and New connection.",
+      "html": "<button class=\"ds-btn-primary\">Connect</button>",
+      "css": ".ds-btn-primary { height: 30px; padding: 0 12px; background: #3b82f6; color: #f1f5f9; border: 1px solid #3b82f6; border-radius: 6px; font: 500 12px system-ui, sans-serif; cursor: pointer; } .ds-btn-primary:hover { background: #60a5fa; border-color: #60a5fa; } .ds-btn-primary:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; } .ds-btn-primary:active { background: #10294d; }"
+    },
+    {
+      "name": "Quiet Button",
+      "kind": "button",
+      "refersTo": "button-quiet",
+      "description": "Secondary actions such as Save, Test Connection, and Choose file. Test Connection validates current input without saving a profile, opening a workspace, or changing database state.",
+      "html": "<button class=\"ds-btn-quiet\">Save</button>",
+      "css": ".ds-btn-quiet { height: 30px; padding: 0 12px; background: #171a20; color: #f1f5f9; border: 1px solid #1f232b; border-radius: 6px; font: 500 12px system-ui, sans-serif; cursor: pointer; } .ds-btn-quiet:hover { background: #171a20; border-color: #3b82f6; } .ds-btn-quiet:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; } .ds-btn-quiet:active { background: #0a0c10; }"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Destructive database actions requiring deliberate confirmation.",
+      "html": "<button class=\"ds-btn-danger\">Delete table</button>",
+      "css": ".ds-btn-danger { height: 30px; padding: 0 12px; background: #171a20; color: #ef4444; border: 1px solid #ef4444; border-radius: 6px; font: 500 12px system-ui, sans-serif; cursor: pointer; } .ds-btn-danger:hover { background: #34191d; } .ds-btn-danger:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; } .ds-btn-danger:active { background: #0a0c10; }"
+    },
+    {
+      "name": "Connection Tab",
+      "kind": "nav",
+      "refersTo": "connection-tab-active",
+      "description": "Persistent primary tab for an open database connection; the active tab carries a full-width 2px Command Blue bottom indicator.",
+      "html": "<button class=\"ds-connection-tab\"><span class=\"ds-tab-db\">▭</span><span>SQLite</span><i></i><span class=\"ds-tab-badge\">SQLite</span><span class=\"ds-tab-close\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m18 6-12 12M6 6l12 12\"/></svg></span></button>",
+      "css": ".ds-connection-tab { position: relative; height: 32px; padding: 0 12px; display: inline-flex; align-items: center; gap: 8px; background: #111318; color: #f1f5f9; border: 1px solid #343b47; border-radius: 6px 6px 0 0; font: 12px system-ui, sans-serif; cursor: pointer; } .ds-connection-tab::after { content: \"\"; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: #3b82f6; } .ds-tab-db { color: #3b82f6; font-size: 16px; } .ds-connection-tab i { width: 5px; height: 5px; border-radius: 9999px; background: #22c55e; } .ds-tab-badge { padding: 4px 8px; border-radius: 9999px; background: #171a20; color: #94a3b8; font: 500 10px system-ui, sans-serif; } .ds-tab-close { width: 18px; height: 18px; display: grid; place-items: center; border-radius: 4px; color: #94a3b8; } .ds-connection-tab:hover .ds-tab-close { background: #171a20; } .ds-connection-tab:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }"
+    },
+    {
+      "name": "Native Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Single-line connection, filter, and cell field treatment. Connection setup gives Details fields (host, port, user, password, database) and Connection String equal weight; SQLite uses a database-file field with a native Choose file action. Saving uses the user-visible name for profile and OS-keyring lookup, never profile JSON for passwords.",
+      "html": "<input class=\"ds-input\" value=\"sqlite://dbx.db?mode=rwc\" aria-label=\"Database file\">",
+      "css": ".ds-input { width: 100%; height: 32px; padding: 7px; box-sizing: border-box; background: #0a0c10; color: #f1f5f9; border: 1px solid #343b47; border-radius: 5px; font: 12px system-ui, sans-serif; } .ds-input:hover { border-color: #94a3b8; } .ds-input:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; } .ds-input::selection { background: #3311ff30; }"
+    },
+    {
+      "name": "SQL Editor",
+      "kind": "custom",
+      "refersTo": "input",
+      "description": "Multiline query field with the built-in lexical color spectrum.",
+      "html": "<div class=\"ds-sql-editor\"><span class=\"ds-sql-keyword\">SELECT</span> <span class=\"ds-sql-identifier\">sqlite_version</span>();<br><span class=\"ds-sql-comment\">-- Run with Cmd+Enter</span></div>",
+      "css": ".ds-sql-editor { height: 204px; padding: 10px; box-sizing: border-box; overflow: auto; background: #0a0c10; color: #f1f5f9; border: 1px solid #343b47; border-radius: 5px; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; } .ds-sql-editor:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; } .ds-sql-keyword { color: #c792ea; } .ds-sql-identifier { color: #82aaff; } .ds-sql-comment { color: #6b7482; }"
+    },
+    {
+      "name": "Explorer Entry",
+      "kind": "nav",
+      "refersTo": "connection-tab-active",
+      "description": "Compact schema explorer item for a table or view.",
+      "html": "<button class=\"ds-explorer-item\"><span>▭</span><span class=\"ds-explorer-name\">orders</span></button>",
+      "css": ".ds-explorer-item { width: 100%; height: 28px; padding: 0 8px; display: flex; align-items: center; gap: 7px; background: #10294d; color: #3b82f6; border: 0; border-radius: 5px; font: 11px system-ui, sans-serif; text-align: left; cursor: pointer; } .ds-explorer-item span:first-child { font-size: 16px; } .ds-explorer-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-explorer-item:hover { background: #171a20; color: #f1f5f9; } .ds-explorer-item:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; }"
+    },
+    {
+      "name": "SVG Line Icon",
+      "kind": "custom",
+      "description": "Embedded 16px database icon from DBX's compile-time SVG asset vocabulary, which includes dedicated Structure and Refresh glyphs; consuming controls provide its semantic color.",
+      "html": "<svg class=\"ds-line-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><ellipse cx=\"12\" cy=\"5\" rx=\"8\" ry=\"3\"/><path d=\"M4 5v7c0 1.66 3.58 3 8 3s8-1.34 8-3V5\"/><path d=\"M4 12v7c0 1.66 3.58 3 8 3s8-1.34 8-3v-7\"/></svg>",
+      "css": ".ds-line-icon { width: 16px; height: 16px; color: #3b82f6; display: block; }"
+    },
+    {
+      "name": "Connection Document Tabs",
+      "kind": "nav",
+      "refersTo": "document-tab-active",
+      "description": "Per-connection horizontal document strip with a persistent Data tab and independently closable Query and Structure tabs.",
+      "html": "<nav class=\"ds-document-tabs\" aria-label=\"Connection documents\"><button class=\"ds-document-tab ds-document-tab-active\"><svg class=\"ds-document-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18M9 21V9\"/></svg>Data</button><button class=\"ds-document-tab\"><svg class=\"ds-document-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m9 18 6-6-6-6\"/><path d=\"M4 12h11\"/><path d=\"M20 19v-4\"/></svg>Query 1 <span><svg class=\"ds-close-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m18 6-12 12M6 6l12 12\"/></svg></span></button><button class=\"ds-document-tab\"><svg class=\"ds-document-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"6\" height=\"6\" rx=\"1.25\"/><rect x=\"3\" y=\"15\" width=\"6\" height=\"6\" rx=\"1.25\"/><rect x=\"15\" y=\"15\" width=\"6\" height=\"6\" rx=\"1.25\"/><path d=\"M6 9v3h12v3M6 12v3\"/></svg>orders structure <span><svg class=\"ds-close-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"m18 6-12 12M6 6l12 12\"/></svg></span></button><button class=\"ds-document-add\" aria-label=\"New query\"><svg class=\"ds-document-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" aria-hidden=\"true\"><path d=\"M12 5v14M5 12h14\"/></svg></button></nav>",
+      "css": ".ds-document-tabs { height: 36px; min-width: 0; padding: 0 9px; display: flex; align-items: end; gap: 3px; overflow-x: auto; background: #111318; border-bottom: 1px solid #1f232b; } .ds-document-tab { height: 31px; padding: 0 11px; display: inline-flex; flex: none; align-items: center; gap: 7px; background: #111318; color: #94a3b8; border: 1px solid #111318; border-radius: 5px 5px 0 0; font: 11px system-ui, sans-serif; cursor: pointer; white-space: nowrap; } .ds-document-icon, .ds-close-icon { width: 16px; height: 16px; color: currentColor; } .ds-document-tab-active { background: #0a0c10; color: #f1f5f9; border-color: #343b47; } .ds-document-tab-active .ds-document-icon { color: #3b82f6; } .ds-document-tab span { width: 18px; height: 18px; display: grid; place-items: center; border-radius: 4px; } .ds-close-icon { width: 12px; height: 12px; } .ds-document-tab:hover span { background: #171a20; color: #ef4444; } .ds-document-tab:focus-visible, .ds-document-add:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px; } .ds-document-add { width: 26px; height: 26px; margin-bottom: 2px; flex: none; display: grid; place-items: center; background: transparent; color: #94a3b8; border: 0; border-radius: 5px; cursor: pointer; } .ds-document-add:hover { background: #10294d; color: #3b82f6; }"
+    },
+    {
+      "name": "Foreign-key Structure Row",
+      "kind": "custom",
+      "description": "Dense structure-document row showing a constraint name and local columns beside its qualified reference target and actions.",
+      "html": "<div class=\"ds-fk-row\"><div><strong>orders_customer_id_fkey</strong><small>customer_id</small></div><div><b>REFERENCES public.customers (id)</b><small>ON UPDATE CASCADE · ON DELETE RESTRICT</small></div></div>",
+      "css": ".ds-fk-row { min-height: 44px; padding: 7px 10px; display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #0a0c10; border-bottom: 1px solid #1f232b; font: 11px system-ui, sans-serif; } .ds-fk-row > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; } .ds-fk-row > div:last-child { align-items: end; text-align: right; } .ds-fk-row strong { overflow: hidden; color: #f1f5f9; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; } .ds-fk-row b { overflow: hidden; color: #3b82f6; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; } .ds-fk-row small { color: #94a3b8; font-size: 10px; } .ds-fk-row > div:last-child small { font-size: 9px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Native Data Console",
+    "overview": "DBX is an operator's cockpit: a compact, near-black workbench where database identity, navigation, data, and row context stay simultaneously visible. The supplied DBX logo asset anchors rail and top-bar identity. It uses crisp one-pixel separators, small label-first typography, and a restrained blue action language to make a large amount of state immediately scannable instead of decorative.\n\nThe interface is intentionally native and dense. Surfaces are layered only enough to establish panes; the visual rhythm comes from alignment, a four-pixel spacing scale, and compact controls. Green is health, amber is work-in-progress or caution, and red is reserved for destructive actions. SQL is the one place where a broader semantic spectrum earns its space. While disconnected, database-only rail controls remain hidden rather than unavailable.",
+    "keyCharacteristics": [
+      "Persistent context: a 46px app rail, 42px top bar, 26px status bar, and visible explorer/inspector panes.",
+      "Deliberate density: 10–12px operational text, 30–36px controls, and four-pixel spacing increments.",
+      "Blue is an interaction locator, not a decorative fill; it marks active navigation and primary commit actions.",
+      "Borders and tonal planes, rather than shadows, separate work areas.",
+      "Embedded 16px SVG line icons and per-connection document tabs keep native work context compact and portable.",
+      "Connection setup gives Details and Connection String equal weight; Details exposes host, port, user, password, and database, while SQLite uses a native file chooser.",
+      "Test Connection validates current input without saving, opening a workspace, or changing database state; saved names identify profiles and OS-keyring lookups."
+    ],
+    "rules": [
+      { "name": "The Sparse Accent Rule", "body": "Use Command Blue to identify an action or current location; never use it as a general panel fill.", "section": "colors" },
+      { "name": "The Label-First Rule", "body": "State the object or mode in a compact muted label, then reserve brighter text for actionable or selected content.", "section": "typography" },
+      { "name": "The Earned Separation Rule", "body": "Add a new tonal plane only when it clarifies a pane, selection, or transient utility; default content stays on the canvas with a single border boundary.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do preserve the 4px, 8px, 12px, 16px spacing rhythm and favor 30–36px controls for dense desktop work.",
+      "Do keep database context visible through persistent rail, top-level connection tabs, explorer, and status feedback.",
+      "Do use the blue active-state system and green connection health consistently across rail, tabs, tables, and connection setup.",
+      "Do scope document tabs to their connection and preserve the Data document while Query and Structure documents are independently closable.",
+      "Do let narrow layouts hide secondary inspection before shrinking primary data and query work below usable density.",
+      "Do keep the DBX logo asset visible in rail and top-bar branding while hiding database-only rail controls until a connection is active.",
+      "Do treat Details and Connection String as equal setup modes, use SQLite's native file chooser, and keep Test Connection non-mutating."
+    ],
+    "donts": [
+      "Don't introduce shadows, glass effects, oversized cards, or decorative gradients; depth is tonal and border-led.",
+      "Don't use blue as ambient decoration or apply semantic success/warning/danger colors without a state meaning.",
+      "Don't wrap multi-connection tabs into ambiguous rows; retain horizontal scrolling and concise metadata.",
+      "Don't repeat an active PostgreSQL schema prefix in explorer table labels; retain qualification only in the All view.",
+      "Don't replace the authored geometric icon vocabulary with emoji, mixed icon sets, or browser-shaped controls.",
+      "Don't save a password in profile JSON or use Test Connection to persist, open, or change a database."
+    ]
+  }
+}

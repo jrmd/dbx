@@ -1,0 +1,45 @@
+[workspace]
+members = ["crates/dbx-core", "crates/dbx-ui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0"
+arrayref = "=0.3.6" # 0.3.10 currently publishes an invalid proc-macro1 dependency.
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+futures-util = "0.3"
+gpui = "=0.2.2"
+keyring = "4.1"
+percent-encoding = "2.3"
+redis = { version = "0.32", features = ["aio", "tokio-comp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sqlx = { version = "0.8", default-features = false, features = [
+  "runtime-tokio-rustls",
+  "sqlite",
+  "postgres",
+  "mysql",
+  "chrono",
+  "bigdecimal",
+  "json",
+  "uuid",
+] }
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "sync", "time"] }
+unicode-segmentation = "1.12"
+url = "2.5"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
