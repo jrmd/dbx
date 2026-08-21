@@ -68,18 +68,21 @@ type SessionId = Uuid;
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
 
-fn traffic_light(id: &'static str, color: Rgba, glyph: impl IntoElement) -> Stateful<Div> {
+fn window_close_button() -> Stateful<Div> {
     div()
-        .id(id)
-        .size(px(18.))
-        .rounded_full()
+        .id("window-close")
+        .size(px(28.))
+        .rounded(px(5.))
+        .border_1()
+        .border_color(THEME.border_strong)
+        .bg(THEME.panel)
+        .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .bg(color)
         .cursor_pointer()
-        .hover(|style| style.opacity(0.78))
-        .child(glyph)
+        .hover(|style| style.bg(THEME.danger).border_color(THEME.danger))
+        .child(icon(Icon::Close, THEME.text).size(px(12.)))
 }
 
 /// Shared, virtualized backing model for both table browsing and ad-hoc query results.
@@ -824,12 +827,16 @@ impl DbxApp {
         fields
     }
 
+    fn draft_connection(&self, cx: &App) -> Result<(DatabaseKind, String), String> {
+        let fields = self.connection_fields(cx);
+        let url = fields.url().map_err(|error| error.to_string())?;
+        Ok((fields.kind, url))
+    }
+
     /// Resolve the visible form through the profile store when it still names
     /// the selected profile. This is the only path that reads keyring secrets.
     fn resolve_draft(&self, cx: &App) -> Result<(DatabaseKind, String, ConnectionConfig), String> {
-        let fields = self.connection_fields(cx);
-        let visible_url = fields.url().map_err(|error| error.to_string())?;
-        let mut kind = fields.kind;
+        let (mut kind, visible_url) = self.draft_connection(cx)?;
         let config = if let (Some(store), Some(profile_id)) =
             (&self.profile_store, self.draft.selected_profile)
         {
@@ -946,19 +953,10 @@ impl DbxApp {
             *name = profile.name;
             cx.notify();
         });
-        // Resolve the profile through the store so its keyring credential
-        // populates the masked password field. Hydrating from the scrubbed
-        // profile URL alone would drop the password on the next mode switch
-        // or save, and any edited field would then disconnect the draft from
-        // the stored credential.
-        let hydrated_url = match self.profile_store.as_ref() {
-            Some(store) => match store.load(profile.id) {
-                Ok(loaded) => loaded.config.url,
-                Err(_) => profile.url.clone(),
-            },
-            None => profile.url.clone(),
-        };
-        self.hydrate_connection_fields(profile.kind, hydrated_url, cx);
+        // Selecting a profile only changes the draft. Resolve the password
+        // lazily when Test Connection or Connect actually needs it; opening
+        // the picker must not trigger a Keychain prompt or block the UI.
+        self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
         self.error = None;
         self.status = "Saved connection selected".into();
         cx.notify();
@@ -971,7 +969,7 @@ impl DbxApp {
             return;
         };
         let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let (kind, url, config) = match self.resolve_draft(cx) {
+        let (kind, url) = match self.draft_connection(cx) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.set_error(error);
@@ -979,17 +977,17 @@ impl DbxApp {
                 return;
             }
         };
-        let mut draft =
-            ConnectionProfileDraft::new(name, kind, url).with_environment(self.draft.environment);
+        let mut draft = ConnectionProfileDraft::new(name, kind, url.clone())
+            .with_environment(self.draft.environment);
         if let Some(id) = self.draft.selected_profile {
             draft = draft.with_id(id);
         }
         match store.save(draft) {
             Ok(profile) => {
                 self.draft.selected_profile = Some(profile.id);
-                // Rehydrate from the resolved URL rather than the scrubbed
-                // profile so the password field keeps its value after saving.
-                self.hydrate_connection_fields(profile.kind, config.url, cx);
+                // Rehydrate from the entered URL rather than the scrubbed
+                // profile so a newly entered password remains in the draft.
+                self.hydrate_connection_fields(profile.kind, url, cx);
                 match store.list() {
                     Ok(profiles) => self.saved_connections = profiles,
                     Err(error) => {
@@ -4167,56 +4165,16 @@ impl DbxApp {
             .child(
                 div()
                     .w(if self.compact_layout {
-                        px(112.)
+                        px(96.)
                     } else {
-                        px(124.)
+                        px(122.)
                     })
                     .flex_none()
-                    .px(px(13.))
+                    .px(px(12.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(
-                        div()
-                            .id("window-traffic-lights")
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.))
-                            .child(
-                                traffic_light(
-                                    "window-close",
-                                    THEME.window_close,
-                                    icon(Icon::Close, THEME.rail).size(px(10.)),
-                                )
-                                .on_click(|_, window, cx| {
-                                    cx.stop_propagation();
-                                    window.remove_window();
-                                }),
-                            )
-                            .child(
-                                traffic_light(
-                                    "window-minimize",
-                                    THEME.window_minimize,
-                                    div().w(px(7.)).h(px(1.)).bg(THEME.rail),
-                                )
-                                .on_click(|_, window, cx| {
-                                    cx.stop_propagation();
-                                    window.minimize_window();
-                                }),
-                            )
-                            .child(
-                                traffic_light(
-                                    "window-maximize",
-                                    THEME.window_maximize,
-                                    div().size(px(7.)).border_1().border_color(THEME.rail),
-                                )
-                                .on_click(|_, window, cx| {
-                                    cx.stop_propagation();
-                                    window.zoom_window();
-                                }),
-                            ),
-                    )
+                    .child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
                     .child(
                         div()
                             .id("window-title-drag")
@@ -4235,6 +4193,22 @@ impl DbxApp {
                     ),
             )
             .child(self.render_connection_tabs(cx))
+            .child(
+                div()
+                    .id("window-title-drag-spacer")
+                    .w(if self.compact_layout {
+                        px(24.)
+                    } else {
+                        px(48.)
+                    })
+                    .h_full()
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                        window.start_window_move();
+                    })
+                    .on_double_click(|_, window, _| window.zoom_window()),
+            )
             .child(
                 div()
                     .flex_none()
@@ -4263,7 +4237,11 @@ impl DbxApp {
                                 .rounded_full()
                                 .bg(THEME.text_muted),
                         )
-                    }),
+                    })
+                    .child(window_close_button().on_click(|_, window, cx| {
+                        cx.stop_propagation();
+                        window.remove_window();
+                    })),
             )
     }
 
