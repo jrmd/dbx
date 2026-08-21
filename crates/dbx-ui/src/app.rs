@@ -5,7 +5,7 @@
 //! FORM: Reference-led operator console, user-supplied DBX screen map; seed key: dbx-native-console.
 //! FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseKind, EntityKind, Filter,
@@ -13,10 +13,14 @@ use dbx_core::{
     ReferentialAction, RowData, TableInfo, TableRef, UpdateRequest,
 };
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, Image, ImageFormat, IntoElement,
-    PathPromptOptions, Point, PromptButton, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement as _, Subscription, Window, anchored, deferred, div, img,
+    AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, IntoElement,
+    PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, Rgba, SharedString,
+    Stateful, StatefulInteractiveElement as _, Subscription, Window, anchored, deferred, div, img,
     prelude::*, px,
+};
+use gpui_component::{
+    Sizable as _,
+    table::{Column as DataColumn, DataTable, TableDelegate, TableEvent, TableState},
 };
 use uuid::Uuid;
 
@@ -27,9 +31,13 @@ use crate::{
     filters::{
         FilterModel, FilterRowId, filter_operator_options, operator_label, operator_requires_value,
     },
-    profiles::{ConnectionProfileDraft, ProfileStore, SavedConnection, sqlite_url},
+    profiles::{
+        ConnectionEnvironment, ConnectionProfileDraft, ProfileStore, SavedConnection, sqlite_url,
+    },
     row_drafts::{FieldId, FieldRow, FieldValueState, RowDraftModel},
-    theme::{ButtonKind, Icon, THEME, badge, button, connection_tab, icon, panel_header},
+    theme::{
+        ButtonKind, Icon, THEME, badge, button, connection_tab, database_logo, icon, panel_header,
+    },
 };
 
 gpui::actions!(dbx_ui, [RunQuery, RefreshData]);
@@ -55,10 +63,240 @@ enum ConnectionFormMode {
 
 type SessionId = Uuid;
 
+const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
+const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
+
+/// Shared, virtualized backing model for both table browsing and ad-hoc query results.
+///
+/// `QueryResult` stays owned by the session/tab through an `Arc`, while DataTable only
+/// asks this delegate to render cells that are currently visible.
+struct ResultTableDelegate {
+    result: Option<Arc<QueryResult>>,
+    columns: Vec<DataColumn>,
+}
+
+impl Default for ResultTableDelegate {
+    fn default() -> Self {
+        Self {
+            result: None,
+            columns: vec![Self::row_number_column()],
+        }
+    }
+}
+
+impl ResultTableDelegate {
+    fn row_number_column() -> DataColumn {
+        DataColumn::new(ROW_NUMBER_COLUMN_KEY, "#")
+            .width(44.)
+            .fixed_left()
+            .resizable(false)
+            .movable(false)
+            .selectable(false)
+            .min_width(44.)
+            .max_width(44.)
+            .p_0()
+    }
+
+    fn data_column_key(index: usize, column: &ColumnInfo) -> String {
+        // Query results may legally contain duplicate column names, so the ordinal is
+        // part of the key. Humanity has already made SQL aliases difficult enough.
+        format!("column:{index}:{}", column.name)
+    }
+
+    fn auto_width(result: &QueryResult, column_index: usize, column: &ColumnInfo) -> Pixels {
+        let header_chars = format!("{}  {}", column.name, column.data_type)
+            .chars()
+            .count();
+        let value_chars = result
+            .rows
+            .iter()
+            .take(AUTO_WIDTH_SAMPLE_ROWS)
+            .filter_map(|row| row.values.get(column_index))
+            .map(|value| value.to_string().chars().count())
+            .max()
+            .unwrap_or_default();
+
+        // This is an initial width, not a prison sentence. The user can resize it.
+        px(((header_chars.max(value_chars) as f32 * 7.0) + 20.0).clamp(80.0, 420.0))
+    }
+
+    fn set_result(
+        &mut self,
+        result: Option<Arc<QueryResult>>,
+        remembered_widths: &HashMap<String, Pixels>,
+    ) {
+        let mut columns = vec![Self::row_number_column()];
+
+        if let Some(result) = result.as_deref() {
+            columns.extend(result.columns.iter().enumerate().map(|(index, column)| {
+                let key = Self::data_column_key(index, column);
+                let width = remembered_widths
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| Self::auto_width(result, index, column));
+
+                DataColumn::new(key, format!("{}  {}", column.name, column.data_type))
+                    .width(width)
+                    .resizable(true)
+                    .movable(false)
+                    .min_width(80.)
+                    .max_width(600.)
+                    .p_0()
+            }));
+        }
+
+        self.result = result;
+        self.columns = columns;
+    }
+
+    fn widths_by_key(result: Option<&QueryResult>, widths: &[Pixels]) -> HashMap<String, Pixels> {
+        let mut remembered = HashMap::new();
+
+        if let Some(width) = widths.first().copied() {
+            remembered.insert(ROW_NUMBER_COLUMN_KEY.to_owned(), width);
+        }
+
+        if let Some(result) = result {
+            for (index, column) in result.columns.iter().enumerate() {
+                if let Some(width) = widths.get(index + 1).copied() {
+                    remembered.insert(Self::data_column_key(index, column), width);
+                }
+            }
+        }
+
+        remembered
+    }
+}
+
+impl TableDelegate for ResultTableDelegate {
+    fn columns_count(&self, _cx: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _cx: &App) -> usize {
+        self.result
+            .as_ref()
+            .map(|result| result.rows.len())
+            .unwrap_or_default()
+    }
+
+    fn column(&self, col_ix: usize, _cx: &App) -> DataColumn {
+        self.columns[col_ix].clone()
+    }
+
+    fn render_header(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        div()
+            .id("dbx-result-header")
+            .bg(THEME.panel_raised)
+            .border_color(THEME.border_strong)
+    }
+
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .px(px(8.))
+            .text_size(px(10.))
+            .text_color(THEME.text_muted)
+            .truncate()
+            .child(self.columns[col_ix].name.clone())
+    }
+
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        div()
+            .id(("dbx-result-row", row_ix))
+            .border_color(THEME.border)
+            .bg(if row_ix.is_multiple_of(2) {
+                THEME.canvas
+            } else {
+                THEME.grid_alternate
+            })
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let (text, text_color) = if col_ix == 0 {
+            ((row_ix + 1).to_string(), THEME.text_muted)
+        } else {
+            self.result
+                .as_ref()
+                .and_then(|result| result.rows.get(row_ix))
+                .and_then(|row| row.values.get(col_ix - 1))
+                .map(|value| {
+                    if matches!(value, CellValue::Null) {
+                        ("NULL".to_owned(), THEME.text_muted)
+                    } else {
+                        (value.to_string(), THEME.text)
+                    }
+                })
+                .unwrap_or_else(|| ("—".to_owned(), THEME.text_muted))
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .px(px(8.))
+            .whitespace_nowrap()
+            .truncate()
+            .text_size(px(11.))
+            .text_color(text_color)
+            .child(text)
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(THEME.text_muted)
+            .child("No rows returned")
+    }
+
+    fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
+        if col_ix == 0 {
+            return (row_ix + 1).to_string();
+        }
+
+        self.result
+            .as_ref()
+            .and_then(|result| result.rows.get(row_ix))
+            .and_then(|row| row.values.get(col_ix - 1))
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+}
+
 struct ConnectionDraft {
     kind: DatabaseKind,
     mode: ConnectionFormMode,
     selected_profile: Option<Uuid>,
+    environment: ConnectionEnvironment,
     connection_name: Entity<String>,
     connection_name_editor: Entity<TextEditor>,
     connection_url: Entity<String>,
@@ -99,8 +337,9 @@ impl ConnectionDraft {
 
         Self {
             kind: DatabaseKind::SQLite,
-            mode: ConnectionFormMode::ConnectionString,
+            mode: ConnectionFormMode::Details,
             selected_profile: None,
+            environment: ConnectionEnvironment::default(),
             connection_name,
             connection_name_editor,
             connection_url,
@@ -144,29 +383,63 @@ type SecondaryTabId = Uuid;
 struct QueryTab {
     query_text: Entity<String>,
     query_editor: Entity<TextEditor>,
-    result: Option<QueryResult>,
+    result: Option<Arc<QueryResult>>,
+    result_grid: Entity<TableState<ResultTableDelegate>>,
+    result_column_widths: HashMap<String, Pixels>,
     busy: bool,
     status: String,
     error: Option<String>,
     request_generation: u64,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl QueryTab {
-    fn new(kind: DatabaseKind, window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
+    fn new(
+        kind: DatabaseKind,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<DbxApp>,
+    ) -> Self {
         let query_text = cx.new(|_| DbxApp::default_query(kind).to_owned());
         let query_editor = cx.new(|cx| TextEditor::new_sql(query_text.clone(), window, cx));
-        let subscription = cx.observe(&query_text, |_, _, cx| cx.notify());
+        let result_grid = cx.new(|cx| {
+            TableState::new(ResultTableDelegate::default(), window, cx)
+                .col_resizable(true)
+                .col_movable(false)
+                .sortable(false)
+                .row_selectable(false)
+                .col_selectable(false)
+                .cell_selectable(false)
+        });
+        let text_subscription = cx.observe(&query_text, |_, _, cx| cx.notify());
+        let table_subscription =
+            cx.subscribe_in(&result_grid, window, move |this, _, event, _, cx| {
+                this.on_query_grid_event(session_id, tab_id, event, cx)
+            });
+
         Self {
             query_text,
             query_editor,
             result: None,
+            result_grid,
+            result_column_widths: HashMap::new(),
             busy: false,
             status: "Ready to query".into(),
             error: None,
             request_generation: 0,
-            _subscription: subscription,
+            _subscriptions: vec![text_subscription, table_subscription],
         }
+    }
+
+    fn set_result(&mut self, result: Option<QueryResult>, cx: &mut Context<DbxApp>) {
+        self.result = result.map(Arc::new);
+        let result = self.result.clone();
+        let remembered_widths = self.result_column_widths.clone();
+        self.result_grid.update(cx, move |table, cx| {
+            table.delegate_mut().set_result(result, &remembered_widths);
+            table.refresh(cx);
+        });
     }
 }
 
@@ -193,9 +466,12 @@ struct ConnectionSession {
     profile_id: Option<Uuid>,
     name: String,
     kind: DatabaseKind,
-    display_url: String,
+    environment: ConnectionEnvironment,
     engine: Option<Arc<DatabaseEngine>>,
     editors: SessionEditors,
+    data_grid: Entity<TableState<ResultTableDelegate>>,
+    result_column_widths: HashMap<String, Pixels>,
+    _data_grid_subscription: Subscription,
     filters: FilterModel,
     filter_picker: Option<FilterPicker>,
     pane: Pane,
@@ -206,7 +482,7 @@ struct ConnectionSession {
     schema_filter: Option<String>,
     selected_table: Option<TableRef>,
     table_columns: Vec<ColumnInfo>,
-    result: Option<QueryResult>,
+    result: Option<Arc<QueryResult>>,
     /// The table that produced `result`, when it is safe to edit through the
     /// grid. Ad-hoc query results deliberately have no table provenance.
     result_table: Option<TableRef>,
@@ -226,18 +502,35 @@ impl ConnectionSession {
         profile_id: Option<Uuid>,
         name: String,
         kind: DatabaseKind,
-        display_url: String,
+        environment: ConnectionEnvironment,
         window: &mut Window,
         cx: &mut Context<DbxApp>,
     ) -> Self {
+        let data_grid = cx.new(|cx| {
+            TableState::new(ResultTableDelegate::default(), window, cx)
+                .col_resizable(true)
+                .col_movable(false)
+                .sortable(false)
+                .row_selectable(true)
+                .col_selectable(true)
+                .cell_selectable(false)
+        });
+        let data_grid_subscription =
+            cx.subscribe_in(&data_grid, window, move |this, _, event, window, cx| {
+                this.on_data_grid_event(id, event, window, cx)
+            });
+
         Self {
             id,
             profile_id,
             name,
             kind,
-            display_url,
+            environment,
             engine: None,
             editors: SessionEditors::new(window, cx),
+            data_grid,
+            result_column_widths: HashMap::new(),
+            _data_grid_subscription: data_grid_subscription,
             filters: FilterModel::new(),
             filter_picker: None,
             pane: Pane::Data,
@@ -258,6 +551,28 @@ impl ConnectionSession {
             error: None,
             request_generation: 0,
         }
+    }
+
+    fn set_result(&mut self, result: Option<QueryResult>, cx: &mut Context<DbxApp>) {
+        self.result = result.map(Arc::new);
+        self.sync_result_grid(true, cx);
+    }
+
+    fn sync_result_grid(&mut self, clear_selection: bool, cx: &mut Context<DbxApp>) {
+        let result = self.result.clone();
+        let remembered_widths = self.result_column_widths.clone();
+        self.data_grid.update(cx, move |table, cx| {
+            table.delegate_mut().set_result(result, &remembered_widths);
+            table.refresh(cx);
+            if clear_selection {
+                table.clear_selection(cx);
+            }
+        });
+    }
+
+    fn clear_grid_selection(&self, cx: &mut Context<DbxApp>) {
+        self.data_grid
+            .update(cx, |table, cx| table.clear_selection(cx));
     }
 }
 
@@ -374,7 +689,7 @@ impl DbxApp {
         let fields =
             ConnectionFields::from_url(url.clone()).unwrap_or_else(|_| ConnectionFields::new(kind));
         self.draft.kind = kind;
-        self.draft.mode = ConnectionFormMode::ConnectionString;
+        self.draft.mode = ConnectionFormMode::Details;
         self.draft.connection_url.update(cx, |value, cx| {
             *value = url;
             cx.notify();
@@ -528,13 +843,31 @@ impl DbxApp {
         cx.notify();
     }
 
+    fn select_environment(&mut self, environment: ConnectionEnvironment, cx: &mut Context<Self>) {
+        self.draft.environment = environment;
+        cx.notify();
+    }
+
     fn select_saved_connection(&mut self, profile: SavedConnection, cx: &mut Context<Self>) {
         self.draft.selected_profile = Some(profile.id);
+        self.draft.environment = profile.environment;
         self.draft.connection_name.update(cx, |name, cx| {
             *name = profile.name;
             cx.notify();
         });
-        self.hydrate_connection_fields(profile.kind, profile.url, cx);
+        // Resolve the profile through the store so its keyring credential
+        // populates the masked password field. Hydrating from the scrubbed
+        // profile URL alone would drop the password on the next mode switch
+        // or save, and any edited field would then disconnect the draft from
+        // the stored credential.
+        let hydrated_url = match self.profile_store.as_ref() {
+            Some(store) => match store.load(profile.id) {
+                Ok(loaded) => loaded.config.url,
+                Err(_) => profile.url.clone(),
+            },
+            None => profile.url.clone(),
+        };
+        self.hydrate_connection_fields(profile.kind, hydrated_url, cx);
         self.error = None;
         self.status = "Saved connection selected".into();
         cx.notify();
@@ -547,7 +880,7 @@ impl DbxApp {
             return;
         };
         let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let (kind, url, _) = match self.resolve_draft(cx) {
+        let (kind, url, config) = match self.resolve_draft(cx) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.set_error(error);
@@ -555,14 +888,17 @@ impl DbxApp {
                 return;
             }
         };
-        let mut draft = ConnectionProfileDraft::new(name, kind, url);
+        let mut draft =
+            ConnectionProfileDraft::new(name, kind, url).with_environment(self.draft.environment);
         if let Some(id) = self.draft.selected_profile {
             draft = draft.with_id(id);
         }
         match store.save(draft) {
             Ok(profile) => {
                 self.draft.selected_profile = Some(profile.id);
-                self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
+                // Rehydrate from the resolved URL rather than the scrubbed
+                // profile so the password field keeps its value after saving.
+                self.hydrate_connection_fields(profile.kind, config.url, cx);
                 match store.list() {
                     Ok(profiles) => self.saved_connections = profiles,
                     Err(error) => {
@@ -649,7 +985,7 @@ impl DbxApp {
     }
 
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (kind, visible_url, config) = match self.resolve_draft(cx) {
+        let (kind, _, config) = match self.resolve_draft(cx) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.set_error(error);
@@ -660,15 +996,16 @@ impl DbxApp {
         let profile_id = self.draft.selected_profile;
         let session_id = Uuid::new_v4();
         let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let mut session = ConnectionSession::new(
-            session_id,
-            profile_id,
-            name,
-            kind,
-            display_url(&visible_url),
-            window,
-            cx,
-        );
+        let environment = profile_id
+            .and_then(|id| {
+                self.saved_connections
+                    .iter()
+                    .find(|profile| profile.id == id)
+            })
+            .map(|profile| profile.environment)
+            .unwrap_or(self.draft.environment);
+        let mut session =
+            ConnectionSession::new(session_id, profile_id, name, kind, environment, window, cx);
         session.busy = true;
         session.request_generation = 1;
         let generation = session.request_generation;
@@ -737,12 +1074,12 @@ impl DbxApp {
                         if let Some((table, columns, result)) = initial {
                             session.selected_table = Some(table.clone());
                             session.table_columns = columns;
-                            session.result = result;
+                            session.set_result(result, cx);
                             session.result_table = Some(table);
                         } else {
                             session.selected_table = None;
                             session.table_columns.clear();
-                            session.result = None;
+                            session.set_result(None, cx);
                             session.result_table = None;
                         }
                         session.status = format!("Connected to {kind}");
@@ -823,14 +1160,9 @@ impl DbxApp {
         .detach();
     }
 
-    fn open_connection_picker(&mut self, cx: &mut Context<Self>) {
-        self.connection_picker_open = true;
-        self.error = None;
-        cx.notify();
-    }
-
     fn begin_new_connection(&mut self, cx: &mut Context<Self>) {
         self.draft.selected_profile = None;
+        self.draft.environment = ConnectionEnvironment::default();
         self.draft.connection_name.update(cx, |name, cx| {
             name.clear();
             cx.notify();
@@ -912,13 +1244,18 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(kind) = self.session(session_id).map(|session| session.kind) else {
+            return;
+        };
+
+        let id = Uuid::new_v4();
+        let query_tab = QueryTab::new(kind, session_id, id, window, cx);
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        let id = Uuid::new_v4();
         session.secondary_tabs.push(SecondaryTab {
             id,
-            kind: SecondaryTabKind::Query(QueryTab::new(session.kind, window, cx)),
+            kind: SecondaryTabKind::Query(query_tab),
         });
         session.active_secondary_tab = Some(id);
         session.pane = Pane::Query;
@@ -1055,7 +1392,7 @@ impl DbxApp {
             // instead and let the user choose a table in the new schema.
             session.selected_table = None;
             session.table_columns.clear();
-            session.result = None;
+            session.set_result(None, cx);
             session.result_table = None;
             session.selected_row = None;
             session.row_draft = None;
@@ -1093,6 +1430,7 @@ impl DbxApp {
         session.result_table = None;
         session.selected_row = None;
         session.row_draft = None;
+        session.clear_grid_selection(cx);
         session.filters = FilterModel::new();
         session.filter_picker = None;
         session.busy = true;
@@ -1137,7 +1475,7 @@ impl DbxApp {
                 match result {
                     Ok((columns, result)) => {
                         session.table_columns = columns;
-                        session.result = Some(result);
+                        session.set_result(Some(result), cx);
                         session.result_table = Some(result_table.clone());
                         session.status = "Ready".into();
                         session.error = None;
@@ -1310,6 +1648,7 @@ impl DbxApp {
         session.result_table = None;
         session.selected_row = None;
         session.row_draft = None;
+        session.clear_grid_selection(cx);
         session.request_generation += 1;
         let generation = session.request_generation;
         let result_table = table.clone();
@@ -1355,7 +1694,7 @@ impl DbxApp {
                 session.busy = false;
                 match result {
                     Ok(result) => {
-                        session.result = Some(result);
+                        session.set_result(Some(result), cx);
                         session.result_table = Some(result_table.clone());
                         session.selected_row = None;
                         session.row_draft = None;
@@ -1388,7 +1727,7 @@ impl DbxApp {
         let column = selected_filter_column(
             session.selected_column,
             &session.table_columns,
-            session.result.as_ref(),
+            session.result.as_deref(),
         )
         .map(|column| column.name.clone());
         Ok(match (value.is_empty(), column) {
@@ -1497,7 +1836,7 @@ impl DbxApp {
                             if result.rows.len() == 1 { "" } else { "s" },
                             result.elapsed_ms
                         );
-                        query_tab.result = Some(result);
+                        query_tab.set_result(Some(result), cx);
                         query_tab.error = None;
                     }
                     Err(error) => {
@@ -1573,9 +1912,72 @@ impl DbxApp {
         };
         session.draft_mode = DraftMode::Insert;
         session.selected_row = None;
+        session.clear_grid_selection(cx);
         session.row_draft = Some(row_draft);
         session.error = None;
         session.status = "Preparing a new row".into();
+        cx.notify();
+    }
+
+    fn on_data_grid_event(
+        &mut self,
+        session_id: SessionId,
+        event: &TableEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TableEvent::ColumnWidthsChanged(widths) => {
+                if let Some(session) = self.session_mut(session_id) {
+                    session.result_column_widths =
+                        ResultTableDelegate::widths_by_key(session.result.as_deref(), widths);
+                }
+            }
+            TableEvent::SelectRow(row_index) => {
+                self.select_row_for(session_id, *row_index, window, cx);
+            }
+            TableEvent::SelectColumn(column_index) if *column_index > 0 => {
+                self.select_column_for(session_id, *column_index - 1, cx);
+            }
+            TableEvent::ClearSelection => {
+                if let Some(session) = self.session_mut(session_id)
+                    && session.draft_mode == DraftMode::Update
+                {
+                    session.selected_row = None;
+                    session.row_draft = None;
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_query_grid_event(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        event: &TableEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let TableEvent::ColumnWidthsChanged(widths) = event else {
+            return;
+        };
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let Some(tab) = session
+            .secondary_tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)
+        else {
+            return;
+        };
+        let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
+            return;
+        };
+
+        query_tab.result_column_widths =
+            ResultTableDelegate::widths_by_key(query_tab.result.as_deref(), widths);
         cx.notify();
     }
 
@@ -1681,6 +2083,7 @@ impl DbxApp {
         if let Some(session) = self.session_mut(session_id) {
             session.row_draft = None;
             session.selected_row = None;
+            session.clear_grid_selection(cx);
             session.draft_mode = DraftMode::Update;
             session.error = None;
             session.status = "Row edit cancelled".into();
@@ -2024,14 +2427,19 @@ impl DbxApp {
                         match action {
                             TableAction::Truncate => {
                                 if let Some(result) = session.result.as_mut() {
+                                    let result = Arc::make_mut(result);
                                     result.rows.clear();
                                     result.rows_affected = Some(outcome.rows_affected);
                                     result.elapsed_ms = outcome.elapsed_ms;
+                                    session.sync_result_grid(true, cx);
                                 } else {
-                                    session.result = Some(QueryResult::empty(
-                                        Some(outcome.rows_affected),
-                                        outcome.elapsed_ms,
-                                    ));
+                                    session.set_result(
+                                        Some(QueryResult::empty(
+                                            Some(outcome.rows_affected),
+                                            outcome.elapsed_ms,
+                                        )),
+                                        cx,
+                                    );
                                 }
                                 session.result_table = Some(target_table.clone());
                                 session.selected_row = None;
@@ -2045,7 +2453,7 @@ impl DbxApp {
                                 if session.selected_table.as_ref() == Some(&target_table) {
                                     session.selected_table = None;
                                     session.table_columns.clear();
-                                    session.result = None;
+                                    session.set_result(None, cx);
                                     session.result_table = None;
                                     session.selected_row = None;
                                     session.row_draft = None;
@@ -3031,7 +3439,9 @@ impl DbxApp {
         let kind = self.draft.kind;
         let details =
             self.draft.mode == ConnectionFormMode::Details && kind != DatabaseKind::SQLite;
+        let environment = self.draft.environment;
         let saved_connections = self.saved_connections.clone();
+        let selected_profile = self.draft.selected_profile;
 
         div().flex_1().min_h_0().flex().bg(THEME.canvas)
             .child(
@@ -3044,35 +3454,39 @@ impl DbxApp {
                     .child(div().id("saved-connections").flex_1().min_h_0().overflow_y_scroll().p(px(8.)).flex().flex_col().gap(px(3.))
                         .when(saved_connections.is_empty(), |view| view.child(div().p(px(10.)).text_size(px(11.)).text_color(THEME.text_muted).child("No saved connections yet.")))
                         .children(saved_connections.into_iter().map(|profile| {
-                            let id = profile.id; let selected = self.draft.selected_profile == Some(id); let choose = profile.clone();
+                            let id = profile.id; let selected = selected_profile == Some(id); let choose = profile.clone();
                             div().id(SharedString::from(format!("saved-connection-{id}"))).h(px(48.)).px(px(9.)).rounded(px(6.)).bg(if selected { THEME.accent_soft } else { THEME.panel }).cursor_pointer().flex().items_center().gap(px(8.))
-                                .child(icon(Icon::Database, if selected { THEME.accent } else { THEME.text_muted }))
+                                .child(database_logo(profile.kind, if selected { THEME.accent } else { THEME.text_muted }))
                                 .child(div().flex_1().min_w_0().flex().flex_col().child(div().truncate().text_size(px(11.)).child(profile.name)).child(div().truncate().text_size(px(9.)).text_color(THEME.text_muted).child(display_url(&profile.url))))
+                                .child(environment_badge(profile.environment))
                                 .on_click(cx.listener(move |this, _, _, cx| this.select_saved_connection(choose.clone(), cx)))
                         }))),
             )
-            .child(div().id("connection-form-scroll").flex_1().min_w_0().overflow_y_scroll().p(if self.compact_layout { px(14.) } else { px(24.) }).flex().justify_center()
-                .child(div().w_full().max_w(px(720.)).flex().flex_col().gap(px(14.))
-                    .child(div().flex().items_end().justify_between().child(div().flex().flex_col().gap(px(3.)).child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(if self.draft.selected_profile.is_some() { "Edit connection" } else { "New connection" })).child(div().text_size(px(11.)).text_color(THEME.text_muted).child("Configure a saved profile or connect once."))).child(badge(kind.to_string(), THEME.accent)))
-                    .child(div().rounded(px(9.)).border_1().border_color(THEME.border).bg(THEME.panel).p(px(16.)).flex().flex_col().gap(px(12.))
-                        .child(div().flex().gap(px(6.)).children([DatabaseKind::PostgreSQL, DatabaseKind::MySQL, DatabaseKind::SQLite, DatabaseKind::Redis].into_iter().map(|option| { let selected = option == kind; div().id(SharedString::from(format!("engine-{option}"))).px(px(9.)).py(px(7.)).rounded(px(6.)).bg(if selected { THEME.accent_soft } else { THEME.panel_raised }).text_color(if selected { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child(option.to_string()).on_click(cx.listener(move |this, _, _, cx| this.select_kind(option, cx))) })))
-                        .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Connection name")).child(editor::input(self.draft.connection_name_editor.clone(), name_focus, false)))
-                        .when(kind != DatabaseKind::SQLite, |view| view.child(div().flex().gap(px(5.))
-                            .child(div().id("connection-details-mode").px(px(9.)).py(px(6.)).rounded(px(5.)).bg(if details { THEME.accent_soft } else { THEME.panel_raised }).text_color(if details { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child("Details").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::Details, cx))))
-                            .child(div().id("connection-string-mode").px(px(9.)).py(px(6.)).rounded(px(5.)).bg(if !details { THEME.accent_soft } else { THEME.panel_raised }).text_color(if !details { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child("Connection string").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx))))))
-                        .when(details, |view| view
-                            .child(div().flex().gap(px(8.)).child(div().flex_1().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Host")).child(editor::input(self.draft.host_editor.clone(), host_focus, false))).child(div().w(px(110.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Port")).child(editor::input(self.draft.port_editor.clone(), port_focus, false))))
-                            .child(div().flex().gap(px(8.)).child(div().flex_1().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Username")).child(editor::input(self.draft.username_editor.clone(), username_focus, false))).child(div().flex_1().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Password")).child(editor::input(self.draft.password_editor.clone(), password_focus, false))))
-                            .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child(if kind == DatabaseKind::Redis { "Database index (optional)" } else { "Database" })).child(editor::input(self.draft.database_editor.clone(), database_focus, false))))
-                        .when(!details, |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child(if kind == DatabaseKind::SQLite { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(px(8.)).child(div().flex_1().child(editor::input(self.draft.connection_editor.clone(), url_focus, false))).when(kind == DatabaseKind::SQLite, |view| view.child(button("Choose file…", ButtonKind::Quiet).id("choose-sqlite-file").cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx)))))))
-                        .child(div().p(px(9.)).rounded(px(6.)).bg(THEME.canvas).text_size(px(10.)).text_color(THEME.text_muted).child("Profiles stay on disk; passwords stay in the OS keyring."))
-                        .child(div().text_size(px(10.)).text_color(if self.error.is_some() { THEME.text_muted } else { THEME.success }).child(self.status.clone()))
-                        .when_some(self.error.clone(), |view, error| view.child(div().p(px(9.)).rounded(px(6.)).border_1().border_color(THEME.danger).text_color(THEME.danger).text_size(px(10.)).child(error)))
-                        .child(div().flex().justify_end().items_center().gap(px(8.))
-                            .child(button(if self.testing_connection { "Testing…" } else { "Test connection" }, ButtonKind::Quiet).id("test-connection").when(!self.testing_connection, |button| button.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.test_connection(cx)))))
-                            .child(button("Save", ButtonKind::Quiet).id("save-connection").cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.save_connection(cx))))
-                            .child(button("Connect", ButtonKind::Primary).id("connect").cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))))))
-            ))
+            .child(div().flex_1().min_w_0().flex().flex_col()
+                .child(div().id("connection-form-scroll").flex_1().min_h_0().overflow_y_scroll().p(if self.compact_layout { px(14.) } else { px(24.) }).flex().justify_center()
+                    .child(div().w_full().max_w(px(720.)).flex().flex_col().gap(px(14.))
+                        .child(div().flex().items_end().justify_between().child(div().flex().flex_col().gap(px(3.)).child(div().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(if self.draft.selected_profile.is_some() { "Edit connection" } else { "New connection" })).child(div().text_size(px(11.)).text_color(THEME.text_muted).child("Configure a saved profile or connect once."))).child(div().flex().items_center().gap(px(6.)).px(px(8.)).py(px(4.)).rounded_full().bg(THEME.panel_raised).child(database_logo(kind, THEME.accent)).child(div().text_size(px(10.)).font_weight(FontWeight::MEDIUM).text_color(THEME.accent).child(kind.to_string()))))
+                        .child(div().rounded(px(9.)).border_1().border_color(THEME.border).bg(THEME.panel).p(px(16.)).flex().flex_col().gap(px(12.))
+                            .child(div().flex().gap(px(6.)).children([DatabaseKind::PostgreSQL, DatabaseKind::MySQL, DatabaseKind::SQLite, DatabaseKind::Redis].into_iter().map(|option| { let selected = option == kind; div().id(SharedString::from(format!("engine-{option}"))).flex().items_center().gap(px(5.)).px(px(9.)).py(px(7.)).rounded(px(6.)).bg(if selected { THEME.accent_soft } else { THEME.panel_raised }).text_color(if selected { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child(database_logo(option, if selected { THEME.accent } else { THEME.text_muted })).child(option.to_string()).on_click(cx.listener(move |this, _, _, cx| this.select_kind(option, cx))) })))
+                            .child(div().flex().items_center().gap(px(6.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Environment")).children(ConnectionEnvironment::ALL.into_iter().map(|option| { let selected = option == environment; div().id(SharedString::from(format!("environment-{option}"))).flex().items_center().gap(px(5.)).px(px(9.)).py(px(7.)).rounded(px(6.)).bg(if selected { THEME.accent_soft } else { THEME.panel_raised }).text_color(if selected { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child(div().size(px(6.)).rounded_full().bg(environment_color(option))).child(option.to_string()).on_click(cx.listener(move |this, _, _, cx| this.select_environment(option, cx))) })))
+                            .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Connection name")).child(editor::input(self.draft.connection_name_editor.clone(), name_focus, false)))
+                            .when(kind != DatabaseKind::SQLite, |view| view.child(div().flex().gap(px(5.))
+                                .child(div().id("connection-details-mode").flex().items_center().gap(px(5.)).px(px(9.)).py(px(6.)).rounded(px(5.)).bg(if details { THEME.accent_soft } else { THEME.panel_raised }).text_color(if details { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child("Details").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::Details, cx))))
+                                .child(div().id("connection-string-mode").flex().items_center().gap(px(5.)).px(px(9.)).py(px(6.)).rounded(px(5.)).bg(if !details { THEME.accent_soft } else { THEME.panel_raised }).text_color(if !details { THEME.accent } else { THEME.text_muted }).text_size(px(10.)).cursor_pointer().child("Connection string").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx))))))
+                            .when(details, |view| view
+                                .child(div().flex().gap(px(8.)).child(div().flex_1().min_w_0().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Host")).child(editor::input(self.draft.host_editor.clone(), host_focus, false))).child(div().w(px(110.)).flex_none().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Port")).child(editor::input(self.draft.port_editor.clone(), port_focus, false))))
+                                .child(div().flex().gap(px(8.)).child(div().flex_1().min_w_0().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Username")).child(editor::input(self.draft.username_editor.clone(), username_focus, false))).child(div().flex_1().min_w_0().child(div().text_size(px(10.)).text_color(THEME.text_muted).child("Password")).child(editor::input(self.draft.password_editor.clone(), password_focus, false))))
+                                .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child(if kind == DatabaseKind::Redis { "Database index (optional)" } else { "Database" })).child(editor::input(self.draft.database_editor.clone(), database_focus, false))))
+                            .when(!details, |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(10.)).text_color(THEME.text_muted).child(if kind == DatabaseKind::SQLite { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false))).when(kind == DatabaseKind::SQLite, |view| view.child(button("Choose file…", ButtonKind::Quiet).id("choose-sqlite-file").flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx))))))))
+                            .child(div().p(px(9.)).rounded(px(6.)).bg(THEME.canvas).text_size(px(10.)).text_color(THEME.text_muted).child("Profiles stay on disk; passwords stay in the OS keyring.")))))
+                .child(div().flex_none().border_t_1().border_color(THEME.border).bg(THEME.panel).px(if self.compact_layout { px(14.) } else { px(24.) }).py(px(12.)).flex().items_center().justify_between().gap(px(12.))
+                    .child(div().min_w_0().flex().flex_col().gap(px(4.))
+                        .child(div().truncate().text_size(px(10.)).text_color(if self.error.is_some() { THEME.text_muted } else { THEME.success }).child(self.status.clone()))
+                        .when_some(self.error.clone(), |view, error| view.child(div().truncate().text_size(px(10.)).text_color(THEME.danger).child(error))))
+                    .child(div().flex_none().flex().items_center().gap(px(8.))
+                        .child(button(if self.testing_connection { "Testing…" } else { "Test connection" }, ButtonKind::Quiet).id("test-connection").when(!self.testing_connection, |button| button.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.test_connection(cx)))))
+                        .child(button("Save", ButtonKind::Quiet).id("save-connection").cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.save_connection(cx))))
+                        .child(button("Connect", ButtonKind::Primary).id("connect").cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))))))
     }
 
     fn render_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3097,10 +3511,6 @@ impl DbxApp {
 
     fn render_app_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pane = self.active_session().map(|session| session.pane);
-        let connected = self
-            .active_session()
-            .is_some_and(|session| session.engine.is_some());
-        let connections_selected = self.connection_picker_open || self.active_session().is_none();
         div()
             .w(px(46.))
             .flex_none()
@@ -3130,46 +3540,34 @@ impl DbxApp {
                     .items_center()
                     .gap(px(4.))
                     .child(self.rail_button(
-                        "rail-connections",
-                        Icon::Database,
-                        connections_selected,
-                        cx.listener(|this, _, _, cx| this.open_connection_picker(cx)),
+                        "rail-data",
+                        Icon::Table,
+                        active_pane == Some(Pane::Data),
+                        cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
                     ))
-                    .when(connected, |view| {
-                        view.child(self.rail_button(
-                            "rail-data",
-                            Icon::Table,
-                            !connections_selected && active_pane == Some(Pane::Data),
-                            cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
-                        ))
-                        .child(self.rail_button(
-                            "rail-structure",
-                            Icon::Structure,
-                            !connections_selected && active_pane == Some(Pane::Structure),
-                            cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Structure, cx)),
-                        ))
-                        .child(self.rail_button(
-                            "rail-query",
-                            Icon::Query,
-                            !connections_selected && active_pane == Some(Pane::Query),
-                            cx.listener(|this, _, window, cx| {
-                                if let Some(session_id) = this.active_session_id() {
-                                    this.add_query_tab_for(session_id, window, cx);
-                                }
-                            }),
-                        ))
-                    }),
+                    .child(self.rail_button(
+                        "rail-structure",
+                        Icon::Structure,
+                        active_pane == Some(Pane::Structure),
+                        cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Structure, cx)),
+                    ))
+                    .child(self.rail_button(
+                        "rail-query",
+                        Icon::Query,
+                        active_pane == Some(Pane::Query),
+                        cx.listener(|this, _, window, cx| {
+                            if let Some(session_id) = this.active_session_id() {
+                                this.add_query_tab_for(session_id, window, cx);
+                            }
+                        }),
+                    )),
             )
             .child(
                 div()
                     .mb(px(11.))
                     .size(px(7.))
                     .rounded_full()
-                    .bg(if connected {
-                        THEME.success
-                    } else {
-                        THEME.text_muted
-                    }),
+                    .bg(THEME.success),
             )
     }
 
@@ -3442,7 +3840,7 @@ impl DbxApp {
                     session.busy,
                     session.kind,
                     session.profile_id.is_some(),
-                    session.display_url.clone(),
+                    session.environment,
                 )
             })
             .collect();
@@ -3457,9 +3855,9 @@ impl DbxApp {
             .gap(px(3.))
             .overflow_scroll()
             .children(sessions.into_iter().map(
-                |(session_id, label, busy, kind, saved, display_url)| {
+                |(session_id, label, busy, kind, saved, environment)| {
                     let selected = active_session_id == Some(session_id);
-                    connection_tab(label, selected)
+                    connection_tab(kind, label, selected)
                         .id(SharedString::from(format!("connection-tab-{session_id}")))
                         .flex_none()
                         .cursor_pointer()
@@ -3468,19 +3866,7 @@ impl DbxApp {
                         } else {
                             THEME.success
                         }))
-                        .child(badge(kind.to_string(), THEME.text_muted))
-                        .child(
-                            div()
-                                .max_w(px(130.))
-                                .truncate()
-                                .text_size(px(9.))
-                                .text_color(THEME.text_muted)
-                                .child(format!(
-                                    "{} · {}",
-                                    if saved { "saved" } else { "ad hoc" },
-                                    truncate(&display_url, 22)
-                                )),
-                        )
+                        .when(saved, |tab| tab.child(environment_badge(environment)))
                         .child(
                             div()
                                 .id(SharedString::from(format!(
@@ -4250,19 +4636,17 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((result, busy, selected_column, selected_row)) =
-            self.session(session_id).map(|session| {
-                (
-                    session.result.clone(),
-                    session.busy,
-                    session.selected_column,
-                    session.selected_row,
-                )
-            })
-        else {
+        let Some((result_grid, has_result, busy)) = self.session(session_id).map(|session| {
+            (
+                session.data_grid.clone(),
+                session.result.is_some(),
+                session.busy,
+            )
+        }) else {
             return div().into_any_element();
         };
-        let Some(result) = result else {
+
+        if !has_result {
             return div()
                 .flex_1()
                 .flex()
@@ -4275,94 +4659,19 @@ impl DbxApp {
                     "Select a table to browse rows"
                 })
                 .into_any_element();
-        };
+        }
+
         div()
-            .id("grid-scroll")
+            .id("grid")
             .flex_1()
             .min_w_0()
-            .overflow_scroll()
+            .min_h_0()
             .child(
-                div()
-                    .min_w(px((result.columns.len().max(1) as f32 * 160.0) + 44.0))
-                    .child(
-                        div()
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .bg(THEME.panel_raised)
-                            .border_b_1()
-                            .border_color(THEME.border_strong)
-                            .child(
-                                div()
-                                    .w(px(44.))
-                                    .px(px(8.))
-                                    .text_color(THEME.text_muted)
-                                    .child("#"),
-                            )
-                            .children(result.columns.iter().enumerate().map(|(index, column)| {
-                                div()
-                                    .id(SharedString::from(format!("column-{index}")))
-                                    .w(px(160.))
-                                    .flex_none()
-                                    .px(px(8.))
-                                    .text_size(px(10.))
-                                    .text_color(if index == selected_column {
-                                        THEME.accent
-                                    } else {
-                                        THEME.text_muted
-                                    })
-                                    .cursor_pointer()
-                                    .child(format!("{}  {}", column.name, column.data_type))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_column_for(session_id, index, cx)
-                                    }))
-                            })),
-                    )
-                    .children(result.rows.iter().enumerate().map(|(row_index, row)| {
-                        let selected = selected_row == Some(row_index);
-                        div()
-                            .id(SharedString::from(format!("row-{row_index}")))
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(THEME.border)
-                            .bg(if selected {
-                                THEME.accent_soft
-                            } else if row_index.is_multiple_of(2) {
-                                THEME.canvas
-                            } else {
-                                THEME.grid_alternate
-                            })
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .w(px(44.))
-                                    .px(px(8.))
-                                    .text_size(px(10.))
-                                    .text_color(THEME.text_muted)
-                                    .child((row_index + 1).to_string()),
-                            )
-                            .children(row.values.iter().map(|value| {
-                                let text = truncate(&value.to_string(), 80);
-                                div()
-                                    .w(px(160.))
-                                    .flex_none()
-                                    .px(px(8.))
-                                    .whitespace_nowrap()
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .text_color(if matches!(value, CellValue::Null) {
-                                        THEME.text_muted
-                                    } else {
-                                        THEME.text
-                                    })
-                                    .child(text)
-                            }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_row_for(session_id, row_index, window, cx)
-                            }))
-                    })),
+                DataTable::new(&result_grid)
+                    .with_size(px(30.))
+                    .stripe(false)
+                    .bordered(false)
+                    .scrollbar_visible(true, true),
             )
             .into_any_element()
     }
@@ -4931,8 +5240,12 @@ impl DbxApp {
             }))
     }
 
-    fn render_query_grid(result: Option<QueryResult>, busy: bool) -> AnyElement {
-        let Some(result) = result else {
+    fn render_query_grid(
+        result_grid: Entity<TableState<ResultTableDelegate>>,
+        has_result: bool,
+        busy: bool,
+    ) -> AnyElement {
+        if !has_result {
             return div()
                 .flex_1()
                 .flex()
@@ -4945,77 +5258,19 @@ impl DbxApp {
                     "Run a query to see rows"
                 })
                 .into_any_element();
-        };
+        }
+
         div()
-            .id("query-grid-scroll")
+            .id("query-grid")
             .flex_1()
             .min_w_0()
-            .overflow_scroll()
+            .min_h_0()
             .child(
-                div()
-                    .min_w(px((result.columns.len().max(1) as f32 * 160.0) + 44.0))
-                    .child(
-                        div()
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .bg(THEME.panel_raised)
-                            .border_b_1()
-                            .border_color(THEME.border_strong)
-                            .child(
-                                div()
-                                    .w(px(44.))
-                                    .px(px(8.))
-                                    .text_color(THEME.text_muted)
-                                    .child("#"),
-                            )
-                            .children(result.columns.iter().map(|column| {
-                                div()
-                                    .w(px(160.))
-                                    .flex_none()
-                                    .px(px(8.))
-                                    .text_size(px(10.))
-                                    .text_color(THEME.text_muted)
-                                    .child(format!("{}  {}", column.name, column.data_type))
-                            })),
-                    )
-                    .children(result.rows.iter().enumerate().map(|(row_index, row)| {
-                        div()
-                            .id(SharedString::from(format!("query-row-{row_index}")))
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(THEME.border)
-                            .bg(if row_index.is_multiple_of(2) {
-                                THEME.canvas
-                            } else {
-                                THEME.grid_alternate
-                            })
-                            .child(
-                                div()
-                                    .w(px(44.))
-                                    .px(px(8.))
-                                    .text_size(px(10.))
-                                    .text_color(THEME.text_muted)
-                                    .child((row_index + 1).to_string()),
-                            )
-                            .children(row.values.iter().map(|value| {
-                                div()
-                                    .w(px(160.))
-                                    .flex_none()
-                                    .px(px(8.))
-                                    .whitespace_nowrap()
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .text_color(if matches!(value, CellValue::Null) {
-                                        THEME.text_muted
-                                    } else {
-                                        THEME.text
-                                    })
-                                    .child(truncate(&value.to_string(), 80))
-                            }))
-                    })),
+                DataTable::new(&result_grid)
+                    .with_size(px(30.))
+                    .stripe(false)
+                    .bordered(false)
+                    .scrollbar_visible(true, true),
             )
             .into_any_element()
     }
@@ -5024,14 +5279,21 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((query_editor, busy, result)) = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            Some((query.query_editor.clone(), query.busy, query.result.clone()))
-        }) else {
+        let Some((query_editor, busy, has_result, result_grid)) =
+            self.session(session_id).and_then(|session| {
+                let tab_id = session.active_secondary_tab?;
+                let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+                let SecondaryTabKind::Query(query) = &tab.kind else {
+                    return None;
+                };
+                Some((
+                    query.query_editor.clone(),
+                    query.busy,
+                    query.result.is_some(),
+                    query.result_grid.clone(),
+                ))
+            })
+        else {
             return div().into_any_element();
         };
         let query_focus = query_editor.read(cx).focus_handle();
@@ -5083,7 +5345,7 @@ impl DbxApp {
                     .border_color(THEME.border)
                     .child(editor::input(query_editor, query_focus, true)),
             )
-            .child(Self::render_query_grid(result, busy))
+            .child(Self::render_query_grid(result_grid, has_result, busy))
             .into_any_element()
     }
 
@@ -5222,6 +5484,10 @@ impl Render for DbxApp {
         } else {
             self.render_workspace(cx).into_any_element()
         };
+        // The pane rail only makes sense once a connection is live.
+        let connected = self
+            .active_session()
+            .is_some_and(|session| session.engine.is_some());
         div()
             .size_full()
             .flex()
@@ -5229,7 +5495,7 @@ impl Render for DbxApp {
             .text_color(THEME.text)
             .on_action(cx.listener(Self::run_query_action))
             .on_action(cx.listener(Self::refresh_action))
-            .child(self.render_app_rail(cx))
+            .when(connected, |view| view.child(self.render_app_rail(cx)))
             .child(
                 div()
                     .flex_1()
@@ -5260,6 +5526,30 @@ fn table_ref_label(table: &TableRef) -> String {
         Some(schema) => format!("{schema}.{}", table.name),
         None => table.name.clone(),
     }
+}
+
+/// Semantic color per deployment environment: production is risky (red),
+/// staging warns, develop stays neutral-accent, local is healthy.
+fn environment_color(environment: ConnectionEnvironment) -> Rgba {
+    match environment {
+        ConnectionEnvironment::Production => THEME.danger,
+        ConnectionEnvironment::Staging => THEME.warning,
+        ConnectionEnvironment::Develop => THEME.accent,
+        ConnectionEnvironment::Local => THEME.success,
+    }
+}
+
+fn environment_badge(environment: ConnectionEnvironment) -> Div {
+    div()
+        .px(px(6.))
+        .py(px(2.))
+        .rounded_full()
+        .border_1()
+        .border_color(environment_color(environment))
+        .text_size(px(9.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(environment_color(environment))
+        .child(environment.to_string())
 }
 
 fn display_url(raw: &str) -> String {

@@ -6,6 +6,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{Div, ParentElement, Rgba, SharedString, Styled, Svg, div, px, rgb, svg};
 
 use crate::assets;
+use dbx_core::DatabaseKind;
 
 /// The DBX shell uses a deliberately restrained density: controls align to a
 /// four-pixel rhythm and panels earn their separation with a single border.
@@ -92,6 +93,19 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
     svg().path(path).size(px(16.)).text_color(color)
 }
 
+/// Draw the brand mark for a database engine. Like [`icon`], consumers provide
+/// the color so the logo follows the active/inactive treatment of its host.
+pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
+    let path = match kind {
+        DatabaseKind::PostgreSQL => assets::LOGO_POSTGRESQL,
+        DatabaseKind::MySQL => assets::LOGO_MYSQL,
+        DatabaseKind::SQLite => assets::LOGO_SQLITE,
+        DatabaseKind::Redis => assets::LOGO_REDIS,
+    };
+
+    svg().path(path).size(px(16.)).text_color(color)
+}
+
 /// Compact, label-first panel title treatment for panes and inspectors.
 pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedString>) -> Div {
     div()
@@ -116,7 +130,7 @@ pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedStri
 
 /// A primary-shell connection tab. Add an id and interaction handler at the
 /// call site to keep this visual primitive usable in any screen state.
-pub fn connection_tab(label: impl Into<SharedString>, active: bool) -> Div {
+pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active: bool) -> Div {
     div()
         .relative()
         .h(px(32.))
@@ -134,8 +148,8 @@ pub fn connection_tab(label: impl Into<SharedString>, active: bool) -> Div {
         .flex()
         .items_center()
         .gap(px(SPACE_2))
-        .child(icon(
-            Icon::Database,
+        .child(database_logo(
+            kind,
             if active {
                 THEME.accent
             } else {

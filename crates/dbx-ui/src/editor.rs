@@ -19,8 +19,8 @@ use gpui::{
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InteractiveElement as _,
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, Size, StatefulInteractiveElement as _,
-    Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, rgba, size,
+    Style, Subscription, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
+    fill, point, prelude::*, px, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -686,7 +686,7 @@ impl TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         let index = self.index_for_mouse_position(event.position);
         // Snapshot after resolving the initial click, before the focus and
         // selection notifications can cause another paint pass.
@@ -1069,7 +1069,7 @@ impl Element for TextEditorText {
             let current_offset = editor.scroll_handle.offset();
             let next_offset = scroll_offset_for_cursor(
                 current_offset,
-                editor.scroll_handle.max_offset(),
+                editor.scroll_handle.max_offset().into(),
                 editor.scroll_handle.bounds().size,
                 cursor_position,
                 size(px(2.), line_height),
@@ -1176,6 +1176,8 @@ impl Element for TextEditorText {
                         state.paint_bounds.top() + window.line_height() * line as f32,
                     ),
                     window.line_height(),
+                    TextAlign::Left,
+                    None,
                     window,
                     cx,
                 )
