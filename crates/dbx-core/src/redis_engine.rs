@@ -222,6 +222,7 @@ impl crate::Engine for RedisEngine {
             ColumnInfo {
                 name: "key".to_owned(),
                 data_type: "string".to_owned(),
+                enum_values: Vec::new(),
                 nullable: false,
                 ordinal: 0,
                 primary_key: true,
@@ -229,6 +230,7 @@ impl crate::Engine for RedisEngine {
             ColumnInfo {
                 name: "type".to_owned(),
                 data_type: "string".to_owned(),
+                enum_values: Vec::new(),
                 nullable: true,
                 ordinal: 1,
                 primary_key: false,
@@ -236,6 +238,7 @@ impl crate::Engine for RedisEngine {
             ColumnInfo {
                 name: "ttl".to_owned(),
                 data_type: "integer".to_owned(),
+                enum_values: Vec::new(),
                 nullable: true,
                 ordinal: 2,
                 primary_key: false,

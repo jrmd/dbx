@@ -3,7 +3,8 @@
 use std::sync::LazyLock;
 
 use gpui::prelude::FluentBuilder;
-use gpui::{Div, ParentElement, Rgba, SharedString, Styled, Svg, div, px, rgb, svg};
+use gpui::{Div, ElementId, ParentElement, Rgba, SharedString, Styled, Svg, div, px, rgb, svg};
+use gpui_component::button::{Button, ButtonVariants as _};
 
 use crate::assets;
 use dbx_core::DatabaseKind;
@@ -80,6 +81,7 @@ pub enum Icon {
     Add,
     Close,
     More,
+    ArrowRight,
 }
 
 /// Draw a 16px icon from the embedded SVG set. Consumers provide the color so
@@ -96,6 +98,7 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
         Icon::Add => assets::ICON_ADD,
         Icon::Close => assets::ICON_CLOSE,
         Icon::More => assets::ICON_MORE,
+        Icon::ArrowRight => assets::ICON_ARROW_RIGHT,
     };
 
     svg().path(path).size(px(16.)).text_color(color)
@@ -185,14 +188,19 @@ pub enum ButtonKind {
     Danger,
 }
 
-pub fn button(label: impl Into<SharedString>, kind: ButtonKind) -> Div {
+pub fn button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+) -> Button {
     let (background, border, text) = match kind {
         ButtonKind::Primary => (THEME.accent, THEME.accent, THEME.text),
         ButtonKind::Quiet => (THEME.panel_raised, THEME.border, THEME.text),
         ButtonKind::Danger => (THEME.panel_raised, THEME.danger, THEME.danger),
     };
 
-    div()
+    let button = Button::new(id)
+        .label(label)
         .h(px(30.))
         .px(px(SPACE_3))
         .rounded(px(RADIUS_CONTROL))
@@ -201,11 +209,13 @@ pub fn button(label: impl Into<SharedString>, kind: ButtonKind) -> Div {
         .bg(background)
         .text_size(px(12.))
         .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(text)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(label.into())
+        .text_color(text);
+
+    match kind {
+        ButtonKind::Primary => button.primary(),
+        ButtonKind::Quiet => button.outline(),
+        ButtonKind::Danger => button.danger().outline(),
+    }
 }
 
 pub fn badge(label: impl Into<SharedString>, color: Rgba) -> Div {

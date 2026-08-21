@@ -319,6 +319,15 @@ async fn assert_postgres_enum_decoding(engine: &DatabaseEngine) -> Result<()> {
                 "ALTER TABLE {table} ADD COLUMN mood dbx_integration_mood"
             ))
             .await?;
+        let columns = engine
+            .describe_table(&table_ref(DatabaseKind::PostgreSQL))
+            .await?;
+        let mood = columns
+            .iter()
+            .find(|column| column.name == "mood")
+            .expect("enum column should be present in table metadata");
+        assert_eq!(mood.data_type, "dbx_integration_mood");
+        assert_eq!(mood.enum_values, ["happy", "sad", "neutral"]);
         engine
             .execute_sql(&format!("UPDATE {table} SET mood = 'happy' WHERE id = 1"))
             .await?;
