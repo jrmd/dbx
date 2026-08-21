@@ -100,7 +100,7 @@ The interface is intentionally native and dense. Surfaces are layered only enoug
 
 **Key Characteristics:**
 
-- Persistent context: a 46px app rail, 42px top bar, 26px status bar, and visible explorer/inspector panes; the supplied DBX logo asset anchors the rail and top-bar identity.
+- Persistent context: a 46px app rail, 42px top bar, 26px status bar, and visible explorer/inspector panes; the supplied DBX logo asset anchors the connected rail or the disconnected top-bar identity.
 - Deliberate density: 10–12px operational text, 30–36px controls, and four-pixel spacing increments.
 - Blue is an interaction locator, not a decorative fill; it marks active navigation and primary commit actions.
 - Borders and tonal planes, rather than shadows, separate work areas.
@@ -153,7 +153,7 @@ The palette is a low-glare charcoal console: cool white text sits on layered bla
 
 ## Layout
 
-The desktop shell is fixed-context and pane-based: the 46px rail remains on the left, the top bar is 42px, primary connection tabs occupy the remaining top-bar width with horizontal overflow, and the status line is 26px. The supplied DBX logo asset anchors both the rail and top-bar branding. While disconnected, the shell retains that identity but hides rail controls that require a database context. In a live workspace, the explorer is 224px wide (180px in compact layout); the inspector remains alongside the grid when space permits. Connection setup is a centered, scrollable form capped at 900px, containing a 170px engine chooser (124px in compact layout).
+The desktop shell is fixed-context and pane-based: the 46px rail remains on the left, the top bar is 42px, primary connection tabs occupy the remaining top-bar width with horizontal overflow, and the status line is 26px. The supplied DBX logo asset anchors the top-bar identity while disconnected and the rail identity in a live workspace, avoiding duplicate marks. While disconnected, the shell retains that identity but hides rail controls that require a database context. In a live workspace, the explorer is 224px wide (180px in compact layout); the inspector remains alongside the grid when space permits. Connection setup is a centered, scrollable form capped at 900px, containing a 170px engine chooser (124px in compact layout).
 
 Spacing follows the exact 4px, 8px, 12px, 16px token rhythm. Do not introduce a competing scale. Data and query panes use 36–38px headers; the SQL editor reserves 224px including its shell; multiline fields are 204px high.
 
@@ -192,7 +192,7 @@ The button family is compact, square-shouldered, and action-ranked.
 ### Navigation
 
 - **App rail:** 46px wide with the supplied DBX logo asset, embedded compile-time 16px SVG line icons including dedicated Structure and Refresh glyphs, 24px icon hit areas, and a persistent green/offline status dot at the bottom. Icons inherit their semantic color from the consuming control. While disconnected, hide controls that operate on a database rather than presenting unavailable actions.
-- **Top bar:** 42px rail-toned strip; repeat the supplied DBX logo asset with the DBX title, and retain connection tabs to preserve multi-connection context.
+- **Top bar:** 42px rail-toned strip; show the supplied DBX logo with the DBX title while disconnected, and retain connection tabs to preserve multi-connection context once a workspace is active.
 - **Connection tabs:** 32px high, 6px top corners, icon + health dot + engine badge + muted metadata. Active tabs use the standard panel and stronger border, with a full-width 2px Command Blue bottom indicator; inactive tabs use the rail.
 - **Document tabs:** each connection owns a 36px, horizontally scrollable row containing the persistent Data document plus independently closable Query and table-bound Structure documents. Active documents use the canvas, strong border, and Command Blue icon; the compact add action opens another query without replacing existing work.
 - **Pane tabs and explorer entries:** active state uses Blue Selection Well with Command Blue icon/text; unselected entries stay muted until hover. When a PostgreSQL schema filter is active, table labels omit that redundant schema prefix; the All view remains qualified.
@@ -216,7 +216,7 @@ The button family is compact, square-shouldered, and action-ranked.
 - **Do** preserve the 4px, 8px, 12px, 16px spacing rhythm and favor 30–36px controls for dense desktop work.
 - **Do** keep database context visible through persistent rail, top-level connection tabs, explorer, and status feedback.
 - **Do** use the blue active-state system and green connection health consistently across rail, tabs, tables, and connection setup.
-- **Do** keep the DBX logo asset visible in the rail and top-bar identity while hiding database-only rail controls until a connection is active.
+- **Do** keep the DBX logo asset visible in the contextual rail or top-bar identity while hiding database-only rail controls until a connection is active.
 - **Do** treat Details and Connection String as equal setup modes, and keep Test Connection non-mutating.
 - **Do** scope document tabs to their connection and preserve the Data document while Query and Structure documents are independently closable.
 - **Do** let narrow layouts hide secondary inspection before shrinking primary data and query work below usable density.

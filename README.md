@@ -92,7 +92,7 @@ terminal. `make cargo-build` and `make cargo-run` remain available for the raw
 Cargo workflow.
 
 The canonical brand asset is [logo.svg](logo.svg). DBX embeds that SVG in the
-native UI, so the rail and top-bar mark stay sharp at any display scale.
+native UI, so the active rail or disconnected top-bar mark stays sharp at any display scale without duplicating the brand in a connected workspace.
 
 For packaged local builds:
 

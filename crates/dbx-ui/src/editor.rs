@@ -36,6 +36,18 @@ use gpui_component::input::{
 /// this context keeps those bindings scoped to text editors.
 pub const TEXT_EDITOR_CONTEXT: &str = "DbxTextEditor";
 
+/// Additional context placed around the SQL editor so completion navigation
+/// can shadow the generic Up/Down/Enter bindings without changing filter or
+/// row-value editors.
+pub const SQL_EDITOR_CONTEXT: &str = "DbxSqlEditor";
+
+// Keep both contexts on the query editor itself. GPUI gives a child context
+// precedence over its parents, so putting only SQL_EDITOR_CONTEXT on the
+// surrounding panel still lets the deeper text-editor bindings win for
+// Up/Down/Enter. A combined context lets the completion bindings win at the
+// same depth while retaining all of the normal text-editing bindings.
+const SQL_TEXT_EDITOR_CONTEXT: &str = "DbxTextEditor DbxSqlEditor";
+
 /// Backwards-compatible name for callers that use the conventional GPUI
 /// input terminology.
 #[allow(dead_code)]
@@ -916,6 +928,12 @@ impl TextEditor {
         self.move_to(start + target_column, cx);
     }
 
+    /// Move the cursor between lines without requiring the caller to depend
+    /// on the editor's private action types.
+    pub fn move_vertical(&mut self, direction: isize, cx: &mut Context<Self>) {
+        self.vertical(direction, cx);
+    }
+
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         self.vertical(-1, cx);
     }
@@ -949,6 +967,13 @@ impl TextEditor {
     }
 
     fn newline(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if self.multiline {
+            self.replace(self.selected_range.clone(), "\n", cx);
+        }
+    }
+
+    /// Insert a newline for a shell-level Enter handler.
+    pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
         if self.multiline {
             self.replace(self.selected_range.clone(), "\n", cx);
         }
@@ -1542,12 +1567,30 @@ impl Element for TextEditorText {
 /// mode obvious at call sites.  It should match the mode passed to
 /// [`TextEditor::new`].
 pub fn input(editor: Entity<TextEditor>, focus: FocusHandle, multiline: bool) -> impl IntoElement {
+    input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT)
+}
+
+/// Render the SQL editor with both its text-editing and completion contexts.
+pub fn sql_input(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    multiline: bool,
+) -> impl IntoElement {
+    input_with_context(editor, focus, multiline, SQL_TEXT_EDITOR_CONTEXT)
+}
+
+fn input_with_context(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    multiline: bool,
+    key_context: &'static str,
+) -> impl IntoElement {
     div()
         .id(gpui::SharedString::from(format!(
             "dbx-text-editor-{:?}",
             editor.entity_id()
         )))
-        .key_context(TEXT_EDITOR_CONTEXT)
+        .key_context(key_context)
         .track_focus(&focus)
         // GPUI 0.2.2 invalidates the owning view whenever a cursor-bearing
         // element is entered or left. This shared shell has no hover style,

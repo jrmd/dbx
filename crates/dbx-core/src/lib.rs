@@ -23,7 +23,7 @@ pub use model::{
 pub use redis_engine::RedisEngine;
 pub use sql::{
     SqlStatement, build_create_table, build_delete, build_drop_table, build_insert, build_select,
-    build_truncate_table, build_update, quote_identifier,
+    build_truncate_table, build_update, build_update_with_columns, quote_identifier,
 };
 pub use sqlx_engine::SqlxEngine;
 
@@ -99,6 +99,45 @@ mod tests {
                 CellValue::Null,
                 CellValue::Integer(7)
             ]
+        );
+    }
+
+    #[test]
+    fn postgres_enum_updates_cast_text_parameters_to_the_enum_type() {
+        let request = UpdateRequest::for_primary_key(
+            TableRef::in_schema("public", "orders"),
+            vec![("status".into(), CellValue::Text("paid".into()))],
+            vec![("id".into(), CellValue::Integer(7))],
+        );
+        let columns = vec![ColumnInfo {
+            name: "status".into(),
+            data_type: "public.order_status".into(),
+            enum_values: vec!["pending".into(), "paid".into()],
+            nullable: false,
+            ordinal: 1,
+            primary_key: false,
+        }];
+
+        let statement =
+            build_update_with_columns(DatabaseKind::PostgreSQL, &request, &columns).unwrap();
+
+        assert_eq!(
+            statement.sql,
+            "UPDATE \"public\".\"orders\" SET \"status\" = CAST($1 AS \"public\".\"order_status\") WHERE \"id\" = $2"
+        );
+        assert_eq!(
+            statement.params,
+            request
+                .assignments
+                .iter()
+                .map(|(_, value)| value.clone())
+                .chain(
+                    request
+                        .filters
+                        .iter()
+                        .map(|filter| filter.value.clone().unwrap())
+                )
+                .collect::<Vec<_>>()
         );
     }
 

@@ -15,6 +15,8 @@ use gpui::{
     size,
 };
 
+gpui::actions!(dbx_ui, [Quit]);
+
 const APP_NAME: &str = "DBX";
 
 fn main() {
@@ -29,7 +31,21 @@ fn main() {
                 KeyBinding::new("ctrl-enter", app::RunQuery, None),
                 KeyBinding::new("cmd-r", app::RefreshData, None),
                 KeyBinding::new("ctrl-r", app::RefreshData, None),
+                KeyBinding::new("up", app::CompletionUp, Some(editor::SQL_EDITOR_CONTEXT)),
+                KeyBinding::new(
+                    "down",
+                    app::CompletionDown,
+                    Some(editor::SQL_EDITOR_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "enter",
+                    app::CompletionEnter,
+                    Some(editor::SQL_EDITOR_CONTEXT),
+                ),
+                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("ctrl-q", Quit, None),
             ]);
+            cx.on_action(|_: &Quit, cx| cx.quit());
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds::new(

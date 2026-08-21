@@ -5,7 +5,7 @@ use crate::{
     ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError, ExecResult, Filter,
     InsertRequest, Order, Page, QueryResult, Result, SqlStatement, TableInfo, TableRef,
     TableStructure, UpdateRequest, build_create_table, build_delete, build_drop_table,
-    build_insert, build_select, build_truncate_table, build_update,
+    build_insert, build_select, build_truncate_table, build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
 
@@ -176,7 +176,7 @@ impl DatabaseEngine {
         ensure_sql(self.kind(), "update")?;
         let columns = self.describe_table(&request.table).await?;
         ensure_primary_key_filters(&columns, &request.filters)?;
-        let statement = build_update(self.kind(), request)?;
+        let statement = build_update_with_columns(self.kind(), request, &columns)?;
         self.execute(&statement).await
     }
 

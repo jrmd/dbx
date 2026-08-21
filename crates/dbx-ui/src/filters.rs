@@ -10,7 +10,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dbx_core::{CellValue, ColumnInfo, Filter, FilterOperator};
-use gpui::{App, AppContext, Context, Entity, Window};
+use gpui::{App, AppContext, Context, Entity, SharedString, Window};
+use gpui_component::{
+    IndexPath,
+    select::{SearchableVec, SelectState},
+};
 
 use crate::editor::TextEditor;
 
@@ -296,6 +300,8 @@ pub struct FilterRow {
     pub operator: FilterOperator,
     pub value: Entity<String>,
     pub editor: Entity<TextEditor>,
+    pub column_selector: Entity<SelectState<SearchableVec<SharedString>>>,
+    pub operator_selector: Entity<SelectState<SearchableVec<SharedString>>>,
 }
 
 impl FilterRow {
@@ -306,7 +312,19 @@ impl FilterRow {
         window: &mut Window,
         cx: &mut Context<T>,
     ) -> Self {
-        Self::with_value(selected_column, operator, "", window, cx)
+        Self::with_value_and_columns(selected_column, operator, "", &[], window, cx)
+    }
+
+    /// Create an empty filter row with native GPUI selectors populated from
+    /// the currently loaded table columns.
+    pub fn new_with_columns<T: 'static>(
+        selected_column: impl Into<String>,
+        operator: FilterOperator,
+        columns: &[ColumnInfo],
+        window: &mut Window,
+        cx: &mut Context<T>,
+    ) -> Self {
+        Self::with_value_and_columns(selected_column, operator, "", columns, window, cx)
     }
 
     /// Create a filter row with an initial editor value.
@@ -317,15 +335,66 @@ impl FilterRow {
         window: &mut Window,
         cx: &mut Context<T>,
     ) -> Self {
+        Self::with_value_and_columns(selected_column, operator, initial_value, &[], window, cx)
+    }
+
+    /// Create a filter row with a value and native GPUI selectors.
+    pub fn with_value_and_columns<T: 'static>(
+        selected_column: impl Into<String>,
+        operator: FilterOperator,
+        initial_value: impl Into<String>,
+        columns: &[ColumnInfo],
+        window: &mut Window,
+        cx: &mut Context<T>,
+    ) -> Self {
+        let selected_column = selected_column.into();
         let value = cx.new(|_| initial_value.into());
         let editor = cx.new(|editor_cx| TextEditor::new(value.clone(), false, window, editor_cx));
+        let column_items = SearchableVec::new(
+            columns
+                .iter()
+                .map(|column| SharedString::from(column.name.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let column_index = columns
+            .iter()
+            .position(|column| column.name == selected_column);
+        let operator_items = SearchableVec::new(
+            filter_operator_options()
+                .iter()
+                .map(|option| SharedString::from(option.label))
+                .collect::<Vec<_>>(),
+        );
+        let operator_index = filter_operator_options()
+            .iter()
+            .position(|option| option.operator == operator);
+        let column_selector = cx.new(|select_cx| {
+            SelectState::new(
+                column_items,
+                column_index.map(IndexPath::new),
+                window,
+                select_cx,
+            )
+            .searchable(true)
+        });
+        let operator_selector = cx.new(|select_cx| {
+            SelectState::new(
+                operator_items,
+                operator_index.map(IndexPath::new),
+                window,
+                select_cx,
+            )
+            .searchable(true)
+        });
 
         Self {
             id: next_filter_row_id(),
-            selected_column: selected_column.into(),
+            selected_column,
             operator,
             value,
             editor,
+            column_selector,
+            operator_selector,
         }
     }
 
@@ -419,6 +488,42 @@ impl FilterModel {
         cx: &mut Context<T>,
     ) -> FilterRowId {
         let row = FilterRow::with_value(selected_column, operator, value, window, cx);
+        let id = row.id;
+        self.rows.push(row);
+        id
+    }
+
+    pub fn add_row_with_columns<T: 'static>(
+        &mut self,
+        selected_column: impl Into<String>,
+        operator: FilterOperator,
+        columns: &[ColumnInfo],
+        window: &mut Window,
+        cx: &mut Context<T>,
+    ) -> FilterRowId {
+        let row = FilterRow::new_with_columns(selected_column, operator, columns, window, cx);
+        let id = row.id;
+        self.rows.push(row);
+        id
+    }
+
+    pub fn add_row_with_value_and_columns<T: 'static>(
+        &mut self,
+        selected_column: impl Into<String>,
+        operator: FilterOperator,
+        value: impl Into<String>,
+        columns: &[ColumnInfo],
+        window: &mut Window,
+        cx: &mut Context<T>,
+    ) -> FilterRowId {
+        let row = FilterRow::with_value_and_columns(
+            selected_column,
+            operator,
+            value,
+            columns,
+            window,
+            cx,
+        );
         let id = row.id;
         self.rows.push(row);
         id
