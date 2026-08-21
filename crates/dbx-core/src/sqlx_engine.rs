@@ -286,14 +286,14 @@ impl SqlxEngine {
             DatabaseKind::PostgreSQL => {
                 let schema = table.schema.clone().unwrap_or_else(|| "public".to_owned());
                 self.metadata_query(
-                    "SELECT c.column_name, c.data_type, c.is_nullable, c.ordinal_position, CASE WHEN EXISTS (SELECT 1 FROM information_schema.key_column_usage kcu JOIN information_schema.table_constraints tc ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name WHERE kcu.table_schema = c.table_schema AND kcu.table_name = c.table_name AND kcu.column_name = c.column_name AND tc.constraint_type = 'PRIMARY KEY') THEN TRUE ELSE FALSE END AS is_primary_key FROM information_schema.columns c WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position",
+                    "SELECT c.column_name, CASE WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name ELSE c.data_type END AS data_type, c.is_nullable, c.ordinal_position, CASE WHEN EXISTS (SELECT 1 FROM information_schema.key_column_usage kcu JOIN information_schema.table_constraints tc ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name WHERE kcu.table_schema = c.table_schema AND kcu.table_name = c.table_name AND kcu.column_name = c.column_name AND tc.constraint_type = 'PRIMARY KEY') THEN TRUE ELSE FALSE END AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = enum_type.oid), '') AS enum_values FROM information_schema.columns c LEFT JOIN pg_namespace enum_namespace ON enum_namespace.nspname = c.udt_schema LEFT JOIN pg_type enum_type ON enum_type.typname = c.udt_name AND enum_type.typnamespace = enum_namespace.oid WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position",
                     &[CellValue::Text(schema), CellValue::Text(table.name.clone())],
                 )
                 .await?
             }
             DatabaseKind::MySQL => {
                 self.metadata_query(
-                    "SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(DATA_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    "SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(DATA_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     &[CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -323,9 +323,15 @@ impl SqlxEngine {
                 ),
                 DatabaseKind::Redis => unreachable!(),
             };
+            let enum_values = match self.kind {
+                DatabaseKind::PostgreSQL => enum_values_from_postgres_metadata(row, 5)?,
+                DatabaseKind::MySQL => parse_mysql_enum_definition(&text_value(row, 5)?),
+                DatabaseKind::SQLite | DatabaseKind::Redis => Vec::new(),
+            };
             columns.push(ColumnInfo {
                 name,
                 data_type,
+                enum_values,
                 nullable,
                 ordinal: if ordinal == 0 { index + 1 } else { ordinal },
                 primary_key,
@@ -1015,6 +1021,71 @@ fn optional_text_value(row: &RowData, index: usize) -> Result<Option<String>> {
     }
 }
 
+fn enum_values_from_postgres_metadata(row: &RowData, index: usize) -> Result<Vec<String>> {
+    let raw = text_value(row, index)?;
+    Ok(raw
+        .split('\u{1f}')
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Parse MySQL's `enum('first','second')` information_schema representation.
+/// This intentionally handles escaped quotes and backslashes because enum
+/// labels are user data, not identifiers.
+fn parse_mysql_enum_definition(definition: &str) -> Vec<String> {
+    let definition = definition.trim();
+    let Some(open) = definition.find('(') else {
+        return Vec::new();
+    };
+    if !definition[..open].eq_ignore_ascii_case("enum") {
+        return Vec::new();
+    }
+    let Some(close) = definition.rfind(')') else {
+        return Vec::new();
+    };
+
+    let mut values = Vec::new();
+    let mut chars = definition[open + 1..close].chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_whitespace() || character == ',' {
+            continue;
+        }
+        if character != '\'' {
+            return Vec::new();
+        }
+
+        let mut value = String::new();
+        loop {
+            let Some(character) = chars.next() else {
+                return Vec::new();
+            };
+            match character {
+                '\\' => {
+                    let Some(escaped) = chars.next() else {
+                        return Vec::new();
+                    };
+                    value.push(match escaped {
+                        '0' => '\0',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    value.push('\'');
+                }
+                '\'' => break,
+                other => value.push(other),
+            }
+        }
+        values.push(value);
+    }
+    values
+}
+
 fn integer_value(row: &RowData, index: usize) -> Result<i64> {
     match row.values.get(index) {
         Some(CellValue::Null) => Ok(0),
@@ -1065,6 +1136,24 @@ mod tests {
         assert_eq!(
             mysql_bytes_fallback(vec![0xff, 0x00, 0xfe]),
             CellValue::Bytes(vec![0xff, 0x00, 0xfe])
+        );
+    }
+
+    #[test]
+    fn mysql_enum_metadata_preserves_labels_and_escapes() {
+        assert_eq!(
+            parse_mysql_enum_definition(r#"enum('happy','sad','needs\'quote','line\n')"#),
+            vec!["happy", "sad", "needs'quote", "line\n",]
+        );
+        assert!(parse_mysql_enum_definition("varchar(32)").is_empty());
+    }
+
+    #[test]
+    fn postgres_enum_metadata_splits_ordered_labels() {
+        let row = RowData::new(vec![CellValue::Text("happy\u{1f}sad\u{1f}neutral".into())]);
+        assert_eq!(
+            enum_values_from_postgres_metadata(&row, 0).unwrap(),
+            vec!["happy", "sad", "neutral"]
         );
     }
 

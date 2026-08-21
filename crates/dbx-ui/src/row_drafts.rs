@@ -9,7 +9,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dbx_core::{CellValue, ColumnInfo};
-use gpui::{App, AppContext, Context, Entity, Window};
+use gpui::{App, AppContext, Context, Entity, SharedString, Window};
+use gpui_component::{
+    IndexPath,
+    select::{SearchableVec, SelectState},
+};
 
 use crate::editor::TextEditor;
 
@@ -298,6 +302,9 @@ pub struct FieldRow {
     pub original: Option<CellValue>,
     pub value: Entity<String>,
     pub editor: Entity<TextEditor>,
+    /// A native select for database enum columns. The text editor remains
+    /// available as the canonical value entity for validation and mutation.
+    pub enum_selector: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
     pub state: FieldValueState,
     pub default_expression: Option<String>,
     pub editable: bool,
@@ -377,14 +384,35 @@ impl FieldRow {
         window: &mut Window,
         cx: &mut Context<T>,
     ) -> Self {
-        let value = cx.new(|_| initial_text.into());
+        let initial_text = initial_text.into();
+        let value = cx.new(|_| initial_text.clone());
         let editor = cx.new(|editor_cx| TextEditor::new(value.clone(), false, window, editor_cx));
+        let enum_selector = if column.enum_values.is_empty() {
+            None
+        } else {
+            let items = SearchableVec::new(
+                column
+                    .enum_values
+                    .iter()
+                    .cloned()
+                    .map(SharedString::from)
+                    .collect::<Vec<_>>(),
+            );
+            let selected_index = column
+                .enum_values
+                .iter()
+                .position(|option| option == &initial_text);
+            Some(cx.new(|select_cx| {
+                SelectState::new(items, selected_index.map(IndexPath::new), window, select_cx)
+            }))
+        };
         Self {
             id: next_field_id(),
             column,
             original,
             value,
             editor,
+            enum_selector,
             state,
             default_expression,
             editable: true,
@@ -864,6 +892,7 @@ mod tests {
         ColumnInfo {
             name: name.into(),
             data_type: data_type.into(),
+            enum_values: Vec::new(),
             nullable,
             ordinal: 0,
             primary_key: false,

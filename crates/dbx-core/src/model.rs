@@ -154,6 +154,10 @@ pub enum EntityKind {
 pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
+    /// Ordered values for a database enum column. Empty for ordinary scalar
+    /// columns and result-set metadata that does not expose enum semantics.
+    #[serde(default)]
+    pub enum_values: Vec<String>,
     pub nullable: bool,
     pub ordinal: usize,
     pub primary_key: bool,
@@ -164,6 +168,7 @@ impl ColumnInfo {
         Self {
             name: name.into(),
             data_type: data_type.into(),
+            enum_values: Vec::new(),
             nullable: true,
             ordinal,
             primary_key: false,
