@@ -14,12 +14,12 @@ use dbx_core::{
 };
 use gpui::{
     AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, IntoElement,
-    PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, Rgba, SharedString,
-    Stateful, StatefulInteractiveElement as _, Subscription, Window, anchored, deferred, div, img,
-    prelude::*, px,
+    MouseButton, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, Rgba,
+    SharedString, Stateful, StatefulInteractiveElement as _, Subscription, Window,
+    WindowControlArea, anchored, deferred, div, img, prelude::*, px,
 };
 use gpui_component::{
-    Sizable as _,
+    InteractiveElementExt as _, Sizable as _,
     table::{Column as DataColumn, DataTable, TableDelegate, TableEvent, TableState},
 };
 use uuid::Uuid;
@@ -65,6 +65,20 @@ type SessionId = Uuid;
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
+
+fn traffic_light(id: &'static str, color: Rgba, glyph: impl IntoElement) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(18.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(color)
+        .cursor_pointer()
+        .hover(|style| style.opacity(0.78))
+        .child(glyph)
+}
 
 /// Shared, virtualized backing model for both table browsing and ad-hoc query results.
 ///
@@ -3885,7 +3899,7 @@ impl DbxApp {
             .child(
                 div()
                     .w(if self.compact_layout {
-                        px(94.)
+                        px(112.)
                     } else {
                         px(124.)
                     })
@@ -3896,6 +3910,57 @@ impl DbxApp {
                     .gap(px(8.))
                     .child(
                         div()
+                            .id("window-traffic-lights")
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                traffic_light(
+                                    "window-close",
+                                    THEME.window_close,
+                                    icon(Icon::Close, THEME.rail).size(px(10.)),
+                                )
+                                .on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.remove_window();
+                                }),
+                            )
+                            .child(
+                                traffic_light(
+                                    "window-minimize",
+                                    THEME.window_minimize,
+                                    div().w(px(7.)).h(px(1.)).bg(THEME.rail),
+                                )
+                                .on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.minimize_window();
+                                }),
+                            )
+                            .child(
+                                traffic_light(
+                                    "window-maximize",
+                                    THEME.window_maximize,
+                                    div().size(px(7.)).border_1().border_color(THEME.rail),
+                                )
+                                .on_click(|_, window, cx| {
+                                    cx.stop_propagation();
+                                    window.zoom_window();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("window-title-drag")
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                window.start_window_move();
+                            })
+                            .on_double_click(|_, window, _| window.zoom_window())
                             .text_size(px(15.))
                             .font_weight(FontWeight::BOLD)
                             .child("DBX"),
