@@ -11,8 +11,8 @@ mod theme;
 
 use app::DbxApp;
 use gpui::{
-    App, AppContext, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds,
-    WindowOptions, point, px, size,
+    App, AppContext, Bounds, KeyBinding, WindowBounds, WindowDecorations, WindowOptions, point, px,
+    size,
 };
 
 const APP_NAME: &str = "DBX";
@@ -37,14 +37,19 @@ fn main() {
                         size(px(1440.0), px(900.0)),
                     ))),
                     window_min_size: Some(size(px(960.0), px(640.0))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(SharedString::from(APP_NAME)),
-                        ..Default::default()
-                    }),
+                    // DBX owns the titlebar so the window chrome follows the
+                    // same compact dark language as the rest of the shell.
+                    // The custom controls are rendered by `DbxApp`.
+                    titlebar: None,
+                    app_owns_titlebar_drag: true,
+                    window_decorations: Some(WindowDecorations::Client),
                     app_id: Some("dbx.jrmd.app".into()),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| DbxApp::new(window, cx)),
+                |window, cx| {
+                    window.set_window_title(APP_NAME);
+                    cx.new(|cx| DbxApp::new(window, cx))
+                },
             )
             .expect("open DBX window");
             cx.activate(true);

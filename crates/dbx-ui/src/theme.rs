@@ -39,6 +39,9 @@ pub struct Theme {
     pub grid_alternate: Rgba,
     pub rail: Rgba,
     pub focus_ring: Rgba,
+    pub window_close: Rgba,
+    pub window_minimize: Rgba,
+    pub window_maximize: Rgba,
 }
 
 pub static THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
@@ -57,6 +60,11 @@ pub static THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
     grid_alternate: rgb(0x0e1116),
     rail: rgb(0x0d1016),
     focus_ring: rgb(0x60a5fa),
+    // Familiar traffic-light colors, used by DBX's app-owned titlebar on
+    // every desktop platform rather than relying on platform defaults.
+    window_close: rgb(0xff5f57),
+    window_minimize: rgb(0xfebc2e),
+    window_maximize: rgb(0x28c840),
 });
 
 /// A compact, consistent line-icon vocabulary for navigation and actions.
