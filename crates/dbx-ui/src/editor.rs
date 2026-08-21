@@ -25,6 +25,10 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::THEME;
+use gpui_component::input::{
+    MoveEnd, MoveHome, MoveToNextWord, MoveToPreviousWord, SelectToEndOfLine, SelectToNextWordEnd,
+    SelectToPreviousWordStart, SelectToStartOfLine,
+};
 
 /// Key context placed on the editor's root element.
 ///
@@ -83,6 +87,34 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-x", Cut, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("home", Home, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("end", End, Some(TEXT_EDITOR_CONTEXT)),
+        // Keep DBX's custom renderer on the same navigation contract as the
+        // gpui-component input controls. These are intentionally bound in
+        // addition to the component's own `Input` context because DBX's
+        // syntax-highlighting editor uses its own context.
+        KeyBinding::new("cmd-left", MoveHome, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-right", MoveEnd, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new(
+            "shift-cmd-left",
+            SelectToStartOfLine,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new(
+            "shift-cmd-right",
+            SelectToEndOfLine,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new("ctrl-left", MoveToPreviousWord, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-right", MoveToNextWord, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new(
+            "ctrl-shift-left",
+            SelectToPreviousWordStart,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-right",
+            SelectToNextWordEnd,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
         KeyBinding::new("up", Up, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("down", Down, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("enter", Enter, Some(TEXT_EDITOR_CONTEXT)),
@@ -559,6 +591,77 @@ impl TextEditor {
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(line_end(&self.text(cx), self.cursor_offset()), cx);
+    }
+
+    fn component_home(&mut self, _: &MoveHome, window: &mut Window, cx: &mut Context<Self>) {
+        self.home(&Home, window, cx);
+    }
+
+    fn component_end(&mut self, _: &MoveEnd, window: &mut Window, cx: &mut Context<Self>) {
+        self.end(&End, window, cx);
+    }
+
+    fn component_select_home(
+        &mut self,
+        _: &SelectToStartOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.text(cx);
+        self.select_to(line_start(&text, self.cursor_offset()), cx);
+    }
+
+    fn component_select_end(
+        &mut self,
+        _: &SelectToEndOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.text(cx);
+        self.select_to(line_end(&text, self.cursor_offset()), cx);
+    }
+
+    fn component_previous_word(
+        &mut self,
+        _: &MoveToPreviousWord,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            let text = self.text(cx);
+            self.move_to(previous_word_boundary(&text, self.cursor_offset()), cx);
+        } else {
+            self.move_to(self.selected_range.start, cx);
+        }
+    }
+
+    fn component_next_word(&mut self, _: &MoveToNextWord, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let text = self.text(cx);
+            self.move_to(next_word_boundary(&text, self.cursor_offset()), cx);
+        } else {
+            self.move_to(self.selected_range.end, cx);
+        }
+    }
+
+    fn component_select_previous_word(
+        &mut self,
+        _: &SelectToPreviousWordStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.text(cx);
+        self.select_to(previous_word_boundary(&text, self.cursor_offset()), cx);
+    }
+
+    fn component_select_next_word(
+        &mut self,
+        _: &SelectToNextWordEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.text(cx);
+        self.select_to(next_word_boundary(&text, self.cursor_offset()), cx);
     }
 
     fn vertical(&mut self, direction: isize, cx: &mut Context<Self>) {
@@ -1284,6 +1387,66 @@ pub fn input(editor: Entity<TextEditor>, focus: FocusHandle, multiline: bool) ->
         })
         .on_action({
             let editor = editor.clone();
+            move |action: &MoveHome, window, cx| {
+                editor.update(cx, |editor, cx| editor.component_home(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveEnd, window, cx| {
+                editor.update(cx, |editor, cx| editor.component_end(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectToStartOfLine, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.component_select_home(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectToEndOfLine, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.component_select_end(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveToPreviousWord, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.component_previous_word(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveToNextWord, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.component_next_word(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectToPreviousWordStart, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.component_select_previous_word(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectToNextWordEnd, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.component_select_next_word(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
             move |action: &Up, window, cx| {
                 editor.update(cx, |editor, cx| editor.up(action, window, cx));
             }
@@ -1885,6 +2048,27 @@ fn next_boundary(text: &str, offset: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+/// Match gpui-component's word navigation: left lands at the start of the
+/// previous word and right lands at the end of the next word. Keeping the
+/// implementation here preserves that behavior for DBX's custom renderer,
+/// including its UTF-8/grapheme-safe selection model.
+fn previous_word_boundary(text: &str, offset: usize) -> usize {
+    let offset = clamp_boundary(text, offset);
+    UnicodeSegmentation::split_word_bound_indices(&text[..offset])
+        .rfind(|(_, segment)| !segment.trim_start().is_empty())
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_word_boundary(text: &str, offset: usize) -> usize {
+    let offset = clamp_boundary(text, offset);
+    let right = &text[offset..];
+    UnicodeSegmentation::split_word_bound_indices(right)
+        .find(|(_, segment)| !segment.trim_start().is_empty())
+        .map(|(index, segment)| offset + index + segment.len())
+        .unwrap_or(text.len())
+}
+
 fn utf16_to_utf8(text: &str, offset: usize) -> usize {
     let mut bytes = 0;
     let mut units = 0;
@@ -2032,6 +2216,15 @@ mod tests {
         assert_eq!(line_start(text, 6), 4);
         assert_eq!(line_end(text, 6), 7);
         assert_eq!(nth_line_start(text, 2), 8);
+    }
+
+    #[test]
+    fn component_word_navigation_lands_on_word_edges() {
+        let text = "one two";
+        assert_eq!(previous_word_boundary(text, text.len()), 4);
+        assert_eq!(previous_word_boundary(text, 4), 0);
+        assert_eq!(next_word_boundary(text, 0), 3);
+        assert_eq!(next_word_boundary(text, 3), text.len());
     }
 
     #[test]
@@ -2211,7 +2404,7 @@ mod tests {
     #[test]
     fn editor_bindings_are_scoped_to_the_text_editor_context() {
         let bindings = default_key_bindings();
-        assert_eq!(bindings.len(), 20);
+        assert_eq!(bindings.len(), 28);
         assert!(bindings.iter().all(|binding| binding.predicate().is_some()));
         assert_eq!(TEXT_INPUT_CONTEXT, TEXT_EDITOR_CONTEXT);
     }
