@@ -32,6 +32,21 @@ pub trait Engine: Send + Sync {
 
     async fn list_tables(&self) -> Result<Vec<TableInfo>>;
 
+    /// Names of the databases reachable through this connection. For SQLite
+    /// these are the attached database aliases; for Redis they are the
+    /// logical indexes.
+    async fn list_databases(&self) -> Result<Vec<String>>;
+
+    /// Name (or index label) of the database the connection currently uses.
+    async fn current_database(&self) -> Result<String>;
+
+    /// Switch the active database while keeping the same [`Engine`] object.
+    ///
+    /// MySQL issues `USE`, Redis issues `SELECT`, PostgreSQL swaps the
+    /// internal pool for one connected to the target database, and SQLite
+    /// rejects the operation because a file is itself one database.
+    async fn use_database(&self, name: &str) -> Result<()>;
+
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
 
     async fn table_structure(&self, table: &TableRef) -> Result<TableStructure>;
@@ -82,6 +97,18 @@ impl DatabaseEngine {
 
     pub async fn list_tables(&self) -> Result<Vec<TableInfo>> {
         Engine::list_tables(self).await
+    }
+
+    pub async fn list_databases(&self) -> Result<Vec<String>> {
+        Engine::list_databases(self).await
+    }
+
+    pub async fn current_database(&self) -> Result<String> {
+        Engine::current_database(self).await
+    }
+
+    pub async fn use_database(&self, name: &str) -> Result<()> {
+        Engine::use_database(self, name).await
     }
 
     pub async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
@@ -225,6 +252,27 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.list_tables().await,
             Self::Redis(engine) => engine.list_tables().await,
+        }
+    }
+
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        match self {
+            Self::Sql(engine) => engine.list_databases().await,
+            Self::Redis(engine) => engine.list_databases().await,
+        }
+    }
+
+    async fn current_database(&self) -> Result<String> {
+        match self {
+            Self::Sql(engine) => engine.current_database().await,
+            Self::Redis(engine) => engine.current_database().await,
+        }
+    }
+
+    async fn use_database(&self, name: &str) -> Result<()> {
+        match self {
+            Self::Sql(engine) => engine.use_database(name).await,
+            Self::Redis(engine) => engine.use_database(name).await,
         }
     }
 

@@ -478,6 +478,10 @@ struct ConnectionSession {
     secondary_tabs: Vec<SecondaryTab>,
     active_secondary_tab: Option<SecondaryTabId>,
     tables: Vec<TableInfo>,
+    /// Databases reachable through this connection, for the sidebar switcher.
+    databases: Vec<String>,
+    /// Database the engine currently uses, if the backend reports one.
+    current_database: Option<String>,
     /// PostgreSQL-only navigator filter. `None` means all schemas.
     schema_filter: Option<String>,
     selected_table: Option<TableRef>,
@@ -537,6 +541,8 @@ impl ConnectionSession {
             secondary_tabs: Vec::new(),
             active_secondary_tab: None,
             tables: Vec::new(),
+            databases: Vec::new(),
+            current_database: None,
             schema_filter: None,
             selected_table: None,
             table_columns: Vec::new(),
@@ -1022,6 +1028,8 @@ impl DbxApp {
                 .spawn(async move {
                     let engine = Arc::new(DatabaseEngine::connect(config).await?);
                     let tables = engine.list_tables().await?;
+                    let databases = engine.list_databases().await.unwrap_or_default();
+                    let current_database = engine.current_database().await.ok();
                     let schema_filter = default_schema_filter(kind, &tables);
                     let initial_table =
                         schema_filtered_tables(kind, &tables, schema_filter.as_deref())
@@ -1054,7 +1062,14 @@ impl DbxApp {
                     } else {
                         None
                     };
-                    Ok::<_, dbx_core::DbxError>((engine, tables, schema_filter, initial))
+                    Ok::<_, dbx_core::DbxError>((
+                        engine,
+                        tables,
+                        databases,
+                        current_database,
+                        schema_filter,
+                        initial,
+                    ))
                 })
                 .await?;
 
@@ -1067,9 +1082,11 @@ impl DbxApp {
                 }
                 session.busy = false;
                 match result {
-                    Ok((engine, tables, schema_filter, initial)) => {
+                    Ok((engine, tables, databases, current_database, schema_filter, initial)) => {
                         session.engine = Some(engine);
                         session.tables = tables;
+                        session.databases = databases;
+                        session.current_database = current_database;
                         session.schema_filter = schema_filter;
                         if let Some((table, columns, result)) = initial {
                             session.selected_table = Some(table.clone());
@@ -1886,6 +1903,69 @@ impl DbxApp {
 
     fn refresh_action(&mut self, _: &RefreshData, _: &mut Window, cx: &mut Context<Self>) {
         self.refresh_table(cx);
+    }
+
+    /// Switch the session's active database on the existing engine. The
+    /// engine keeps its connection; only the selected database changes, so
+    /// tables and data are reloaded for the new context.
+    fn switch_database_for(
+        &mut self,
+        session_id: SessionId,
+        database: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let Some(engine) = session.engine.clone() else {
+            return;
+        };
+        if session.current_database.as_deref() == Some(database.as_str()) || session.busy {
+            return;
+        }
+        session.busy = true;
+        session.status = format!("Switching to {database}…");
+        session.error = None;
+        let runtime = self.runtime.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let target = database.clone();
+            let result = runtime
+                .spawn(async move {
+                    engine.use_database(&target).await?;
+                    let tables = engine.list_tables().await?;
+                    Ok::<_, dbx_core::DbxError>(tables)
+                })
+                .await?;
+
+            this.update(cx, |this, cx| {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                session.busy = false;
+                match result {
+                    Ok(tables) => {
+                        session.tables = tables;
+                        session.current_database = Some(database.clone());
+                        session.selected_table = None;
+                        session.table_columns.clear();
+                        session.set_result(None, cx);
+                        session.result_table = None;
+                        session.schema_filter = None;
+                        session.row_draft = None;
+                        session.status = format!("Switched to {database}");
+                        session.error = None;
+                    }
+                    Err(error) => {
+                        session.error = Some(error.to_string());
+                        session.status = "Database switch failed".into();
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     fn begin_insert_for(
@@ -3913,11 +3993,13 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((kind, tables, selected_schema, selected_table)) =
+        let Some((kind, tables, databases, current_database, selected_schema, selected_table)) =
             self.session(session_id).map(|session| {
                 (
                     session.kind,
                     session.tables.clone(),
+                    session.databases.clone(),
+                    session.current_database.clone(),
                     session.schema_filter.clone(),
                     session.selected_table.clone(),
                 )
@@ -4009,6 +4091,52 @@ impl DbxApp {
                                     ),
                             ),
                     )
+                    .when(databases.len() > 1, |view| {
+                        view.child(
+                            div()
+                                .id("database-switcher-scroll")
+                                .flex()
+                                .gap(px(4.))
+                                .overflow_x_scroll()
+                                .children(databases.into_iter().map(|database| {
+                                    let selected =
+                                        current_database.as_deref() == Some(database.as_str());
+                                    let label = if kind == DatabaseKind::Redis {
+                                        format!("db{database}")
+                                    } else {
+                                        database.clone()
+                                    };
+                                    div()
+                                        .id(SharedString::from(format!("db-{database}")))
+                                        .px(px(7.))
+                                        .py(px(3.))
+                                        .rounded(px(4.))
+                                        .bg(if selected {
+                                            THEME.accent_soft
+                                        } else {
+                                            THEME.panel_raised
+                                        })
+                                        .text_color(if selected {
+                                            THEME.accent
+                                        } else {
+                                            THEME.text_muted
+                                        })
+                                        .text_size(px(9.))
+                                        .cursor_pointer()
+                                        .hover(|style| {
+                                            style.bg(THEME.panel_raised).text_color(THEME.text)
+                                        })
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.switch_database_for(
+                                                session_id,
+                                                database.clone(),
+                                                cx,
+                                            )
+                                        }))
+                                })),
+                        )
+                    })
                     .when(kind == DatabaseKind::PostgreSQL, |view| {
                         view.child(
                             div()

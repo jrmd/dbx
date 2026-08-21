@@ -456,6 +456,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_reports_databases_and_rejects_switching() {
+        let engine = DatabaseEngine::connect(ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(engine.current_database().await.unwrap(), "main");
+        let databases = engine.list_databases().await.unwrap();
+        assert!(databases.iter().any(|name| name == "main"));
+        let error = engine.use_database("other").await.unwrap_err();
+        assert!(matches!(
+            error,
+            DbxError::Unsupported { operation, kind } if operation == "use_database" && kind == DatabaseKind::SQLite
+        ));
+        // A rejected switch must leave the connection usable.
+        assert_eq!(engine.current_database().await.unwrap(), "main");
+    }
+
+    #[tokio::test]
     async fn sqlite_table_structure_includes_composite_foreign_keys() {
         let engine = DatabaseEngine::connect(ConnectionConfig::new(
             DatabaseKind::SQLite,
