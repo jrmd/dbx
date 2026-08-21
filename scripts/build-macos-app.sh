@@ -12,6 +12,8 @@ CARGO_BIN="${CARGO:-cargo}"
 
 readonly BINARY_PATH="$ROOT_DIR/target/release/dbx"
 readonly INFO_PLIST="$ROOT_DIR/packaging/macos/Info.plist"
+readonly LOGO_SVG="$ROOT_DIR/logo.svg"
+readonly LOGO_PNG="$ROOT_DIR/logo.png"
 
 log() {
 	printf 'DBX: %s\n' "$*"
@@ -32,8 +34,12 @@ check_host() {
 	require_command codesign
 	require_command security
 	require_command open
+	require_command iconutil
+	require_command sips
 
 	[[ -f "$INFO_PLIST" ]] || die "missing bundle metadata: $INFO_PLIST"
+	[[ -f "$LOGO_SVG" ]] || die "missing vector logo: $LOGO_SVG"
+	[[ -f "$LOGO_PNG" ]] || die "missing raster logo fallback: $LOGO_PNG"
 	[[ -f "$KEYCHAIN" ]] || die "login keychain not found: $KEYCHAIN"
 }
 
@@ -129,14 +135,77 @@ ensure_signing_identity() {
 	identity_is_available || create_local_identity
 }
 
+render_icon_png() {
+	local output="$1"
+	local size="$2"
+
+	if command -v rsvg-convert >/dev/null 2>&1; then
+		rsvg-convert -w "$size" -h "$size" "$LOGO_SVG" -o "$output"
+	else
+		# sips is part of macOS. The supplied PNG is only used to make the
+		# Finder icon fallback when librsvg is not installed; the app UI still
+		# embeds and renders the vector SVG.
+		sips -s format png -z "$size" "$size" "$LOGO_PNG" --out "$output" >/dev/null
+	fi
+}
+
+build_icon() {
+	local resources_dir="$APP_DIR/Contents/Resources"
+	local iconset_dir="$resources_dir/DBX.iconset"
+
+	mkdir -p "$iconset_dir"
+	rm -f \
+		"$iconset_dir/icon_16x16.png" \
+		"$iconset_dir/icon_16x16@2x.png" \
+		"$iconset_dir/icon_32x32.png" \
+		"$iconset_dir/icon_32x32@2x.png" \
+		"$iconset_dir/icon_128x128.png" \
+		"$iconset_dir/icon_128x128@2x.png" \
+		"$iconset_dir/icon_256x256.png" \
+		"$iconset_dir/icon_256x256@2x.png" \
+		"$iconset_dir/icon_512x512.png" \
+		"$iconset_dir/icon_512x512@2x.png"
+
+	render_icon_png "$iconset_dir/icon_16x16.png" 16
+	render_icon_png "$iconset_dir/icon_16x16@2x.png" 32
+	render_icon_png "$iconset_dir/icon_32x32.png" 32
+	render_icon_png "$iconset_dir/icon_32x32@2x.png" 64
+	render_icon_png "$iconset_dir/icon_128x128.png" 128
+	render_icon_png "$iconset_dir/icon_128x128@2x.png" 256
+	render_icon_png "$iconset_dir/icon_256x256.png" 256
+	render_icon_png "$iconset_dir/icon_256x256@2x.png" 512
+	render_icon_png "$iconset_dir/icon_512x512.png" 512
+	render_icon_png "$iconset_dir/icon_512x512@2x.png" 1024
+
+	rm -f "$resources_dir/DBX.icns"
+	iconutil -c icns -o "$resources_dir/DBX.icns" "$iconset_dir"
+	# The generated iconset is an iconutil input, not a runtime resource.
+	rm -f \
+		"$iconset_dir/icon_16x16.png" \
+		"$iconset_dir/icon_16x16@2x.png" \
+		"$iconset_dir/icon_32x32.png" \
+		"$iconset_dir/icon_32x32@2x.png" \
+		"$iconset_dir/icon_128x128.png" \
+		"$iconset_dir/icon_128x128@2x.png" \
+		"$iconset_dir/icon_256x256.png" \
+		"$iconset_dir/icon_256x256@2x.png" \
+		"$iconset_dir/icon_512x512.png" \
+		"$iconset_dir/icon_512x512@2x.png"
+	rmdir "$iconset_dir" 2>/dev/null || true
+}
+
 build_bundle() {
 	log "building release binary"
 	(cd "$ROOT_DIR" && "$CARGO_BIN" build --release --package dbx-ui)
 	[[ -x "$BINARY_PATH" ]] || die "release binary was not produced: $BINARY_PATH"
 
 	mkdir -p "$APP_DIR/Contents/MacOS"
+	mkdir -p "$APP_DIR/Contents/Resources"
 	cp "$BINARY_PATH" "$APP_DIR/Contents/MacOS/dbx"
 	cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
+	cp "$LOGO_SVG" "$APP_DIR/Contents/Resources/DBX.svg"
+	build_icon
+	[[ -s "$APP_DIR/Contents/Resources/DBX.icns" ]] || die "macOS icon was not produced"
 }
 
 sign_bundle() {

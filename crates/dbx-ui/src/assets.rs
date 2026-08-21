@@ -17,8 +17,8 @@ pub const LOGO_POSTGRESQL: &str = "icons/postgresql.svg";
 pub const LOGO_MYSQL: &str = "icons/mysql.svg";
 pub const LOGO_SQLITE: &str = "icons/sqlite.svg";
 pub const LOGO_REDIS: &str = "icons/redis.svg";
-pub const LOGO: &str = "logo.png";
-pub const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
+pub const LOGO: &str = "logo.svg";
+pub const LOGO_BYTES: &[u8] = include_bytes!("../../../logo.svg");
 
 /// Compile-time UI assets, so packaged binaries never rely on the current
 /// working directory to render their icons.
@@ -83,7 +83,7 @@ impl AssetSource for Assets {
 mod tests {
     use gpui::AssetSource;
 
-    use super::{Assets, LOGO};
+    use super::{Assets, LOGO, LOGO_BYTES};
 
     #[test]
     fn loads_and_lists_the_embedded_logo() {
@@ -96,6 +96,16 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|asset| asset.as_ref() == LOGO)
+        );
+        assert!(
+            LOGO_BYTES
+                .windows(b"<path".len())
+                .any(|window| window == b"<path")
+        );
+        assert!(
+            !LOGO_BYTES
+                .windows(b"<image".len())
+                .any(|window| window == b"<image")
         );
     }
 }

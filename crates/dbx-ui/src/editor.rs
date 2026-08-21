@@ -416,7 +416,13 @@ pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletion
         SqlCompletionTarget::Any
     };
 
-    if prefix.is_empty() && qualifier.is_none() && previous_word.is_none() {
+    let after_list_separator = text[..start]
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|character| matches!(character, '(' | ','));
+    if prefix.is_empty() && qualifier.is_none() && previous_word.is_none() && !after_list_separator
+    {
         return None;
     }
 
@@ -460,12 +466,8 @@ fn completion_qualifier(text: &str, start: usize) -> Option<(String, usize)> {
     }
 
     let mut segment_end = text[..dot_start].trim_end().len();
-    let mut segment_start = completion_identifier_start(text, segment_end);
-    if segment_start == segment_end {
-        return None;
-    }
-
-    let mut segments = vec![text[segment_start..segment_end].to_owned()];
+    let (mut segment_start, segment) = completion_qualifier_segment(text, segment_end)?;
+    let mut segments = vec![segment];
     while segment_start > 0 {
         let (separator_start, separator) = text[..segment_start]
             .char_indices()
@@ -475,16 +477,47 @@ fn completion_qualifier(text: &str, start: usize) -> Option<(String, usize)> {
             break;
         }
         segment_end = text[..separator_start].trim_end().len();
-        let previous_start = completion_identifier_start(text, segment_end);
-        if previous_start == segment_end {
-            break;
-        }
-        segments.push(text[previous_start..segment_end].to_owned());
+        let (previous_start, previous_segment) = completion_qualifier_segment(text, segment_end)?;
+        segments.push(previous_segment);
         segment_start = previous_start;
     }
 
     segments.reverse();
     Some((segments.join("."), segment_start))
+}
+
+fn completion_qualifier_segment(text: &str, end: usize) -> Option<(usize, String)> {
+    let end = text[..end].trim_end().len();
+    if end == 0 {
+        return None;
+    }
+
+    let bytes = text.as_bytes();
+    if end >= 2 && matches!(bytes[end - 1], b'"' | b'`') {
+        let quote = bytes[end - 1];
+        let mut index = end.saturating_sub(2);
+        loop {
+            if bytes[index] == quote {
+                if index > 1 && bytes[index - 1] == quote {
+                    index -= 2;
+                    continue;
+                }
+                let raw = &text[index..end];
+                let quote = char::from(quote);
+                let segment =
+                    raw[1..raw.len() - 1].replace(&format!("{quote}{quote}"), &quote.to_string());
+                return (!segment.is_empty()).then_some((index, segment));
+            }
+            if index == 0 {
+                break;
+            }
+            index -= 1;
+        }
+        return None;
+    }
+
+    let start = completion_identifier_start(text, end);
+    (start < end).then(|| (start, text[start..end].to_owned()))
 }
 
 fn previous_sql_word(text: &str, before: usize) -> Option<String> {
@@ -2732,11 +2765,23 @@ mod tests {
             Some("analytics.users")
         );
 
+        let quoted_qualified = sql_completion_context(
+            "SELECT \"analytics\".\"users\".",
+            "SELECT \"analytics\".\"users\".".len(),
+        )
+        .unwrap();
+        assert_eq!(
+            quoted_qualified.qualifier.as_deref(),
+            Some("analytics.users")
+        );
+
         let quoted =
             sql_completion_context("SELECT * FROM \"us", "SELECT * FROM \"us".len()).unwrap();
         assert_eq!(quoted.target, SqlCompletionTarget::Table);
         assert_eq!(quoted.quote, Some('"'));
         assert_eq!(quoted.prefix, "us");
+
+        assert!(sql_completion_context("\"\"\".\"", "\"\"\".\"".len()).is_none());
     }
 
     #[test]
