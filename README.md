@@ -91,6 +91,24 @@ Use `DBX_FOREGROUND=1 make run` when you want the app's stdout/stderr in the
 terminal. `make cargo-build` and `make cargo-run` remain available for the raw
 Cargo workflow.
 
+The canonical brand asset is [logo.svg](logo.svg). DBX embeds that SVG in the
+native UI, so the rail and top-bar mark stay sharp at any display scale.
+
+For packaged local builds:
+
+```bash
+# macOS: target/macos/DBX.app, with Contents/Resources/DBX.icns
+make macos-build
+
+# Linux: target/linux/DBX plus target/linux/dbx-linux.tar.gz
+make linux-build
+```
+
+The Linux staging tree includes `usr/share/applications/dbx.desktop` and the
+scalable `usr/share/icons/hicolor/scalable/apps/dbx.svg` icon. The macOS
+bundle includes the SVG source and generates the Finder `.icns` resource from
+the same artwork.
+
 Run the disposable connector suite with Docker:
 
 ```bash
