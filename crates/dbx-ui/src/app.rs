@@ -327,7 +327,6 @@ impl TableDelegate for ResultTableDelegate {
                     .ghost()
                     .tooltip("Open referenced row")
                     .text_color(THEME.accent)
-                    .hover(|style| style.text_color(THEME.focus_ring))
                     .child(icon(Icon::ArrowRight, THEME.accent))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
@@ -3787,9 +3786,6 @@ impl DbxApp {
                                                     .child(
                                                         button("legacy-save-connection", "Save", ButtonKind::Quiet)
                                                             .cursor_pointer()
-                                                            .hover(|style| {
-                                                                style.border_color(THEME.accent)
-                                                            })
                                                             .on_click(cx.listener(
                                                                 |this, _, _, cx| {
                                                                     this.save_connection(cx)
@@ -6020,10 +6016,7 @@ impl DbxApp {
             } else {
                 THEME.text_muted
             })
-            .when(enabled, |view| {
-                view.cursor_pointer()
-                    .hover(|style| style.border_color(THEME.accent).text_color(THEME.accent))
-            })
+            .when(enabled, |view| view.cursor_pointer())
             .on_click(listener)
     }
 
