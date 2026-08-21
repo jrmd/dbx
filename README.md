@@ -71,6 +71,26 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 ```
 
+For local macOS development, use the Makefile workflow instead of `cargo run`:
+
+```bash
+make build
+make run
+```
+
+The first run creates a self-signed `DBX Local Development` code-signing
+identity in the Mac login keychain, then reuses it to sign a stable
+`target/macos/DBX.app` bundle with identifier `dbx.jrmd.app`. This is only for
+local development; it does not require an Apple Developer account and does not
+produce a distributable or notarized app. Launching the same signed bundle on
+every run gives macOS a stable app identity for Keychain access. The first
+access to an existing credential may still require choosing `Always Allow`
+once, especially if it was created by an older unsigned build.
+
+Use `DBX_FOREGROUND=1 make run` when you want the app's stdout/stderr in the
+terminal. `make cargo-build` and `make cargo-run` remain available for the raw
+Cargo workflow.
+
 Run the disposable connector suite with Docker:
 
 ```bash
