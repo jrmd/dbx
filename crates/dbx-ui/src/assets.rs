@@ -12,6 +12,10 @@ pub const ICON_SETTINGS: &str = "icons/settings.svg";
 pub const ICON_ADD: &str = "icons/add.svg";
 pub const ICON_CLOSE: &str = "icons/close.svg";
 pub const ICON_MORE: &str = "icons/more.svg";
+pub const LOGO_POSTGRESQL: &str = "icons/postgresql.svg";
+pub const LOGO_MYSQL: &str = "icons/mysql.svg";
+pub const LOGO_SQLITE: &str = "icons/sqlite.svg";
+pub const LOGO_REDIS: &str = "icons/redis.svg";
 pub const LOGO: &str = "logo.png";
 pub const LOGO_BYTES: &[u8] = include_bytes!("../assets/logo.png");
 
@@ -32,6 +36,10 @@ impl AssetSource for Assets {
             ICON_ADD => include_bytes!("../assets/icons/add.svg").as_slice(),
             ICON_CLOSE => include_bytes!("../assets/icons/close.svg").as_slice(),
             ICON_MORE => include_bytes!("../assets/icons/more.svg").as_slice(),
+            LOGO_POSTGRESQL => include_bytes!("../assets/icons/postgresql.svg").as_slice(),
+            LOGO_MYSQL => include_bytes!("../assets/icons/mysql.svg").as_slice(),
+            LOGO_SQLITE => include_bytes!("../assets/icons/sqlite.svg").as_slice(),
+            LOGO_REDIS => include_bytes!("../assets/icons/redis.svg").as_slice(),
             LOGO => LOGO_BYTES,
             _ => return Ok(None),
         };
@@ -54,6 +62,10 @@ impl AssetSource for Assets {
                 "add.svg",
                 "close.svg",
                 "more.svg",
+                "postgresql.svg",
+                "mysql.svg",
+                "sqlite.svg",
+                "redis.svg",
             ]
             .into_iter()
             .map(SharedString::from)

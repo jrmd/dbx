@@ -16,7 +16,6 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 futures-util = "0.3"
-gpui = "=0.2.2"
 keyring = "4.1"
 percent-encoding = "2.3"
 redis = { version = "0.32", features = ["aio", "tokio-comp"] }
@@ -38,6 +37,9 @@ tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "sync", "ti
 unicode-segmentation = "1.12"
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 
 [profile.release]
 lto = "thin"

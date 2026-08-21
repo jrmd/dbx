@@ -28,6 +28,39 @@ use uuid::Uuid;
 /// Version of the on-disk profile document.
 pub const PROFILE_FILE_VERSION: u32 = 1;
 
+/// Deployment environment label a connection can be tagged with.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionEnvironment {
+    Production,
+    Staging,
+    Develop,
+    #[default]
+    Local,
+}
+
+impl ConnectionEnvironment {
+    /// Every label in display order for pickers.
+    pub const ALL: [ConnectionEnvironment; 4] = [
+        ConnectionEnvironment::Production,
+        ConnectionEnvironment::Staging,
+        ConnectionEnvironment::Develop,
+        ConnectionEnvironment::Local,
+    ];
+}
+
+impl fmt::Display for ConnectionEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            ConnectionEnvironment::Production => "Production",
+            ConnectionEnvironment::Staging => "Staging",
+            ConnectionEnvironment::Develop => "Develop",
+            ConnectionEnvironment::Local => "Local",
+        };
+        f.write_str(label)
+    }
+}
+
 /// Name of the profile file below the platform configuration directory.
 pub const PROFILE_FILE_NAME: &str = "connections.json";
 
@@ -107,6 +140,7 @@ pub struct SavedConnection {
     pub kind: DatabaseKind,
     /// A normalized connection URL with no password in its userinfo.
     pub url: String,
+    pub environment: ConnectionEnvironment,
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
     secret_key: Option<String>,
@@ -138,6 +172,7 @@ pub struct ConnectionProfileDraft {
     pub id: Option<Uuid>,
     pub name: String,
     pub config: ConnectionConfig,
+    pub environment: ConnectionEnvironment,
     pub secret: Option<String>,
 }
 
@@ -163,6 +198,7 @@ impl ConnectionProfileDraft {
             id: None,
             name: name.into(),
             config,
+            environment: ConnectionEnvironment::default(),
             secret: None,
         }
     }
@@ -178,6 +214,12 @@ impl ConnectionProfileDraft {
 
     pub fn with_id(mut self, id: Uuid) -> Self {
         self.id = Some(id);
+        self
+    }
+
+    /// Tag the profile with a deployment environment label.
+    pub fn with_environment(mut self, environment: ConnectionEnvironment) -> Self {
+        self.environment = environment;
         self
     }
 
@@ -321,6 +363,7 @@ impl ProfileStore {
             name: draft.name,
             kind: draft.config.kind,
             url,
+            environment: draft.environment,
             max_connections: draft.config.max_connections,
             connect_timeout_ms: draft.config.connect_timeout_ms,
             secret_key: new_secret_key.clone(),
@@ -495,6 +538,8 @@ struct StoredConnection {
     name: String,
     kind: DatabaseKind,
     url: String,
+    #[serde(default)]
+    environment: ConnectionEnvironment,
     max_connections: u32,
     connect_timeout_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,6 +553,7 @@ impl StoredConnection {
             name: self.name,
             kind: self.kind,
             url: self.url,
+            environment: self.environment,
             max_connections: self.max_connections,
             connect_timeout_ms: self.connect_timeout_ms,
             secret_key: self.secret_key,
@@ -815,6 +861,37 @@ mod tests {
             store.load(saved.id).unwrap().config.url,
             "postgres://alice:durable-secret@example.test/app"
         );
+    }
+
+    #[test]
+    fn environment_labels_round_trip_and_default_for_older_documents() {
+        let (_directory, store, _secrets) = test_store();
+        let saved = store
+            .save(
+                ConnectionProfileDraft::new(
+                    "Prod",
+                    DatabaseKind::PostgreSQL,
+                    "postgres://alice@example.test/app",
+                )
+                .with_environment(ConnectionEnvironment::Production),
+            )
+            .expect("save profile");
+        assert_eq!(saved.environment, ConnectionEnvironment::Production);
+        assert_eq!(
+            store.list().unwrap()[0].environment,
+            ConnectionEnvironment::Production
+        );
+
+        // A document written before environments existed still loads, and the
+        // connection defaults to Local.
+        let id = Uuid::new_v4();
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        let json = format!(
+            r#"{{"version":1,"connections":[{{"id":"{id}","name":"Legacy","kind":"postgresql","url":"postgres://u@example.test/db","max_connections":8,"connect_timeout_ms":10000}}]}}"#
+        );
+        fs::write(store.path(), json).unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(listed[0].environment, ConnectionEnvironment::Local);
     }
 
     #[test]

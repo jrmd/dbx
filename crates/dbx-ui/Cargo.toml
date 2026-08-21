@@ -25,6 +25,8 @@ tokio.workspace = true
 unicode-segmentation.workspace = true
 url.workspace = true
 uuid.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

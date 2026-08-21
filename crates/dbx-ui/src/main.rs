@@ -11,16 +11,18 @@ mod theme;
 
 use app::DbxApp;
 use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds,
+    App, AppContext, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds,
     WindowOptions, point, px, size,
 };
 
 const APP_NAME: &str = "DBX";
 
 fn main() {
-    Application::new()
+    gpui_platform::application()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {
+            gpui_component::init(cx);
+            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
             cx.bind_keys(editor::default_key_bindings());
             cx.bind_keys([
                 KeyBinding::new("cmd-enter", app::RunQuery, None),
