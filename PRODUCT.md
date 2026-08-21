@@ -38,7 +38,7 @@ Users move repeatedly between saved connections, schema navigation, table data, 
 
 ## Brand Commitments
 
-The product name is DBX. The supplied DBX logo asset must appear in rail and top-bar branding. The supplied DBX screen-map image at `/tmp/codex-clipboard-9272fa2f-5a32-4169-962f-0c077297d380.png` is the binding visual reference for the desktop workbench: compact dark surfaces, crisp blue navigation and actions, green connection health, and dense professional database tooling.
+The product name is DBX. The supplied DBX logo asset anchors the disconnected connection setup/top-bar identity and the connected app rail; the connected workspace should not repeat the same mark in both places. The supplied DBX screen-map image at `/tmp/codex-clipboard-9272fa2f-5a32-4169-962f-0c077297d380.png` is the binding visual reference for the desktop workbench: compact dark surfaces, crisp blue navigation and actions, green connection health, and dense professional database tooling.
 
 ## Evidence on Hand
 

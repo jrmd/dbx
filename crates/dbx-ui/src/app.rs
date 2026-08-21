@@ -33,9 +33,7 @@ use crate::{
     assets::LOGO_BYTES,
     connection_fields::ConnectionFields,
     editor::{self, SqlCompletionTarget, TextEditor},
-    filters::{
-        FilterModel, FilterRowId, filter_operator_options, operator_label, operator_requires_value,
-    },
+    filters::{FilterModel, FilterRowId, filter_operator_options, operator_requires_value},
     profiles::{
         ConnectionEnvironment, ConnectionProfileDraft, ProfileStore, SavedConnection, sqlite_url,
     },
@@ -45,7 +43,16 @@ use crate::{
     },
 };
 
-gpui::actions!(dbx_ui, [RunQuery, RefreshData]);
+gpui::actions!(
+    dbx_ui,
+    [
+        RunQuery,
+        RefreshData,
+        CompletionUp,
+        CompletionDown,
+        CompletionEnter
+    ]
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Pane {
@@ -58,6 +65,13 @@ enum Pane {
 enum DraftMode {
     Insert,
     Update,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionAction {
+    Up,
+    Down,
+    Enter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -674,7 +688,7 @@ struct ConnectionSession {
     result_column_widths: HashMap<String, Pixels>,
     _data_grid_subscription: Subscription,
     filters: FilterModel,
-    filter_picker: Option<FilterPicker>,
+    filter_subscriptions: Vec<Subscription>,
     pane: Pane,
     secondary_tabs: Vec<SecondaryTab>,
     active_secondary_tab: Option<SecondaryTabId>,
@@ -698,6 +712,7 @@ struct ConnectionSession {
     result_table: Option<TableRef>,
     selected_row: Option<usize>,
     selected_column: usize,
+    inspector_open: bool,
     draft_mode: DraftMode,
     row_draft: Option<RowDraftModel>,
     row_draft_subscriptions: Vec<Subscription>,
@@ -743,7 +758,7 @@ impl ConnectionSession {
             result_column_widths: HashMap::new(),
             _data_grid_subscription: data_grid_subscription,
             filters: FilterModel::new(),
-            filter_picker: None,
+            filter_subscriptions: Vec::new(),
             pane: Pane::Data,
             secondary_tabs: Vec::new(),
             active_secondary_tab: None,
@@ -759,6 +774,7 @@ impl ConnectionSession {
             result_table: None,
             selected_row: None,
             selected_column: 0,
+            inspector_open: true,
             draft_mode: DraftMode::Update,
             row_draft: None,
             row_draft_subscriptions: Vec::new(),
@@ -807,18 +823,6 @@ struct TableContextMenu {
 enum TableAction {
     Truncate,
     Drop,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FilterPickerKind {
-    Column,
-    Operator,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FilterPicker {
-    row_id: FilterRowId,
-    kind: FilterPickerKind,
 }
 
 pub struct DbxApp {
@@ -908,10 +912,11 @@ impl DbxApp {
     ) {
         let fields =
             ConnectionFields::from_url(url.clone()).unwrap_or_else(|_| ConnectionFields::new(kind));
+        let normalized_url = fields.url().unwrap_or(url);
         self.draft.kind = kind;
         self.draft.mode = ConnectionFormMode::Details;
         self.draft.connection_url.update(cx, |value, cx| {
-            *value = url;
+            *value = normalized_url;
             cx.notify();
         });
         self.draft.host.update(cx, |value, cx| {
@@ -960,7 +965,8 @@ impl DbxApp {
     }
 
     /// Resolve the visible form through the profile store when it still names
-    /// the selected profile. This is the only path that reads keyring secrets.
+    /// the selected profile. This preserves the password-free form URL while
+    /// using the stored credential for connection operations.
     fn resolve_draft(&self, cx: &App) -> Result<(DatabaseKind, String, ConnectionConfig), String> {
         let (mut kind, visible_url) = self.draft_connection(cx)?;
         let config = if let (Some(store), Some(profile_id)) =
@@ -1073,18 +1079,60 @@ impl DbxApp {
     }
 
     fn select_saved_connection(&mut self, profile: SavedConnection, cx: &mut Context<Self>) {
+        let profile_id = profile.id;
+        let has_secret = profile.has_secret();
         self.draft.selected_profile = Some(profile.id);
         self.draft.environment = profile.environment;
         self.draft.connection_name.update(cx, |name, cx| {
             *name = profile.name;
             cx.notify();
         });
-        // Selecting a profile only changes the draft. Resolve the password
-        // lazily when Test Connection or Connect actually needs it; opening
-        // the picker must not trigger a Keychain prompt or block the UI.
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
         self.error = None;
-        self.status = "Saved connection selected".into();
+        self.status = if has_secret {
+            "Saved connection selected · loading password…".into()
+        } else {
+            "Saved connection selected".into()
+        };
+        if has_secret && let Some(store) = self.profile_store.clone() {
+            let runtime = self.runtime.clone();
+            cx.spawn(async move |this, cx| {
+                let loaded = runtime
+                    .spawn_blocking(move || store.load(profile_id))
+                    .await?;
+                this.update(cx, |this, cx| {
+                    if this.draft.selected_profile != Some(profile_id) {
+                        return;
+                    }
+                    let password_is_empty = this.draft.password.read(cx).is_empty();
+                    match loaded {
+                        Ok(loaded) if password_is_empty => {
+                            this.hydrate_connection_fields(
+                                loaded.config.kind,
+                                loaded.config.url,
+                                cx,
+                            );
+                            this.error = None;
+                            this.status = "Saved connection selected".into();
+                        }
+                        Ok(_) => {
+                            // The user started editing before the keyring
+                            // returned. Never overwrite their new password.
+                            this.error = None;
+                            this.status = "Saved connection selected".into();
+                        }
+                        Err(error) if password_is_empty => {
+                            this.status = "Saved password unavailable · enter it again".into();
+                            this.error = Some(error.to_string());
+                        }
+                        Err(_) => {}
+                    }
+                    cx.notify();
+                })?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -1095,16 +1143,20 @@ impl DbxApp {
             return;
         };
         let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let (kind, url) = match self.draft_connection(cx) {
-            Ok(resolved) => resolved,
+        let fields = self.connection_fields(cx);
+        let (kind, url) = match fields.url() {
+            Ok(url) => (fields.kind, url),
             Err(error) => {
-                self.set_error(error);
+                self.set_error(error.to_string());
                 cx.notify();
                 return;
             }
         };
         let mut draft = ConnectionProfileDraft::new(name, kind, url.clone())
             .with_environment(self.draft.environment);
+        if !fields.password.is_empty() {
+            draft = draft.with_secret(fields.password.clone());
+        }
         if let Some(id) = self.draft.selected_profile {
             draft = draft.with_id(id);
         }
@@ -1246,7 +1298,7 @@ impl DbxApp {
                             .next();
                     let initial = if let Some(table) = initial_table {
                         let table_ref = table_ref(&table);
-                        let columns = engine.describe_table(&table_ref).await?;
+                        let structure = engine.table_structure(&table_ref).await?;
                         let result = if kind.is_sql() {
                             Some(
                                 engine
@@ -1267,7 +1319,7 @@ impl DbxApp {
                                     .await?,
                             )
                         };
-                        Some((table_ref, columns, result))
+                        Some((table_ref, structure, result))
                     } else {
                         None
                     };
@@ -1297,9 +1349,10 @@ impl DbxApp {
                         session.databases = databases;
                         session.current_database = current_database;
                         session.schema_filter = schema_filter;
-                        if let Some((table, columns, result)) = initial {
+                        if let Some((table, structure, result)) = initial {
                             session.selected_table = Some(table.clone());
-                            session.table_columns = columns;
+                            session.table_columns = structure.columns;
+                            session.foreign_keys = structure.foreign_keys;
                             session.completion_columns.insert(
                                 completion_table_key(&table),
                                 session.table_columns.clone(),
@@ -1669,6 +1722,28 @@ impl DbxApp {
         };
         let table_ref = table_ref(&table);
         let runtime = self.runtime.clone();
+        let filter_columns = self
+            .session(session_id)
+            .map(|session| session.table_columns.clone())
+            .unwrap_or_default();
+        let mut filter_model = FilterModel::new();
+        for filter in &filters {
+            if let Some(value) = filter.value.as_ref() {
+                filter_model.add_row_with_value_and_columns(
+                    filter.column.clone(),
+                    filter.operator,
+                    value.to_string(),
+                    &filter_columns,
+                    window,
+                    cx,
+                );
+            }
+        }
+        let filter_row_ids = filter_model
+            .rows()
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
@@ -1683,20 +1758,8 @@ impl DbxApp {
         session.row_draft_subscriptions.clear();
         session.foreign_keys.clear();
         session.clear_grid_selection(cx);
-        let mut filter_model = FilterModel::new();
-        for filter in &filters {
-            if let Some(value) = filter.value.as_ref() {
-                filter_model.add_row_with_value(
-                    filter.column.clone(),
-                    filter.operator,
-                    value.to_string(),
-                    window,
-                    cx,
-                );
-            }
-        }
         session.filters = filter_model;
-        session.filter_picker = None;
+        session.filter_subscriptions.clear();
         session.busy = true;
         session.error = None;
         session.status = format!("Loading {}…", table.name);
@@ -1704,6 +1767,9 @@ impl DbxApp {
         let generation = session.request_generation;
         let result_table = table_ref.clone();
         let row_navigation = !filters.is_empty();
+        for row_id in filter_row_ids {
+            self.watch_filter_row_for(session_id, row_id, window, cx);
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1888,24 +1954,88 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(column) = self
-            .session(session_id)
-            .and_then(|session| session.table_columns.first())
-            .map(|column| column.name.clone())
+        let Some((column, columns)) = self.session(session_id).map(|session| {
+            (
+                session
+                    .table_columns
+                    .first()
+                    .map(|column| column.name.clone())
+                    .unwrap_or_default(),
+                session.table_columns.clone(),
+            )
+        }) else {
+            return;
+        };
+        let row_id = {
+            let Some(session) = self.session_mut(session_id) else {
+                return;
+            };
+            if session.table_columns.is_empty() {
+                return;
+            }
+            session.filters.add_row_with_columns(
+                column,
+                FilterOperator::Equals,
+                &columns,
+                window,
+                cx,
+            )
+        };
+        self.watch_filter_row_for(session_id, row_id, window, cx);
+        cx.notify();
+    }
+
+    fn watch_filter_row_for(
+        &mut self,
+        session_id: SessionId,
+        row_id: FilterRowId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((column_selector, operator_selector)) =
+            self.session(session_id).and_then(|session| {
+                session
+                    .filters
+                    .rows()
+                    .iter()
+                    .find(|row| row.id == row_id)
+                    .map(|row| (row.column_selector.clone(), row.operator_selector.clone()))
+            })
         else {
             return;
         };
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let row_id = session
-            .filters
-            .add_row(column, FilterOperator::Equals, window, cx);
-        session.filter_picker = Some(FilterPicker {
-            row_id,
-            kind: FilterPickerKind::Column,
-        });
-        cx.notify();
+        let column_subscription = cx.subscribe_in(
+            &column_selector,
+            window,
+            move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                let SelectEvent::Confirm(value) = event;
+                if let Some(value) = value {
+                    this.set_filter_column_for(session_id, row_id, value.to_string(), cx);
+                }
+            },
+        );
+        let operator_subscription = cx.subscribe_in(
+            &operator_selector,
+            window,
+            move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let Some(operator) = filter_operator_options()
+                    .iter()
+                    .find(|option| option.label == value.as_ref())
+                    .map(|option| option.operator)
+                else {
+                    return;
+                };
+                this.set_filter_operator_for(session_id, row_id, operator, cx);
+            },
+        );
+        if let Some(session) = self.session_mut(session_id) {
+            session
+                .filter_subscriptions
+                .extend([column_subscription, operator_subscription]);
+        }
     }
 
     fn remove_filter_for(
@@ -1916,12 +2046,6 @@ impl DbxApp {
     ) {
         if let Some(session) = self.session_mut(session_id) {
             session.filters.remove(row_id);
-            if session
-                .filter_picker
-                .is_some_and(|picker| picker.row_id == row_id)
-            {
-                session.filter_picker = None;
-            }
             cx.notify();
         }
     }
@@ -1929,21 +2053,7 @@ impl DbxApp {
     fn clear_filters_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         if let Some(session) = self.session_mut(session_id) {
             session.filters = FilterModel::new();
-            session.filter_picker = None;
-            cx.notify();
-        }
-    }
-
-    fn toggle_filter_picker_for(
-        &mut self,
-        session_id: SessionId,
-        row_id: FilterRowId,
-        kind: FilterPickerKind,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session) = self.session_mut(session_id) {
-            let picker = FilterPicker { row_id, kind };
-            session.filter_picker = (session.filter_picker != Some(picker)).then_some(picker);
+            session.filter_subscriptions.clear();
             cx.notify();
         }
     }
@@ -1964,7 +2074,6 @@ impl DbxApp {
             {
                 row.set_selected_column(column);
             }
-            session.filter_picker = None;
             cx.notify();
         }
     }
@@ -1985,7 +2094,6 @@ impl DbxApp {
             {
                 row.set_operator(operator);
             }
-            session.filter_picker = None;
             cx.notify();
         }
     }
@@ -2299,6 +2407,71 @@ impl DbxApp {
                 cx.notify();
             }
             _ => {}
+        }
+    }
+
+    fn handle_completion_action(
+        &mut self,
+        session_id: SessionId,
+        action: CompletionAction,
+        query_editor: Entity<TextEditor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.query_completion_for(session_id, cx) else {
+            match action {
+                CompletionAction::Up => {
+                    query_editor.update(cx, |editor, cx| editor.move_vertical(-1, cx));
+                }
+                CompletionAction::Down => {
+                    query_editor.update(cx, |editor, cx| editor.move_vertical(1, cx));
+                }
+                CompletionAction::Enter => {
+                    query_editor.update(cx, |editor, cx| editor.insert_newline(cx));
+                }
+            }
+            return;
+        };
+        let Some(tab_id) = self
+            .session(session_id)
+            .and_then(|session| session.active_secondary_tab)
+        else {
+            return;
+        };
+
+        match action {
+            CompletionAction::Up | CompletionAction::Down => {
+                let Some(session) = self.session_mut(session_id) else {
+                    return;
+                };
+                let Some(tab) = session
+                    .secondary_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                else {
+                    return;
+                };
+                let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
+                    return;
+                };
+                let count = menu.items.len();
+                query_tab.completion_index = if action == CompletionAction::Up {
+                    if query_tab.completion_index == 0 {
+                        count - 1
+                    } else {
+                        query_tab.completion_index - 1
+                    }
+                } else {
+                    (query_tab.completion_index + 1) % count
+                };
+                cx.notify();
+            }
+            CompletionAction::Enter => {
+                let Some(item) = menu.items.get(menu.selected).cloned() else {
+                    return;
+                };
+                self.accept_completion_for(session_id, tab_id, menu.context, item, window, cx);
+            }
         }
     }
 
@@ -2628,6 +2801,7 @@ impl DbxApp {
         };
         session.draft_mode = DraftMode::Insert;
         session.selected_row = None;
+        session.inspector_open = true;
         session.clear_grid_selection(cx);
         session.row_draft = Some(row_draft);
         session.error = None;
@@ -2824,6 +2998,7 @@ impl DbxApp {
         };
         session.selected_row = Some(row);
         session.draft_mode = DraftMode::Update;
+        session.inspector_open = true;
         session.row_draft = row_draft;
         session.error = None;
         session.status = if editable {
@@ -2832,6 +3007,20 @@ impl DbxApp {
             "Inspecting read-only query row".into()
         };
         cx.notify();
+    }
+
+    fn toggle_inspector_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut(session_id) {
+            session.inspector_open = !session.inspector_open;
+            cx.notify();
+        }
+    }
+
+    fn close_inspector_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut(session_id) {
+            session.inspector_open = false;
+            cx.notify();
+        }
     }
 
     fn select_column_for(&mut self, session_id: SessionId, column: usize, cx: &mut Context<Self>) {
@@ -4560,7 +4749,6 @@ impl DbxApp {
     }
 
     fn render_topbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_active_session = self.active_session().is_some();
         let connected = self
             .active_session()
             .is_some_and(|session| session.engine.is_some());
@@ -4572,36 +4760,38 @@ impl DbxApp {
             .border_b_1()
             .border_color(THEME.border)
             .bg(THEME.rail)
-            .child(
-                div()
-                    .w(if self.compact_layout {
-                        px(96.)
-                    } else {
-                        px(122.)
-                    })
-                    .flex_none()
-                    .px(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
-                    .child(
-                        div()
-                            .id("window-title-drag")
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .window_control_area(WindowControlArea::Drag)
-                            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                window.start_window_move();
-                            })
-                            .on_double_click(|_, window, _| window.zoom_window())
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("DBX"),
-                    ),
-            )
+            .when(!connected, |view| {
+                view.child(
+                    div()
+                        .w(if self.compact_layout {
+                            px(96.)
+                        } else {
+                            px(122.)
+                        })
+                        .flex_none()
+                        .px(px(12.))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
+                        .child(
+                            div()
+                                .id("window-title-drag")
+                                .flex_1()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .window_control_area(WindowControlArea::Drag)
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.start_window_move();
+                                })
+                                .on_double_click(|_, window, _| window.zoom_window())
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::BOLD)
+                                .child("DBX"),
+                        ),
+                )
+            })
             .child(self.render_connection_tabs(cx))
             .child(
                 div()
@@ -4639,19 +4829,7 @@ impl DbxApp {
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx))),
                     )
-                    .when(!has_active_session, |view| {
-                        view.child(
-                            div()
-                                .ml(px(2.))
-                                .size(px(6.))
-                                .rounded_full()
-                                .bg(THEME.text_muted),
-                        )
-                    })
-                    .child(window_close_button().on_click(|_, window, cx| {
-                        cx.stop_propagation();
-                        window.remove_window();
-                    })),
+                    .child(window_close_button().on_click(|_, _, cx| cx.quit())),
             )
     }
 
@@ -5190,7 +5368,7 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((kind, redis_filter_editor, can_mutate, can_delete, filter_rows, picker, columns)) =
+        let Some((kind, redis_filter_editor, can_mutate, can_delete, filter_rows, inspector_open)) =
             self.session(session_id).map(|session| {
                 (
                     session.kind,
@@ -5204,14 +5382,14 @@ impl DbxApp {
                         .map(|row| {
                             (
                                 row.id,
-                                row.selected_column.clone(),
+                                row.column_selector.clone(),
+                                row.operator_selector.clone(),
                                 row.operator,
                                 row.editor.clone(),
                             )
                         })
                         .collect::<Vec<_>>(),
-                    session.filter_picker,
-                    session.table_columns.clone(),
+                    session.inspector_open,
                 )
             })
         else {
@@ -5219,76 +5397,6 @@ impl DbxApp {
         };
         let has_filter_rows = !filter_rows.is_empty();
         let redis_filter_focus = redis_filter_editor.read(cx).focus_handle();
-        let picker_panel = match picker {
-            Some(FilterPicker {
-                row_id,
-                kind: FilterPickerKind::Column,
-            }) => div()
-                .id("filter-column-options")
-                .max_h(px(150.))
-                .overflow_y_scroll()
-                .p(px(5.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(THEME.border)
-                .bg(THEME.panel_raised)
-                .children(columns.iter().map(|column| {
-                    let column_name = column.name.clone();
-                    div()
-                        .id(SharedString::from(format!(
-                            "filter-column-{row_id}-{}",
-                            column.name
-                        )))
-                        .px(px(8.))
-                        .py(px(6.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(THEME.accent_soft))
-                        .flex()
-                        .justify_between()
-                        .child(column.name.clone())
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(THEME.text_muted)
-                                .child(column.data_type.clone()),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_filter_column_for(session_id, row_id, column_name.clone(), cx)
-                        }))
-                }))
-                .into_any_element(),
-            Some(FilterPicker {
-                row_id,
-                kind: FilterPickerKind::Operator,
-            }) => div()
-                .id("filter-operator-options")
-                .max_h(px(180.))
-                .overflow_y_scroll()
-                .p(px(5.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(THEME.border)
-                .bg(THEME.panel_raised)
-                .children(filter_operator_options().iter().copied().map(|option| {
-                    div()
-                        .id(SharedString::from(format!(
-                            "filter-operator-{row_id}-{:?}",
-                            option.operator
-                        )))
-                        .px(px(8.))
-                        .py(px(6.))
-                        .rounded(px(4.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(THEME.accent_soft))
-                        .child(option.label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_filter_operator_for(session_id, row_id, option.operator, cx)
-                        }))
-                }))
-                .into_any_element(),
-            None => div().into_any_element(),
-        };
         div()
             .flex_1()
             .min_h_0()
@@ -5300,7 +5408,7 @@ impl DbxApp {
                     .py(px(6.))
                     .flex()
                     .flex_col()
-                    .gap(px(5.))
+                    .gap(px(7.))
                     .border_b_1()
                     .border_color(THEME.border)
                     .bg(THEME.panel)
@@ -5309,22 +5417,38 @@ impl DbxApp {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_size(px(9.)).text_color(THEME.text_muted).child(
-                                if kind.is_sql() {
-                                    "FILTERS · ALL RULES MUST MATCH"
-                                } else {
-                                    "KEY PATTERN"
-                                },
-                            ))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(5.))
+                                    .gap(px(7.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(THEME.text)
+                                            .child(if kind.is_sql() {
+                                                "Filters"
+                                            } else {
+                                                "Key pattern"
+                                            }),
+                                    )
+                                    .when(kind.is_sql(), |view| {
+                                        view.child(badge(
+                                            format!("{} active", filter_rows.len()),
+                                            THEME.text_muted,
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
                                     .when(kind.is_sql(), |view| {
                                         view.child(self.small_button(
                                             "add-filter",
-                                            "+ Filter",
+                                            "Add filter",
                                             cx.listener(move |this, _, window, cx| {
                                                 this.add_filter_for(session_id, window, cx)
                                             }),
@@ -5339,16 +5463,29 @@ impl DbxApp {
                                             ),
                                         )
                                     })
-                                    .child(self.small_button(
-                                        "apply-filter",
-                                        "Apply",
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.refresh_table_for(session_id, cx)
-                                        }),
-                                    ))
+                                    .child(
+                                        button("apply-filter", "Apply", ButtonKind::Primary)
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.refresh_table_for(session_id, cx)
+                                            })),
+                                    )
+                                    .when(!self.narrow_workspace, |view| {
+                                        view.child(self.small_button(
+                                            "toggle-inspector",
+                                            if inspector_open {
+                                                "Hide details"
+                                            } else {
+                                                "Show details"
+                                            },
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.toggle_inspector_for(session_id, cx)
+                                            }),
+                                        ))
+                                    })
                                     .child(self.small_button_state(
                                         "add-row",
-                                        "+ Row",
+                                        "Add row",
                                         can_mutate,
                                         cx.listener(move |this, _, window, cx| {
                                             this.begin_insert_for(session_id, window, cx)
@@ -5378,79 +5515,60 @@ impl DbxApp {
                                 .py(px(6.))
                                 .text_size(px(11.))
                                 .text_color(THEME.text_muted)
-                                .child("No filters — all rows are shown."),
+                                .child("All rows are shown. Add a filter to narrow this table."),
                         )
                     })
                     .when(kind.is_sql() && has_filter_rows, |view| {
                         view.child(
                             div()
                                 .id("filter-rows-scroll")
+                                .w_full()
+                                .min_w_0()
                                 .max_h(px(132.))
                                 .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
-                                .gap(px(5.))
+                                .gap(px(6.))
                                 .children(filter_rows.into_iter().map(
-                                    |(row_id, column, operator, value_editor)| {
+                                    |(
+                                        row_id,
+                                        column_selector,
+                                        operator_selector,
+                                        operator,
+                                        value_editor,
+                                    )| {
                                         let value_focus = value_editor.read(cx).focus_handle();
                                         div()
                                             .id(SharedString::from(format!("filter-row-{row_id}")))
+                                            .w_full()
+                                            .min_w_0()
                                             .flex()
                                             .items_center()
                                             .gap(px(7.))
                                             .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "filter-column-button-{row_id}"
-                                                    )))
-                                                    .w(px(150.))
-                                                    .h(px(32.))
-                                                    .px(px(9.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .rounded(px(6.))
-                                                    .border_1()
-                                                    .border_color(THEME.border)
-                                                    .bg(THEME.panel_raised)
-                                                    .cursor_pointer()
-                                                    .child(column)
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.toggle_filter_picker_for(
-                                                                session_id,
-                                                                row_id,
-                                                                FilterPickerKind::Column,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
+                                                div().flex_1().min_w_0().max_w(px(240.)).child(
+                                                    Select::new(&column_selector)
+                                                        .with_size(Size::Small)
+                                                        .w_full()
+                                                        .menu_max_h(px(220.))
+                                                        .placeholder("Column")
+                                                        .text_size(px(11.))
+                                                        .bg(THEME.panel_raised)
+                                                        .border_color(THEME.border_strong)
+                                                        .text_color(THEME.text),
+                                                ),
                                             )
                                             .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "filter-operator-button-{row_id}"
-                                                    )))
-                                                    .w(px(170.))
-                                                    .h(px(32.))
-                                                    .px(px(9.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .rounded(px(6.))
-                                                    .border_1()
-                                                    .border_color(THEME.border)
-                                                    .bg(THEME.panel_raised)
-                                                    .cursor_pointer()
-                                                    .child(operator_label(operator))
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.toggle_filter_picker_for(
-                                                                session_id,
-                                                                row_id,
-                                                                FilterPickerKind::Operator,
-                                                                cx,
-                                                            )
-                                                        },
-                                                    )),
+                                                div().flex_1().min_w_0().max_w(px(220.)).child(
+                                                    Select::new(&operator_selector)
+                                                        .with_size(Size::Small)
+                                                        .w_full()
+                                                        .menu_max_h(px(220.))
+                                                        .text_size(px(11.))
+                                                        .bg(THEME.panel_raised)
+                                                        .border_color(THEME.border_strong)
+                                                        .text_color(THEME.text),
+                                                ),
                                             )
                                             .child(
                                                 div()
@@ -5481,30 +5599,24 @@ impl DbxApp {
                                                     ),
                                             )
                                             .child(
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "remove-filter-{row_id}"
-                                                    )))
-                                                    .px(px(9.))
-                                                    .py(px(8.))
-                                                    .rounded(px(5.))
-                                                    .text_color(THEME.text_muted)
-                                                    .cursor_pointer()
-                                                    .hover(|style| style.text_color(THEME.danger))
-                                                    .child("Remove")
-                                                    .on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.remove_filter_for(
-                                                                session_id, row_id, cx,
-                                                            )
-                                                        },
-                                                    )),
+                                                Button::new(SharedString::from(format!(
+                                                    "remove-filter-{row_id}"
+                                                )))
+                                                .flex_none()
+                                                .w(px(28.))
+                                                .with_size(Size::XSmall)
+                                                .compact()
+                                                .ghost()
+                                                .tooltip("Remove filter")
+                                                .child(icon(Icon::Close, THEME.text_muted))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.remove_filter_for(session_id, row_id, cx)
+                                                })),
                                             )
                                     },
                                 )),
                         )
-                    })
-                    .child(picker_panel),
+                    }),
             )
             .child(
                 div()
@@ -5512,7 +5624,7 @@ impl DbxApp {
                     .min_h_0()
                     .flex()
                     .child(self.render_grid(cx))
-                    .when(!self.narrow_workspace, |view| {
+                    .when(!self.narrow_workspace && inspector_open, |view| {
                         view.child(self.render_inspector(cx))
                     }),
             )
@@ -5656,18 +5768,35 @@ impl DbxApp {
                                 DraftMode::Update => "Row details",
                             }),
                     )
-                    .child(badge(
-                        match draft_mode {
-                            DraftMode::Insert => "INSERT",
-                            DraftMode::Update if has_draft => "EDITING",
-                            DraftMode::Update => "READ ONLY",
-                        },
-                        if draft_mode == DraftMode::Update && !has_draft {
-                            THEME.text_muted
-                        } else {
-                            THEME.accent
-                        },
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .child(badge(
+                                match draft_mode {
+                                    DraftMode::Insert => "INSERT",
+                                    DraftMode::Update if has_draft => "EDITING",
+                                    DraftMode::Update => "READ ONLY",
+                                },
+                                if draft_mode == DraftMode::Update && !has_draft {
+                                    THEME.text_muted
+                                } else {
+                                    THEME.accent
+                                },
+                            ))
+                            .child(
+                                Button::new("close-inspector")
+                                    .with_size(Size::XSmall)
+                                    .compact()
+                                    .ghost()
+                                    .tooltip("Close row inspector")
+                                    .child(icon(Icon::Close, THEME.text_muted))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_inspector_for(session_id, cx)
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -6374,14 +6503,45 @@ impl DbxApp {
         let completion_key_listener = cx.listener(move |this, event, window, cx| {
             this.handle_completion_key(session_id, event, window, cx)
         });
+        let completion_up_editor = query_editor.clone();
+        let completion_down_editor = query_editor.clone();
+        let completion_enter_editor = query_editor.clone();
         let mut editor_panel = div()
             .relative()
             .h(px(224.))
             .p(px(10.))
             .border_b_1()
             .border_color(THEME.border)
+            .key_context(editor::SQL_EDITOR_CONTEXT)
             .capture_key_down(completion_key_listener)
-            .child(editor::input(query_editor, query_focus, true));
+            .on_action(cx.listener(move |this, _: &CompletionUp, window, cx| {
+                this.handle_completion_action(
+                    session_id,
+                    CompletionAction::Up,
+                    completion_up_editor.clone(),
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(move |this, _: &CompletionDown, window, cx| {
+                this.handle_completion_action(
+                    session_id,
+                    CompletionAction::Down,
+                    completion_down_editor.clone(),
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(move |this, _: &CompletionEnter, window, cx| {
+                this.handle_completion_action(
+                    session_id,
+                    CompletionAction::Enter,
+                    completion_enter_editor.clone(),
+                    window,
+                    cx,
+                );
+            }))
+            .child(editor::sql_input(query_editor, query_focus, true));
         if let Some(completion_element) = completion_element {
             editor_panel = editor_panel.child(completion_element);
         }

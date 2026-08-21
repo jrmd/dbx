@@ -1,8 +1,8 @@
 use std::fmt::Write;
 
 use crate::{
-    CellValue, CreateTableRequest, DatabaseKind, DbxError, Filter, FilterOperator, InsertRequest,
-    Order, OrderDirection, Page, Result, TableRef, UpdateRequest,
+    CellValue, ColumnInfo, CreateTableRequest, DatabaseKind, DbxError, Filter, FilterOperator,
+    InsertRequest, Order, OrderDirection, Page, Result, TableRef, UpdateRequest,
 };
 
 /// A parameterized SQL statement. Values are kept separately so a caller can
@@ -140,6 +140,16 @@ pub fn build_insert(kind: DatabaseKind, request: &InsertRequest) -> Result<SqlSt
 }
 
 pub fn build_update(kind: DatabaseKind, request: &UpdateRequest) -> Result<SqlStatement> {
+    build_update_with_columns(kind, request, &[])
+}
+
+/// Build an update while retaining the database type information needed by
+/// drivers whose enum parameters cannot be inferred from a text bind.
+pub fn build_update_with_columns(
+    kind: DatabaseKind,
+    request: &UpdateRequest,
+    columns: &[ColumnInfo],
+) -> Result<SqlStatement> {
     if request.assignments.is_empty() {
         return Err(DbxError::Parse(
             "update requires at least one assignment".into(),
@@ -166,11 +176,30 @@ pub fn build_update(kind: DatabaseKind, request: &UpdateRequest) -> Result<SqlSt
         if index > 0 {
             statement.push_str(", ");
         }
+        let placeholder = placeholder(kind, params.len() + 1);
+        let value_sql = if kind == DatabaseKind::PostgreSQL
+            && columns
+                .iter()
+                .find(|metadata| metadata.name == *column)
+                .is_some_and(|metadata| !metadata.enum_values.is_empty())
+        {
+            let enum_type = columns
+                .iter()
+                .find(|metadata| metadata.name == *column)
+                .map(|metadata| metadata.data_type.as_str())
+                .ok_or_else(|| DbxError::Parse("enum column metadata disappeared".into()))?;
+            format!(
+                "CAST({placeholder} AS {})",
+                quote_identifier(kind, enum_type)?
+            )
+        } else {
+            placeholder
+        };
         write!(
             statement,
             "{} = {}",
             quote_identifier(kind, column)?,
-            placeholder(kind, params.len() + 1)
+            value_sql
         )
         .map_err(|error| DbxError::Parse(error.to_string()))?;
         params.push(value.clone());

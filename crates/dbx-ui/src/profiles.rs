@@ -18,12 +18,13 @@ use std::{
 
 use dbx_core::{ConnectionConfig, DatabaseKind};
 use keyring::{Entry, Error as KeyringError};
-#[cfg(test)]
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
+
+use crate::connection_fields::normalize_connection_string;
 
 /// Version of the on-disk profile document.
 pub const PROFILE_FILE_VERSION: u32 = 1;
@@ -149,7 +150,6 @@ pub struct SavedConnection {
 impl SavedConnection {
     /// Whether this profile has a password stored in the keyring/session
     /// backend.
-    #[cfg(test)]
     pub fn has_secret(&self) -> bool {
         self.secret_key.is_some()
     }
@@ -223,7 +223,6 @@ impl ConnectionProfileDraft {
         self
     }
 
-    #[cfg(test)]
     pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
         self.secret = Some(secret.into());
         self
@@ -578,9 +577,15 @@ fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
             "connection URL cannot be empty".into(),
         ));
     }
-    let mut parsed = Url::parse(raw)
+    let normalized = normalize_connection_string(raw)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
-    let secret = parsed.password().map(ToOwned::to_owned);
+    let mut parsed = Url::parse(&normalized)
+        .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
+    let secret = parsed.password().map(|password| {
+        percent_decode_str(password)
+            .decode_utf8_lossy()
+            .into_owned()
+    });
     if secret.is_some() {
         parsed
             .set_password(None)
@@ -590,7 +595,9 @@ fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
 }
 
 fn add_password(raw: &str, secret: &str) -> ProfileResult<String> {
-    let mut parsed = Url::parse(raw)
+    let normalized = normalize_connection_string(raw)
+        .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
+    let mut parsed = Url::parse(&normalized)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
     parsed
         .set_password(Some(secret))
@@ -758,6 +765,27 @@ mod tests {
             "postgres://alice:super-secret@example.test/app"
         );
         assert_eq!(loaded.config.max_connections, 8);
+    }
+
+    #[test]
+    fn encoded_password_is_decoded_before_keyring_storage_and_reencoded_on_load() {
+        let (_directory, store, secrets) = test_store();
+        let saved = store
+            .save(ConnectionProfileDraft::new(
+                "Special password",
+                DatabaseKind::PostgreSQL,
+                "postgres://alice:p%40ss%2Fword@example.test/app",
+            ))
+            .expect("save profile");
+
+        assert_eq!(
+            secrets.get(&keyring_key(saved.id)).unwrap(),
+            Some("p@ss/word".into())
+        );
+        assert_eq!(
+            store.load(saved.id).unwrap().config.url,
+            "postgres://alice:p%40ss%2Fword@example.test/app"
+        );
     }
 
     #[test]

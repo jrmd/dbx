@@ -55,10 +55,11 @@ impl ConnectionFields {
         }
     }
 
-    /// Parse a supplied URL into editable fields. The original is retained as
-    /// the fast path, preserving query parameters and less-common URL options.
+    /// Parse a supplied URL into editable fields. The normalized URL is
+    /// retained as the fast path, preserving query parameters and less-common
+    /// URL options while repairing unescaped credentials.
     pub fn from_url(connection_string: impl Into<String>) -> Result<Self, ConnectionFieldsError> {
-        let connection_string = connection_string.into();
+        let connection_string = normalize_connection_string(&connection_string.into())?;
         let url = Url::parse(&connection_string).map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         let kind = kind_for_scheme(url.scheme())?;
         if kind == DatabaseKind::SQLite {
@@ -99,15 +100,16 @@ impl ConnectionFields {
     /// Validate and return the address used to open a connection.
     pub fn url(&self) -> Result<String, ConnectionFieldsError> {
         if !self.connection_string.trim().is_empty() {
-            let url = Url::parse(&self.connection_string)
-                .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+            let connection_string = normalize_connection_string(&self.connection_string)?;
+            let url =
+                Url::parse(&connection_string).map_err(|_| ConnectionFieldsError::InvalidUrl)?;
             let actual = kind_for_scheme(url.scheme())?;
             if actual != self.kind {
                 return Err(ConnectionFieldsError::MismatchedScheme {
                     expected: self.kind,
                 });
             }
-            return Ok(self.connection_string.clone());
+            return Ok(connection_string);
         }
         self.structured_url()
     }
@@ -208,6 +210,84 @@ fn kind_for_scheme(scheme: &str) -> Result<DatabaseKind, ConnectionFieldsError> 
     }
 }
 
+/// Normalize a connection URL whose password contains characters that should
+/// have been percent-encoded before the URL reached DBX.
+///
+/// `url::Url` may reject or reinterpret an unescaped `#`, `?`, slash, or `@`
+/// in userinfo. Connection strings are commonly copied from password
+/// managers, though, so losing the whole form to `ConnectionFields::new` is a
+/// much worse failure mode than repairing the password in memory. We only
+/// enter this recovery path for supported network schemes. The returned value
+/// is safe to persist/display as a URL, while the password remains in the
+/// caller's editable fields or secret store.
+pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, ConnectionFieldsError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(ConnectionFieldsError::InvalidUrl);
+    }
+    if let Ok(mut url) = Url::parse(raw) {
+        if url.scheme().eq_ignore_ascii_case("sqlite") {
+            return Ok(raw.to_owned());
+        }
+        // A network URL without a host may still be recoverable below if its
+        // password swallowed a delimiter such as `/`, `?`, or `#`.
+        if url.host_str().is_some() {
+            let username = decode(url.username());
+            let password = url.password().map(decode);
+            if password.is_some() {
+                url.set_username(&username)
+                    .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+                url.set_password(password.as_deref())
+                    .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+                return Ok(url.to_string());
+            }
+            return Ok(raw.to_owned());
+        }
+    }
+
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return Err(ConnectionFieldsError::InvalidUrl);
+    };
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if !matches!(
+        scheme_lower.as_str(),
+        "postgres" | "postgresql" | "mysql" | "redis"
+    ) {
+        return Err(ConnectionFieldsError::InvalidUrl);
+    }
+
+    for (at, _) in rest
+        .char_indices()
+        .rev()
+        .filter(|(_, character)| *character == '@')
+    {
+        let userinfo = &rest[..at];
+        let suffix = &rest[at + 1..];
+        let Some(colon) = userinfo.find(':') else {
+            continue;
+        };
+        let username = &userinfo[..colon];
+        let password = &userinfo[colon + 1..];
+
+        // Parse only the host/path/query portion first. This keeps password
+        // punctuation out of URL's authority parser, after which Url performs
+        // the canonical percent-encoding when the userinfo is restored.
+        let Ok(mut url) = Url::parse(&format!("{scheme_lower}://placeholder@{suffix}")) else {
+            continue;
+        };
+        if url.host_str().is_none() {
+            continue;
+        }
+        url.set_username(&decode(username))
+            .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+        url.set_password(Some(&decode(password)))
+            .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+        return Ok(url.to_string());
+    }
+
+    Err(ConnectionFieldsError::InvalidUrl)
+}
+
 fn decode(value: &str) -> String {
     percent_encoding::percent_decode_str(value)
         .decode_utf8_lossy()
@@ -282,6 +362,37 @@ mod tests {
         assert_eq!(fields.password, "p@ss/word");
         assert_eq!(fields.database, "team/data");
         assert_eq!(fields.url().unwrap(), input);
+    }
+
+    #[test]
+    fn repairs_unencoded_special_characters_in_a_password() {
+        let input =
+            "postgres://al ice:p@ss word/#?@db.example.test:5432/team%2Fdata?sslmode=require";
+        let fields = ConnectionFields::from_url(input).unwrap();
+
+        assert_eq!(fields.username, "al ice");
+        assert_eq!(fields.password, "p@ss word/#?");
+        assert_eq!(
+            fields.url().unwrap(),
+            "postgres://al%20ice:p%40ss%20word%2F%23%3F@db.example.test:5432/team%2Fdata?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn repairs_each_common_unencoded_password_delimiter() {
+        for (password, input, encoded) in [
+            ("p@ss", "postgres://user:p@ss@localhost:5432/app", "p%40ss"),
+            ("p/ss", "postgres://user:p/ss@localhost:5432/app", "p%2Fss"),
+            ("p#ss", "postgres://user:p#ss@localhost:5432/app", "p%23ss"),
+            ("p?ss", "postgres://user:p?ss@localhost:5432/app", "p%3Fss"),
+        ] {
+            let fields = ConnectionFields::from_url(input).unwrap();
+            assert_eq!(fields.password, password);
+            assert_eq!(
+                fields.url().unwrap(),
+                format!("postgres://user:{encoded}@localhost:5432/app")
+            );
+        }
     }
 
     #[test]
