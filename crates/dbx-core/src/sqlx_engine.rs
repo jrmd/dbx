@@ -7,6 +7,7 @@ use sqlx::{
     postgres::{PgArguments, PgPool, PgPoolOptions, PgRow},
     sqlite::{SqliteArguments, SqlitePoolOptions, SqliteRow},
 };
+use tokio::sync::RwLock;
 
 use crate::engine::{exec_result, query_result, row_limit};
 use crate::{
@@ -19,7 +20,13 @@ use async_trait::async_trait;
 /// SQLx-backed engine for PostgreSQL, MySQL, and SQLite.
 pub struct SqlxEngine {
     kind: DatabaseKind,
-    pool: SqlxPool,
+    /// Retained so `use_database` can rebuild a pool for another database
+    /// while reusing the original host, credentials, and pool settings.
+    config: ConnectionConfig,
+    /// Guarded because `use_database` replaces the pool. Readers clone the
+    /// pool (an `Arc`-backed handle) instead of holding the lock across a
+    /// query, so in-flight queries never block a database switch for long.
+    pool: RwLock<SqlxPool>,
 }
 
 /// Native SQLx pools for the supported SQL drivers.
@@ -111,7 +118,8 @@ impl SqlxEngine {
         };
         Ok(Self {
             kind: config.kind,
-            pool,
+            config,
+            pool: RwLock::new(pool),
         })
     }
 
@@ -119,8 +127,14 @@ impl SqlxEngine {
         self.kind
     }
 
-    pub fn pool(&self) -> &SqlxPool {
+    pub fn pool(&self) -> &RwLock<SqlxPool> {
         &self.pool
+    }
+
+    /// Snapshot the current pool handle. `SqlxPool` clones are cheap and stay
+    /// valid even if a later `use_database` swaps the pool underneath.
+    async fn pool_snapshot(&self) -> SqlxPool {
+        self.pool.read().await.clone()
     }
 
     async fn query_with_statement(
@@ -132,7 +146,7 @@ impl SqlxEngine {
         let limit = row_limit(options);
         let mut columns = Vec::new();
         let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
-        match &self.pool {
+        match &self.pool_snapshot().await {
             SqlxPool::Postgres(pool) => {
                 let mut rows = bind_postgres_query(statement).fetch(pool);
                 while let Some(row) = rows.try_next().await? {
@@ -175,7 +189,7 @@ impl SqlxEngine {
 
     async fn execute_statement(&self, statement: &SqlStatement) -> Result<ExecResult> {
         let started = Instant::now();
-        let (rows_affected, last_insert_id) = match &self.pool {
+        let (rows_affected, last_insert_id) = match &self.pool_snapshot().await {
             SqlxPool::Postgres(pool) => {
                 let result = bind_postgres_query(statement).execute(pool).await?;
                 (result.rows_affected(), None)
@@ -353,6 +367,100 @@ impl SqlxEngine {
             foreign_keys: self.foreign_keys(table).await?,
         })
     }
+
+    async fn list_sql_databases(&self) -> Result<Vec<String>> {
+        let result = match self.kind {
+            DatabaseKind::SQLite => {
+                self.metadata_query("PRAGMA database_list", &[]).await?
+            }
+            DatabaseKind::PostgreSQL => {
+                self.metadata_query(
+                    "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname",
+                    &[],
+                )
+                .await?
+            }
+            DatabaseKind::MySQL => {
+                self.metadata_query(
+                    "SELECT CAST(SCHEMA_NAME AS CHAR) AS schema_name FROM information_schema.schemata WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') ORDER BY SCHEMA_NAME",
+                    &[],
+                )
+                .await?
+            }
+            DatabaseKind::Redis => unreachable!(),
+        };
+        let mut names = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            // PRAGMA database_list exposes (seq, name, file); both other
+            // queries return a single name column.
+            let column = if self.kind == DatabaseKind::SQLite {
+                1
+            } else {
+                0
+            };
+            names.push(text_value(&row, column)?);
+        }
+        Ok(names)
+    }
+
+    async fn current_sql_database(&self) -> Result<String> {
+        match self.kind {
+            DatabaseKind::SQLite => Ok("main".to_owned()),
+            DatabaseKind::PostgreSQL => {
+                let result = self
+                    .metadata_query("SELECT current_database()", &[])
+                    .await?;
+                result
+                    .rows
+                    .first()
+                    .map(|row| text_value(row, 0))
+                    .transpose()
+                    .map(|value| value.unwrap_or_else(|| "postgres".to_owned()))
+            }
+            DatabaseKind::MySQL => {
+                let result = self.metadata_query("SELECT DATABASE()", &[]).await?;
+                result
+                    .rows
+                    .first()
+                    .map(|row| text_value(row, 0))
+                    .transpose()
+                    .map(|value| value.unwrap_or_default())
+            }
+            DatabaseKind::Redis => unreachable!(),
+        }
+    }
+
+    async fn use_sql_database(&self, name: &str) -> Result<()> {
+        validate_database_name(name)?;
+        match self.kind {
+            DatabaseKind::SQLite => Err(DbxError::Unsupported {
+                operation: "use_database".to_owned(),
+                kind: self.kind,
+            }),
+            DatabaseKind::MySQL => {
+                let escaped = name.replace('`', "``");
+                self.execute_statement(&SqlStatement::new(format!("USE `{escaped}`"), Vec::new()))
+                    .await?;
+                Ok(())
+            }
+            DatabaseKind::PostgreSQL => {
+                // PostgreSQL cannot change database on a live connection, so
+                // swap in a pool connected to the target database. Callers
+                // keep using the same engine object.
+                let url = with_database_path(&self.config.url, name)?;
+                let timeout = std::time::Duration::from_millis(self.config.connect_timeout_ms);
+                let pool = PgPoolOptions::new()
+                    .max_connections(self.config.max_connections)
+                    .acquire_timeout(timeout)
+                    .connect(&url)
+                    .await
+                    .map_err(|error| DbxError::Connection(error.to_string()))?;
+                *self.pool.write().await = SqlxPool::Postgres(pool);
+                Ok(())
+            }
+            DatabaseKind::Redis => unreachable!(),
+        }
+    }
 }
 
 #[async_trait]
@@ -363,6 +471,18 @@ impl crate::Engine for SqlxEngine {
 
     async fn list_tables(&self) -> Result<Vec<TableInfo>> {
         self.list_sql_tables().await
+    }
+
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        self.list_sql_databases().await
+    }
+
+    async fn current_database(&self) -> Result<String> {
+        self.current_sql_database().await
+    }
+
+    async fn use_database(&self, name: &str) -> Result<()> {
+        self.use_sql_database(name).await
     }
 
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
@@ -393,6 +513,38 @@ impl crate::Engine for SqlxEngine {
 
 fn is_sqlite_memory_url(url: &str) -> bool {
     url.to_ascii_lowercase().contains(":memory:")
+}
+
+/// Reject names that could break out of quoting or URL rewriting before they
+/// reach a driver.
+fn validate_database_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(DbxError::InvalidConfig(
+            "database name cannot be empty".into(),
+        ));
+    }
+    if trimmed.len() > 128
+        || trimmed.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '\0' | ';' | '/')
+        })
+    {
+        return Err(DbxError::InvalidConfig(format!(
+            "invalid database name `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Rewrite the path of a PostgreSQL URL to point at another database while
+/// preserving host, credentials, and query options.
+fn with_database_path(base: &str, database: &str) -> Result<String> {
+    let mut parsed =
+        url::Url::parse(base).map_err(|error| DbxError::InvalidConfig(error.to_string()))?;
+    parsed.set_path(&format!("/{database}"));
+    Ok(parsed.to_string())
 }
 
 fn foreign_keys_from_rows(kind: DatabaseKind, rows: Vec<RowData>) -> Result<Vec<ForeignKeyInfo>> {
@@ -901,5 +1053,28 @@ mod tests {
             mysql_bytes_fallback(vec![0xff, 0x00, 0xfe]),
             CellValue::Bytes(vec![0xff, 0x00, 0xfe])
         );
+    }
+
+    #[test]
+    fn database_name_validation_rejects_injection_shapes() {
+        assert!(validate_database_name("app_db").is_ok());
+        assert!(validate_database_name("db-1.prod").is_ok());
+        assert!(validate_database_name("").is_err());
+        assert!(validate_database_name("  ").is_err());
+        assert!(validate_database_name("a;b").is_err());
+        assert!(validate_database_name("a/b").is_err());
+        assert!(validate_database_name("a b").is_err());
+        assert!(validate_database_name("a\nb").is_err());
+    }
+
+    #[test]
+    fn postgres_url_rewrite_targets_another_database() {
+        let rewritten = with_database_path(
+            "postgres://user:secret@db.example.test:5432/primary?sslmode=require",
+            "analytics",
+        )
+        .unwrap();
+        assert!(rewritten.starts_with("postgres://user:secret@db.example.test:5432/analytics"));
+        assert!(rewritten.contains("sslmode=require"));
     }
 }

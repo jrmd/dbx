@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -15,6 +16,10 @@ use crate::{
 pub struct RedisEngine {
     client: Client,
     connection: MultiplexedConnection,
+    /// Logical database currently selected. Clones of the multiplexed
+    /// connection share one socket, so `SELECT` through any clone moves every
+    /// subsequent command to that index.
+    database: AtomicUsize,
 }
 
 impl std::fmt::Debug for RedisEngine {
@@ -45,7 +50,19 @@ impl RedisEngine {
             .map_err(|error| {
                 DbxError::Connection(crate::error::connection_message(&config.url, error))
             })?;
-        Ok(Self { client, connection })
+        // The URL path selects the initial logical database, defaulting to 0.
+        let database = config
+            .url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.rsplit_once('/'))
+            .and_then(|(_, path)| path.split(['?', '#']).next())
+            .and_then(|path| path.parse::<usize>().ok())
+            .unwrap_or(0);
+        Ok(Self {
+            client,
+            connection,
+            database: AtomicUsize::new(database),
+        })
     }
 
     pub fn kind(&self) -> DatabaseKind {
@@ -54,6 +71,20 @@ impl RedisEngine {
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Number of logical databases the server exposes. Falls back to the
+    /// stock 16 when `CONFIG GET` is disabled (for example on managed Redis).
+    async fn database_count(&self) -> Result<usize> {
+        let value = self.send_command("CONFIG GET databases", &[]).await?;
+        if let Value::Array(entries) = &value
+            && entries.len() == 2
+            && let Ok(text) = String::from_utf8(redis_argument(&cell_value(entries[1].clone()))?)
+            && let Ok(count) = text.trim().parse::<usize>()
+        {
+            return Ok(count.max(1));
+        }
+        Ok(16)
     }
 
     async fn send_command(&self, command: &str, params: &[CellValue]) -> Result<Value> {
@@ -157,6 +188,33 @@ impl crate::Engine for RedisEngine {
             schema: None,
             kind: EntityKind::Collection,
         }])
+    }
+
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        let count = self.database_count().await?;
+        Ok((0..count).map(|index| index.to_string()).collect())
+    }
+
+    async fn current_database(&self) -> Result<String> {
+        Ok(self.database.load(Ordering::SeqCst).to_string())
+    }
+
+    async fn use_database(&self, name: &str) -> Result<()> {
+        let index = name.trim().parse::<usize>().map_err(|_| {
+            DbxError::InvalidConfig(format!("`{name}` is not a valid Redis database index"))
+        })?;
+        let mut cmd = Cmd::new();
+        cmd.arg("SELECT").arg(index);
+        let mut connection = self.connection.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cmd.query_async::<()>(&mut connection),
+        )
+        .await
+        .map_err(|_| DbxError::Connection("Redis SELECT timed out".into()))?
+        .map_err(|error| DbxError::Connection(error.to_string()))?;
+        self.database.store(index, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn describe_table(&self, _table: &TableRef) -> Result<Vec<ColumnInfo>> {
