@@ -11,6 +11,10 @@
 	<string>DBX</string>
 	<key>CFBundleDisplayName</key>
 	<string>DBX</string>
+	<key>CFBundleIconFile</key>
+	<string>DBX.icns</string>
+	<key>CFBundleIconName</key>
+	<string>DBX</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
