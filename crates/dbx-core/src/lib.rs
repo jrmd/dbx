@@ -23,7 +23,7 @@ pub use model::{
 pub use redis_engine::RedisEngine;
 pub use sql::{
     SqlStatement, build_create_table, build_delete, build_drop_table, build_insert, build_select,
-    build_truncate_table, build_update,
+    build_truncate_table, build_update, quote_identifier,
 };
 pub use sqlx_engine::SqlxEngine;
 

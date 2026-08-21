@@ -161,6 +161,26 @@ pub struct SqlToken {
     pub range: Range<usize>,
 }
 
+/// The part of a SQL statement that a completion menu should search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqlCompletionTarget {
+    Any,
+    Table,
+    Column,
+}
+
+/// The lexical context used by DBX's schema-aware SQL completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlCompletionContext {
+    pub target: SqlCompletionTarget,
+    pub prefix: String,
+    pub qualifier: Option<String>,
+    /// The quote delimiter immediately before the editable prefix, when the
+    /// user is completing inside a quoted identifier.
+    pub quote: Option<char>,
+    pub replacement_range: Range<usize>,
+}
+
 /// Lex SQL into byte ranges suitable for syntax highlighting.
 ///
 /// The lexer is deliberately tolerant: malformed or unfinished strings and
@@ -340,6 +360,169 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
     tokens
 }
 
+/// Return the completion context at a UTF-8 cursor offset.
+///
+/// This is intentionally a small, tolerant lexer-side context detector rather
+/// than a full SQL parser. It is safe while a statement is incomplete and
+/// understands the contexts that matter most for a database workbench:
+/// tables after `FROM`/`JOIN`/`UPDATE`/`INTO`, columns after projection and
+/// predicate keywords, and qualified names after a dot.
+pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletionContext> {
+    let cursor = clamp_boundary(text, cursor);
+    if cursor == 0 {
+        return None;
+    }
+
+    if lex_sql(text).iter().any(|token| {
+        matches!(token.kind, SqlTokenKind::String | SqlTokenKind::Comment)
+            && token.range.start <= cursor
+            && cursor <= token.range.end
+    }) {
+        return None;
+    }
+
+    let start = completion_identifier_start(text, cursor);
+    let prefix = text[start..cursor].to_owned();
+    let qualifier = completion_qualifier(text, start);
+    let quote = text[..start]
+        .chars()
+        .next_back()
+        .filter(|character| matches!(character, '"' | '`'));
+    let previous_position = qualifier.as_ref().map_or_else(
+        || quote.map_or(start, |_| start.saturating_sub(1)),
+        |(_, qualifier_start)| *qualifier_start,
+    );
+    let previous_word = previous_sql_word(text, previous_position);
+    let target = if qualifier.is_some() {
+        if previous_word
+            .as_deref()
+            .is_some_and(is_table_completion_keyword)
+        {
+            SqlCompletionTarget::Table
+        } else {
+            SqlCompletionTarget::Column
+        }
+    } else if previous_word
+        .as_deref()
+        .is_some_and(is_table_completion_keyword)
+    {
+        SqlCompletionTarget::Table
+    } else if previous_word
+        .as_deref()
+        .is_some_and(is_column_completion_keyword)
+    {
+        SqlCompletionTarget::Column
+    } else {
+        SqlCompletionTarget::Any
+    };
+
+    if prefix.is_empty() && qualifier.is_none() && previous_word.is_none() {
+        return None;
+    }
+
+    Some(SqlCompletionContext {
+        target,
+        prefix,
+        qualifier: qualifier.map(|(qualifier, _)| qualifier),
+        quote,
+        replacement_range: start..cursor,
+    })
+}
+
+/// The keyword vocabulary used by the syntax highlighter and completion menu.
+pub fn sql_completion_keywords() -> &'static [&'static str] {
+    SQL_KEYWORDS
+}
+
+/// The common SQL type vocabulary used for DDL completion.
+pub fn sql_completion_types() -> &'static [&'static str] {
+    SQL_TYPES
+}
+
+fn completion_identifier_start(text: &str, cursor: usize) -> usize {
+    let cursor = clamp_boundary(text, cursor);
+    text[..cursor]
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            (!is_identifier_continue(character)).then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0)
+}
+
+fn completion_qualifier(text: &str, start: usize) -> Option<(String, usize)> {
+    let (dot_start, dot) = text[..start]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_whitespace())?;
+    if dot != '.' {
+        return None;
+    }
+
+    let mut segment_end = text[..dot_start].trim_end().len();
+    let mut segment_start = completion_identifier_start(text, segment_end);
+    if segment_start == segment_end {
+        return None;
+    }
+
+    let mut segments = vec![text[segment_start..segment_end].to_owned()];
+    while segment_start > 0 {
+        let (separator_start, separator) = text[..segment_start]
+            .char_indices()
+            .rev()
+            .find(|(_, character)| !character.is_whitespace())?;
+        if separator != '.' {
+            break;
+        }
+        segment_end = text[..separator_start].trim_end().len();
+        let previous_start = completion_identifier_start(text, segment_end);
+        if previous_start == segment_end {
+            break;
+        }
+        segments.push(text[previous_start..segment_end].to_owned());
+        segment_start = previous_start;
+    }
+
+    segments.reverse();
+    Some((segments.join("."), segment_start))
+}
+
+fn previous_sql_word(text: &str, before: usize) -> Option<String> {
+    let before = clamp_boundary(text, before);
+    let end = text[..before]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_whitespace())
+        .map_or(before, |(index, character)| index + character.len_utf8());
+    let start = completion_identifier_start(text, end);
+    (start < end).then(|| text[start..end].to_ascii_lowercase())
+}
+
+fn is_table_completion_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "from" | "join" | "update" | "into" | "table" | "view" | "references"
+    )
+}
+
+fn is_column_completion_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "select"
+            | "where"
+            | "and"
+            | "or"
+            | "on"
+            | "by"
+            | "group"
+            | "order"
+            | "having"
+            | "set"
+            | "returning"
+            | "values"
+    )
+}
+
 /// A native single-line or multiline text editor.
 pub struct TextEditor {
     /// The surrounding view owns this entity and can observe it for changes.
@@ -506,7 +689,24 @@ impl TextEditor {
         self.selected_range.clone()
     }
 
-    fn cursor_offset(&self) -> usize {
+    /// The UTF-8 byte offset where the next edit will be inserted.
+    pub fn cursor_offset(&self) -> usize {
+        self.cursor_offset_internal()
+    }
+
+    /// Replace a UTF-8 range while keeping the caret immediately after the
+    /// inserted text. Completion uses this instead of replacing the entire
+    /// backing entity so the rest of a query remains untouched.
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        inserted: impl AsRef<str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace(range, inserted.as_ref(), cx);
+    }
+
+    fn cursor_offset_internal(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
         } else {
@@ -2505,5 +2705,43 @@ mod tests {
                 (SqlTokenKind::Parameter, "$2"),
             ]
         );
+    }
+
+    #[test]
+    fn completion_context_detects_table_and_column_positions() {
+        let table = sql_completion_context("SELECT * FROM pu", "SELECT * FROM pu".len()).unwrap();
+        assert_eq!(table.target, SqlCompletionTarget::Table);
+        assert_eq!(table.prefix, "pu");
+        assert_eq!(table.replacement_range, 14..16);
+
+        let column = sql_completion_context("SELECT us", "SELECT us".len()).unwrap();
+        assert_eq!(column.target, SqlCompletionTarget::Column);
+        assert_eq!(column.prefix, "us");
+
+        let qualified = sql_completion_context("SELECT users.", "SELECT users.".len()).unwrap();
+        assert_eq!(qualified.target, SqlCompletionTarget::Column);
+        assert_eq!(qualified.qualifier.as_deref(), Some("users"));
+        assert_eq!(qualified.quote, None);
+        assert_eq!(qualified.replacement_range, 13..13);
+
+        let schema_qualified =
+            sql_completion_context("SELECT analytics.users.", "SELECT analytics.users.".len())
+                .unwrap();
+        assert_eq!(
+            schema_qualified.qualifier.as_deref(),
+            Some("analytics.users")
+        );
+
+        let quoted =
+            sql_completion_context("SELECT * FROM \"us", "SELECT * FROM \"us".len()).unwrap();
+        assert_eq!(quoted.target, SqlCompletionTarget::Table);
+        assert_eq!(quoted.quote, Some('"'));
+        assert_eq!(quoted.prefix, "us");
+    }
+
+    #[test]
+    fn completion_context_ignores_strings_and_comments() {
+        assert!(sql_completion_context("SELECT 'users", "SELECT 'users".len()).is_none());
+        assert!(sql_completion_context("SELECT 1 -- users", "SELECT 1 -- users".len()).is_none());
     }
 }
