@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use futures_util::TryStreamExt;
 use sqlx::{
-    Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo,
+    Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
     mysql::{MySqlArguments, MySqlPoolOptions, MySqlRow},
     postgres::{PgArguments, PgPool, PgPoolOptions, PgRow},
     sqlite::{SqliteArguments, SqlitePoolOptions, SqliteRow},
@@ -939,12 +939,25 @@ fn decode_text_or_bytes_pg(row: &PgRow, index: usize, type_name: &str) -> Result
     if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
         return Ok(value.map(CellValue::Bytes).unwrap_or(CellValue::Null));
     }
-    // A custom/extension type should not make an otherwise valid result set
-    // unusable. Keep the type visible in the grid and leave mutation to an
-    // explicit SQL query until a native adapter is added.
-    Ok(CellValue::Text(format!(
-        "<unsupported SQL type `{type_name}`>"
-    )))
+    // Custom types such as PostgreSQL enums are transmitted as text but do
+    // not match any built-in Rust decoder, so the typed `try_get` calls
+    // above reject them. Read the raw wire value so enum labels stay usable
+    // instead of surfacing an unsupported-type cell.
+    match row.try_get_raw(index) {
+        Ok(value) if value.is_null() => Ok(CellValue::Null),
+        Ok(value) => match value.as_str() {
+            Ok(text) => Ok(CellValue::Text(text.to_owned())),
+            Err(_) => match value.as_bytes() {
+                Ok(bytes) => Ok(CellValue::Bytes(bytes.to_vec())),
+                Err(_) => Ok(CellValue::Text(format!(
+                    "<unsupported SQL type `{type_name}`>"
+                ))),
+            },
+        },
+        Err(_) => Ok(CellValue::Text(format!(
+            "<unsupported SQL type `{type_name}`>"
+        ))),
+    }
 }
 
 fn decode_text_or_bytes_mysql(row: &MySqlRow, index: usize, type_name: &str) -> Result<CellValue> {
