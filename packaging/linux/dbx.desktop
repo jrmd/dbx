@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DBX
+Comment=Native database workbench
+Exec=dbx
+TryExec=dbx
+Icon=dbx
+Terminal=false
+Categories=Development;Database;
+StartupWMClass=dbx
