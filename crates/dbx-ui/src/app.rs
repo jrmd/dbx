@@ -1510,6 +1510,38 @@ impl DbxApp {
         .detach();
     }
 
+    fn navigate_to_foreign_key_for(
+        &mut self,
+        session_id: SessionId,
+        foreign_key: ForeignKeyInfo,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target_table) = self
+            .session(session_id)
+            .and_then(|session| foreign_key_target_table(&session.tables, &foreign_key))
+        else {
+            if let Some(session) = self.session_mut(session_id) {
+                session.status = format!(
+                    "Referenced table {} is not available in this database",
+                    foreign_key.referenced_table
+                );
+                session.error = None;
+            }
+            cx.notify();
+            return;
+        };
+
+        // A PostgreSQL foreign key may cross schemas. Keep the navigator and
+        // the selected table in the same visible context before loading data.
+        if self
+            .session(session_id)
+            .is_some_and(|session| session.kind == DatabaseKind::PostgreSQL)
+        {
+            self.select_schema_filter_for(session_id, target_table.schema.clone(), cx);
+        }
+        self.select_table_for(session_id, target_table, cx);
+    }
+
     fn refresh_table(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.active_session_id() else {
             return;
@@ -4257,7 +4289,7 @@ impl DbxApp {
             .child(self.render_tabs(cx))
             .child(match pane {
                 Pane::Data => self.render_data(cx).into_any_element(),
-                Pane::Structure => self.render_structure().into_any_element(),
+                Pane::Structure => self.render_structure(cx).into_any_element(),
                 Pane::Query => self.render_query(cx).into_any_element(),
             })
     }
@@ -4760,7 +4792,7 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_grid(&mut self, _cx: &mut Context<Self>) -> AnyElement {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
@@ -5178,8 +5210,8 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_structure(&self) -> impl IntoElement {
-        let (table_name, table_columns, foreign_keys, busy, error) = self
+    fn render_structure(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (session_id, table_name, table_columns, foreign_keys, tables, busy, error) = self
             .active_session()
             .and_then(|session| {
                 let tab_id = session.active_secondary_tab?;
@@ -5188,14 +5220,26 @@ impl DbxApp {
                     return None;
                 };
                 Some((
+                    session.id,
                     table_ref_label(&structure.table),
                     structure.columns.clone(),
                     structure.foreign_keys.clone(),
+                    session.tables.clone(),
                     structure.busy,
                     structure.error.clone(),
                 ))
             })
-            .unwrap_or_else(|| ("Structure".into(), Vec::new(), Vec::new(), false, None));
+            .unwrap_or_else(|| {
+                (
+                    Uuid::nil(),
+                    "Structure".into(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    false,
+                    None,
+                )
+            });
         div()
             .id("structure-scroll")
             .flex_1()
@@ -5295,7 +5339,7 @@ impl DbxApp {
                     )
                 },
             )
-            .children(foreign_keys.iter().map(|foreign_key| {
+            .children(foreign_keys.iter().enumerate().map(|(index, foreign_key)| {
                 let source = foreign_key.columns.join(", ");
                 let target_table = match &foreign_key.referenced_schema {
                     Some(schema) => format!("{schema}.{}", foreign_key.referenced_table),
@@ -5307,6 +5351,8 @@ impl DbxApp {
                     foreign_key.referenced_columns.join(", ")
                 );
                 let actions = foreign_key_actions(foreign_key);
+                let can_navigate = foreign_key_target_table(&tables, foreign_key).is_some();
+                let foreign_key = foreign_key.clone();
                 div()
                     .min_h(px(44.))
                     .px(px(10.))
@@ -5344,16 +5390,34 @@ impl DbxApp {
                     )
                     .child(
                         div()
+                            .id(SharedString::from(format!(
+                                "foreign-key-target-{session_id}-{index}"
+                            )))
                             .min_w_0()
                             .flex()
                             .flex_col()
                             .items_end()
                             .gap(px(3.))
+                            .when(can_navigate, |view| {
+                                view.cursor_pointer()
+                                    .hover(|style| style.text_color(THEME.text))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.navigate_to_foreign_key_for(
+                                            session_id,
+                                            foreign_key.clone(),
+                                            cx,
+                                        )
+                                    }))
+                            })
                             .child(
                                 div()
                                     .truncate()
                                     .text_size(px(11.))
-                                    .text_color(THEME.accent)
+                                    .text_color(if can_navigate {
+                                        THEME.accent
+                                    } else {
+                                        THEME.text_muted
+                                    })
                                     .child(format!("REFERENCES {target}")),
                             )
                             .when(!actions.is_empty(), |view| {
@@ -5768,6 +5832,22 @@ fn selected_filter_column<'a>(
         .or_else(|| table_columns.first())
 }
 
+fn foreign_key_target_table(
+    tables: &[TableInfo],
+    foreign_key: &ForeignKeyInfo,
+) -> Option<TableInfo> {
+    tables
+        .iter()
+        .find(|table| {
+            table.name == foreign_key.referenced_table
+                && match foreign_key.referenced_schema.as_deref() {
+                    Some(schema) => table.schema.as_deref() == Some(schema),
+                    None => true,
+                }
+        })
+        .cloned()
+}
+
 fn foreign_key_actions(foreign_key: &ForeignKeyInfo) -> String {
     let mut actions = Vec::with_capacity(2);
     if let Some(action) = foreign_key.on_update {
@@ -5926,6 +6006,43 @@ mod tests {
             foreign_key_actions(&foreign_key),
             "ON UPDATE CASCADE · ON DELETE SET NULL"
         );
+    }
+
+    #[test]
+    fn foreign_key_target_resolves_the_referenced_schema() {
+        let tables = vec![
+            TableInfo::table("users", Some("analytics".into())),
+            TableInfo::table("users", Some("public".into())),
+        ];
+        let foreign_key = ForeignKeyInfo {
+            constraint_name: Some("events_user_id_fkey".into()),
+            columns: vec!["user_id".into()],
+            referenced_schema: Some("analytics".into()),
+            referenced_table: "users".into(),
+            referenced_columns: vec!["id".into()],
+            on_update: None,
+            on_delete: None,
+        };
+
+        assert_eq!(
+            foreign_key_target_table(&tables, &foreign_key),
+            Some(TableInfo::table("users", Some("analytics".into())))
+        );
+    }
+
+    #[test]
+    fn foreign_key_target_is_unavailable_when_the_table_is_not_listed() {
+        let foreign_key = ForeignKeyInfo {
+            constraint_name: None,
+            columns: vec!["owner_id".into()],
+            referenced_schema: None,
+            referenced_table: "owners".into(),
+            referenced_columns: vec!["id".into()],
+            on_update: None,
+            on_delete: None,
+        };
+
+        assert_eq!(foreign_key_target_table(&[], &foreign_key), None);
     }
 
     #[test]
