@@ -5,7 +5,10 @@
 //! FORM: Reference-led operator console, user-supplied DBX screen map; seed key: dbx-native-console.
 //! FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseKind, EntityKind, Filter,
@@ -14,8 +17,8 @@ use dbx_core::{
 };
 use gpui::{
     AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, IntoElement,
-    MouseButton, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render, Rgba,
-    SharedString, Stateful, StatefulInteractiveElement as _, Subscription, Window,
+    KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Point, PromptButton, PromptLevel, Render,
+    Rgba, SharedString, Stateful, StatefulInteractiveElement as _, Subscription, Window,
     WindowControlArea, anchored, deferred, div, img, prelude::*, px,
 };
 use gpui_component::{
@@ -29,7 +32,7 @@ use uuid::Uuid;
 use crate::{
     assets::LOGO_BYTES,
     connection_fields::ConnectionFields,
-    editor::{self, TextEditor},
+    editor::{self, SqlCompletionTarget, TextEditor},
     filters::{
         FilterModel, FilterRowId, filter_operator_options, operator_label, operator_requires_value,
     },
@@ -458,6 +461,61 @@ impl SessionEditors {
 
 type SecondaryTabId = Uuid;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionItemKind {
+    Keyword,
+    Type,
+    Table,
+    Column,
+}
+
+impl CompletionItemKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keyword => "keyword",
+            Self::Type => "type",
+            Self::Table => "table",
+            Self::Column => "column",
+        }
+    }
+
+    fn color(self) -> Rgba {
+        match self {
+            Self::Keyword => gpui::rgb(0xc792ea),
+            Self::Type => gpui::rgb(0x89ddff),
+            Self::Table => THEME.accent,
+            Self::Column => THEME.success,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SqlCompletionItem {
+    label: String,
+    insert_text: String,
+    detail: String,
+    search_text: String,
+    kind: CompletionItemKind,
+}
+
+struct SqlCompletionSources<'a> {
+    database_kind: DatabaseKind,
+    tables: &'a [TableInfo],
+    completion_columns: &'a HashMap<String, Vec<ColumnInfo>>,
+    selected_table: Option<&'a TableRef>,
+    active_columns: &'a [ColumnInfo],
+    result: Option<&'a QueryResult>,
+    active_schema_filter: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+struct SqlCompletionMenu {
+    context: editor::SqlCompletionContext,
+    items: Vec<SqlCompletionItem>,
+    selected: usize,
+    signature: String,
+}
+
 struct QueryTab {
     query_text: Entity<String>,
     query_editor: Entity<TextEditor>,
@@ -468,6 +526,9 @@ struct QueryTab {
     status: String,
     error: Option<String>,
     request_generation: u64,
+    completion_signature: Option<String>,
+    completion_dismissed_signature: Option<String>,
+    completion_index: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -491,6 +552,7 @@ impl QueryTab {
                 .cell_selectable(false)
         });
         let text_subscription = cx.observe(&query_text, |_, _, cx| cx.notify());
+        let editor_subscription = cx.observe(&query_editor, |_, _, cx| cx.notify());
         let table_subscription =
             cx.subscribe_in(&result_grid, window, move |this, _, event, _, cx| {
                 this.on_query_grid_event(session_id, tab_id, event, cx)
@@ -506,7 +568,10 @@ impl QueryTab {
             status: "Ready to query".into(),
             error: None,
             request_generation: 0,
-            _subscriptions: vec![text_subscription, table_subscription],
+            completion_signature: None,
+            completion_dismissed_signature: None,
+            completion_index: 0,
+            _subscriptions: vec![text_subscription, editor_subscription, table_subscription],
         }
     }
 
@@ -558,6 +623,10 @@ struct ConnectionSession {
     secondary_tabs: Vec<SecondaryTab>,
     active_secondary_tab: Option<SecondaryTabId>,
     tables: Vec<TableInfo>,
+    /// Schema metadata already fetched for completion. The navigator always
+    /// supplies table names; columns are added as tables are opened or their
+    /// structure is inspected, avoiding a metadata query for every keystroke.
+    completion_columns: HashMap<String, Vec<ColumnInfo>>,
     /// Databases reachable through this connection, for the sidebar switcher.
     databases: Vec<String>,
     /// Database the engine currently uses, if the backend reports one.
@@ -623,6 +692,7 @@ impl ConnectionSession {
             secondary_tabs: Vec::new(),
             active_secondary_tab: None,
             tables: Vec::new(),
+            completion_columns: HashMap::new(),
             databases: Vec::new(),
             current_database: None,
             schema_filter: None,
@@ -1174,11 +1244,16 @@ impl DbxApp {
                         if let Some((table, columns, result)) = initial {
                             session.selected_table = Some(table.clone());
                             session.table_columns = columns;
+                            session.completion_columns.insert(
+                                completion_table_key(&table),
+                                session.table_columns.clone(),
+                            );
                             session.set_result(result, cx);
                             session.result_table = Some(table);
                         } else {
                             session.selected_table = None;
                             session.table_columns.clear();
+                            session.completion_columns.clear();
                             session.set_result(None, cx);
                             session.result_table = None;
                         }
@@ -1192,6 +1267,7 @@ impl DbxApp {
                     }
                 }
                 cx.notify();
+                this.prefetch_completion_columns_for(session_id, cx);
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -1410,6 +1486,10 @@ impl DbxApp {
                 structure.busy = false;
                 match result {
                     Ok(table_structure) => {
+                        session.completion_columns.insert(
+                            completion_table_key(&structure.table),
+                            table_structure.columns.clone(),
+                        );
                         structure.columns = table_structure.columns;
                         structure.foreign_keys = table_structure.foreign_keys;
                         structure.error = None;
@@ -1605,6 +1685,10 @@ impl DbxApp {
                     Ok((structure, result)) => {
                         let has_rows = !result.rows.is_empty();
                         session.table_columns = structure.columns;
+                        session.completion_columns.insert(
+                            completion_table_key(&result_table),
+                            session.table_columns.clone(),
+                        );
                         session.foreign_keys = structure.foreign_keys;
                         session.set_result(Some(result), cx);
                         session.result_table = Some(result_table.clone());
@@ -2000,6 +2084,204 @@ impl DbxApp {
         .filter(|_| is_real_table)
     }
 
+    fn query_completion_for(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) -> Option<SqlCompletionMenu> {
+        let (tab_id, context, items, signature) = {
+            let session = self.session(session_id)?;
+            if !session.kind.is_sql() {
+                return None;
+            }
+            let tab_id = session.active_secondary_tab?;
+            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+            let SecondaryTabKind::Query(query_tab) = &tab.kind else {
+                return None;
+            };
+            let query_text = query_tab.query_text.read(cx).clone();
+            let cursor = query_tab.query_editor.read(cx).cursor_offset();
+            let context = editor::sql_completion_context(&query_text, cursor)?;
+            let items = sql_completion_items(
+                &context,
+                SqlCompletionSources {
+                    database_kind: session.kind,
+                    tables: &session.tables,
+                    completion_columns: &session.completion_columns,
+                    selected_table: session.selected_table.as_ref(),
+                    active_columns: &session.table_columns,
+                    result: session.result.as_deref(),
+                    active_schema_filter: session.schema_filter.as_deref(),
+                },
+            );
+            let signature = format!("{query_text}\u{0}{cursor}\u{0}{context:?}");
+            (tab_id, context, items, signature)
+        };
+
+        if items.is_empty() {
+            return None;
+        }
+
+        let session = self.session_mut(session_id)?;
+        let tab = session
+            .secondary_tabs
+            .iter_mut()
+            .find(|tab| tab.id == tab_id)?;
+        let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
+            return None;
+        };
+        if query_tab.completion_dismissed_signature.as_deref() == Some(signature.as_str()) {
+            return None;
+        }
+        if query_tab.completion_signature.as_deref() != Some(signature.as_str()) {
+            query_tab.completion_signature = Some(signature.clone());
+            query_tab.completion_index = 0;
+        }
+        query_tab.completion_dismissed_signature = None;
+        let selected = query_tab
+            .completion_index
+            .min(items.len().saturating_sub(1));
+        query_tab.completion_index = selected;
+
+        Some(SqlCompletionMenu {
+            context,
+            items,
+            selected,
+            signature,
+        })
+    }
+
+    fn handle_completion_key(
+        &mut self,
+        session_id: SessionId,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_focused = self
+            .session(session_id)
+            .and_then(|session| {
+                let tab_id = session.active_secondary_tab?;
+                session.secondary_tabs.iter().find(|tab| tab.id == tab_id)
+            })
+            .and_then(|tab| match &tab.kind {
+                SecondaryTabKind::Query(query) => Some(
+                    query
+                        .query_editor
+                        .read(cx)
+                        .focus_handle()
+                        .is_focused(window),
+                ),
+                SecondaryTabKind::Structure(_) => None,
+            })
+            .unwrap_or(false);
+        if !editor_focused {
+            return;
+        }
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let Some(menu) = self.query_completion_for(session_id, cx) else {
+            return;
+        };
+        let Some(tab_id) = self
+            .session(session_id)
+            .and_then(|session| session.active_secondary_tab)
+        else {
+            return;
+        };
+
+        match key {
+            "up" | "down" => {
+                let Some(session) = self.session_mut(session_id) else {
+                    return;
+                };
+                let Some(tab) = session
+                    .secondary_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                else {
+                    return;
+                };
+                let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
+                    return;
+                };
+                let count = menu.items.len();
+                query_tab.completion_index = if key == "up" {
+                    if query_tab.completion_index == 0 {
+                        count - 1
+                    } else {
+                        query_tab.completion_index - 1
+                    }
+                } else {
+                    (query_tab.completion_index + 1) % count
+                };
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "enter" | "tab" => {
+                let Some(item) = menu.items.get(menu.selected).cloned() else {
+                    return;
+                };
+                self.accept_completion_for(session_id, tab_id, menu.context, item, window, cx);
+                cx.stop_propagation();
+            }
+            "escape" => {
+                if let Some(session) = self.session_mut(session_id)
+                    && let Some(tab) = session
+                        .secondary_tabs
+                        .iter_mut()
+                        .find(|tab| tab.id == tab_id)
+                    && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
+                {
+                    query_tab.completion_dismissed_signature = Some(menu.signature);
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn accept_completion_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        context: editor::SqlCompletionContext,
+        item: SqlCompletionItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query_editor) = self
+            .session(session_id)
+            .and_then(|session| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
+            .and_then(|tab| match &tab.kind {
+                SecondaryTabKind::Query(query) => Some(query.query_editor.clone()),
+                SecondaryTabKind::Structure(_) => None,
+            })
+        else {
+            return;
+        };
+        let focus = query_editor.read(cx).focus_handle();
+        query_editor.update(cx, |editor, cx| {
+            editor.replace_range(context.replacement_range, item.insert_text, cx);
+        });
+        if let Some(session) = self.session_mut(session_id)
+            && let Some(tab) = session
+                .secondary_tabs
+                .iter_mut()
+                .find(|tab| tab.id == tab_id)
+            && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
+        {
+            query_tab.completion_signature = None;
+            query_tab.completion_dismissed_signature = None;
+            query_tab.completion_index = 0;
+        }
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn run_query(&mut self, cx: &mut Context<Self>) {
         let Some(session_id) = self.active_session_id() else {
             return;
@@ -2120,8 +2402,73 @@ impl DbxApp {
                 }
 
                 cx.notify();
+                this.prefetch_completion_columns_for(session_id, cx);
             })?;
 
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Warm a bounded schema cache in the background so query completion can
+    /// resolve columns for tables the user has not opened yet. Failures are
+    /// intentionally ignored here: table names remain useful completions and
+    /// opening a table still retries its authoritative structure request.
+    fn prefetch_completion_columns_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        const MAX_COMPLETION_METADATA_TABLES: usize = 128;
+
+        let Some((engine, kind, database, tables)) = self.session(session_id).map(|session| {
+            (
+                session.engine.clone(),
+                session.kind,
+                session.current_database.clone(),
+                session.tables.clone(),
+            )
+        }) else {
+            return;
+        };
+        let Some(engine) = engine else {
+            return;
+        };
+        if !kind.is_sql() {
+            return;
+        }
+
+        let request_engine = engine.clone();
+        let expected_engine = engine;
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            let metadata = runtime
+                .spawn(async move {
+                    let mut metadata = HashMap::new();
+                    for table in tables
+                        .into_iter()
+                        .filter(|table| matches!(table.kind, EntityKind::Table | EntityKind::View))
+                        .take(MAX_COMPLETION_METADATA_TABLES)
+                    {
+                        let table_ref = table_ref(&table);
+                        if let Ok(columns) = request_engine.describe_table(&table_ref).await {
+                            metadata.insert(completion_table_key(&table_ref), columns);
+                        }
+                    }
+                    metadata
+                })
+                .await?;
+
+            this.update(cx, |this, cx| {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                let same_engine = session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &expected_engine));
+                if session.kind != kind || session.current_database != database || !same_engine {
+                    return;
+                }
+                session.completion_columns.extend(metadata);
+                cx.notify();
+            })?;
             Ok::<(), anyhow::Error>(())
         })
         .detach();
@@ -2175,6 +2522,7 @@ impl DbxApp {
                         session.current_database = Some(database.clone());
                         session.selected_table = None;
                         session.table_columns.clear();
+                        session.completion_columns.clear();
                         session.set_result(None, cx);
                         session.result_table = None;
                         session.schema_filter = None;
@@ -2190,6 +2538,7 @@ impl DbxApp {
                     }
                 }
                 cx.notify();
+                this.prefetch_completion_columns_for(session_id, cx);
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -2839,6 +3188,9 @@ impl DbxApp {
                                 if session.selected_table.as_ref() == Some(&target_table) {
                                     session.selected_table = None;
                                     session.table_columns.clear();
+                                    session
+                                        .completion_columns
+                                        .remove(&completion_table_key(&target_table));
                                     session.set_result(None, cx);
                                     session.result_table = None;
                                     session.selected_row = None;
@@ -3871,7 +4223,7 @@ impl DbxApp {
                         .child(button("connect", "Connect", ButtonKind::Primary).cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))))))
     }
 
-    fn render_workspace(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_workspace(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_1()
             .min_h_0()
@@ -3885,7 +4237,7 @@ impl DbxApp {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(cx))
-                    .child(self.render_main(cx)),
+                    .child(self.render_main(window, cx)),
             )
             .child(self.render_status())
             .child(self.render_table_context_menu(cx))
@@ -4593,7 +4945,7 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self
             .active_session()
             .map(|session| session.pane)
@@ -4607,7 +4959,7 @@ impl DbxApp {
             .child(match pane {
                 Pane::Data => self.render_data(cx).into_any_element(),
                 Pane::Structure => self.render_structure(cx).into_any_element(),
-                Pane::Query => self.render_query(cx).into_any_element(),
+                Pane::Query => self.render_query(window, cx).into_any_element(),
             })
     }
 
@@ -5836,11 +6188,107 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_query(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sql_completion(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        menu: SqlCompletionMenu,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = menu.selected;
+        let rows = menu.items.iter().enumerate().map(|(index, item)| {
+            let item = item.clone();
+            let context = menu.context.clone();
+            let item_kind = item.kind;
+            div()
+                .id(SharedString::from(format!(
+                    "sql-completion-{session_id}-{tab_id}-{index}"
+                )))
+                .h(px(28.))
+                .px(px(8.))
+                .rounded(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .bg(if index == selected {
+                    THEME.accent_soft
+                } else {
+                    THEME.panel_raised
+                })
+                .hover(|style| style.bg(THEME.accent_soft))
+                .child(
+                    div()
+                        .w(px(52.))
+                        .flex_none()
+                        .text_size(px(9.))
+                        .text_color(item_kind.color())
+                        .child(item_kind.label()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(THEME.text)
+                        .child(item.label.clone()),
+                )
+                .child(
+                    div()
+                        .max_w(px(190.))
+                        .truncate()
+                        .text_size(px(10.))
+                        .text_color(THEME.text_muted)
+                        .child(item.detail.clone()),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.accept_completion_for(
+                        session_id,
+                        tab_id,
+                        context.clone(),
+                        item.clone(),
+                        window,
+                        cx,
+                    );
+                }))
+        });
+
+        deferred(
+            div()
+                .id("sql-completion-menu")
+                .absolute()
+                .left(px(10.))
+                .right(px(10.))
+                .top(px(214.))
+                .max_h(px(270.))
+                .p(px(5.))
+                .rounded(px(7.))
+                .border_1()
+                .border_color(THEME.border_strong)
+                .bg(THEME.panel_raised)
+                .text_size(px(12.))
+                .children(rows)
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .pt(px(5.))
+                        .px(px(8.))
+                        .border_t_1()
+                        .border_color(THEME.border)
+                        .text_size(px(9.))
+                        .text_color(THEME.text_muted)
+                        .child("↑↓ navigate · Tab/Enter insert · Esc dismiss"),
+                ),
+        )
+        .with_priority(20)
+        .into_any_element()
+    }
+
+    fn render_query(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((query_editor, busy, has_result, result_grid)) =
+        let Some((tab_id, query_editor, busy, has_result, result_grid)) =
             self.session(session_id).and_then(|session| {
                 let tab_id = session.active_secondary_tab?;
                 let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
@@ -5848,6 +6296,7 @@ impl DbxApp {
                     return None;
                 };
                 Some((
+                    tab_id,
                     query.query_editor.clone(),
                     query.busy,
                     query.result.is_some(),
@@ -5858,6 +6307,26 @@ impl DbxApp {
             return div().into_any_element();
         };
         let query_focus = query_editor.read(cx).focus_handle();
+        let completion = query_focus
+            .is_focused(window)
+            .then(|| self.query_completion_for(session_id, cx))
+            .flatten();
+        let completion_element =
+            completion.map(|menu| self.render_sql_completion(session_id, tab_id, menu, cx));
+        let completion_key_listener = cx.listener(move |this, event, window, cx| {
+            this.handle_completion_key(session_id, event, window, cx)
+        });
+        let mut editor_panel = div()
+            .relative()
+            .h(px(224.))
+            .p(px(10.))
+            .border_b_1()
+            .border_color(THEME.border)
+            .capture_key_down(completion_key_listener)
+            .child(editor::input(query_editor, query_focus, true));
+        if let Some(completion_element) = completion_element {
+            editor_panel = editor_panel.child(completion_element);
+        }
         div()
             .flex_1()
             .min_h_0()
@@ -5898,14 +6367,7 @@ impl DbxApp {
                         ),
                     ),
             )
-            .child(
-                div()
-                    .h(px(224.))
-                    .p(px(10.))
-                    .border_b_1()
-                    .border_color(THEME.border)
-                    .child(editor::input(query_editor, query_focus, true)),
-            )
+            .child(editor_panel)
             .child(Self::render_query_grid(result_grid, has_result, busy))
             .into_any_element()
     }
@@ -6038,7 +6500,7 @@ impl Render for DbxApp {
         let content = if self.connection_picker_open || self.active_session().is_none() {
             self.render_connection(cx).into_any_element()
         } else {
-            self.render_workspace(cx).into_any_element()
+            self.render_workspace(window, cx).into_any_element()
         };
         // The pane rail only makes sense once a connection is live.
         let connected = self
@@ -6082,6 +6544,249 @@ fn table_ref_label(table: &TableRef) -> String {
         Some(schema) => format!("{schema}.{}", table.name),
         None => table.name.clone(),
     }
+}
+
+const MAX_SQL_COMPLETIONS: usize = 10;
+
+fn sql_completion_items(
+    context: &editor::SqlCompletionContext,
+    sources: SqlCompletionSources<'_>,
+) -> Vec<SqlCompletionItem> {
+    let SqlCompletionSources {
+        database_kind,
+        tables,
+        completion_columns,
+        selected_table,
+        active_columns,
+        result,
+        active_schema_filter,
+    } = sources;
+    let prefix = context.prefix.trim_matches(['"', '`']).to_ascii_lowercase();
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut push = |item: SqlCompletionItem| {
+        let matches_prefix = prefix.is_empty()
+            || item
+                .search_text
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .any(|candidate| candidate.starts_with(prefix.as_str()));
+        let key = item.insert_text.to_ascii_lowercase();
+        if matches_prefix && seen.insert(key) {
+            items.push(item);
+        }
+    };
+
+    if matches!(context.target, SqlCompletionTarget::Any) {
+        for keyword in editor::sql_completion_keywords() {
+            push(SqlCompletionItem {
+                label: (*keyword).into(),
+                insert_text: (*keyword).into(),
+                detail: "SQL keyword".into(),
+                search_text: (*keyword).into(),
+                kind: CompletionItemKind::Keyword,
+            });
+        }
+        for sql_type in editor::sql_completion_types() {
+            push(SqlCompletionItem {
+                label: (*sql_type).into(),
+                insert_text: (*sql_type).into(),
+                detail: "SQL type".into(),
+                search_text: (*sql_type).into(),
+                kind: CompletionItemKind::Type,
+            });
+        }
+    }
+
+    if matches!(
+        context.target,
+        SqlCompletionTarget::Any | SqlCompletionTarget::Column
+    ) {
+        let mut added_qualified_source = false;
+        if let Some(qualifier) = context.qualifier.as_deref() {
+            for table in tables
+                .iter()
+                .filter(|table| completion_table_matches_qualifier(table, qualifier))
+            {
+                let table_ref = table_ref(table);
+                if let Some(columns) = completion_columns.get(&completion_table_key(&table_ref)) {
+                    push_columns(
+                        &mut push,
+                        columns,
+                        &table_ref_label(&table_ref),
+                        database_kind,
+                        context.quote,
+                    );
+                    added_qualified_source = true;
+                }
+            }
+        }
+
+        if !added_qualified_source {
+            if let Some(selected_table) = selected_table {
+                push_columns(
+                    &mut push,
+                    active_columns,
+                    &table_ref_label(selected_table),
+                    database_kind,
+                    context.quote,
+                );
+            } else {
+                push_columns(
+                    &mut push,
+                    active_columns,
+                    "active table",
+                    database_kind,
+                    context.quote,
+                );
+            }
+
+            if let Some(result) = result {
+                push_columns(
+                    &mut push,
+                    &result.columns,
+                    "query result",
+                    database_kind,
+                    context.quote,
+                );
+            }
+        }
+
+        if context.qualifier.is_none() {
+            for table in tables {
+                let table_ref = table_ref(table);
+                if let Some(columns) = completion_columns.get(&completion_table_key(&table_ref)) {
+                    push_columns(
+                        &mut push,
+                        columns,
+                        &table_ref_label(&table_ref),
+                        database_kind,
+                        context.quote,
+                    );
+                }
+            }
+        }
+    }
+
+    if matches!(
+        context.target,
+        SqlCompletionTarget::Any | SqlCompletionTarget::Table
+    ) {
+        for table in tables.iter().filter(|table| {
+            matches!(table.kind, EntityKind::Table | EntityKind::View)
+                && context.qualifier.as_deref().is_none_or(|qualifier| {
+                    table.schema.as_deref().is_some_and(|schema| {
+                        !qualifier.contains('.') && schema.eq_ignore_ascii_case(qualifier)
+                    })
+                })
+        }) {
+            let schema = table.schema.as_deref();
+            let qualified = schema.is_some_and(|schema| Some(schema) != active_schema_filter);
+            let label = if context.qualifier.is_some() || !qualified {
+                table.name.clone()
+            } else {
+                format!("{}.{}", schema.unwrap_or_default(), table.name)
+            };
+            let raw_insert_text = if context.qualifier.is_some() || !qualified {
+                table.name.clone()
+            } else {
+                format!("{}.{}", schema.unwrap_or_default(), table.name)
+            };
+            let insert_text = completion_identifier(database_kind, &raw_insert_text, context.quote);
+            let entity = match table.kind {
+                EntityKind::View => "view",
+                _ => "table",
+            };
+            let detail = schema
+                .map(|schema| format!("{entity} · {schema}"))
+                .unwrap_or_else(|| entity.into());
+            let search_text = schema
+                .map(|schema| format!("{schema}.{} {}", table.name, table.name))
+                .unwrap_or_else(|| table.name.clone());
+            push(SqlCompletionItem {
+                label,
+                insert_text,
+                detail,
+                search_text,
+                kind: CompletionItemKind::Table,
+            });
+        }
+    }
+
+    items.sort_by(|left, right| {
+        let left_exact = left.label.eq_ignore_ascii_case(&prefix);
+        let right_exact = right.label.eq_ignore_ascii_case(&prefix);
+        right_exact.cmp(&left_exact).then_with(|| {
+            left.label
+                .to_ascii_lowercase()
+                .cmp(&right.label.to_ascii_lowercase())
+        })
+    });
+    items.truncate(MAX_SQL_COMPLETIONS);
+    items
+}
+
+fn push_columns(
+    push: &mut impl FnMut(SqlCompletionItem),
+    columns: &[ColumnInfo],
+    source: &str,
+    database_kind: DatabaseKind,
+    quote: Option<char>,
+) {
+    for column in columns {
+        push(SqlCompletionItem {
+            label: column.name.clone(),
+            insert_text: completion_identifier(database_kind, &column.name, quote),
+            detail: format!("column · {source} · {}", column.data_type),
+            search_text: column.name.clone(),
+            kind: CompletionItemKind::Column,
+        });
+    }
+}
+
+fn completion_table_matches_qualifier(table: &TableInfo, qualifier: &str) -> bool {
+    let parts = qualifier.split('.').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [name] => {
+            table.name.eq_ignore_ascii_case(name)
+                || table
+                    .schema
+                    .as_deref()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case(name))
+        }
+        [schema, name] => {
+            table.name.eq_ignore_ascii_case(name)
+                && table
+                    .schema
+                    .as_deref()
+                    .is_some_and(|table_schema| table_schema.eq_ignore_ascii_case(schema))
+        }
+        _ => false,
+    }
+}
+
+fn completion_identifier(kind: DatabaseKind, identifier: &str, quote: Option<char>) -> String {
+    if let Some(quote) = quote {
+        let mut escaped = String::with_capacity(identifier.len());
+        for character in identifier.chars() {
+            if character == quote {
+                escaped.push(quote);
+            }
+            escaped.push(character);
+        }
+        escaped
+    } else {
+        dbx_core::quote_identifier(kind, identifier).unwrap_or_else(|_| identifier.to_owned())
+    }
+}
+
+fn completion_table_key(table: &TableRef) -> String {
+    format!(
+        "{}\u{0}{}",
+        table.schema.as_deref().unwrap_or_default(),
+        table.name
+    )
 }
 
 /// Semantic color per deployment environment: production is risky (red),
@@ -6519,5 +7224,116 @@ mod tests {
             Some("public"),
             &TableRef::in_schema("analytics", "events")
         ));
+    }
+
+    #[test]
+    fn sql_completion_uses_schema_and_cached_columns() {
+        let tables = vec![
+            TableInfo::table("users", Some("public".into())),
+            TableInfo::table("events", Some("analytics".into())),
+        ];
+        let users = TableRef::in_schema("public", "users");
+        let mut columns = HashMap::new();
+        columns.insert(
+            completion_table_key(&users),
+            vec![ColumnInfo::result("user_id", 0, "INTEGER")],
+        );
+        let events = TableRef::in_schema("analytics", "events");
+        columns.insert(
+            completion_table_key(&events),
+            vec![ColumnInfo::result("event_id", 0, "INTEGER")],
+        );
+
+        let table_context = editor::sql_completion_context("SELECT * FROM pu", 16).unwrap();
+        let table_items = sql_completion_items(
+            &table_context,
+            SqlCompletionSources {
+                database_kind: DatabaseKind::PostgreSQL,
+                tables: &tables,
+                completion_columns: &columns,
+                selected_table: Some(&users),
+                active_columns: &[],
+                result: None,
+                active_schema_filter: Some("public"),
+            },
+        );
+        assert!(table_items.iter().any(|item| {
+            item.kind == CompletionItemKind::Table
+                && item.label == "users"
+                && item.detail.contains("public")
+        }));
+
+        let column_context = editor::sql_completion_context("SELECT user", 11).unwrap();
+        let column_items = sql_completion_items(
+            &column_context,
+            SqlCompletionSources {
+                database_kind: DatabaseKind::PostgreSQL,
+                tables: &tables,
+                completion_columns: &columns,
+                selected_table: Some(&users),
+                active_columns: &[],
+                result: None,
+                active_schema_filter: Some("public"),
+            },
+        );
+        assert!(
+            column_items
+                .iter()
+                .any(|item| { item.kind == CompletionItemKind::Column && item.label == "user_id" })
+        );
+        assert_eq!(
+            table_items
+                .iter()
+                .find(|item| item.label == "users")
+                .map(|item| item.insert_text.as_str()),
+            Some("\"users\"")
+        );
+        assert_eq!(
+            column_items
+                .iter()
+                .find(|item| item.label == "user_id")
+                .map(|item| item.insert_text.as_str()),
+            Some("\"user_id\"")
+        );
+
+        let qualified_context = editor::sql_completion_context(
+            "SELECT analytics.events.",
+            "SELECT analytics.events.".len(),
+        )
+        .unwrap();
+        let qualified_items = sql_completion_items(
+            &qualified_context,
+            SqlCompletionSources {
+                database_kind: DatabaseKind::PostgreSQL,
+                tables: &tables,
+                completion_columns: &columns,
+                selected_table: Some(&users),
+                active_columns: &[],
+                result: None,
+                active_schema_filter: Some("public"),
+            },
+        );
+        assert!(qualified_items.iter().any(|item| item.label == "event_id"));
+        assert!(!qualified_items.iter().any(|item| item.label == "user_id"));
+    }
+
+    #[test]
+    fn sql_completion_quotes_identifiers_per_dialect_and_preserves_open_quote() {
+        assert_eq!(
+            completion_identifier(DatabaseKind::PostgreSQL, "display name", None),
+            "\"display name\""
+        );
+        assert_eq!(
+            completion_identifier(DatabaseKind::MySQL, "display name", None),
+            "`display name`"
+        );
+        assert_eq!(
+            completion_identifier(DatabaseKind::PostgreSQL, "display\"name", None),
+            "\"display\"\"name\""
+        );
+        assert_eq!(
+            completion_identifier(DatabaseKind::PostgreSQL, "display name", Some('"')),
+            "display name"
+        );
     }
 }
