@@ -240,6 +240,10 @@ async fn run_sql_scenario(kind: DatabaseKind, variable: &str) -> Result<()> {
         .await?;
     assert_eq!(integer_value(&raw.rows[0].values[0]), 3);
 
+    if kind == DatabaseKind::PostgreSQL {
+        assert_postgres_enum_decoding(&engine).await?;
+    }
+
     let updated = engine
         .update(&UpdateRequest::for_primary_key(
             table.clone(),
@@ -299,6 +303,55 @@ async fn run_sql_scenario(kind: DatabaseKind, variable: &str) -> Result<()> {
     let after_drop = engine.list_tables().await?;
     assert!(!after_drop.iter().any(|item| item.name == TABLE_NAME));
     Ok(())
+}
+
+async fn assert_postgres_enum_decoding(engine: &DatabaseEngine) -> Result<()> {
+    let table = qualified_table(DatabaseKind::PostgreSQL);
+    engine
+        .execute_sql("DROP TYPE IF EXISTS dbx_integration_mood")
+        .await?;
+    engine
+        .execute_sql("CREATE TYPE dbx_integration_mood AS ENUM ('happy', 'sad', 'neutral')")
+        .await?;
+    let result = std::panic::AssertUnwindSafe(async {
+        engine
+            .execute_sql(&format!(
+                "ALTER TABLE {table} ADD COLUMN mood dbx_integration_mood"
+            ))
+            .await?;
+        engine
+            .execute_sql(&format!("UPDATE {table} SET mood = 'happy' WHERE id = 1"))
+            .await?;
+
+        let rows = engine
+            .query(
+                &format!("SELECT mood FROM {table} WHERE id = 1"),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(
+            rows.rows[0].values[0],
+            CellValue::Text("happy".into()),
+            "enum labels should decode as text, not an unsupported-type placeholder"
+        );
+
+        let null_rows = engine
+            .query(
+                &format!("SELECT mood FROM {table} WHERE id = 2"),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(null_rows.rows[0].values[0], CellValue::Null);
+        Ok::<(), dbx_core::DbxError>(())
+    })
+    .await;
+    // The table outlives this check, so its enum column must go first.
+    let _ = engine
+        .execute_sql(&format!("ALTER TABLE {table} DROP COLUMN mood"))
+        .await;
+    engine.execute_sql("DROP TYPE dbx_integration_mood").await?;
+    result
 }
 
 async fn assert_foreign_key_structure(engine: &DatabaseEngine, kind: DatabaseKind) -> Result<()> {
