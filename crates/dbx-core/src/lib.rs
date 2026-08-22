@@ -11,6 +11,7 @@ mod model;
 mod redis_engine;
 mod sql;
 mod sqlx_engine;
+mod transfer;
 
 pub use engine::{DatabaseEngine, Engine, QueryOptions};
 pub use error::{DbxError, Result};
@@ -22,10 +23,15 @@ pub use model::{
 };
 pub use redis_engine::RedisEngine;
 pub use sql::{
-    SqlStatement, build_create_table, build_delete, build_drop_table, build_insert, build_select,
-    build_truncate_table, build_update, build_update_with_columns, quote_identifier,
+    SqlStatement, build_create_table, build_delete, build_drop_table, build_insert,
+    build_multi_row_insert, build_select, build_truncate_table, build_update,
+    build_update_with_columns, quote_identifier,
 };
 pub use sqlx_engine::SqlxEngine;
+pub use transfer::{
+    DelimitedReader, DumpFormat, ExportSummary, FileFormat, ImportReport, detect_file_format,
+    export_table, import_file, render_sql_insert, split_sql_statements,
+};
 
 #[cfg(test)]
 mod tests {
@@ -337,6 +343,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("invalid column type"));
+    }
+
+    #[test]
+    fn bulk_insert_builder_numbers_placeholders_across_rows() {
+        let rows = vec![
+            vec![CellValue::Integer(1), CellValue::Text("a".into())],
+            vec![CellValue::Null, CellValue::Text("b".into())],
+        ];
+        let statement = build_multi_row_insert(
+            DatabaseKind::PostgreSQL,
+            &TableRef::new("items"),
+            &["id".into(), "name".into()],
+            &rows,
+        )
+        .unwrap();
+        assert_eq!(
+            statement.sql,
+            "INSERT INTO \"items\" (\"id\", \"name\") VALUES ($1, $2), ($3, $4)"
+        );
+        assert_eq!(statement.params.len(), 4);
+        let error = build_multi_row_insert(
+            DatabaseKind::SQLite,
+            &TableRef::new("items"),
+            &["id".into()],
+            &[vec![CellValue::Integer(1), CellValue::Null]],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("match the column count"));
     }
 
     #[test]

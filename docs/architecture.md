@@ -50,6 +50,7 @@ The exact Rust module names may change, but the seam should remain close to thes
 - `DbValue`: null, booleans, signed/unsigned numbers, floating values, text, bytes, timestamps, JSON, and an explicit opaque/display-only value for types the grid cannot safely edit.
 - `FilterExpr`: a structured predicate (`and`, `or`, `not`, equality, comparison, null checks, text match, and membership) plus sort and page information. It compiles to SQL and bound parameters for relational engines; Redis uses an intentionally narrower key/type predicate set.
 - `Mutation`: insert/update/delete or create-table intent, including the target identity, values, expected row count/version when available, and a preview representation before execution.
+- `Transfer`: table import/export between a connection and local files. SQL dumps (`.sql`), CSV/TSV, each optionally gzip-compressed. Exports page through the shared query path; SQL-dump imports replay statements through the same execute path as the console (behind an explicit confirmation), and delimited imports bulk-append parameterized multi-row inserts after mapping the file header onto real columns. Transfers are connection-level operations in core, so they inherit quoting, parameterization, capability checks, and redacted errors for free.
 
 Identifiers are represented as identifiers, not raw SQL fragments. Each connector quotes them according to its engine. User-entered SQL is still allowed in the console, but is clearly separated from generated statements and is never silently mixed with GUI filter input.
 
@@ -139,6 +140,6 @@ The safest vertical slices are:
 - PostgreSQL and MySQL adapter parity for metadata, paging, filters, and writes.
 - Relational SQL console with cancellation and result limits.
 - Redis keyspace browser and command-aware value editor.
-- Keychain/TLS hardening, conflict handling, accessibility, import/export, and future migration tooling.
+- Keychain/TLS hardening, conflict handling, accessibility, transfer progress/streaming for very large files, and future migration tooling.
 
 Each slice should keep connector-specific code behind the core contracts and add an integration test before widening the UI surface.
