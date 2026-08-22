@@ -15,6 +15,7 @@
 //!   nor TSV has a binary convention.
 
 use std::{
+    collections::VecDeque,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -24,7 +25,8 @@ use std::{
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 use crate::{
-    CellValue, DatabaseEngine, DatabaseKind, DbxError, Page, QueryOptions, Result, TableRef,
+    CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Page, QueryOptions, Result,
+    TableRef, TableStructure,
     sql::{build_multi_row_insert, quote_identifier, quote_table},
 };
 
@@ -52,6 +54,14 @@ impl DumpFormat {
             Self::Sql => None,
             Self::Csv => Some(b','),
             Self::Tsv => Some(b'\t'),
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Sql => "sql",
+            Self::Csv => "csv",
+            Self::Tsv => "tsv",
         }
     }
 }
@@ -104,6 +114,39 @@ pub struct ExportSummary {
     pub rows_exported: u64,
     pub format: DumpFormat,
     pub gzipped: bool,
+}
+
+/// A connection-level export request.
+///
+/// SQL exports are written as one file. CSV and TSV exports write one file per
+/// selected table beneath `output_directory`, using `output_name` as the
+/// filename prefix. This keeps each delimited file independently consumable by
+/// spreadsheet and database tooling while still making one database export a
+/// single user action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseExportRequest {
+    pub tables: Vec<TableRef>,
+    pub output_directory: PathBuf,
+    pub output_name: String,
+    pub format: DumpFormat,
+    pub schema_only: bool,
+    pub gzipped: bool,
+}
+
+/// Summary of a completed connection-level export.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseExportSummary {
+    pub tables_exported: u64,
+    pub files_written: u64,
+    pub rows_exported: u64,
+    pub format: DumpFormat,
+    pub gzipped: bool,
+    pub schema_only: bool,
+}
+
+struct PreparedExportTable {
+    table: TableRef,
+    structure: TableStructure,
 }
 
 /// Summary of a completed import.
@@ -210,6 +253,564 @@ pub async fn export_table(
         format: file_format.format,
         gzipped,
     })
+}
+
+/// Export selected tables from the active database.
+///
+/// SQL exports contain all generated table schemas first, followed by all data
+/// inserts unless `schema_only` is set. PostgreSQL and MySQL foreign keys are
+/// added after the data phase so the dump never depends on table or row order;
+/// SQLite keeps them inline and orders tables by their dependencies. CSV and
+/// TSV exports are written one file per table; those formats do not have a
+/// portable representation for a database schema, so schema-only mode is
+/// intentionally limited to SQL.
+pub async fn export_database(
+    engine: &DatabaseEngine,
+    request: &DatabaseExportRequest,
+) -> Result<DatabaseExportSummary> {
+    let kind = engine.kind();
+    if !kind.is_sql() {
+        return Err(DbxError::Unsupported {
+            operation: "export_database".to_owned(),
+            kind,
+        });
+    }
+    if request.tables.is_empty() {
+        return Err(DbxError::Parse(
+            "database export requires at least one table".into(),
+        ));
+    }
+    if request.schema_only && request.format != DumpFormat::Sql {
+        return Err(DbxError::Parse(
+            "schema-only exports require the SQL format".into(),
+        ));
+    }
+
+    validate_output_directory(&request.output_directory)?;
+    let stem = normalize_output_stem(&request.output_name)?;
+
+    if request.format == DumpFormat::Sql {
+        // Snapshot every structure before writing any output. This lets the
+        // dump emit a complete schema phase before it starts querying rows.
+        let mut export_tables = Vec::with_capacity(request.tables.len());
+        for table in &request.tables {
+            export_tables.push(PreparedExportTable {
+                table: table.clone(),
+                structure: engine.table_structure(table).await?,
+            });
+        }
+        let table_order = table_export_order(&export_tables);
+        let mut output = Vec::new();
+        output.extend_from_slice(b"-- DBX database dump\n");
+        output.extend_from_slice(
+            format!(
+                "-- Tables: {}\n{}\n",
+                request.tables.len(),
+                if request.schema_only {
+                    "-- Schema only"
+                } else {
+                    "-- Schema and data"
+                }
+            )
+            .as_bytes(),
+        );
+        output.extend_from_slice(b"\n-- Schema\n");
+        for &index in &table_order {
+            let export_table = &export_tables[index];
+            output.extend_from_slice(
+                format!("-- Table: {}\n", quote_table(kind, &export_table.table)?).as_bytes(),
+            );
+            let schema = if kind == DatabaseKind::SQLite {
+                render_sql_schema(
+                    kind,
+                    &export_table.table,
+                    &export_table.structure,
+                    &request.tables,
+                )?
+            } else {
+                render_sql_schema_without_foreign_keys(
+                    kind,
+                    &export_table.table,
+                    &export_table.structure,
+                    &request.tables,
+                )?
+            };
+            output.extend_from_slice(schema.as_bytes());
+            output.extend_from_slice(b";\n");
+            output.push(b'\n');
+        }
+
+        let mut rows_exported = 0u64;
+        if !request.schema_only {
+            output.extend_from_slice(b"-- Data\n");
+            for &index in &table_order {
+                let export_table = &export_tables[index];
+                rows_exported += append_sql_table_data(
+                    engine,
+                    kind,
+                    &export_table.table,
+                    &export_table.structure.columns,
+                    &mut output,
+                )
+                .await?;
+                output.push(b'\n');
+            }
+        }
+
+        // SQLite cannot add a constraint with ALTER TABLE, so its selected
+        // foreign keys remain in CREATE TABLE. PostgreSQL and MySQL can add
+        // them after the data phase, which also handles cycles and arbitrary
+        // selection order without disabling referential checks.
+        if kind != DatabaseKind::SQLite {
+            output.extend_from_slice(b"-- Foreign-key constraints\n");
+            for &index in &table_order {
+                append_sql_foreign_keys(
+                    kind,
+                    &export_tables[index].table,
+                    &export_tables[index].structure,
+                    &request.tables,
+                    &mut output,
+                )?;
+            }
+            output.push(b'\n');
+        }
+
+        let path =
+            request
+                .output_directory
+                .join(with_extension(&stem, DumpFormat::Sql, request.gzipped));
+        let bytes = if request.gzipped {
+            gzip_encode(output)?
+        } else {
+            output
+        };
+        write_export_file(path, bytes).await?;
+        return Ok(DatabaseExportSummary {
+            tables_exported: request.tables.len() as u64,
+            files_written: 1,
+            rows_exported,
+            format: request.format,
+            gzipped: request.gzipped,
+            schema_only: request.schema_only,
+        });
+    }
+
+    let mut rows_exported = 0u64;
+    for table in &request.tables {
+        let table_stem = transfer_file_stem(table);
+        let file_stem = format!("{stem}_{table_stem}");
+        let path = request.output_directory.join(with_extension(
+            &file_stem,
+            request.format,
+            request.gzipped,
+        ));
+        let summary = export_table(engine, table, &path).await?;
+        rows_exported += summary.rows_exported;
+    }
+
+    Ok(DatabaseExportSummary {
+        tables_exported: request.tables.len() as u64,
+        files_written: request.tables.len() as u64,
+        rows_exported,
+        format: request.format,
+        gzipped: request.gzipped,
+        schema_only: false,
+    })
+}
+
+/// Import a complete database dump. Delimited files remain table-scoped and
+/// must go through [`import_file`] with an explicit target table.
+pub async fn import_database(engine: &DatabaseEngine, path: &Path) -> Result<ImportReport> {
+    let file_format = detect_file_format(path)?;
+    if file_format.format != DumpFormat::Sql {
+        return Err(DbxError::Parse(
+            "database imports require an SQL dump; CSV and TSV imports target one table".into(),
+        ));
+    }
+    import_file(engine, None, path).await
+}
+
+/// Render a portable `CREATE TABLE` statement from DBX's normalized metadata.
+///
+/// Defaults, generated expressions, and indexes are not currently part of
+/// [`TableStructure`], so the output intentionally includes only columns,
+/// primary keys, and foreign keys that DBX can verify from metadata.
+pub fn render_sql_schema(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+    selected_tables: &[TableRef],
+) -> Result<String> {
+    render_sql_schema_with_foreign_keys(kind, table, structure, selected_tables, true)
+}
+
+fn render_sql_schema_without_foreign_keys(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+    selected_tables: &[TableRef],
+) -> Result<String> {
+    render_sql_schema_with_foreign_keys(kind, table, structure, selected_tables, false)
+}
+
+fn render_sql_schema_with_foreign_keys(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+    selected_tables: &[TableRef],
+    include_foreign_keys: bool,
+) -> Result<String> {
+    if !kind.is_sql() {
+        return Err(DbxError::Unsupported {
+            operation: "render_sql_schema".to_owned(),
+            kind,
+        });
+    }
+    if structure.columns.is_empty() {
+        return Err(DbxError::Parse(format!(
+            "table `{}` has no columns",
+            table.name
+        )));
+    }
+
+    let mut definitions = Vec::new();
+    for column in &structure.columns {
+        let mut definition = format!(
+            "{} {}",
+            quote_identifier(kind, &column.name)?,
+            safe_schema_type(&column.data_type)?
+        );
+        if !column.nullable {
+            definition.push_str(" NOT NULL");
+        }
+        definitions.push(definition);
+    }
+
+    let primary_keys: Vec<String> = structure
+        .columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .map(|column| quote_identifier(kind, &column.name))
+        .collect::<Result<Vec<_>>>()?;
+    if !primary_keys.is_empty() {
+        definitions.push(format!("PRIMARY KEY ({})", primary_keys.join(", ")));
+    }
+
+    for foreign_key in &structure.foreign_keys {
+        let definition =
+            render_sql_foreign_key_definition(kind, table, foreign_key, selected_tables)?;
+        if include_foreign_keys {
+            let Some(definition) = definition else {
+                continue;
+            };
+            definitions.push(definition);
+        }
+    }
+
+    let mut statement = format!(
+        "CREATE TABLE IF NOT EXISTS {} (\n",
+        quote_table(kind, table)?
+    );
+    for (index, definition) in definitions.iter().enumerate() {
+        if index > 0 {
+            statement.push_str(",\n");
+        }
+        statement.push_str("  ");
+        statement.push_str(definition);
+    }
+    statement.push_str("\n)");
+    Ok(statement)
+}
+
+fn render_sql_foreign_key_definition(
+    kind: DatabaseKind,
+    table: &TableRef,
+    foreign_key: &crate::ForeignKeyInfo,
+    selected_tables: &[TableRef],
+) -> Result<Option<String>> {
+    if foreign_key.columns.is_empty()
+        || foreign_key.columns.len() != foreign_key.referenced_columns.len()
+    {
+        return Err(DbxError::Parse(format!(
+            "foreign key on `{}` has mismatched column metadata",
+            table.name
+        )));
+    }
+    let referenced_table = TableRef {
+        schema: foreign_key.referenced_schema.clone(),
+        name: foreign_key.referenced_table.clone(),
+    };
+    // A selected subset should not emit a constraint whose target is not in
+    // the export. That keeps a partial schema dump executable.
+    if !selected_tables.is_empty()
+        && !selected_tables
+            .iter()
+            .any(|selected| selected == &referenced_table)
+    {
+        return Ok(None);
+    }
+    let local_columns = foreign_key
+        .columns
+        .iter()
+        .map(|column| quote_identifier(kind, column))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let referenced_columns = foreign_key
+        .referenced_columns
+        .iter()
+        .map(|column| quote_identifier(kind, column))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let mut definition = String::new();
+    if let Some(constraint_name) = &foreign_key.constraint_name {
+        definition.push_str("CONSTRAINT ");
+        definition.push_str(&quote_identifier(kind, constraint_name)?);
+        definition.push(' ');
+    }
+    definition.push_str("FOREIGN KEY (");
+    definition.push_str(&local_columns);
+    definition.push_str(") REFERENCES ");
+    definition.push_str(&quote_table(kind, &referenced_table)?);
+    definition.push_str(" (");
+    definition.push_str(&referenced_columns);
+    definition.push(')');
+    if let Some(action) = foreign_key.on_update {
+        definition.push_str(" ON UPDATE ");
+        definition.push_str(referential_action_sql(action));
+    }
+    if let Some(action) = foreign_key.on_delete {
+        definition.push_str(" ON DELETE ");
+        definition.push_str(referential_action_sql(action));
+    }
+    Ok(Some(definition))
+}
+
+fn append_sql_foreign_keys(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+    selected_tables: &[TableRef],
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    for foreign_key in &structure.foreign_keys {
+        let Some(definition) =
+            render_sql_foreign_key_definition(kind, table, foreign_key, selected_tables)?
+        else {
+            continue;
+        };
+        output.extend_from_slice(
+            format!(
+                "ALTER TABLE {} ADD {};\n",
+                quote_table(kind, table)?,
+                definition
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(())
+}
+
+fn table_export_order(tables: &[PreparedExportTable]) -> Vec<usize> {
+    let mut dependencies = vec![Vec::new(); tables.len()];
+    for (index, export_table) in tables.iter().enumerate() {
+        for foreign_key in &export_table.structure.foreign_keys {
+            let referenced_table = TableRef {
+                schema: foreign_key.referenced_schema.clone(),
+                name: foreign_key.referenced_table.clone(),
+            };
+            let Some(referenced_index) = tables
+                .iter()
+                .position(|candidate| candidate.table == referenced_table)
+            else {
+                continue;
+            };
+            if referenced_index != index && !dependencies[index].contains(&referenced_index) {
+                dependencies[index].push(referenced_index);
+            }
+        }
+    }
+
+    let mut dependents = vec![Vec::new(); tables.len()];
+    let mut dependency_counts: Vec<usize> = dependencies.iter().map(Vec::len).collect();
+    for (index, table_dependencies) in dependencies.iter().enumerate() {
+        for &dependency in table_dependencies {
+            dependents[dependency].push(index);
+        }
+    }
+
+    let mut ready = VecDeque::new();
+    for (index, &count) in dependency_counts.iter().enumerate() {
+        if count == 0 {
+            ready.push_back(index);
+        }
+    }
+
+    let mut order = Vec::with_capacity(tables.len());
+    let mut emitted = vec![false; tables.len()];
+    while let Some(index) = ready.pop_front() {
+        emitted[index] = true;
+        order.push(index);
+        for &dependent in &dependents[index] {
+            dependency_counts[dependent] -= 1;
+            if dependency_counts[dependent] == 0 {
+                ready.push_back(dependent);
+            }
+        }
+    }
+
+    // Cyclic foreign-key graphs have no topological order. Keep those tables
+    // stable rather than dropping them; PostgreSQL/MySQL add their constraints
+    // after data, while SQLite accepts forward references in CREATE TABLE.
+    for (index, was_emitted) in emitted.into_iter().enumerate() {
+        if !was_emitted {
+            order.push(index);
+        }
+    }
+    order
+}
+
+async fn append_sql_table_data(
+    engine: &DatabaseEngine,
+    kind: DatabaseKind,
+    table: &TableRef,
+    columns: &[ColumnInfo],
+    output: &mut Vec<u8>,
+) -> Result<u64> {
+    let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
+    let mut rows_exported = 0u64;
+    let mut offset = 0u64;
+    loop {
+        let result = engine
+            .query_table(
+                table,
+                &[],
+                &[],
+                &[],
+                Some(Page {
+                    limit: EXPORT_PAGE_SIZE as u32,
+                    offset,
+                }),
+                QueryOptions { max_rows: None },
+            )
+            .await?;
+        for row in &result.rows {
+            output.extend_from_slice(
+                render_sql_insert(kind, table, &column_names, &row.values)?.as_bytes(),
+            );
+            output.extend_from_slice(b";\n");
+        }
+        let page_rows = result.rows.len();
+        rows_exported += page_rows as u64;
+        offset += page_rows as u64;
+        if page_rows < EXPORT_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(rows_exported)
+}
+
+fn validate_output_directory(directory: &Path) -> Result<()> {
+    if !directory.is_dir() {
+        return Err(DbxError::Io(format!(
+            "export destination `{}` is not a directory",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_output_stem(name: &str) -> Result<String> {
+    let mut stem = name.trim().to_owned();
+    if stem.is_empty() || stem.contains('/') || stem.contains('\\') || stem.contains('\0') {
+        return Err(DbxError::Parse(
+            "export name must be a non-empty file name without path separators".into(),
+        ));
+    }
+    if stem.to_ascii_lowercase().ends_with(".gz") {
+        stem.truncate(stem.len().saturating_sub(3));
+    }
+    for extension in [".sql", ".csv", ".tsv"] {
+        if stem.to_ascii_lowercase().ends_with(extension) {
+            stem.truncate(stem.len().saturating_sub(extension.len()));
+            break;
+        }
+    }
+    if stem.is_empty() {
+        return Err(DbxError::Parse(
+            "export name cannot be only an extension".into(),
+        ));
+    }
+    Ok(stem)
+}
+
+fn with_extension(stem: &str, format: DumpFormat, gzipped: bool) -> String {
+    if gzipped {
+        format!("{stem}.{}.gz", format.extension())
+    } else {
+        format!("{stem}.{}", format.extension())
+    }
+}
+
+fn transfer_file_stem(table: &TableRef) -> String {
+    let raw = match &table.schema {
+        Some(schema) => format!("{schema}_{}", table.name),
+        None => table.name.clone(),
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "table".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+async fn write_export_file(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    tokio::task::spawn_blocking(move || fs::write(path, bytes))
+        .await
+        .map_err(|error| DbxError::Io(error.to_string()))?
+        .map_err(|error| DbxError::Io(error.to_string()))
+}
+
+fn safe_schema_type(data_type: &str) -> Result<String> {
+    let data_type = data_type.trim();
+    if data_type.is_empty()
+        || data_type.contains(';')
+        || data_type.contains('\\')
+        || data_type.contains('\0')
+        || data_type.contains("--")
+        || data_type.contains("/*")
+        || data_type.contains("*/")
+        || data_type.contains('\n')
+        || data_type.contains('\r')
+        || !data_type.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '(' | ')' | ',' | ' ' | '.' | '[' | ']')
+        })
+    {
+        return Err(DbxError::Parse(format!(
+            "invalid metadata column type `{data_type}`"
+        )));
+    }
+    Ok(data_type.to_owned())
+}
+
+fn referential_action_sql(action: crate::ReferentialAction) -> &'static str {
+    match action {
+        crate::ReferentialAction::NoAction => "NO ACTION",
+        crate::ReferentialAction::Restrict => "RESTRICT",
+        crate::ReferentialAction::Cascade => "CASCADE",
+        crate::ReferentialAction::SetNull => "SET NULL",
+        crate::ReferentialAction::SetDefault => "SET DEFAULT",
+    }
 }
 
 fn write_sql_dump_header(output: &mut Vec<u8>, kind: DatabaseKind, table: &TableRef) -> Result<()> {
@@ -1164,6 +1765,275 @@ mod tests {
         assert_eq!(literals, "INSERT INTO \"t\" (\"v\") VALUES (NULL)");
     }
 
+    #[test]
+    fn sql_schema_rendering_keeps_selected_foreign_keys_and_primary_keys() {
+        let parent = TableRef::in_schema("public", "accounts");
+        let child = TableRef::in_schema("public", "events");
+        let structure = TableStructure {
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: "integer".into(),
+                    enum_values: Vec::new(),
+                    nullable: false,
+                    ordinal: 1,
+                    primary_key: true,
+                },
+                ColumnInfo {
+                    name: "account_id".into(),
+                    data_type: "integer".into(),
+                    enum_values: Vec::new(),
+                    nullable: false,
+                    ordinal: 2,
+                    primary_key: false,
+                },
+            ],
+            foreign_keys: vec![crate::ForeignKeyInfo {
+                constraint_name: Some("events_account_id_fkey".into()),
+                columns: vec!["account_id".into()],
+                referenced_schema: Some("public".into()),
+                referenced_table: "accounts".into(),
+                referenced_columns: vec!["id".into()],
+                on_update: Some(crate::ReferentialAction::Cascade),
+                on_delete: Some(crate::ReferentialAction::SetNull),
+            }],
+        };
+
+        let sql =
+            render_sql_schema(DatabaseKind::PostgreSQL, &child, &structure, &[parent]).unwrap();
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"public\".\"events\""));
+        assert!(sql.contains("PRIMARY KEY (\"id\")"));
+        assert!(sql.contains("CONSTRAINT \"events_account_id_fkey\""));
+        assert!(sql.contains("ON UPDATE CASCADE ON DELETE SET NULL"));
+    }
+
+    #[test]
+    fn non_sqlite_schema_rendering_can_defer_foreign_keys() {
+        let parent = TableRef::in_schema("public", "accounts");
+        let child = TableRef::in_schema("public", "events");
+        let structure = TableStructure {
+            columns: vec![
+                ColumnInfo {
+                    name: "id".into(),
+                    data_type: "integer".into(),
+                    enum_values: Vec::new(),
+                    nullable: false,
+                    ordinal: 1,
+                    primary_key: true,
+                },
+                ColumnInfo {
+                    name: "account_id".into(),
+                    data_type: "integer".into(),
+                    enum_values: Vec::new(),
+                    nullable: false,
+                    ordinal: 2,
+                    primary_key: false,
+                },
+            ],
+            foreign_keys: vec![crate::ForeignKeyInfo {
+                constraint_name: Some("events_account_id_fkey".into()),
+                columns: vec!["account_id".into()],
+                referenced_schema: Some("public".into()),
+                referenced_table: "accounts".into(),
+                referenced_columns: vec!["id".into()],
+                on_update: Some(crate::ReferentialAction::Cascade),
+                on_delete: Some(crate::ReferentialAction::SetNull),
+            }],
+        };
+        let selected = [parent];
+
+        let schema = render_sql_schema_without_foreign_keys(
+            DatabaseKind::PostgreSQL,
+            &child,
+            &structure,
+            &selected,
+        )
+        .unwrap();
+        assert!(!schema.contains("FOREIGN KEY"));
+
+        let mut output = Vec::new();
+        append_sql_foreign_keys(
+            DatabaseKind::PostgreSQL,
+            &child,
+            &structure,
+            &selected,
+            &mut output,
+        )
+        .unwrap();
+        let constraints = String::from_utf8(output).unwrap();
+        assert_eq!(
+            constraints,
+            "ALTER TABLE \"public\".\"events\" ADD CONSTRAINT \"events_account_id_fkey\" FOREIGN KEY (\"account_id\") REFERENCES \"public\".\"accounts\" (\"id\") ON UPDATE CASCADE ON DELETE SET NULL;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_database_export_emits_all_schema_before_foreign_key_data() {
+        let source = DatabaseEngine::connect(crate::ConnectionConfig::new(
+            crate::DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        source
+            .execute_sql("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        source
+            .execute_sql(
+                "CREATE TABLE dbx_transfer_parent (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        source
+            .execute_sql(
+                "CREATE TABLE dbx_transfer_child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, FOREIGN KEY (parent_id) REFERENCES dbx_transfer_parent (id))",
+            )
+            .await
+            .unwrap();
+        source
+            .execute_sql("INSERT INTO dbx_transfer_parent (id, name) VALUES (1, 'Ada')")
+            .await
+            .unwrap();
+        source
+            .execute_sql("INSERT INTO dbx_transfer_child (id, parent_id) VALUES (7, 1)")
+            .await
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let request = DatabaseExportRequest {
+            // Reverse the dependency order to prove the exporter calculates a
+            // safe order instead of trusting the navigator selection order.
+            tables: vec![
+                TableRef::new("dbx_transfer_child"),
+                TableRef::new("dbx_transfer_parent"),
+            ],
+            output_directory: directory.path().to_owned(),
+            output_name: "foreign-keys".into(),
+            format: DumpFormat::Sql,
+            schema_only: false,
+            gzipped: false,
+        };
+        let summary = export_database(&source, &request).await.unwrap();
+        assert_eq!(summary.rows_exported, 2);
+
+        let path = directory.path().join("foreign-keys.sql");
+        let dump = fs::read_to_string(&path).unwrap();
+        let first_insert = dump.find("INSERT INTO").unwrap();
+        let parent_create = dump
+            .find("CREATE TABLE IF NOT EXISTS \"dbx_transfer_parent\"")
+            .unwrap();
+        let child_create = dump
+            .find("CREATE TABLE IF NOT EXISTS \"dbx_transfer_child\"")
+            .unwrap();
+        let parent_insert = dump.find("INSERT INTO \"dbx_transfer_parent\"").unwrap();
+        let child_insert = dump.find("INSERT INTO \"dbx_transfer_child\"").unwrap();
+        assert!(parent_create < child_create);
+        assert!(child_create < first_insert);
+        assert!(parent_insert < child_insert);
+        assert!(dump.contains("FOREIGN KEY (\"parent_id\")"));
+
+        let restored = DatabaseEngine::connect(crate::ConnectionConfig::new(
+            crate::DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        restored
+            .execute_sql("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        let report = import_database(&restored, &path).await.unwrap();
+        assert_eq!(report.statements_executed, 4);
+        let violations = restored
+            .query("PRAGMA foreign_key_check", QueryOptions { max_rows: None })
+            .await
+            .unwrap();
+        assert!(violations.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_database_export_supports_selected_tables_and_schema_only() {
+        let engine = DatabaseEngine::connect(crate::ConnectionConfig::new(
+            crate::DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE dbx_transfer_accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        engine
+            .execute_sql("CREATE TABLE dbx_transfer_events (id INTEGER PRIMARY KEY, account_id INTEGER, note TEXT)")
+            .await
+            .unwrap();
+        engine
+            .execute_sql("INSERT INTO dbx_transfer_accounts (id, name) VALUES (1, 'Ada')")
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO dbx_transfer_events (id, account_id, note) VALUES (7, 1, 'created')",
+            )
+            .await
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let tables = vec![
+            TableRef::new("dbx_transfer_accounts"),
+            TableRef::new("dbx_transfer_events"),
+        ];
+        let data_request = DatabaseExportRequest {
+            tables: tables.clone(),
+            output_directory: directory.path().to_owned(),
+            output_name: "database.sql".into(),
+            format: DumpFormat::Sql,
+            schema_only: false,
+            gzipped: false,
+        };
+        let summary = export_database(&engine, &data_request).await.unwrap();
+        assert_eq!(summary.tables_exported, 2);
+        assert_eq!(summary.files_written, 1);
+        assert_eq!(summary.rows_exported, 2);
+        let data = fs::read_to_string(directory.path().join("database.sql")).unwrap();
+        assert!(data.contains("CREATE TABLE IF NOT EXISTS \"dbx_transfer_accounts\""));
+        assert!(data.contains("INSERT INTO \"dbx_transfer_events\""));
+
+        let delimited_request = DatabaseExportRequest {
+            output_name: "rows".into(),
+            format: DumpFormat::Csv,
+            ..data_request.clone()
+        };
+        let delimited_summary = export_database(&engine, &delimited_request).await.unwrap();
+        assert_eq!(delimited_summary.files_written, 2);
+        assert!(
+            directory
+                .path()
+                .join("rows_dbx_transfer_accounts.csv")
+                .is_file()
+        );
+        assert!(
+            directory
+                .path()
+                .join("rows_dbx_transfer_events.csv")
+                .is_file()
+        );
+
+        let schema_request = DatabaseExportRequest {
+            output_name: "schema-only".into(),
+            schema_only: true,
+            ..data_request
+        };
+        let schema_summary = export_database(&engine, &schema_request).await.unwrap();
+        assert_eq!(schema_summary.rows_exported, 0);
+        let schema = fs::read_to_string(directory.path().join("schema-only.sql")).unwrap();
+        assert!(schema.contains("CREATE TABLE IF NOT EXISTS"));
+        assert!(!schema.contains("INSERT INTO"));
+    }
+
     #[tokio::test]
     async fn sqlite_round_trips_a_gzipped_sql_dump() {
         let engine = DatabaseEngine::connect(crate::ConnectionConfig::new(
@@ -1306,7 +2176,7 @@ mod tests {
         // SQL dumps do not need a target table.
         let script_path = directory.path().join("setup.sql");
         fs::write(&script_path, "CREATE TABLE dbx_transfer_direct (a INT);\nINSERT INTO dbx_transfer_direct VALUES (7);\n").unwrap();
-        let report = import_file(&engine, None, &script_path).await.unwrap();
+        let report = import_database(&engine, &script_path).await.unwrap();
         assert_eq!(report.statements_executed, 2);
         let direct = engine
             .query(

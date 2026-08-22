@@ -29,8 +29,9 @@ pub use sql::{
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::{
-    DelimitedReader, DumpFormat, ExportSummary, FileFormat, ImportReport, detect_file_format,
-    export_table, import_file, render_sql_insert, split_sql_statements,
+    DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
+    FileFormat, ImportReport, detect_file_format, export_database, export_table, import_database,
+    import_file, render_sql_insert, render_sql_schema, split_sql_statements,
 };
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ Users move repeatedly between saved connections, schema navigation, table data, 
 - Every connection can keep multiple independent query documents and table-bound structure documents open at once.
 - SQL editing requires syntax highlighting.
 - Table browsing supports predefined multi-row filters, full-row insert and edit, refresh, and destructive table actions behind confirmation.
-- Tables can be exported to SQL dump, CSV, or TSV files (optionally gzip-compressed) through a native save dialog, and compatible files can be imported: SQL dumps replay their statements behind an explicit confirmation, while CSV/TSV files bulk-append rows whose header maps to the table's columns.
+- Tables can be exported to SQL dump, CSV, or TSV files (optionally gzip-compressed) through a native save dialog, and the active database can export a selected set of tables with a chosen format, output name, destination folder, and schema-only SQL mode. Database SQL dumps replay their statements behind an explicit confirmation, while CSV/TSV files bulk-append rows whose header maps to one table's columns.
 - Structure documents expose columns, primary keys, and normalized foreign-key relationships for PostgreSQL, MySQL, and SQLite.
 - The application must remain native and responsive under large result sets.
 
