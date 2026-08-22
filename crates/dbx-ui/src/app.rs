@@ -7,13 +7,15 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseKind, EntityKind, Filter,
     FilterOperator, ForeignKeyInfo, InsertRequest, Page, QueryOptions, QueryResult,
-    ReferentialAction, RowData, TableInfo, TableRef, UpdateRequest,
+    ReferentialAction, RowData, TableInfo, TableRef, UpdateRequest, detect_file_format,
+    export_table, import_file,
 };
 use gpui::{
     AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, IntoElement,
@@ -3459,6 +3461,313 @@ impl DbxApp {
         .detach();
     }
 
+    fn transfer_available_for(&self, session_id: SessionId, table: &TableInfo) -> bool {
+        self.session(session_id).is_some_and(|session| {
+            session.kind.is_sql()
+                && !session.busy
+                && session.engine.is_some()
+                && table.kind == EntityKind::Table
+        })
+    }
+
+    /// Ask where to save an export. The chosen extension decides the format,
+    /// so suggesting `.sql` produces a SQL dump while the user may freely
+    /// type `.csv`, `.tsv`, or a `.gz` variant instead.
+    fn begin_table_export(
+        &mut self,
+        session_id: SessionId,
+        table: TableInfo,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transfer_available_for(session_id, &table) {
+            return;
+        }
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let suggested = format!("{}.sql", export_file_stem(&table));
+        let receiver = cx.prompt_for_new_path(&directory, Some(suggested.as_str()));
+        cx.spawn(async move |this, cx| {
+            match receiver.await {
+                Ok(Ok(Some(path))) => {
+                    this.update(cx, |this, cx| {
+                        this.execute_table_export(session_id, table, path, cx)
+                    })?;
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("Could not open the save dialog: {error}"));
+                        cx.notify();
+                    })?;
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("Save dialog closed unexpectedly: {error}"));
+                        cx.notify();
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn execute_table_export(
+        &mut self,
+        session_id: SessionId,
+        table: TableInfo,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        if session.busy || !session.kind.is_sql() || table.kind != EntityKind::Table {
+            return;
+        }
+        let Some(engine) = session.engine.clone() else {
+            return;
+        };
+        let target = table_ref(&table);
+        let runtime = self.runtime.clone();
+        let destination = path.display().to_string();
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.busy = true;
+        session.error = None;
+        session.status = format!("Exporting {}…", table.name);
+        session.request_generation += 1;
+        let generation = session.request_generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move { export_table(&engine, &target, &path).await })
+                .await
+                .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
+            this.update(cx, |this, cx| {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                if generation != session.request_generation {
+                    return;
+                }
+                session.busy = false;
+                match result {
+                    Ok(summary) => {
+                        session.error = None;
+                        session.status = format!(
+                            "Exported {} row(s) to {}",
+                            summary.rows_exported, destination
+                        );
+                    }
+                    Err(error) => {
+                        session.error = Some(error.to_string());
+                        session.status = "Export failed".into();
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Pick a file to import into `table`. SQL dumps run against the whole
+    /// connection; CSV/TSV files append rows to the right-clicked table.
+    fn begin_table_import(
+        &mut self,
+        session_id: SessionId,
+        table: TableInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transfer_available_for(session_id, &table) {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Choose import file")),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            match receiver.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.update_in(cx, |this, window, cx| {
+                            this.confirm_table_import(session_id, table, path, window, cx);
+                        })?;
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("Could not open the file picker: {error}"));
+                        cx.notify();
+                    })?;
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("File picker closed unexpectedly: {error}"));
+                        cx.notify();
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn confirm_table_import(
+        &mut self,
+        session_id: SessionId,
+        table: TableInfo,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_format = match detect_file_format(&path) {
+            Ok(file_format) => file_format,
+            Err(error) => {
+                self.set_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let connection_name = self
+            .session(session_id)
+            .map(|session| session.name.clone())
+            .unwrap_or_default();
+        let qualified_name = table_sidebar_label(&table, None);
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (message, detail, confirmation) = match file_format.format {
+            dbx_core::DumpFormat::Sql => (
+                "Run this SQL dump?".to_owned(),
+                format!(
+                    "Every statement in ‘{file_name}’ will be executed against connection \
+                     ‘{connection_name}’. Review the file first if you did not create it."
+                ),
+                "Run dump",
+            ),
+            dbx_core::DumpFormat::Csv | dbx_core::DumpFormat::Tsv => (
+                format!("Append rows to {qualified_name}?"),
+                format!(
+                    "‘{file_name}’ ({}) will be inserted into {qualified_name}. Its first row \
+                     must contain column names that match the table.",
+                    file_format.format
+                ),
+                "Import data",
+            ),
+        };
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &message,
+            Some(&detail),
+            &[
+                PromptButton::cancel("Cancel"),
+                PromptButton::ok(confirmation),
+            ],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if matches!(receiver.await, Ok(1)) {
+                this.update(cx, |this, cx| {
+                    this.execute_table_import(session_id, table, path, cx)
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn execute_table_import(
+        &mut self,
+        session_id: SessionId,
+        table: TableInfo,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        if session.busy || !session.kind.is_sql() || table.kind != EntityKind::Table {
+            return;
+        }
+        let Some(engine) = session.engine.clone() else {
+            return;
+        };
+        let target = table_ref(&table);
+        let runtime = self.runtime.clone();
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let imported_table = target.clone();
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.busy = true;
+        session.error = None;
+        session.status = format!("Importing {}…", file_name);
+        session.request_generation += 1;
+        let generation = session.request_generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move { import_file(&engine, Some(&target), &path).await })
+                .await
+                .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
+            this.update(cx, |this, cx| {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                if generation != session.request_generation {
+                    return;
+                }
+                session.busy = false;
+                match result {
+                    Ok(report) => {
+                        session.error = None;
+                        // Reload the grid when the imported table is open so
+                        // new rows appear without a manual refresh.
+                        let imported_table_open =
+                            session.selected_table.as_ref() == Some(&imported_table);
+                        if imported_table_open {
+                            this.refresh_table_for(session_id, cx);
+                        }
+                        if let Some(session) = this.session_mut(session_id) {
+                            session.status = if report.statements_executed > 0 {
+                                format!(
+                                    "Ran {} statement(s) from {}",
+                                    report.statements_executed, file_name
+                                )
+                            } else {
+                                format!(
+                                    "Imported {} row(s) from {}",
+                                    report.rows_inserted, file_name
+                                )
+                            };
+                        }
+                    }
+                    Err(error) => {
+                        session.error = Some(error.to_string());
+                        session.status = "Import failed".into();
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     fn identity_filters_for(
         &self,
         session_id: SessionId,
@@ -4597,9 +4906,12 @@ impl DbxApp {
                 && session.engine.is_some()
                 && menu.table.kind == EntityKind::Table
         });
+        let transfer_enabled = destructive_enabled;
         let open_table = menu.table.clone();
         let open_structure = menu.table.clone();
         let refresh_table = menu.table.clone();
+        let export_table_item = menu.table.clone();
+        let import_table_item = menu.table.clone();
         let truncate_table = menu.table.clone();
         let drop_table = menu.table.clone();
         let session_id = menu.session_id;
@@ -4683,6 +4995,55 @@ impl DbxApp {
                                         window,
                                         cx,
                                     )
+                                })),
+                        )
+                        .child(div().my(px(4.)).border_t_1().border_color(THEME.border))
+                        .child(
+                            div()
+                                .id("context-export-table")
+                                .px(px(8.))
+                                .py(px(7.))
+                                .rounded(px(5.))
+                                .text_color(if transfer_enabled {
+                                    THEME.text
+                                } else {
+                                    THEME.text_muted
+                                })
+                                .when(transfer_enabled, |view| {
+                                    view.cursor_pointer()
+                                        .hover(|style| style.bg(THEME.accent_soft))
+                                })
+                                .child("Export data…")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if transfer_enabled {
+                                        let table = export_table_item.clone();
+                                        this.table_context_menu = None;
+                                        this.begin_table_export(session_id, table, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("context-import-table")
+                                .px(px(8.))
+                                .py(px(7.))
+                                .rounded(px(5.))
+                                .text_color(if transfer_enabled {
+                                    THEME.text
+                                } else {
+                                    THEME.text_muted
+                                })
+                                .when(transfer_enabled, |view| {
+                                    view.cursor_pointer()
+                                        .hover(|style| style.bg(THEME.accent_soft))
+                                })
+                                .child("Import data…")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if transfer_enabled {
+                                        let table = import_table_item.clone();
+                                        this.table_context_menu = None;
+                                        this.begin_table_import(session_id, table, window, cx);
+                                    }
                                 })),
                         )
                         .child(div().my(px(4.)).border_t_1().border_color(THEME.border))
@@ -6761,6 +7122,30 @@ fn table_ref_label(table: &TableRef) -> String {
     match &table.schema {
         Some(schema) => format!("{schema}.{}", table.name),
         None => table.name.clone(),
+    }
+}
+
+/// A filesystem-friendly base name for exported files, for example
+/// `public_orders` or `events`.
+fn export_file_stem(table: &TableInfo) -> String {
+    let raw = match &table.schema {
+        Some(schema) => format!("{schema}_{}", table.name),
+        None => table.name.clone(),
+    };
+    let sanitized: String = raw
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "table".to_owned()
+    } else {
+        sanitized
     }
 }
 

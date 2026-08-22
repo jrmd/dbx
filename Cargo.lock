@@ -1474,11 +1474,13 @@ name = "dbx-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "flate2",
  "futures-util",
  "redis",
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "url",
