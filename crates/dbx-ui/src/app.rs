@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     path::PathBuf,
     sync::Arc,
 };
@@ -49,6 +50,7 @@ gpui::actions!(
     dbx_ui,
     [
         RunQuery,
+        FormatQuery,
         RefreshData,
         CompletionUp,
         CompletionDown,
@@ -483,6 +485,7 @@ enum CompletionItemKind {
     Type,
     Table,
     Column,
+    Function,
 }
 
 impl CompletionItemKind {
@@ -492,6 +495,7 @@ impl CompletionItemKind {
             Self::Type => "type",
             Self::Table => "table",
             Self::Column => "column",
+            Self::Function => "function",
         }
     }
 
@@ -501,6 +505,7 @@ impl CompletionItemKind {
             Self::Type => gpui::rgb(0x89ddff),
             Self::Table => THEME.accent,
             Self::Column => THEME.success,
+            Self::Function => gpui::rgb(0xf78c6c),
         }
     }
 }
@@ -597,6 +602,10 @@ struct QueryTab {
     busy: bool,
     status: String,
     error: Option<String>,
+    /// The query text a failed run was executed against plus the byte range
+    /// its error message points at. Highlighting only paints while the editor
+    /// still holds that exact text, so any edit clears it.
+    error_highlight: Option<(String, Range<usize>)>,
     request_generation: u64,
     completion_signature: Option<String>,
     completion_dismissed_signature: Option<String>,
@@ -639,6 +648,7 @@ impl QueryTab {
             busy: false,
             status: "Ready to query".into(),
             error: None,
+            error_highlight: None,
             request_generation: 0,
             completion_signature: None,
             completion_dismissed_signature: None,
@@ -2523,19 +2533,23 @@ impl DbxApp {
     }
 
     fn run_query_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let Some((engine, tab_id, query, busy)) = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query_tab) = &tab.kind else {
-                return None;
-            };
-            Some((
-                session.engine.clone(),
-                tab_id,
-                query_tab.query_text.read(cx).trim().to_owned(),
-                query_tab.busy,
-            ))
-        }) else {
+        let Some((engine, tab_id, query, full_query, busy)) =
+            self.session(session_id).and_then(|session| {
+                let tab_id = session.active_secondary_tab?;
+                let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+                let SecondaryTabKind::Query(query_tab) = &tab.kind else {
+                    return None;
+                };
+                let full = query_tab.query_text.read(cx).clone();
+                Some((
+                    session.engine.clone(),
+                    tab_id,
+                    full.trim().to_owned(),
+                    full,
+                    query_tab.busy,
+                ))
+            })
+        else {
             return;
         };
         let Some(engine) = engine else {
@@ -2564,9 +2578,12 @@ impl DbxApp {
         query_tab.request_generation += 1;
         let generation = query_tab.request_generation;
         cx.notify();
+        // The executed statement moves into the blocking task; the original
+        // stays behind so failures can locate the offending token in it.
+        let executed_query = query.clone();
         cx.spawn(async move |this, cx| {
             let result = runtime
-                .spawn(async move { engine.query(&query, QueryOptions::default()).await })
+                .spawn(async move { engine.query(&executed_query, QueryOptions::default()).await })
                 .await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
@@ -2596,9 +2613,18 @@ impl DbxApp {
                         );
                         query_tab.set_result(Some(result), cx);
                         query_tab.error = None;
+                        query_tab.error_highlight = None;
                     }
                     Err(error) => {
-                        query_tab.error = Some(error.to_string());
+                        let message = error.to_string();
+                        // Positions reported against the trimmed statement
+                        // shift by the trimmed leading whitespace.
+                        let lead = full_query.len() - full_query.trim_start().len();
+                        query_tab.error_highlight =
+                            editor::sql_error_range(&message, &query).map(|range| {
+                                (full_query.clone(), range.start + lead..range.end + lead)
+                            });
+                        query_tab.error = Some(message);
                         query_tab.status = "Operation failed".into();
                     }
                 }
@@ -2611,6 +2637,59 @@ impl DbxApp {
 
     fn run_query_action(&mut self, _: &RunQuery, _: &mut Window, cx: &mut Context<Self>) {
         self.run_query(cx);
+    }
+
+    /// Pretty-print the active query tab's SQL in place, keeping the caret
+    /// anchored to the token it sat on. Redis tabs have nothing to format.
+    fn format_query_for(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query_editor) = self.session(session_id).and_then(|session| {
+            if !session.kind.is_sql() {
+                return None;
+            }
+            let tab_id = session.active_secondary_tab?;
+            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+            let SecondaryTabKind::Query(query) = &tab.kind else {
+                return None;
+            };
+            Some(query.query_editor.clone())
+        }) else {
+            return;
+        };
+
+        let (text, cursor, focus_handle) = query_editor.update(cx, |editor, cx| {
+            (
+                editor.text(cx),
+                editor.cursor_offset(),
+                editor.focus_handle(),
+            )
+        });
+        let (formatted, mapped_cursor) = editor::format_sql_at_cursor(&text, cursor);
+        if formatted != text {
+            let length = text.len();
+            query_editor.update(cx, |editor, cx| {
+                editor.replace_range(0..length, formatted.as_str(), cx);
+                editor.move_cursor_to(mapped_cursor, cx);
+            });
+        }
+        if let Some(session) = self.session_mut(session_id)
+            && let Some(tab_id) = session.active_secondary_tab
+            && let Some(tab) = session
+                .secondary_tabs
+                .iter_mut()
+                .find(|tab| tab.id == tab_id)
+            && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
+        {
+            query_tab.completion_signature = None;
+            query_tab.completion_dismissed_signature = None;
+            query_tab.completion_index = 0;
+        }
+        focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     fn refresh_tables_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
@@ -6808,14 +6887,20 @@ impl DbxApp {
                 .left(px(10.))
                 .right(px(10.))
                 .top(px(214.))
-                .max_h(px(270.))
+                .max_h(px(300.))
                 .p(px(5.))
                 .rounded(px(7.))
                 .border_1()
                 .border_color(THEME.border_strong)
                 .bg(THEME.panel_raised)
                 .text_size(px(12.))
-                .children(rows)
+                .child(
+                    div()
+                        .id("sql-completion-items")
+                        .max_h(px(252.))
+                        .overflow_y_scroll()
+                        .children(rows),
+                )
                 .child(
                     div()
                         .mt(px(4.))
@@ -6836,7 +6921,7 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((tab_id, query_editor, busy, has_result, result_grid)) =
+        let Some((tab_id, query_editor, busy, has_result, result_grid, sql_dialect)) =
             self.session(session_id).and_then(|session| {
                 let tab_id = session.active_secondary_tab?;
                 let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
@@ -6849,11 +6934,36 @@ impl DbxApp {
                     query.busy,
                     query.result.is_some(),
                     query.result_grid.clone(),
+                    session.kind.is_sql(),
                 ))
             })
         else {
             return div().into_any_element();
         };
+        // Paint failed-query underlines only while the text still matches the
+        // run that produced them; any edit silently clears highlighting.
+        if sql_dialect {
+            let highlight = self
+                .session(session_id)
+                .and_then(|session| {
+                    let tab_id = session.active_secondary_tab?;
+                    let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+                    let SecondaryTabKind::Query(query) = &tab.kind else {
+                        return None;
+                    };
+                    Some((
+                        query.error_highlight.clone(),
+                        query.query_text.read(cx).clone(),
+                    ))
+                })
+                .map(|(highlight, text)| match highlight {
+                    Some((snapshot, range)) if snapshot == text => vec![range],
+                    _ => Vec::new(),
+                });
+            if let Some(ranges) = highlight {
+                query_editor.update(cx, |editor, cx| editor.set_diagnostics(ranges, cx));
+            }
+        }
         let query_focus = query_editor.read(cx).focus_handle();
         let completion = query_focus
             .is_focused(window)
@@ -6902,6 +7012,9 @@ impl DbxApp {
                     cx,
                 );
             }))
+            .on_action(cx.listener(move |this, _: &FormatQuery, window, cx| {
+                this.format_query_for(session_id, window, cx);
+            }))
             .child(editor::sql_input(query_editor, query_focus, true));
         if let Some(completion_element) = completion_element {
             editor_panel = editor_panel.child(completion_element);
@@ -6935,15 +7048,30 @@ impl DbxApp {
                             ),
                     )
                     .child(
-                        button(
-                            "run-query",
-                            if busy { "Running…" } else { "Run  ⌘↵" },
-                            ButtonKind::Primary,
-                        )
-                        .cursor_pointer()
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.run_query_for(session_id, cx)),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(7.))
+                            .when(sql_dialect, |actions| {
+                                actions.child(
+                                    button("format-query", "Format", ButtonKind::Quiet)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.format_query_for(session_id, window, cx);
+                                        })),
+                                )
+                            })
+                            .child(
+                                button(
+                                    "run-query",
+                                    if busy { "Running…" } else { "Run  ⌘↵" },
+                                    ButtonKind::Primary,
+                                )
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.run_query_for(session_id, cx),
+                                )),
+                            ),
                     ),
             )
             .child(editor_panel)
@@ -7149,7 +7277,7 @@ fn export_file_stem(table: &TableInfo) -> String {
     }
 }
 
-const MAX_SQL_COMPLETIONS: usize = 10;
+const MAX_SQL_COMPLETIONS: usize = 14;
 
 fn sql_completion_items(
     query_text: &str,
@@ -7173,15 +7301,16 @@ fn sql_completion_items(
     let mut seen = HashSet::new();
 
     let mut push = |item: SqlCompletionItem| {
-        let matches_prefix = prefix.is_empty()
-            || item
-                .search_text
-                .to_ascii_lowercase()
-                .split_whitespace()
-                .any(|candidate| candidate.starts_with(prefix.as_str()));
+        // Insertion order doubles as context priority: candidates pushed
+        // earlier come from tighter scopes (visible sources before fallback
+        // tables, for example).
+        let order = items.len();
+        let score = completion_match_score(&item.search_text, &prefix);
         let key = item.insert_text.to_ascii_lowercase();
-        if matches_prefix && seen.insert(key) {
-            items.push(item);
+        if let Some(score) = score
+            && seen.insert(key)
+        {
+            items.push((score, order, item));
         }
     };
 
@@ -7191,6 +7320,7 @@ fn sql_completion_items(
             if sql_is_create_table_columns(query_text, cursor) {
                 push_sql_types(&mut push);
             }
+            push_sql_functions(&mut push);
         }
         SqlCompletionArea::Type => push_sql_types(&mut push),
         SqlCompletionArea::Table => {
@@ -7311,20 +7441,45 @@ fn sql_completion_items(
                     );
                 }
             }
+
+            // Functions rank below real schema columns: after a qualifier dot
+            // they make no sense at all.
+            if context.qualifier.is_none() {
+                push_sql_functions(&mut push);
+            }
         }
     }
 
-    items.sort_by(|left, right| {
-        let left_exact = left.label.eq_ignore_ascii_case(&prefix);
-        let right_exact = right.label.eq_ignore_ascii_case(&prefix);
-        right_exact.cmp(&left_exact).then_with(|| {
-            left.label
-                .to_ascii_lowercase()
-                .cmp(&right.label.to_ascii_lowercase())
-        })
-    });
+    items.sort_by_key(|(score, order, _)| (*score, *order));
     items.truncate(MAX_SQL_COMPLETIONS);
-    items
+    items.into_iter().map(|(_, _, item)| item).collect()
+}
+
+/// Relevance rank for a completion candidate against the typed prefix. Lower
+/// sorts first; `None` drops the candidate entirely.
+///
+/// 0 exact word, 1 candidate starts with the prefix, 2 any whitespace word in
+/// the search text starts with it (so `analytics.users users` still matches on
+/// its bare name), 3 substring hit (`mail` finds `email`), 4 untyped — used
+/// for an empty prefix where source order alone decides.
+fn completion_match_score(search_text: &str, prefix: &str) -> Option<u8> {
+    if prefix.is_empty() {
+        return Some(4);
+    }
+    let lowered = search_text.to_ascii_lowercase();
+    if lowered == prefix {
+        return Some(0);
+    }
+    if lowered.starts_with(prefix) {
+        return Some(1);
+    }
+    if lowered
+        .split_whitespace()
+        .any(|word| word.starts_with(prefix))
+    {
+        return Some(2);
+    }
+    lowered.contains(prefix).then_some(3)
 }
 
 fn infer_sql_query_index(
@@ -8208,6 +8363,26 @@ fn push_sql_types(push: &mut impl FnMut(SqlCompletionItem)) {
             detail: "SQL type".into(),
             search_text: (*sql_type).into(),
             kind: CompletionItemKind::Type,
+        });
+    }
+}
+
+/// Offer DBX's cross-engine function vocabulary. Value-style constants keep
+/// their bare form; everything else inserts an open paren ready for arguments.
+fn push_sql_functions(push: &mut impl FnMut(SqlCompletionItem)) {
+    const BARE_FORMS: &[&str] = &["CURRENT_DATE", "CURRENT_TIMESTAMP"];
+    for function in editor::sql_completion_functions() {
+        let insert_text = if BARE_FORMS.contains(function) {
+            (*function).to_owned()
+        } else {
+            format!("{function}(")
+        };
+        push(SqlCompletionItem {
+            label: (*function).into(),
+            insert_text,
+            detail: "function".into(),
+            search_text: (*function).into(),
+            kind: CompletionItemKind::Function,
         });
     }
 }

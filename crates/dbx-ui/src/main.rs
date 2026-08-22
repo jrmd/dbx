@@ -31,6 +31,16 @@ fn main() {
                 KeyBinding::new("ctrl-enter", app::RunQuery, None),
                 KeyBinding::new("cmd-r", app::RefreshData, None),
                 KeyBinding::new("ctrl-r", app::RefreshData, None),
+                KeyBinding::new(
+                    "shift-cmd-f",
+                    app::FormatQuery,
+                    Some(editor::SQL_EDITOR_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "ctrl-shift-f",
+                    app::FormatQuery,
+                    Some(editor::SQL_EDITOR_CONTEXT),
+                ),
                 KeyBinding::new("up", app::CompletionUp, Some(editor::SQL_EDITOR_CONTEXT)),
                 KeyBinding::new(
                     "down",
