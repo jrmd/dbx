@@ -457,6 +457,728 @@ pub fn sql_completion_types() -> &'static [&'static str] {
     SQL_TYPES
 }
 
+/// The common built-in function vocabulary used for completion.
+pub fn sql_completion_functions() -> &'static [&'static str] {
+    SQL_FUNCTIONS
+}
+
+/// Locate the part of `query` that a database error message is most likely
+/// pointing at.
+///
+/// Drivers surface the same failure in dialect-specific prose, so this uses a
+/// chain of tolerant strategies instead of one strict grammar:
+///
+/// 1. PostgreSQL's trailing `POSITION: n` marker.
+/// 2. A quoted token after `near` / `at or near` (PostgreSQL syntax errors,
+///    SQLite `near "x": syntax error`).
+/// 3. MySQL's `near 'fragment' at line n`, matching the longest exact prefix
+///    of the fragment because MySQL quotes the *remainder* of the statement.
+/// 4. Missing-column phrasings (`column "x" does not exist`,
+///    `Unknown column 'x'`).
+///
+/// Returns a UTF-8 byte range into `query`, expanded to whole identifier
+/// boundaries, or `None` when nothing in the message can be located. The
+/// result is advisory: it only drives an underline in the query editor.
+pub fn sql_error_range(message: &str, query: &str) -> Option<Range<usize>> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let lowered = message.to_ascii_lowercase();
+
+    if let Some(range) = sql_error_position_range(&lowered, query) {
+        return Some(range);
+    }
+    if let Some(needle) = quoted_after(&lowered, &["at or near", "near"]) {
+        if let Some(range) = find_word_in_query(query, &needle) {
+            return Some(range);
+        }
+        // MySQL quotes the remaining text rather than the offending token;
+        // its first word usually is that token.
+        if let Some(first) = needle.split_whitespace().next()
+            && first.len() >= 2
+            && let Some(range) = find_word_in_query(query, first)
+        {
+            return Some(range);
+        }
+    }
+    if let Some(needle) = missing_column_name(&lowered)
+        && let Some(range) = find_word_in_query(query, &needle)
+    {
+        return Some(range);
+    }
+    // Last resort: any quoted identifier-ish snippet that actually appears
+    // in the query (`relation "x" does not exist`, duplicate-key values,
+    // driver-specific phrasings).
+    for needle in quoted_snippets(&lowered) {
+        if let Some(range) = find_word_in_query(query, &needle) {
+            return Some(range);
+        }
+    }
+    None
+}
+
+/// Every `"…"` / `'…'` snippet in a lowercased message that plausibly names a
+/// database object (letters, digits, `_ $ .` only).
+fn quoted_snippets(lowered_message: &str) -> Vec<String> {
+    let mut snippets = Vec::new();
+    let bytes = lowered_message.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !matches!(bytes[index], b'"' | b'\'') {
+            index += 1;
+            continue;
+        }
+        let quote = bytes[index];
+        let Some(close) = lowered_message[index + 1..].find(quote as char) else {
+            break;
+        };
+        let inner = &lowered_message[index + 1..index + 1 + close];
+        if !inner.is_empty()
+            && inner.chars().all(|character| {
+                character.is_alphanumeric() || matches!(character, '_' | '$' | '.')
+            })
+        {
+            snippets.push(inner.to_owned());
+        }
+        index += inner.len() + 2;
+    }
+    snippets
+}
+
+fn sql_error_position_range(lowered_message: &str, query: &str) -> Option<Range<usize>> {
+    let marker = lowered_message.find("position")?;
+    let digits = lowered_message[marker + "position".len()..]
+        .chars()
+        .skip_while(|character| !character.is_ascii_digit())
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    // PostgreSQL positions are 1-based character offsets.
+    let position: usize = digits.parse().ok()?;
+    let position = position.checked_sub(1)?;
+    let offset = clamp_boundary(
+        query,
+        query
+            .char_indices()
+            .nth(position)
+            .map_or(query.len(), |(offset, _)| offset),
+    );
+    expand_to_identifier(query, offset)
+}
+fn quoted_after(lowered_message: &str, markers: &[&str]) -> Option<String> {
+    let quote = ['"', '\''];
+    for marker in markers {
+        let Some(start) = lowered_message.find(marker) else {
+            continue;
+        };
+        let tail = &lowered_message[start + marker.len()..];
+        let quote_index = tail.find(quote)?;
+        let open = tail[quote_index..].chars().next()?;
+        let rest = &tail[quote_index + open.len_utf8()..];
+        let end = rest.find(open)?;
+        let inner = rest[..end].trim();
+        // Skip empty and degenerate quotes; they carry no location signal.
+        if !inner.is_empty()
+            && inner.chars().all(|character| {
+                character.is_alphanumeric()
+                    || character == '_'
+                    || character == '$'
+                    || character == '.'
+                    || character == ' '
+            })
+        {
+            return Some(inner.to_owned());
+        }
+        return None;
+    }
+    None
+}
+
+fn missing_column_name(lowered_message: &str) -> Option<String> {
+    for (marker, terminator) in [
+        ("column \"", '"'),
+        ("unknown column '", '\''),
+        ("column '", '\''),
+        ("no such column: ", ' '),
+    ] {
+        let Some(start) = lowered_message.find(marker) else {
+            continue;
+        };
+        let rest = &lowered_message[start + marker.len()..];
+        let end = rest
+            .find(terminator)
+            .unwrap_or_else(|| rest.find(['\n', ',']).unwrap_or(rest.len()));
+        let name = rest[..end].trim();
+        let name = name.rsplit('.').next().unwrap_or(name);
+        if !name.is_empty() {
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+/// Case-insensitively locate `needle` as a standalone word inside `query` and
+/// return its range expanded to full identifier boundaries.
+fn find_word_in_query(query: &str, needle: &str) -> Option<Range<usize>> {
+    let lowered = query.to_ascii_lowercase();
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return None;
+    }
+    let mut search_from = 0;
+    while let Some(found) = lowered[search_from..].find(needle) {
+        let start = search_from + found;
+        let end = start + needle.len();
+        let bounded_before = lowered[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_identifier_continue(character));
+        let bounded_after = lowered[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !is_identifier_continue(character));
+        if bounded_before && bounded_after {
+            return expand_to_identifier(query, start);
+        }
+        search_from = start + needle.len().max(1);
+        if search_from >= lowered.len() {
+            break;
+        }
+    }
+    // Fall back to any occurrence when the word never appears standalone
+    // (for example `users.id` reported as `id`).
+    lowered
+        .find(needle)
+        .and_then(|start| expand_to_identifier(query, start))
+}
+
+/// Expand the offset to full identifier boundaries. Returns `None` when the
+/// offset does not sit inside an identifier-like run.
+fn expand_to_identifier(text: &str, at: usize) -> Option<Range<usize>> {
+    let at = clamp_boundary(text, at);
+    let start = text[..at]
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_identifier_continue(*character))
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(at);
+    let end = text[at..]
+        .char_indices()
+        .take_while(|(_, character)| is_identifier_continue(*character))
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    (end > 0).then_some(start..at + end)
+}
+
+/// Format a SQL string with DBX's tolerant pretty-printer.
+///
+/// The formatter is token-driven on top of [`lex_sql`], so it is safe on
+/// incomplete statements and never rewrites strings, comments, parameters, or
+/// identifier casing. It uppercases keywords and types, breaks major clauses
+/// onto indented lines, puts top-level projection/VALUES list items on their
+/// own lines, and separates statements with a blank line.
+pub fn format_sql(text: &str) -> String {
+    SqlFormatter::new(text).run()
+}
+
+/// Format `text` and map `cursor` to the equivalent offset in the output.
+///
+/// The formatter preserves every token exactly once and in order, so offsets
+/// are remapped by aligning the two lexings instead of diffing strings.
+pub fn format_sql_at_cursor(text: &str, cursor: usize) -> (String, usize) {
+    let formatted = format_sql(text);
+    let old_tokens = lex_sql(text);
+    let new_tokens = lex_sql(&formatted);
+    let cursor = clamp_boundary(text, cursor);
+
+    let mapped = match old_tokens
+        .iter()
+        .position(|token| token.range.start <= cursor && cursor <= token.range.end)
+    {
+        Some(index) => {
+            let delta = cursor - old_tokens[index].range.start;
+            new_tokens
+                .get(index)
+                .map(|token| token.range.start + delta.min(token.range.len()))
+        }
+        None => old_tokens
+            .iter()
+            .position(|token| token.range.start >= cursor)
+            .and_then(|index| new_tokens.get(index))
+            .map(|token| token.range.start),
+    }
+    .unwrap_or(formatted.len());
+    let mapped = clamp_boundary(&formatted, mapped);
+
+    (formatted, mapped)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AtomKind<'a> {
+    Token(SqlTokenKind),
+    /// A punctuation atom. Grouping characters (`(` `)` `,` `;` `.`) stand
+    /// alone; every other punctuation run merges into one operator slice so
+    /// `::`, `<=`, and `||` survive formatting intact.
+    Punct(&'a str),
+}
+
+enum ClauseBreak {
+    /// Break onto a new line at the enclosing indent.
+    Clause,
+    /// Break with one extra indent level (AND/OR predicates).
+    Predicate,
+}
+
+/// Split the whitespace-only gap between tokens into punctuation atoms,
+/// keeping operator runs together.
+fn push_gap_atoms<'a>(atoms: &mut Vec<(AtomKind<'a>, &'a str)>, gap: &'a str) {
+    const GROUPING: [char; 5] = ['(', ')', ',', ';', '.'];
+    let mut iter = gap.char_indices().peekable();
+    while let Some((start, character)) = iter.next() {
+        if character.is_whitespace() {
+            continue;
+        }
+        if GROUPING.contains(&character) {
+            atoms.push((
+                AtomKind::Punct(&gap[start..start + character.len_utf8()]),
+                "",
+            ));
+            continue;
+        }
+        let mut end = start + character.len_utf8();
+        while let Some(&(next, more)) = iter.peek() {
+            if more.is_whitespace() || GROUPING.contains(&more) {
+                break;
+            }
+            end = next + more.len_utf8();
+            iter.next();
+        }
+        atoms.push((AtomKind::Punct(&gap[start..end]), ""));
+    }
+}
+
+struct SqlFormatter<'a> {
+    atoms: Vec<(AtomKind<'a>, &'a str)>,
+    out: String,
+    line: String,
+    /// One entry per unclosed parenthesis; `true` marks a subquery body
+    /// (an opening paren directly followed by SELECT/WITH). Raw length
+    /// drives comma breaking, the `true` count drives indentation.
+    parens: Vec<bool>,
+    /// Raw paren depth of the most recent clause keyword; top-level commas
+    /// break onto new lines at this depth.
+    clause_depth: usize,
+    /// Set while a JOIN phrase (LEFT OUTER JOIN…) is being emitted so later
+    /// modifiers do not each force another line break.
+    join_phrase_open: bool,
+    /// Extra indent units owed to the line currently being built (AND/OR
+    /// predicates sit one level deeper than their clause keyword).
+    line_extra: usize,
+    /// Subquery indent units captured when the current line started. A
+    /// closing paren may appear later on the same line, so indentation must
+    /// not be recomputed at flush time.
+    line_base: usize,
+    pending_blank_line: bool,
+}
+
+impl<'a> SqlFormatter<'a> {
+    fn new(text: &'a str) -> Self {
+        let mut atoms = Vec::new();
+        let mut previous_end = 0;
+        for token in lex_sql(text) {
+            push_gap_atoms(&mut atoms, &text[previous_end..token.range.start]);
+            atoms.push((AtomKind::Token(token.kind), &text[token.range.clone()]));
+            previous_end = token.range.end;
+        }
+        push_gap_atoms(&mut atoms, &text[previous_end..]);
+
+        Self {
+            atoms,
+            out: String::with_capacity(text.len() + 32),
+            line: String::new(),
+            parens: Vec::new(),
+            clause_depth: 0,
+            join_phrase_open: false,
+            line_extra: 0,
+            line_base: 0,
+            pending_blank_line: false,
+        }
+    }
+
+    fn raw_depth(&self) -> usize {
+        self.parens.len()
+    }
+
+    /// Indent units contributed by enclosing subqueries.
+    fn subquery_depth(&self) -> usize {
+        self.parens.iter().filter(|open| **open).count()
+    }
+
+    fn flush(&mut self) {
+        let has_content = !self.line.trim().is_empty();
+        if has_content {
+            if self.pending_blank_line {
+                self.out.push('\n');
+                self.pending_blank_line = false;
+            }
+            for _ in 0..self.line_base + self.line_extra {
+                self.out.push_str("  ");
+            }
+            self.out.push_str(self.line.trim_end());
+            self.out.push('\n');
+        }
+        self.line.clear();
+        // Whatever comes next starts at the indentation live right now.
+        // Empty flushes still refresh this: a carried `(` or a comment can
+        // clear the line without going through a real break.
+        self.line_base = self.subquery_depth();
+        self.line_extra = 0;
+    }
+
+    fn previous_atom(&self, index: usize) -> Option<AtomKind<'_>> {
+        self.atoms.get(index.wrapping_sub(1)).map(|(kind, _)| *kind)
+    }
+
+    /// Decide whether the keyword at `index` forces a line break and how deep
+    /// that line sits. Returns the extra indent units, if any.
+    fn break_before(
+        &mut self,
+        lower: &str,
+        index: usize,
+        case_stack: &mut Vec<usize>,
+    ) -> Option<usize> {
+        if lower == "case" {
+            // CASE stays glued to its clause (`SELECT CASE …`, `sum(case
+            // …)`); only its WHEN/ELSE/END arms break, so just track nesting.
+            case_stack.push(self.raw_depth());
+            return None;
+        }
+
+        if let Some(clause) = clause_break_kind(lower) {
+            if let ClauseBreak::Predicate = clause {
+                self.join_phrase_open = false;
+                return Some(1);
+            }
+            if is_join_modifier(lower) || lower == "join" {
+                // JOIN phrases occupy a single line; later modifiers continue
+                // it. Words like LEFT/RIGHT only break when they really head
+                // a join, never when they are function calls.
+                if !join_word_starts_phrase(&self.atoms, index) {
+                    return None;
+                }
+                let brk = (!self.join_phrase_open).then_some(0);
+                self.join_phrase_open = true;
+                return brk;
+            }
+            // REPLACE doubles as a statement starter and a common string
+            // function; a following open paren means the function call.
+            if lower == "replace" && followed_by_open_paren(&self.atoms, index) {
+                return None;
+            }
+            self.join_phrase_open = false;
+            return Some(0);
+        }
+
+        self.join_phrase_open = false;
+        let case_top = case_stack.last().copied();
+        let at_clause_level = self.raw_depth() == self.clause_depth;
+        match lower {
+            "when" | "else"
+                if case_top.is_some_and(|depth| depth == self.raw_depth()) && at_clause_level =>
+            {
+                Some(1)
+            }
+            "end" if case_top.is_some_and(|depth| depth == self.raw_depth()) => {
+                case_stack.pop();
+                at_clause_level.then_some(0)
+            }
+            _ => None,
+        }
+    }
+
+    fn run(mut self) -> String {
+        let mut case_stack: Vec<usize> = Vec::new();
+        let mut index = 0;
+        while index < self.atoms.len() {
+            let (kind, raw) = self.atoms[index];
+            match kind {
+                AtomKind::Token(kind) => {
+                    let lower = raw.to_ascii_lowercase();
+                    let is_keyword = matches!(kind, SqlTokenKind::Keyword | SqlTokenKind::Type);
+
+                    if is_keyword
+                        && let Some(extra) = self.break_before(&lower, index, &mut case_stack)
+                    {
+                        // A paren already appended to this line belongs to
+                        // the clause that follows (`FROM (`), so carry it.
+                        let mut carried_open = false;
+                        if self.line.trim_end().ends_with('(') {
+                            while self.line.ends_with(char::is_whitespace) {
+                                self.line.pop();
+                            }
+                            self.line.pop();
+                            while self.line.ends_with(' ') {
+                                self.line.pop();
+                            }
+                            carried_open = true;
+                        }
+                        // The line being built keeps its own indent; the
+                        // break's extra indent belongs to the next line.
+                        self.flush();
+                        self.line_extra = extra;
+                        self.clause_depth = self.raw_depth();
+                        if carried_open {
+                            self.line.push('(');
+                        }
+                    }
+
+                    // Spacing against whatever is already on the line.
+                    // Operators and closing punctuation manage their own
+                    // trailing spaces, so only genuinely missing gaps are
+                    // filled here.
+                    if !self.line.is_empty() {
+                        let glued = match self.previous_atom(index) {
+                            Some(AtomKind::Punct(open))
+                                if open == "(" || open == "." || open.ends_with(':') =>
+                            {
+                                true
+                            }
+                            _ => self.line.ends_with(' '),
+                        };
+                        if !glued {
+                            self.line.push(' ');
+                        }
+                    }
+                    let word = if is_keyword {
+                        raw.to_ascii_uppercase()
+                    } else {
+                        raw.to_owned()
+                    };
+                    self.line.push_str(&word);
+
+                    if kind == SqlTokenKind::Comment && raw.starts_with("--") {
+                        self.flush();
+                    }
+                }
+                AtomKind::Punct("(") => {
+                    // A paren opened directly before SELECT/WITH begins a
+                    // subquery body: mark it now so the body's lines indent.
+                    let opens_subquery = matches!(
+                        self.atoms.get(index + 1),
+                        Some((AtomKind::Token(_), raw))
+                            if raw.eq_ignore_ascii_case("select")
+                                || raw.eq_ignore_ascii_case("with")
+                    );
+                    if !self.line.is_empty() {
+                        let glued = match self.previous_atom(index) {
+                            Some(AtomKind::Punct(open)) => open == "(" || open == ".",
+                            Some(AtomKind::Token(
+                                SqlTokenKind::Identifier | SqlTokenKind::Parameter,
+                            )) => true,
+                            _ => false,
+                        };
+                        if !glued {
+                            self.line.push(' ');
+                        }
+                    }
+                    self.line.push('(');
+                    self.parens.push(opens_subquery);
+                }
+                AtomKind::Punct(")") => {
+                    self.parens.pop();
+                    self.clause_depth = self.clause_depth.min(self.raw_depth());
+                    while self.line.ends_with(' ') {
+                        self.line.pop();
+                    }
+                    self.line.push(')');
+                }
+                AtomKind::Punct(",") => {
+                    while self.line.ends_with(' ') {
+                        self.line.pop();
+                    }
+                    self.line.push(',');
+                    if self.raw_depth() <= self.clause_depth {
+                        self.flush();
+                        self.line_extra = 0;
+                    }
+                }
+                AtomKind::Punct(";") => {
+                    while self.line.ends_with(' ') {
+                        self.line.pop();
+                    }
+                    self.line.push(';');
+                    self.flush();
+                    self.line_extra = 0;
+                    self.parens.clear();
+                    self.clause_depth = 0;
+                    self.join_phrase_open = false;
+                    self.pending_blank_line = true;
+                }
+                AtomKind::Punct(".") => {
+                    while self.line.ends_with(' ') {
+                        self.line.pop();
+                    }
+                    self.line.push('.');
+                }
+                AtomKind::Punct(operator) => {
+                    self.append_operator(index, operator);
+                }
+            }
+            index += 1;
+        }
+        self.flush();
+        self.out.trim_end().to_owned()
+    }
+
+    /// Append an operator atom with even spacing, gluing against grouping
+    /// punctuation and unary signs (`-5`, `count(*)`, `(a)::text`).
+    fn append_operator(&mut self, index: usize, operator: &str) {
+        let previous = self.previous_atom(index).and_then(|kind| match kind {
+            AtomKind::Punct(text) => Some(text),
+            AtomKind::Token(_) => None,
+        });
+        // `None`: the next atom is a word token rather than punctuation.
+        let next = self.atoms.get(index + 1).and_then(|(kind, _)| match kind {
+            AtomKind::Punct(text) => Some(Some(*text)),
+            AtomKind::Token(_) => None,
+        });
+
+        let unary = (operator == "-" || operator == "+")
+            && operator.len() == 1
+            && matches!(
+                previous,
+                None | Some("(" | "," | "=" | "<" | ">" | "!" | "*" | "/" | "-" | "+" | "::")
+            );
+        // PostgreSQL casts glue on both sides: `a.x::text`.
+        let cast = operator == "::";
+        let glue_before =
+            unary || cast || previous.is_some_and(|previous| previous == "(" || previous == ".");
+        let glue_after =
+            unary || cast || next.is_some_and(|next| matches!(next, Some(")" | "," | ";" | ".")));
+
+        if !glue_before && !self.line.is_empty() && !self.line.ends_with(' ') {
+            self.line.push(' ');
+        }
+        self.line.push_str(operator);
+        if !glue_after {
+            self.line.push(' ');
+        }
+    }
+}
+
+/// Whether the next significant atom after `index` is an open paren, which
+/// distinguishes function-call keywords (`REPLACE(…)`) from statement
+/// starters.
+fn followed_by_open_paren(atoms: &[(AtomKind<'_>, &str)], index: usize) -> bool {
+    for atom in &atoms[index + 1..] {
+        match atom {
+            (AtomKind::Punct("("), _) => return true,
+            (AtomKind::Punct(_), _) => continue,
+            (AtomKind::Token(_), _) => return false,
+        }
+    }
+    false
+}
+
+/// True when the keyword at `index` participates in a JOIN phrase that should
+/// occupy one line: either `JOIN` itself or a modifier whose next word token
+/// leads to `JOIN` (so `LEFT(name, 3)` stays a function call).
+fn join_word_starts_phrase(atoms: &[(AtomKind, &str)], index: usize) -> bool {
+    let word = |atom: &(AtomKind, &str)| match atom {
+        (AtomKind::Token(_), raw) => Some(raw.to_ascii_lowercase()),
+        (AtomKind::Punct(_), _) => None,
+    };
+    let Some(current) = word(&atoms[index]) else {
+        return false;
+    };
+    if current == "join" {
+        return true;
+    }
+    let mut ahead = index + 1;
+    while ahead < atoms.len() {
+        match &atoms[ahead] {
+            (AtomKind::Punct(_), _) => ahead += 1,
+            (AtomKind::Token(_), raw) => {
+                let candidate = raw.to_ascii_lowercase();
+                if candidate == "join" {
+                    return true;
+                }
+                if is_join_modifier(&candidate) {
+                    ahead += 1;
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    false
+}
+
+fn is_join_modifier(word: &str) -> bool {
+    matches!(
+        word,
+        "inner" | "outer" | "left" | "right" | "full" | "cross" | "natural"
+    )
+}
+
+fn clause_break_kind(word: &str) -> Option<ClauseBreak> {
+    match word {
+        "select" | "from" | "where" | "group" | "order" | "having" | "limit" | "offset"
+        | "returning" | "set" | "values" | "window" | "union" | "except" | "intersect"
+        | "insert" | "update" | "delete" | "create" | "alter" | "drop" | "truncate" | "begin"
+        | "commit" | "rollback" | "with" | "explain" | "pragma" | "vacuum" | "replace" | "on"
+        | "join" | "inner" | "outer" | "left" | "right" | "full" | "cross" | "natural" => {
+            Some(ClauseBreak::Clause)
+        }
+        "and" | "or" => Some(ClauseBreak::Predicate),
+        _ => None,
+    }
+}
+
+const SQL_FUNCTIONS: &[&str] = &[
+    "ABS",
+    "AVG",
+    "CEIL",
+    "CHAR_LENGTH",
+    "COALESCE",
+    "CONCAT",
+    "COUNT",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
+    "DATE_TRUNC",
+    "EXTRACT",
+    "FLOOR",
+    "GREATEST",
+    "GROUP_CONCAT",
+    "IFNULL",
+    "LEAST",
+    "LENGTH",
+    "LOWER",
+    "LPAD",
+    "LTRIM",
+    "MAX",
+    "MIN",
+    "MOD",
+    "NOW",
+    "NULLIF",
+    "POWER",
+    "RANDOM",
+    "REPLACE",
+    "ROUND",
+    "RPAD",
+    "RTRIM",
+    "STRING_AGG",
+    "SUBSTR",
+    "SUBSTRING",
+    "SUM",
+    "TO_CHAR",
+    "TO_TIMESTAMP",
+    "TRIM",
+    "UPPER",
+];
+
 fn completion_identifier_start(text: &str, cursor: usize) -> usize {
     let cursor = clamp_boundary(text, cursor);
     text[..cursor]
@@ -583,6 +1305,10 @@ pub struct TextEditor {
     password: bool,
     /// UTF-8 byte ranges at grapheme boundaries.
     selected_range: Range<usize>,
+    /// UTF-8 byte ranges painted with a wavy error underline. The SQL shell
+    /// derives these from failed-query messages; they are advisory paint only
+    /// and never participate in selection or input handling.
+    diagnostics: Vec<Range<usize>>,
     selection_reversed: bool,
     /// The currently composing IME text, as a UTF-8 byte range.
     marked_range: Option<Range<usize>>,
@@ -645,6 +1371,7 @@ impl TextEditor {
             language,
             password: false,
             selected_range: 0..0,
+            diagnostics: Vec::new(),
             selection_reversed: false,
             marked_range: None,
             scroll_handle: ScrollHandle::new(),
@@ -749,6 +1476,23 @@ impl TextEditor {
         cx: &mut Context<Self>,
     ) {
         self.replace(range, inserted.as_ref(), cx);
+    }
+
+    /// Replace the error ranges painted with a wavy underline. Ranges are
+    /// UTF-8 byte offsets into the current value; passing an empty vector
+    /// clears highlighting. No-ops when the set is unchanged so callers can
+    /// invoke this every render frame without invalidating the window.
+    pub fn set_diagnostics(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        if self.diagnostics == ranges {
+            return;
+        }
+        self.diagnostics = clamp_ranges(&self.text(cx), ranges);
+        cx.notify();
+    }
+
+    /// Move the caret to a UTF-8 byte offset, collapsing any selection.
+    pub fn move_cursor_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.move_to(offset, cx);
     }
 
     fn cursor_offset_internal(&self) -> usize {
@@ -1404,6 +2148,7 @@ impl Element for TextEditorText {
                 editor.language,
                 sql_tokens.as_deref().unwrap_or(&[]),
                 marked_range.as_ref(),
+                &editor.diagnostics,
             );
             lines.push(window.text_system().shape_line(
                 painted_line.to_owned().into(),
@@ -1804,13 +2549,15 @@ fn editor_text_runs(
     language: EditorLanguage,
     tokens: &[SqlToken],
     marked_range: Option<&Range<usize>>,
+    diagnostics: &[Range<usize>],
 ) -> Vec<TextRun> {
     let base = style.to_run(line.len());
     let runs = match language {
         EditorLanguage::PlainText => vec![base],
         EditorLanguage::Sql => sql_runs(line, line_start, tokens, &base),
     };
-    apply_marked_runs(line.len(), line_start, marked_range, runs)
+    let runs = apply_marked_runs(line.len(), line_start, marked_range, runs);
+    apply_diagnostic_runs(line.len(), line_start, diagnostics, runs)
 }
 
 fn sql_runs(line: &str, line_start: usize, tokens: &[SqlToken], base: &TextRun) -> Vec<TextRun> {
@@ -1903,6 +2650,57 @@ fn apply_marked_runs(
         offset = run_end;
     }
     result
+}
+
+/// Split runs so every diagnostic range on this line carries a wavy error
+/// underline. Applied after IME marking so a composing range keeps its own
+/// treatment while the diagnostic underline remains visible underneath.
+fn apply_diagnostic_runs(
+    line_len: usize,
+    line_start: usize,
+    diagnostics: &[Range<usize>],
+    mut runs: Vec<TextRun>,
+) -> Vec<TextRun> {
+    for range in diagnostics {
+        let Some(range) = marked_slice(line_len, line_start, range) else {
+            continue;
+        };
+        let mut result = Vec::with_capacity(runs.len() + 2);
+        let mut offset = 0;
+        for run in runs.drain(..) {
+            let run_start = offset;
+            let run_end = offset + run.len;
+            let start = range.start.max(run_start).min(run_end);
+            let end = range.end.max(run_start).min(run_end);
+
+            if start > run_start {
+                result.push(TextRun {
+                    len: start - run_start,
+                    ..run.clone()
+                });
+            }
+            if end > start {
+                result.push(TextRun {
+                    len: end - start,
+                    underline: Some(UnderlineStyle {
+                        color: Some(THEME.danger.into()),
+                        thickness: px(1.),
+                        wavy: true,
+                    }),
+                    ..run.clone()
+                });
+            }
+            if run_end > end {
+                result.push(TextRun {
+                    len: run_end - end,
+                    ..run
+                });
+            }
+            offset = run_end;
+        }
+        runs = result;
+    }
+    runs
 }
 
 fn sql_token_color(kind: SqlTokenKind) -> gpui::Hsla {
@@ -2307,6 +3105,14 @@ fn clamp_boundary(text: &str, mut offset: usize) -> usize {
 
 fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
     clamp_boundary(text, range.start)..clamp_boundary(text, range.end)
+}
+
+fn clamp_ranges(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges
+        .into_iter()
+        .map(|range| clamp_range(text, range))
+        .filter(|range| !range.is_empty())
+        .collect()
 }
 
 fn previous_boundary(text: &str, offset: usize) -> usize {
@@ -2831,5 +3637,129 @@ mod tests {
     fn completion_context_ignores_strings_and_comments() {
         assert!(sql_completion_context("SELECT 'users", "SELECT 'users".len()).is_none());
         assert!(sql_completion_context("SELECT 1 -- users", "SELECT 1 -- users".len()).is_none());
+    }
+
+    #[test]
+    fn formatter_breaks_clauses_and_uppercases_keywords() {
+        let formatted =
+            format_sql("select id, name from users where id = 1 order by id desc limit 5;");
+        assert_eq!(
+            formatted,
+            "SELECT id,\nname\nFROM users\nWHERE id = 1\nORDER BY id DESC\nLIMIT 5;"
+        );
+    }
+
+    #[test]
+    fn formatter_keeps_function_calls_and_operators_tight() {
+        let formatted = format_sql("select count(*), coalesce(a.b, 0) as total, a.x::text from t");
+        assert_eq!(
+            formatted,
+            "SELECT count(*),\ncoalesce(a.b, 0) AS total,\na.x::TEXT\nFROM t"
+        );
+    }
+
+    #[test]
+    fn formatter_breaks_joins_and_predicates() {
+        let formatted = format_sql(
+            "select u.id from users u left outer join orders o on o.user_id = u.id where u.active = true and o.total > 10",
+        );
+        assert_eq!(
+            formatted,
+            "SELECT u.id\nFROM users u\nLEFT OUTER JOIN orders o\nON o.user_id = u.id\nWHERE u.active = TRUE\n  AND o.total > 10"
+        );
+    }
+
+    #[test]
+    fn formatter_indents_subqueries_and_breaks_projection_commas_only_at_top_level() {
+        let formatted = format_sql(
+            "select id, (select count(*) from orders o where o.uid = u.id) n, concat(first, ' ', last) from users u",
+        );
+        assert_eq!(
+            formatted,
+            "SELECT id,\n  (SELECT count(*)\n  FROM orders o\n  WHERE o.uid = u.id) n,\nconcat(first, ' ', last)\nFROM users u"
+        );
+    }
+
+    #[test]
+    fn formatter_formats_case_blocks_and_insert_values() {
+        let formatted = format_sql("select case when a then 1 else 0 end from t");
+        assert_eq!(
+            formatted,
+            "SELECT CASE\n  WHEN a THEN 1\n  ELSE 0\nEND\nFROM t"
+        );
+
+        let inserted = format_sql("insert into t(a,b) values(1,2),(3,4)");
+        assert_eq!(inserted, "INSERT INTO t(a, b)\nVALUES (1, 2),\n(3, 4)");
+    }
+
+    #[test]
+    fn formatter_preserves_strings_comments_identifiers_and_statements() {
+        let formatted = format_sql(
+            "select 'a  b' as s, -- trailing note\nMyCol /* keep me */ from \"Weird Table\"; select 2;",
+        );
+        assert_eq!(
+            formatted,
+            "SELECT 'a  b' AS s,\n-- trailing note\nMyCol /* keep me */\nFROM \"Weird Table\";\n\nSELECT 2;"
+        );
+    }
+
+    #[test]
+    fn formatter_is_safe_on_incomplete_input() {
+        assert_eq!(format_sql(""), "");
+        assert_eq!(format_sql("   \n  "), "");
+        assert_eq!(format_sql("select"), "SELECT");
+        assert_eq!(format_sql("select 'unterminated"), "SELECT 'unterminated");
+    }
+
+    #[test]
+    fn format_cursor_stays_on_the_same_token() {
+        let text = "select id,name from users";
+        let (formatted, cursor) = format_sql_at_cursor(text, 7);
+        assert_eq!(&formatted[cursor..cursor + 2], "id");
+        // Cursor in the gap before `name` maps to that token's start.
+        let (_, gap_cursor) = format_sql_at_cursor(text, 10);
+        assert!(formatted[gap_cursor..].starts_with("name"));
+        // End of input clamps to the end of the output.
+        let (_, end_cursor) = format_sql_at_cursor(text, text.len());
+        assert_eq!(end_cursor, formatted.len());
+    }
+
+    #[test]
+    fn error_range_reads_postgres_position_markers() {
+        let query = "SELECT FORM users";
+        let message = "error returned from database: syntax error at or near \"FORM\"\nPOSITION: 8";
+        assert_eq!(sql_error_range(message, query), Some(7..11));
+    }
+
+    #[test]
+    fn error_range_finds_quoted_near_tokens() {
+        let query = "SELECT * FROM userss ORDER BY id";
+        let message = "error returned from database: relation \"userss\" does not exist";
+        assert_eq!(sql_error_range(message, query), Some(14..20));
+
+        let sqlite_query = "SELEC * FROM t";
+        let sqlite_message = "near \"SELEC\": syntax error";
+        assert_eq!(sql_error_range(sqlite_message, sqlite_query), Some(0..5));
+    }
+
+    #[test]
+    fn error_range_matches_mysql_remainder_prefixes_and_missing_columns() {
+        let query = "SELECT FORM LIMIT 1 FROM users";
+        let message = "You have an error in your SQL syntax; check the manual for the right syntax to use near 'FORM LIMIT 1 FROM users' at line 1";
+        assert_eq!(sql_error_range(message, query), Some(7..11));
+
+        let pg_column = "SELECT usr FROM users";
+        let pg_message = "error returned from database: column \"usr\" does not exist";
+        assert_eq!(sql_error_range(pg_message, pg_column), Some(7..10));
+
+        let mysql_column = "SELECT usr FROM users";
+        let mysql_message = "Unknown column 'usr' in 'field list'";
+        assert_eq!(sql_error_range(mysql_message, mysql_column), Some(7..10));
+    }
+
+    #[test]
+    fn error_range_returns_none_when_nothing_matches() {
+        assert_eq!(sql_error_range("connection refused", "SELECT 1"), None);
+        assert_eq!(sql_error_range("syntax error", ""), None);
     }
 }
