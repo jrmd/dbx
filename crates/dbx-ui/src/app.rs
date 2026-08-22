@@ -13,10 +13,10 @@ use std::{
 };
 
 use dbx_core::{
-    CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseKind, EntityKind, Filter,
-    FilterOperator, ForeignKeyInfo, InsertRequest, Page, QueryOptions, QueryResult,
-    ReferentialAction, RowData, TableInfo, TableRef, UpdateRequest, detect_file_format,
-    export_table, import_file,
+    CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
+    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Page,
+    QueryOptions, QueryResult, ReferentialAction, RowData, TableInfo, TableRef, UpdateRequest,
+    detect_file_format, export_database, export_table, import_database, import_file,
 };
 use gpui::{
     AnyElement, App, Context, Div, Entity, FontWeight, Image, ImageFormat, IntoElement,
@@ -88,6 +88,21 @@ type SessionId = Uuid;
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
+const TABLE_BROWSE_PAGE_SIZE: u32 = 1_000;
+const TABLE_BROWSE_QUERY_LIMIT: u32 = TABLE_BROWSE_PAGE_SIZE + 1;
+
+fn table_browse_page(page: u64) -> Page {
+    Page {
+        limit: TABLE_BROWSE_QUERY_LIMIT,
+        offset: page.saturating_mul(u64::from(TABLE_BROWSE_PAGE_SIZE)),
+    }
+}
+
+fn trim_table_browse_result(result: &mut QueryResult) -> bool {
+    let has_next_page = result.rows.len() > TABLE_BROWSE_PAGE_SIZE as usize;
+    result.rows.truncate(TABLE_BROWSE_PAGE_SIZE as usize);
+    has_next_page
+}
 
 fn window_close_button() -> Stateful<Div> {
     div()
@@ -722,6 +737,8 @@ struct ConnectionSession {
     /// The table that produced `result`, when it is safe to edit through the
     /// grid. Ad-hoc query results deliberately have no table provenance.
     result_table: Option<TableRef>,
+    table_page: u64,
+    table_has_next_page: bool,
     selected_row: Option<usize>,
     selected_column: usize,
     inspector_open: bool,
@@ -784,6 +801,8 @@ impl ConnectionSession {
             foreign_keys: Vec::new(),
             result: None,
             result_table: None,
+            table_page: 0,
+            table_has_next_page: false,
             selected_row: None,
             selected_column: 0,
             inspector_open: true,
@@ -831,10 +850,29 @@ struct TableContextMenu {
     position: Point<gpui::Pixels>,
 }
 
+struct DatabaseExportDialog {
+    session_id: SessionId,
+    tables: Vec<TableInfo>,
+    selected_tables: HashSet<String>,
+    format: DumpFormat,
+    schema_only: bool,
+    gzipped: bool,
+    output_directory: PathBuf,
+    output_name: Entity<String>,
+    output_name_editor: Entity<TextEditor>,
+    _output_name_subscription: Subscription,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TableAction {
     Truncate,
     Drop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableClickAction {
+    Select,
+    OpenContextMenu,
 }
 
 pub struct DbxApp {
@@ -847,6 +885,7 @@ pub struct DbxApp {
     active_session_id: Option<SessionId>,
     connection_picker_open: bool,
     table_context_menu: Option<TableContextMenu>,
+    database_export_dialog: Option<DatabaseExportDialog>,
     compact_layout: bool,
     narrow_workspace: bool,
     test_generation: u64,
@@ -888,6 +927,7 @@ impl DbxApp {
             active_session_id: None,
             connection_picker_open: false,
             table_context_menu: None,
+            database_export_dialog: None,
             compact_layout: false,
             narrow_workspace: false,
             test_generation: 0,
@@ -1311,7 +1351,7 @@ impl DbxApp {
                     let initial = if let Some(table) = initial_table {
                         let table_ref = table_ref(&table);
                         let structure = engine.table_structure(&table_ref).await?;
-                        let result = if kind.is_sql() {
+                        let mut result = if kind.is_sql() {
                             Some(
                                 engine
                                     .query_table(
@@ -1319,7 +1359,7 @@ impl DbxApp {
                                         &[],
                                         &[],
                                         &[],
-                                        Some(Page::default()),
+                                        Some(table_browse_page(0)),
                                         QueryOptions::default(),
                                     )
                                     .await?,
@@ -1331,7 +1371,15 @@ impl DbxApp {
                                     .await?,
                             )
                         };
-                        Some((table_ref, structure, result))
+                        let has_next_page = if kind.is_sql() {
+                            result
+                                .as_mut()
+                                .map(trim_table_browse_result)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        Some((table_ref, structure, result, has_next_page))
                     } else {
                         None
                     };
@@ -1361,7 +1409,7 @@ impl DbxApp {
                         session.databases = databases;
                         session.current_database = current_database;
                         session.schema_filter = schema_filter;
-                        if let Some((table, structure, result)) = initial {
+                        if let Some((table, structure, result, has_next_page)) = initial {
                             session.selected_table = Some(table.clone());
                             session.table_columns = structure.columns;
                             session.foreign_keys = structure.foreign_keys;
@@ -1369,12 +1417,16 @@ impl DbxApp {
                                 completion_table_key(&table),
                                 session.table_columns.clone(),
                             );
+                            session.table_page = 0;
+                            session.table_has_next_page = has_next_page;
                             session.set_result(result, cx);
                             session.result_table = Some(table);
                         } else {
                             session.selected_table = None;
                             session.table_columns.clear();
                             session.completion_columns.clear();
+                            session.table_page = 0;
+                            session.table_has_next_page = false;
                             session.set_result(None, cx);
                             session.result_table = None;
                         }
@@ -1488,6 +1540,13 @@ impl DbxApp {
         else {
             return;
         };
+        if self
+            .database_export_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.session_id == session_id)
+        {
+            self.database_export_dialog = None;
+        }
         self.sessions[index].request_generation += 1;
         self.sessions.remove(index);
         if self.active_session_id == Some(session_id) {
@@ -1508,6 +1567,13 @@ impl DbxApp {
 
     fn activate_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         if self.sessions.iter().any(|session| session.id == session_id) {
+            if self
+                .database_export_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.session_id != session_id)
+            {
+                self.database_export_dialog = None;
+            }
             self.active_session_id = Some(session_id);
             self.connection_picker_open = false;
             cx.notify();
@@ -1695,6 +1761,8 @@ impl DbxApp {
             session.table_columns.clear();
             session.set_result(None, cx);
             session.result_table = None;
+            session.table_page = 0;
+            session.table_has_next_page = false;
             session.selected_row = None;
             session.row_draft = None;
             session.row_draft_subscriptions.clear();
@@ -1762,6 +1830,8 @@ impl DbxApp {
         session.active_secondary_tab = None;
         session.pane = Pane::Data;
         session.selected_table = Some(table_ref.clone());
+        session.table_page = 0;
+        session.table_has_next_page = false;
         // Until this request completes, the visible snapshot belongs to the
         // previous table and must not be used for a mutation.
         session.result_table = None;
@@ -1788,23 +1858,28 @@ impl DbxApp {
             let result = runtime
                 .spawn(async move {
                     let structure = engine.table_structure(&table_ref).await?;
-                    let result = if kind.is_sql() {
-                        engine
+                    let (result, has_next_page) = if kind.is_sql() {
+                        let mut result = engine
                             .query_table(
                                 &table_ref,
                                 &[],
                                 &filters,
                                 &[],
-                                Some(Page::default()),
+                                Some(table_browse_page(0)),
                                 QueryOptions::default(),
                             )
-                            .await?
+                            .await?;
+                        let has_next_page = trim_table_browse_result(&mut result);
+                        (result, has_next_page)
                     } else {
-                        engine
-                            .query("SCAN 0 COUNT 100", QueryOptions::default())
-                            .await?
+                        (
+                            engine
+                                .query("SCAN 0 COUNT 100", QueryOptions::default())
+                                .await?,
+                            false,
+                        )
                     };
-                    Ok::<_, dbx_core::DbxError>((structure, result))
+                    Ok::<_, dbx_core::DbxError>((structure, result, has_next_page))
                 })
                 .await?;
             this.update(cx, |this, cx| {
@@ -1816,7 +1891,7 @@ impl DbxApp {
                 }
                 session.busy = false;
                 match result {
-                    Ok((structure, result)) => {
+                    Ok((structure, result, has_next_page)) => {
                         let has_rows = !result.rows.is_empty();
                         session.table_columns = structure.columns;
                         session.completion_columns.insert(
@@ -1824,6 +1899,8 @@ impl DbxApp {
                             session.table_columns.clone(),
                         );
                         session.foreign_keys = structure.foreign_keys;
+                        session.table_page = 0;
+                        session.table_has_next_page = has_next_page;
                         session.set_result(Some(result), cx);
                         session.result_table = Some(result_table.clone());
                         session.status = if row_navigation && has_rows {
@@ -2111,6 +2188,26 @@ impl DbxApp {
     }
 
     fn refresh_table_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        self.load_table_page_for(session_id, 0, cx);
+    }
+
+    fn set_table_page(&mut self, session_id: SessionId, page: u64, cx: &mut Context<Self>) {
+        let Some((current_page, has_next_page, busy)) = self.session(session_id).map(|session| {
+            (
+                session.table_page,
+                session.table_has_next_page,
+                session.busy,
+            )
+        }) else {
+            return;
+        };
+        if busy || page == current_page || (page > current_page && !has_next_page) {
+            return;
+        }
+        self.load_table_page_for(session_id, page, cx);
+    }
+
+    fn load_table_page_for(&mut self, session_id: SessionId, page: u64, cx: &mut Context<Self>) {
         let Some((engine, table, kind, busy)) = self.session(session_id).map(|session| {
             (
                 session.engine.clone(),
@@ -2146,7 +2243,7 @@ impl DbxApp {
         };
         session.busy = true;
         session.error = None;
-        session.status = "Applying filters…".into();
+        session.status = format!("Loading page {}…", page + 1);
         session.result_table = None;
         session.selected_row = None;
         session.row_draft = None;
@@ -2161,16 +2258,18 @@ impl DbxApp {
             let result = runtime
                 .spawn(async move {
                     if kind.is_sql() {
-                        engine
+                        let mut result = engine
                             .query_table(
                                 &table,
                                 &[],
                                 &filters,
                                 &[],
-                                Some(Page::default()),
+                                Some(table_browse_page(page)),
                                 QueryOptions::default(),
                             )
-                            .await
+                            .await?;
+                        let has_next_page = trim_table_browse_result(&mut result);
+                        Ok::<_, dbx_core::DbxError>((result, has_next_page))
                     } else {
                         let pattern = filters
                             .first()
@@ -2178,12 +2277,13 @@ impl DbxApp {
                             .map(ToString::to_string)
                             .unwrap_or_else(|| "*".into());
                         let pattern = redis_command_word(&pattern);
-                        engine
+                        let result = engine
                             .query(
                                 &format!("SCAN 0 MATCH {pattern} COUNT 100"),
                                 QueryOptions::default(),
                             )
-                            .await
+                            .await?;
+                        Ok((result, false))
                     }
                 })
                 .await?;
@@ -2196,7 +2296,9 @@ impl DbxApp {
                 }
                 session.busy = false;
                 match result {
-                    Ok(result) => {
+                    Ok((result, has_next_page)) => {
+                        session.table_page = page;
+                        session.table_has_next_page = has_next_page;
                         session.set_result(Some(result), cx);
                         session.result_table = Some(result_table.clone());
                         session.selected_row = None;
@@ -3540,6 +3642,428 @@ impl DbxApp {
         .detach();
     }
 
+    fn begin_database_export(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((kind, busy, engine, database, session_name, tables)) =
+            self.session(session_id).map(|session| {
+                (
+                    session.kind,
+                    session.busy,
+                    session.engine.clone(),
+                    session.current_database.clone(),
+                    session.name.clone(),
+                    session.tables.clone(),
+                )
+            })
+        else {
+            return;
+        };
+        if busy || engine.is_none() || !kind.is_sql() {
+            return;
+        }
+        let tables: Vec<_> = tables
+            .into_iter()
+            .filter(|table| table.kind == EntityKind::Table)
+            .collect();
+        if tables.is_empty() {
+            if let Some(session) = self.session_mut(session_id) {
+                session.status = "No tables are available to export".into();
+                session.error = None;
+            }
+            cx.notify();
+            return;
+        }
+        let selected_tables = tables.iter().map(table_selection_key).collect();
+        let base_name = database
+            .or_else(|| (!session_name.trim().is_empty()).then_some(session_name))
+            .unwrap_or_else(|| "database".into());
+        let output_name = cx.new(|_| format!("{}_export", transfer_name_stem(&base_name)));
+        let output_name_editor =
+            cx.new(|cx| TextEditor::new(output_name.clone(), false, window, cx));
+        let output_name_subscription = cx.observe(&output_name, |_, _, cx| cx.notify());
+        let focus = output_name_editor.read(cx).focus_handle();
+        let output_directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        self.table_context_menu = None;
+        self.database_export_dialog = Some(DatabaseExportDialog {
+            session_id,
+            tables,
+            selected_tables,
+            format: DumpFormat::Sql,
+            schema_only: false,
+            gzipped: false,
+            output_directory,
+            output_name,
+            output_name_editor,
+            _output_name_subscription: output_name_subscription,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn set_database_export_format(&mut self, format: DumpFormat, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.database_export_dialog.as_mut() {
+            dialog.format = format;
+            if format != DumpFormat::Sql {
+                dialog.schema_only = false;
+            }
+            cx.notify();
+        }
+    }
+
+    fn toggle_database_export_table(&mut self, key: String, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.database_export_dialog.as_mut() {
+            if !dialog.selected_tables.remove(&key) {
+                dialog.selected_tables.insert(key);
+            }
+            cx.notify();
+        }
+    }
+
+    fn toggle_all_database_export_tables(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.database_export_dialog.as_mut() {
+            if dialog.selected_tables.len() == dialog.tables.len() {
+                dialog.selected_tables.clear();
+            } else {
+                dialog.selected_tables = dialog.tables.iter().map(table_selection_key).collect();
+            }
+            cx.notify();
+        }
+    }
+
+    fn toggle_database_export_schema_only(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.database_export_dialog.as_mut()
+            && dialog.format == DumpFormat::Sql
+        {
+            dialog.schema_only = !dialog.schema_only;
+            cx.notify();
+        }
+    }
+
+    fn toggle_database_export_gzip(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.database_export_dialog.as_mut() {
+            dialog.gzipped = !dialog.gzipped;
+            cx.notify();
+        }
+    }
+
+    fn choose_database_export_directory(&mut self, cx: &mut Context<Self>) {
+        if self.database_export_dialog.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(SharedString::from("Choose export folder")),
+        });
+        cx.spawn(async move |this, cx| {
+            match receiver.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.update(cx, |this, cx| {
+                            if let Some(dialog) = this.database_export_dialog.as_mut() {
+                                dialog.output_directory = path;
+                                cx.notify();
+                            }
+                        })?;
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("Could not open the folder picker: {error}"));
+                        cx.notify();
+                    })?;
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("Folder picker closed unexpectedly: {error}"));
+                        cx.notify();
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn cancel_database_export(&mut self, cx: &mut Context<Self>) {
+        if self.database_export_dialog.take().is_some() {
+            self.error = None;
+            cx.notify();
+        }
+    }
+
+    fn execute_database_export(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.database_export_dialog.as_ref() else {
+            return;
+        };
+        let selected_tables: Vec<TableRef> = dialog
+            .tables
+            .iter()
+            .filter(|table| dialog.selected_tables.contains(&table_selection_key(table)))
+            .map(table_ref)
+            .collect();
+        if selected_tables.is_empty() {
+            self.set_error("Select at least one table to export".into());
+            cx.notify();
+            return;
+        }
+        let output_name = dialog.output_name.read(cx).trim().to_owned();
+        if output_name.is_empty() {
+            self.set_error("Enter an output name".into());
+            cx.notify();
+            return;
+        }
+        let session_id = dialog.session_id;
+        let request = DatabaseExportRequest {
+            tables: selected_tables,
+            output_directory: dialog.output_directory.clone(),
+            output_name,
+            format: dialog.format,
+            schema_only: dialog.schema_only,
+            gzipped: dialog.gzipped,
+        };
+        let Some((engine, kind, busy)) = self
+            .session(session_id)
+            .map(|session| (session.engine.clone(), session.kind, session.busy))
+        else {
+            return;
+        };
+        let Some(engine) = engine else {
+            return;
+        };
+        if busy || !kind.is_sql() {
+            return;
+        }
+
+        self.database_export_dialog = None;
+        let runtime = self.runtime.clone();
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.busy = true;
+        session.error = None;
+        session.status = "Exporting database…".into();
+        session.request_generation += 1;
+        let generation = session.request_generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move { export_database(&engine, &request).await })
+                .await
+                .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
+            this.update(cx, |this, cx| {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                if generation != session.request_generation {
+                    return;
+                }
+                session.busy = false;
+                match result {
+                    Ok(summary) => {
+                        session.error = None;
+                        let mode = if summary.schema_only {
+                            "schema"
+                        } else {
+                            "data"
+                        };
+                        session.status = format!(
+                            "Exported {} table(s) · {} row(s) · {} {} file{}",
+                            summary.tables_exported,
+                            summary.rows_exported,
+                            mode,
+                            summary.files_written,
+                            if summary.files_written == 1 { "" } else { "s" }
+                        );
+                    }
+                    Err(error) => {
+                        session.error = Some(error.to_string());
+                        session.status = "Database export failed".into();
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn begin_database_import(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let available = self.session(session_id).is_some_and(|session| {
+            session.kind.is_sql() && !session.busy && session.engine.is_some()
+        });
+        if !available {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Choose database SQL dump")),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            match receiver.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.update_in(cx, |this, window, cx| {
+                            this.confirm_database_import(session_id, path, window, cx);
+                        })?;
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("Could not open the file picker: {error}"));
+                        cx.notify();
+                    })?;
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.set_error(format!("File picker closed unexpectedly: {error}"));
+                        cx.notify();
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn confirm_database_import(
+        &mut self,
+        session_id: SessionId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file_format = match detect_file_format(&path) {
+            Ok(file_format) => file_format,
+            Err(error) => {
+                self.set_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        if file_format.format != DumpFormat::Sql {
+            self.set_error(
+                "Database imports require an SQL dump. CSV and TSV files import into one table from its context menu.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "database dump".into());
+        let connection_name = self
+            .session(session_id)
+            .and_then(|session| session.current_database.clone())
+            .unwrap_or_else(|| "the active database".into());
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            "Run this database SQL dump?",
+            Some(format!(
+                "Every statement in ‘{file_name}’ will run against {connection_name}. Review the file first if you did not create it."
+            ).as_str()),
+            &[
+                PromptButton::cancel("Cancel"),
+                PromptButton::ok("Run dump"),
+            ],
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            if matches!(receiver.await, Ok(1)) {
+                this.update(cx, |this, cx| {
+                    this.execute_database_import(session_id, path, cx)
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn execute_database_import(
+        &mut self,
+        session_id: SessionId,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, kind, busy)) = self
+            .session(session_id)
+            .map(|session| (session.engine.clone(), session.kind, session.busy))
+        else {
+            return;
+        };
+        let Some(engine) = engine else {
+            return;
+        };
+        if busy || !kind.is_sql() {
+            return;
+        }
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "database dump".into());
+        let runtime = self.runtime.clone();
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.busy = true;
+        session.error = None;
+        session.status = format!("Importing {file_name}…");
+        session.request_generation += 1;
+        let generation = session.request_generation;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn(async move { import_database(&engine, &path).await })
+                .await
+                .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
+            this.update(cx, |this, cx| {
+                let Some(session) = this.session_mut(session_id) else {
+                    return;
+                };
+                if generation != session.request_generation {
+                    return;
+                }
+                session.busy = false;
+                match result {
+                    Ok(report) => {
+                        session.error = None;
+                        session.status = format!(
+                            "Imported {} statement(s) from {file_name}",
+                            report.statements_executed
+                        );
+                        this.refresh_tables_for(session_id, cx);
+                    }
+                    Err(error) => {
+                        session.error = Some(error.to_string());
+                        session.status = "Database import failed".into();
+                    }
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     fn transfer_available_for(&self, session_id: SessionId, table: &TableInfo) -> bool {
         self.session(session_id).is_some_and(|session| {
             session.kind.is_sql()
@@ -4874,8 +5398,9 @@ impl DbxApp {
                     .child(self.render_sidebar(cx))
                     .child(self.render_main(window, cx)),
             )
-            .child(self.render_status())
+            .child(self.render_status(cx))
             .child(self.render_table_context_menu(cx))
+            .child(self.render_database_export_dialog(window, cx))
     }
 
     fn render_app_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4973,6 +5498,439 @@ impl DbxApp {
             }
         }
         cx.notify();
+    }
+
+    fn render_database_export_dialog(
+        &mut self,
+        _window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(dialog) = self.database_export_dialog.as_ref() else {
+            return div().into_any_element();
+        };
+        let tables = dialog.tables.clone();
+        let selected_tables = dialog.selected_tables.clone();
+        let selected_count = selected_tables.len();
+        let all_selected = selected_count == tables.len();
+        let format = dialog.format;
+        let schema_only = dialog.schema_only;
+        let gzipped = dialog.gzipped;
+        let output_directory = dialog.output_directory.display().to_string();
+        let output_name_editor = dialog.output_name_editor.clone();
+        let output_name_focus = output_name_editor.read(cx).focus_handle();
+        let output_name = dialog.output_name.read(cx).clone();
+        let can_export = selected_count > 0 && !output_name.trim().is_empty();
+
+        let table_rows = tables.into_iter().map(|table| {
+            let key = table_selection_key(&table);
+            let selected = selected_tables.contains(&key);
+            let label = table_sidebar_label(&table, None);
+            div()
+                .id(SharedString::from(format!(
+                    "database-export-{}",
+                    table_sidebar_id(&table)
+                )))
+                .h(px(30.))
+                .px(px(8.))
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .bg(if selected {
+                    THEME.accent_soft
+                } else {
+                    THEME.panel
+                })
+                .text_color(if selected {
+                    THEME.text
+                } else {
+                    THEME.text_muted
+                })
+                .cursor_pointer()
+                .hover(|style| style.bg(THEME.panel_raised))
+                .child(
+                    div()
+                        .size(px(14.))
+                        .rounded(px(3.))
+                        .border_1()
+                        .border_color(if selected {
+                            THEME.accent
+                        } else {
+                            THEME.border_strong
+                        })
+                        .bg(if selected { THEME.accent } else { THEME.canvas })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.))
+                        .text_color(THEME.canvas)
+                        .child(if selected { "✓" } else { "" }),
+                )
+                .child(icon(Icon::Table, THEME.text_muted).size(px(14.)))
+                .child(div().flex_1().truncate().child(label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_database_export_table(key.clone(), cx)
+                }))
+        });
+
+        let format_choices = [DumpFormat::Sql, DumpFormat::Csv, DumpFormat::Tsv]
+            .into_iter()
+            .map(|choice| {
+                let selected = choice == format;
+                div()
+                    .id(SharedString::from(format!(
+                        "database-export-format-{choice}"
+                    )))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(5.))
+                    .bg(if selected {
+                        THEME.accent_soft
+                    } else {
+                        THEME.panel_raised
+                    })
+                    .text_color(if selected {
+                        THEME.accent
+                    } else {
+                        THEME.text_muted
+                    })
+                    .text_size(px(10.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(THEME.accent_soft).text_color(THEME.text))
+                    .child(choice.to_string())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_database_export_format(choice, cx)
+                    }))
+            });
+
+        let schema_toggle = div()
+            .id("database-export-schema-only")
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .text_size(px(10.))
+            .text_color(if format == DumpFormat::Sql {
+                THEME.text
+            } else {
+                THEME.text_muted
+            })
+            .when(format == DumpFormat::Sql, |view| {
+                view.cursor_pointer().on_click(
+                    cx.listener(|this, _, _, cx| this.toggle_database_export_schema_only(cx)),
+                )
+            })
+            .child(
+                div()
+                    .size(px(14.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(if schema_only && format == DumpFormat::Sql {
+                        THEME.accent
+                    } else {
+                        THEME.border_strong
+                    })
+                    .bg(if schema_only && format == DumpFormat::Sql {
+                        THEME.accent
+                    } else {
+                        THEME.canvas
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.))
+                    .text_color(THEME.canvas)
+                    .child(if schema_only && format == DumpFormat::Sql {
+                        "✓"
+                    } else {
+                        ""
+                    }),
+            )
+            .child("Schema only");
+
+        let gzip_toggle = div()
+            .id("database-export-gzip")
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .text_size(px(10.))
+            .text_color(THEME.text)
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_database_export_gzip(cx)))
+            .child(
+                div()
+                    .size(px(14.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(if gzipped {
+                        THEME.accent
+                    } else {
+                        THEME.border_strong
+                    })
+                    .bg(if gzipped { THEME.accent } else { THEME.canvas })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.))
+                    .text_color(THEME.canvas)
+                    .child(if gzipped { "✓" } else { "" }),
+            )
+            .child("Gzip output");
+
+        let select_all_label = if all_selected {
+            "Clear all"
+        } else {
+            "Select all"
+        };
+        let destination_label = if format == DumpFormat::Sql {
+            format!(
+                "One {} file{} · schema and data unless Schema only is selected",
+                format.extension().to_ascii_uppercase(),
+                if gzipped { " (gzip)" } else { "" }
+            )
+        } else {
+            format!(
+                "One {} file per table{}",
+                format.extension().to_ascii_uppercase(),
+                if gzipped { " (gzip)" } else { "" }
+            )
+        };
+
+        let overlay = div()
+            .absolute()
+            .top(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x00000088))
+            .child(
+                div()
+                    .id("database-export-dialog")
+                    .w(px(560.))
+                    .max_h(px(680.))
+                    .p(px(18.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(THEME.border_strong)
+                    .bg(THEME.panel_raised)
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .child(
+                                        div()
+                                            .text_size(px(16.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(THEME.text)
+                                            .child("Export database"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(THEME.text_muted)
+                                            .child(destination_label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-database-export")
+                                    .size(px(24.))
+                                    .rounded(px(5.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(THEME.panel))
+                                    .child(icon(Icon::Close, THEME.text_muted).size(px(12.)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_database_export(cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(THEME.text_muted)
+                                    .child(format!("TABLES · {selected_count} selected")),
+                            )
+                            .child(
+                                div()
+                                    .id("database-export-select-all")
+                                    .px(px(8.))
+                                    .py(px(4.))
+                                    .rounded(px(4.))
+                                    .text_size(px(10.))
+                                    .text_color(THEME.accent)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(THEME.accent_soft))
+                                    .child(select_all_label)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_all_database_export_tables(cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("database-export-table-list")
+                            .h(px(190.))
+                            .p(px(5.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(THEME.border)
+                            .bg(THEME.canvas)
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .children(table_rows),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(THEME.text_muted)
+                                    .child("OUTPUT FORMAT"),
+                            )
+                            .child(div().flex().gap(px(5.)).children(format_choices))
+                            .child(div().flex().gap(px(16.)).child(schema_toggle).child(gzip_toggle)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(5.))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(THEME.text_muted)
+                                    .child("OUTPUT NAME"),
+                            )
+                            .child(editor::input(output_name_editor, output_name_focus, false)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(10.))
+                                    .text_color(THEME.text_muted)
+                                    .truncate()
+                                    .child(output_directory),
+                            )
+                            .child(
+                                div()
+                                    .id("database-export-choose-folder")
+                                    .px(px(9.))
+                                    .py(px(6.))
+                                    .rounded(px(5.))
+                                    .border_1()
+                                    .border_color(THEME.border)
+                                    .text_size(px(10.))
+                                    .text_color(THEME.text)
+                                    .cursor_pointer()
+                                    .hover(|style| style.border_color(THEME.accent))
+                                    .child("Choose folder…")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.choose_database_export_directory(cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .pt(px(4.))
+                            .child(
+                                div()
+                                    .max_w(px(340.))
+                                    .text_size(px(9.))
+                                    .text_color(THEME.text_muted)
+                                    .child(if format == DumpFormat::Sql {
+                                        "SQL includes table columns, primary keys, and selected foreign keys."
+                                    } else {
+                                        "Delimited exports create one independently usable file per selected table."
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(7.))
+                                    .child(
+                                        div()
+                                            .id("cancel-database-export")
+                                            .px(px(10.))
+                                            .py(px(7.))
+                                            .rounded(px(5.))
+                                            .border_1()
+                                            .border_color(THEME.border)
+                                            .text_size(px(10.))
+                                            .text_color(THEME.text)
+                                            .cursor_pointer()
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.cancel_database_export(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("run-database-export")
+                                            .px(px(11.))
+                                            .py(px(7.))
+                                            .rounded(px(5.))
+                                            .bg(if can_export {
+                                                THEME.accent
+                                            } else {
+                                                THEME.panel
+                                            })
+                                            .text_size(px(10.))
+                                            .text_color(if can_export {
+                                                THEME.canvas
+                                            } else {
+                                                THEME.text_muted
+                                            })
+                                            .when(can_export, |view| {
+                                                view.cursor_pointer().on_click(cx.listener(
+                                                    |this, _, _, cx| {
+                                                        this.execute_database_export(cx)
+                                                    },
+                                                ))
+                                            })
+                                            .child(format!("Export {selected_count} table{}", if selected_count == 1 { "" } else { "s" })),
+                                    ),
+                            ),
+                    ),
+            );
+
+        deferred(overlay).with_priority(30).into_any_element()
     }
 
     fn render_table_context_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -5458,7 +6416,47 @@ impl DbxApp {
                                                     session_id, window, cx,
                                                 )
                                             })),
-                                    ),
+                                    )
+                                    .when(kind.is_sql(), |view| {
+                                        view.child(
+                                            div()
+                                                .id("export-database")
+                                                .px(px(7.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .text_size(px(9.))
+                                                .text_color(THEME.accent)
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(THEME.accent_soft))
+                                                .child("Export")
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.begin_database_export(
+                                                            session_id, window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("import-database")
+                                                .px(px(7.))
+                                                .py(px(5.))
+                                                .rounded(px(5.))
+                                                .text_size(px(9.))
+                                                .text_color(THEME.text_muted)
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(THEME.panel_raised))
+                                                .child("Import")
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.begin_database_import(
+                                                            session_id, window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                    }),
                             ),
                     )
                     .when(databases.len() > 1, |view| {
@@ -5597,20 +6595,18 @@ impl DbxApp {
                                 },
                             ))
                             .child(div().truncate().child(label))
-                            .on_click(cx.listener(
-                                move |this, event: &gpui::ClickEvent, window, cx| {
-                                    if event.is_right_click() {
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_table_for(session_id, table.clone(), window, cx);
+                            }))
+                            .on_aux_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, _, cx| {
+                                    if table_click_action(event)
+                                        == TableClickAction::OpenContextMenu
+                                    {
                                         this.open_table_context_menu(
                                             session_id,
                                             menu_table.clone(),
                                             event.position(),
-                                            cx,
-                                        );
-                                    } else {
-                                        this.select_table_for(
-                                            session_id,
-                                            table.clone(),
-                                            window,
                                             cx,
                                         );
                                     }
@@ -5955,7 +6951,9 @@ impl DbxApp {
                                 .py(px(6.))
                                 .text_size(px(11.))
                                 .text_color(THEME.text_muted)
-                                .child("All rows are shown. Add a filter to narrow this table."),
+                                .child(format!(
+                                    "Showing up to {TABLE_BROWSE_PAGE_SIZE} rows. Add a filter to narrow this table."
+                                )),
                         )
                     })
                     .when(kind.is_sql() && has_filter_rows, |view| {
@@ -7079,8 +8077,8 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_status(&self) -> impl IntoElement {
-        let (error, status, result) = self
+    fn render_status(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (error, status, result, table_pagination) = self
             .active_session()
             .map(|session| {
                 if let Some((error, status, result)) =
@@ -7101,15 +8099,73 @@ impl DbxApp {
                             })
                     })
                 {
-                    return (error, status, result);
+                    return (error, status, result, None);
                 }
+                let table_pagination = (session.kind.is_sql()
+                    && session.selected_table.is_some()
+                    && session.pane == Pane::Data
+                    && session.active_secondary_tab.is_none()
+                    && session.result.is_some())
+                .then_some((
+                    session.id,
+                    session.table_page,
+                    session.table_has_next_page,
+                    session.busy,
+                ));
                 (
                     session.error.clone(),
                     session.status.clone(),
                     session.result.clone(),
+                    table_pagination,
                 )
             })
-            .unwrap_or_else(|| (self.error.clone(), self.status.clone(), None));
+            .unwrap_or_else(|| (self.error.clone(), self.status.clone(), None, None));
+        let result_summary = result
+            .as_ref()
+            .map(|result| {
+                if let Some((_, page, _, _)) = table_pagination {
+                    let page_number = page.saturating_add(1);
+                    if result.rows.is_empty() {
+                        format!(
+                            "No rows · page {page_number} · {TABLE_BROWSE_PAGE_SIZE}/page"
+                        )
+                    } else {
+                        let first_row = page
+                            .saturating_mul(u64::from(TABLE_BROWSE_PAGE_SIZE))
+                            .saturating_add(1);
+                        let last_row = first_row + result.rows.len() as u64 - 1;
+                        format!(
+                            "Rows {first_row}–{last_row} · page {page_number} · {TABLE_BROWSE_PAGE_SIZE}/page"
+                        )
+                    }
+                } else {
+                    format!("{} rows", result.rows.len())
+                }
+            })
+            .unwrap_or_default();
+        let pagination_controls =
+            table_pagination.map(|(session_id, page, has_next_page, busy)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(self.small_button_state(
+                        "table-page-previous",
+                        "Previous",
+                        !busy && page > 0,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_table_page(session_id, page.saturating_sub(1), cx)
+                        }),
+                    ))
+                    .child(self.small_button_state(
+                        "table-page-next",
+                        "Next",
+                        !busy && has_next_page,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_table_page(session_id, page.saturating_add(1), cx)
+                        }),
+                    ))
+            });
         div()
             .h(px(26.))
             .px(px(10.))
@@ -7121,12 +8177,21 @@ impl DbxApp {
             .bg(THEME.panel)
             .text_size(px(10.))
             .text_color(THEME.text_muted)
-            .child(error.unwrap_or(status))
             .child(
-                result
-                    .as_ref()
-                    .map(|result| format!("{} rows · limit 10,000", result.rows.len()))
-                    .unwrap_or_default(),
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .child(error.unwrap_or(status)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(result_summary)
+                    .when_some(pagination_controls, |view, controls| view.child(controls)),
             )
     }
 
@@ -7272,6 +8337,28 @@ fn export_file_stem(table: &TableInfo) -> String {
         .collect();
     if sanitized.is_empty() {
         "table".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+fn table_selection_key(table: &TableInfo) -> String {
+    completion_table_key(&table_ref(table))
+}
+
+fn transfer_name_stem(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "database".into()
     } else {
         sanitized
     }
@@ -8684,6 +9771,14 @@ fn table_sidebar_id(table: &TableInfo) -> String {
     )
 }
 
+fn table_click_action(event: &gpui::ClickEvent) -> TableClickAction {
+    if event.is_right_click() {
+        TableClickAction::OpenContextMenu
+    } else {
+        TableClickAction::Select
+    }
+}
+
 fn truncate(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
@@ -8706,6 +9801,25 @@ mod tests {
     fn truncation_is_character_safe() {
         assert_eq!(truncate("éclair", 2), "éc…");
         assert_eq!(truncate("short", 10), "short");
+    }
+
+    #[test]
+    fn table_browser_pages_are_bounded_and_offset_by_page() {
+        let page = table_browse_page(3);
+
+        assert_eq!(page.limit, TABLE_BROWSE_QUERY_LIMIT);
+        assert_eq!(page.offset, 3 * u64::from(TABLE_BROWSE_PAGE_SIZE));
+    }
+
+    #[test]
+    fn table_browser_keeps_the_probe_row_out_of_the_grid() {
+        let mut result = QueryResult::empty(None, 0);
+        result.rows = (0..TABLE_BROWSE_QUERY_LIMIT)
+            .map(|_| RowData::default())
+            .collect();
+
+        assert!(trim_table_browse_result(&mut result));
+        assert_eq!(result.rows.len(), TABLE_BROWSE_PAGE_SIZE as usize);
     }
 
     #[test]
@@ -8786,6 +9900,25 @@ mod tests {
             "analytics.users"
         );
         assert_eq!(table_sidebar_id(&table), "table-analytics-users");
+    }
+
+    #[test]
+    fn right_click_routes_to_the_table_context_menu_action() {
+        let event = gpui::ClickEvent::Mouse(gpui::MouseClickEvent {
+            down: gpui::MouseDownEvent {
+                button: gpui::MouseButton::Right,
+                ..Default::default()
+            },
+            up: gpui::MouseUpEvent {
+                button: gpui::MouseButton::Right,
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(
+            table_click_action(&event),
+            TableClickAction::OpenContextMenu
+        );
     }
 
     #[test]
