@@ -24,6 +24,7 @@ DBX is an early, runnable MVP. It already has a native connection picker, simult
 - Right-click table actions for refresh, truncate, and drop, with engine-aware SQL and explicit destructive confirmations.
 - Full-row insertion with explicit Value/NULL/Default states, multi-field primary-key-guarded updates, and primary-key-guarded deletion.
 - Raw SQL execution for relational databases and a raw Redis command surface; Redis browsing starts with incremental `SCAN`.
+- Table data import/export through the table context menu: SQL dumps, CSV, and TSV files, each optionally gzip-compressed (`events.sql.gz`, `rows.csv.gz`). Exports stream pages into dialect-aware `INSERT` statements or delimiter-separated rows; imports replay dump statements against the connection (after an explicit confirmation) or bulk-append delimited rows whose header maps onto the table's columns. Unquoted empty delimited fields import as NULL while quoted empties stay empty strings.
 - Docker-backed PostgreSQL, MySQL, and Redis contract coverage plus file-backed SQLite coverage for discovery, create, inspect, insert, GUI-style filtering, update, delete, SQL/commands, and Redis TTL/type scanning.
 
 Current UX limitations are deliberate and visible: the table designer begins from an engine-aware SQL template, Redis values use the command console for mutation, and the first grid renders a bounded page rather than a fully virtualized multi-million-row dataset.
@@ -47,7 +48,7 @@ Redis is intentionally modelled as a key/value data source rather than pretendin
 | --- | --- | --- |
 | Connections | PostgreSQL, MySQL, SQLite, Redis; per-connection settings | Cloud-provider login flows, SSH tunnel management, team sync |
 | Browsing | Tables/keyspaces, columns, types, indexes, paged rows | Full ER diagrams, data lineage, server monitoring |
-| Editing | Insert, update, delete, create-table form, SQL preview | Migrations, schema diff/deploy, bulk import/export |
+| Editing | Insert, update, delete, create-table form, SQL preview, table import/export (SQL/CSV/TSV, gzip) | Migrations, schema diff/deploy, server-side bulk loaders, partial-column CSV mapping |
 | Queries | SQL editor for relational engines, cancellation, result grid | SQL autocomplete parity with a full IDE, query plan visualizer |
 | Filtering | Structured predicates compiled to parameterized SQL; Redis key/type filters | Saved team-wide searches and cross-database joins |
 
@@ -146,6 +147,6 @@ Robust read-only sessions, SSH tunnels, and a formal audit log remain security w
 2. Replace the bounded first grid with virtualized rows, resizable columns, multi-column edits, and pagination controls.
 3. Add a structured table designer with generated DDL review, indexes, constraints, and engine-aware types.
 4. Expand Redis into typed string/hash/list/set/sorted-set/stream inspectors with TTL editing.
-5. Harden cancellation, transactions, query history, SSH tunnels, import/export, accessibility, and cross-platform packaging through real-world testing.
+5. Harden cancellation, transactions, query history, SSH tunnels, accessibility, and cross-platform packaging through real-world testing; extend transfers with progress, streaming, and native bulk-loader hand-off for very large files.
 
 Contributions should keep the UI responsive, preserve parameterization, and include a connector-level test for any engine-specific behaviour.

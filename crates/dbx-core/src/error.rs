@@ -28,6 +28,9 @@ pub enum DbxError {
 
     #[error("database driver error: {0}")]
     Driver(String),
+
+    #[error("local file operation failed: {0}")]
+    Io(String),
 }
 
 impl From<sqlx::Error> for DbxError {
