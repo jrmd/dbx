@@ -139,6 +139,57 @@ pub fn build_insert(kind: DatabaseKind, request: &InsertRequest) -> Result<SqlSt
     Ok(SqlStatement::new(statement, request.values.clone()))
 }
 
+/// Build one multi-row `INSERT` for bulk loading, for example during CSV/TSV
+/// imports. Every row must supply exactly one value per column; values stay
+/// parameterized and identifiers quoted like the single-row builder.
+pub fn build_multi_row_insert(
+    kind: DatabaseKind,
+    table: &TableRef,
+    columns: &[String],
+    rows: &[Vec<CellValue>],
+) -> Result<SqlStatement> {
+    if rows.is_empty() {
+        return Err(DbxError::Parse(
+            "bulk insert requires at least one row".into(),
+        ));
+    }
+    let width = columns.len();
+    if width == 0 {
+        return Err(DbxError::Parse(
+            "bulk insert requires at least one column".into(),
+        ));
+    }
+    if rows.iter().any(|row| row.len() != width) {
+        return Err(DbxError::Parse(
+            "bulk insert rows must all match the column count".into(),
+        ));
+    }
+    let mut statement = format!("INSERT INTO {} (", quote_table(kind, table)?);
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            statement.push_str(", ");
+        }
+        statement.push_str(&quote_identifier(kind, column)?);
+    }
+    statement.push_str(") VALUES ");
+    let mut params = Vec::with_capacity(rows.len() * width);
+    for (row_index, row) in rows.iter().enumerate() {
+        if row_index > 0 {
+            statement.push_str(", ");
+        }
+        statement.push('(');
+        for (column_index, value) in row.iter().enumerate() {
+            if column_index > 0 {
+                statement.push_str(", ");
+            }
+            statement.push_str(&placeholder(kind, params.len() + 1));
+            params.push(value.clone());
+        }
+        statement.push(')');
+    }
+    Ok(SqlStatement::new(statement, params))
+}
+
 pub fn build_update(kind: DatabaseKind, request: &UpdateRequest) -> Result<SqlStatement> {
     build_update_with_columns(kind, request, &[])
 }
