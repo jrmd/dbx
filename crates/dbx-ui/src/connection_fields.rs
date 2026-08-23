@@ -5,6 +5,7 @@ use std::fmt;
 use dbx_core::DatabaseKind;
 use thiserror::Error;
 use url::Url;
+use zeroize::Zeroize;
 
 /// Editable connection fields. `connection_string` is an optional fast path:
 /// when set, [`Self::url`] returns it after validation instead of rebuilding a
@@ -19,6 +20,13 @@ pub struct ConnectionFields {
     pub password: String,
     pub database: String,
     pub connection_string: String,
+}
+
+impl Drop for ConnectionFields {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.connection_string.zeroize();
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -65,8 +73,12 @@ impl ConnectionFields {
         if kind == DatabaseKind::SQLite {
             return Ok(Self {
                 kind,
+                host: String::new(),
+                port: String::new(),
+                username: String::new(),
+                password: String::new(),
+                database: String::new(),
                 connection_string,
-                ..Self::new(kind)
             });
         }
 
@@ -74,9 +86,9 @@ impl ConnectionFields {
             .host_str()
             .ok_or(ConnectionFieldsError::MissingHost(kind))?
             .trim_matches(['[', ']']);
-        let username = decode(url.username());
-        let password = url.password().map(decode).unwrap_or_default();
-        let database = decode(url.path().trim_start_matches('/'));
+        let username = decode(url.username())?;
+        let password = url.password().map(decode).transpose()?.unwrap_or_default();
+        let database = decode(url.path().trim_start_matches('/'))?;
         Ok(Self {
             kind,
             host: host.to_owned(),
@@ -162,7 +174,7 @@ impl ConnectionFields {
                 .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         }
         if !self.password.is_empty() {
-            url.set_password(Some(&self.password))
+            set_url_password(&mut url, Some(&self.password))
                 .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         }
         if !self.database.is_empty() {
@@ -232,12 +244,12 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
         // A network URL without a host may still be recoverable below if its
         // password swallowed a delimiter such as `/`, `?`, or `#`.
         if url.host_str().is_some() {
-            let username = decode(url.username());
-            let password = url.password().map(decode);
+            let username = decode(url.username())?;
+            let password = url.password().map(decode).transpose()?;
             if password.is_some() {
                 url.set_username(&username)
                     .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
-                url.set_password(password.as_deref())
+                set_url_password(&mut url, password.as_deref())
                     .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
                 return Ok(url.to_string());
             }
@@ -278,9 +290,10 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
         if url.host_str().is_none() {
             continue;
         }
-        url.set_username(&decode(username))
+        url.set_username(&decode(username)?)
             .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
-        url.set_password(Some(&decode(password)))
+        let password = decode(password)?;
+        set_url_password(&mut url, Some(&password))
             .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         return Ok(url.to_string());
     }
@@ -288,10 +301,22 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     Err(ConnectionFieldsError::InvalidUrl)
 }
 
-fn decode(value: &str) -> String {
+/// Set a decoded password on a URL without allowing a literal `%` to be
+/// mistaken for the start of an existing percent-escape.
+///
+/// `url::Url::set_password` encodes other userinfo delimiters but deliberately
+/// accepts `%` verbatim. Passwords in DBX are decoded values, so `%` must be
+/// escaped first to preserve the credential byte-for-byte.
+pub(crate) fn set_url_password(url: &mut Url, password: Option<&str>) -> Result<(), ()> {
+    let password = password.map(|value| value.replace('%', "%25"));
+    url.set_password(password.as_deref())
+}
+
+fn decode(value: &str) -> Result<String, ConnectionFieldsError> {
     percent_encoding::percent_decode_str(value)
-        .decode_utf8_lossy()
-        .into_owned()
+        .decode_utf8()
+        .map(|value| value.into_owned())
+        .map_err(|_| ConnectionFieldsError::InvalidUrl)
 }
 
 trait DatabaseKindUrlExt {
@@ -393,6 +418,14 @@ mod tests {
                 format!("postgres://user:{encoded}@localhost:5432/app")
             );
         }
+    }
+
+    #[test]
+    fn rejects_non_utf8_percent_encoded_credentials_instead_of_changing_them() {
+        assert_eq!(
+            ConnectionFields::from_url("postgres://user:p%FFss@localhost:5432/app"),
+            Err(ConnectionFieldsError::InvalidUrl)
+        );
     }
 
     #[test]

@@ -12,21 +12,27 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 arrayref.workspace = true
+chacha20poly1305.workspace = true
 dbx-core = { path = "../dbx-core" }
 dirs.workspace = true
 gpui.workspace = true
+getrandom.workspace = true
 keyring.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+secrecy.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 unicode-segmentation.workspace = true
 url.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -28,7 +28,7 @@ Users move repeatedly between saved connections, schema navigation, table data, 
 - Connection setup must offer Details fields for host, port, user, password, and database alongside an equally capable Connection String mode; SQLite must offer a native database-file chooser.
 - Connections can be named, saved to disk, opened concurrently, and switched through persistent primary tabs.
 - Test Connection must validate the entered configuration without saving it, opening a workspace, or changing database state.
-- Saving uses the user-provided connection name for the profile and OS-keyring lookup; connection secrets must use the OS keyring and must never be written to the saved connection JSON file.
+- Saving uses the user-provided connection name for password-free profile metadata. Normal saved credentials live in the encrypted, app-owned DBX Vault (Argon2id + XChaCha20-Poly1305), unlocked once in-app per launch; the passphrase is never stored or recoverable. Selecting a saved connection eagerly hydrates its credential. Keychain/Secret Service is consulted only after an explicit **Import old system passwords** action, which never overwrites a vault entry.
 - Database-only rail controls must remain hidden until a connection is active.
 - Every connection can keep multiple independent query documents and table-bound structure documents open at once.
 - SQL editing requires syntax highlighting.
@@ -36,6 +36,7 @@ Users move repeatedly between saved connections, schema navigation, table data, 
 - Tables can be exported to SQL dump, CSV, or TSV files (optionally gzip-compressed) through a native save dialog, and the active database can export a selected set of tables with a chosen format, output name, destination folder, and schema-only SQL mode. Database SQL dumps replay their statements behind an explicit confirmation, while CSV/TSV files bulk-append rows whose header maps to one table's columns.
 - Structure documents expose columns, primary keys, and normalized foreign-key relationships for PostgreSQL, MySQL, and SQLite.
 - The application must remain native and responsive under large result sets.
+- Light and dark appearances are first-class, persist across launches, and preserve the same semantic color roles and dense workbench hierarchy.
 
 ## Brand Commitments
 

@@ -1,5 +1,14 @@
 use super::*;
 
+fn hydration_matches_current_draft(
+    selected_profile: Option<Uuid>,
+    expected_profile: Option<Uuid>,
+    current_fields: &ConnectionFields,
+    requested_fields: &ConnectionFields,
+) -> bool {
+    selected_profile == expected_profile && current_fields == requested_fields
+}
+
 impl DbxApp {
     fn default_url(kind: DatabaseKind) -> &'static str {
         match kind {
@@ -16,7 +25,7 @@ impl DbxApp {
         url: String,
         cx: &mut Context<Self>,
     ) {
-        let fields =
+        let mut fields =
             ConnectionFields::from_url(url.clone()).unwrap_or_else(|_| ConnectionFields::new(kind));
         let normalized_url = fields.url().unwrap_or(url);
         self.draft.kind = kind;
@@ -26,23 +35,24 @@ impl DbxApp {
             cx.notify();
         });
         self.draft.host.update(cx, |value, cx| {
-            *value = fields.host;
+            *value = std::mem::take(&mut fields.host);
             cx.notify();
         });
         self.draft.port.update(cx, |value, cx| {
-            *value = fields.port;
+            *value = std::mem::take(&mut fields.port);
             cx.notify();
         });
         self.draft.username.update(cx, |value, cx| {
-            *value = fields.username;
+            *value = std::mem::take(&mut fields.username);
             cx.notify();
         });
         self.draft.password.update(cx, |value, cx| {
-            *value = fields.password;
+            value.zeroize();
+            *value = std::mem::take(&mut fields.password);
             cx.notify();
         });
         self.draft.database.update(cx, |value, cx| {
-            *value = fields.database;
+            *value = std::mem::take(&mut fields.database);
             cx.notify();
         });
     }
@@ -70,26 +80,142 @@ impl DbxApp {
         Ok((fields.kind, url))
     }
 
-    /// Resolve the visible form through the profile store when it still names
-    /// the selected profile. This preserves the password-free form URL while
-    /// using the stored credential for connection operations.
+    /// Resolve the already-hydrated visible form for Test and Connect.
+    /// Saved credentials are restored eagerly when the profile is selected.
     fn resolve_draft(&self, cx: &App) -> Result<(DatabaseKind, String, ConnectionConfig), String> {
-        let (mut kind, visible_url) = self.draft_connection(cx)?;
-        let config = if let (Some(store), Some(profile_id)) =
-            (&self.profile_store, self.draft.selected_profile)
-        {
-            match store.get(profile_id).map_err(|error| error.to_string())? {
-                Some(profile) if profile.kind == kind && profile.url == visible_url => {
-                    let loaded = store.load(profile_id).map_err(|error| error.to_string())?;
-                    kind = loaded.config.kind;
-                    loaded.config
-                }
-                _ => ConnectionConfig::new(kind, visible_url.clone()),
-            }
-        } else {
-            ConnectionConfig::new(kind, visible_url.clone())
-        };
+        let (kind, visible_url) = self.draft_connection(cx)?;
+        let config = ConnectionConfig::new(kind, visible_url.clone());
         Ok((kind, visible_url, config))
+    }
+
+    fn clear_vault_inputs(&mut self, cx: &mut Context<Self>) {
+        self.vault_editors.passphrase.update(cx, |value, cx| {
+            value.zeroize();
+            cx.notify();
+        });
+        self.vault_editors.confirmation.update(cx, |value, cx| {
+            value.zeroize();
+            cx.notify();
+        });
+    }
+
+    pub(super) fn submit_vault_passphrase(&mut self, creating: bool, cx: &mut Context<Self>) {
+        let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
+            self.set_error("Credential vault is unavailable".into());
+            cx.notify();
+            return;
+        };
+        let mut passphrase = self.vault_editors.passphrase.read(cx).clone();
+        let mut confirmation = self.vault_editors.confirmation.read(cx).clone();
+        if passphrase.chars().count() < 12 {
+            passphrase.zeroize();
+            confirmation.zeroize();
+            self.set_error("Passphrase must contain at least 12 characters".into());
+            cx.notify();
+            return;
+        }
+        if creating && passphrase != confirmation {
+            passphrase.zeroize();
+            confirmation.zeroize();
+            self.set_error("Passphrase confirmation does not match".into());
+            cx.notify();
+            return;
+        }
+        confirmation.zeroize();
+        let passphrase = SecretString::from(std::mem::take(&mut passphrase));
+        self.clear_vault_inputs(cx);
+        self.vault_busy = true;
+        self.vault_generation += 1;
+        let generation = self.vault_generation;
+        let runtime = self.runtime.clone();
+        self.error = None;
+        self.status = if creating {
+            "Creating credential vault…"
+        } else {
+            "Unlocking credential vault…"
+        }
+        .into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn_blocking(move || {
+                    if creating {
+                        vault.create(passphrase)
+                    } else {
+                        vault.unlock(passphrase)
+                    }
+                })
+                .await?;
+            this.update(cx, |this, cx| {
+                if this.vault_generation != generation {
+                    return;
+                }
+                this.vault_busy = false;
+                match result {
+                    Ok(()) => {
+                        this.vault_state = Some(VaultState::Unlocked);
+                        this.status = if creating {
+                            "Credential vault created and unlocked"
+                        } else {
+                            "Credential vault unlocked"
+                        }
+                        .into();
+                        this.error = None;
+                        let selected_with_secret = this.draft.selected_profile.filter(|id| {
+                            this.saved_connections
+                                .iter()
+                                .find(|profile| profile.id == *id)
+                                .is_some_and(SavedConnection::has_secret)
+                        });
+                        if let Some(profile_id) = selected_with_secret {
+                            this.status =
+                                "Credential vault unlocked · loading saved password…".into();
+                            this.hydrate_saved_credential(profile_id, cx);
+                        }
+                    }
+                    Err(_) => this.set_error(if creating {
+                        "Could not create the credential vault.".into()
+                    } else {
+                        "Could not unlock the credential vault. Check the passphrase or vault data."
+                            .into()
+                    }),
+                }
+                this.clear_vault_inputs(cx);
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    pub(super) fn lock_vault(&mut self, cx: &mut Context<Self>) {
+        if self.saving_connection {
+            return;
+        }
+        let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
+            return;
+        };
+        if vault.lock().is_err() {
+            self.set_error("Could not lock the credential vault".into());
+            cx.notify();
+            return;
+        }
+        self.vault_state = Some(VaultState::Locked);
+        self.cancel_credential_hydration();
+        self.draft.password.update(cx, |value, cx| {
+            value.zeroize();
+            cx.notify();
+        });
+        if self.draft.kind != DatabaseKind::SQLite {
+            self.draft.connection_url.update(cx, |value, cx| {
+                value.zeroize();
+                cx.notify();
+            });
+        }
+        self.clear_vault_inputs(cx);
+        self.status = "Credential vault locked".into();
+        self.error = None;
+        cx.notify();
     }
 
     fn draft_test_fingerprint(
@@ -117,7 +243,7 @@ impl DbxApp {
         match mode {
             ConnectionFormMode::Details if self.draft.kind != DatabaseKind::SQLite => {
                 let connection_string = self.draft.connection_url.read(cx).trim().to_owned();
-                let fields = match ConnectionFields::from_url(connection_string) {
+                let mut fields = match ConnectionFields::from_url(connection_string) {
                     Ok(fields) if fields.kind == self.draft.kind => fields,
                     Ok(_) => {
                         self.set_error(format!(
@@ -134,23 +260,24 @@ impl DbxApp {
                     }
                 };
                 self.draft.host.update(cx, |value, cx| {
-                    *value = fields.host;
+                    *value = std::mem::take(&mut fields.host);
                     cx.notify();
                 });
                 self.draft.port.update(cx, |value, cx| {
-                    *value = fields.port;
+                    *value = std::mem::take(&mut fields.port);
                     cx.notify();
                 });
                 self.draft.username.update(cx, |value, cx| {
-                    *value = fields.username;
+                    *value = std::mem::take(&mut fields.username);
                     cx.notify();
                 });
                 self.draft.password.update(cx, |value, cx| {
-                    *value = fields.password;
+                    value.zeroize();
+                    *value = std::mem::take(&mut fields.password);
                     cx.notify();
                 });
                 self.draft.database.update(cx, |value, cx| {
-                    *value = fields.database;
+                    *value = std::mem::take(&mut fields.database);
                     cx.notify();
                 });
                 self.draft.mode = ConnectionFormMode::Details;
@@ -177,6 +304,7 @@ impl DbxApp {
     }
 
     pub(super) fn select_kind(&mut self, kind: DatabaseKind, cx: &mut Context<Self>) {
+        self.cancel_credential_hydration();
         self.draft.selected_profile = None;
         self.hydrate_connection_fields(kind, Self::default_url(kind).to_owned(), cx);
         self.error = None;
@@ -197,8 +325,9 @@ impl DbxApp {
         profile: SavedConnection,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_credential_hydration();
+        let has_saved_password = profile.has_secret();
         let profile_id = profile.id;
-        let has_secret = profile.has_secret();
         self.draft.selected_profile = Some(profile.id);
         self.draft.environment = profile.environment;
         self.draft.connection_name.update(cx, |name, cx| {
@@ -207,61 +336,74 @@ impl DbxApp {
         });
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
         self.error = None;
-        self.status = if has_secret {
-            "Saved connection selected · loading password…".into()
+        self.status = if has_saved_password {
+            "Loading saved password…".into()
         } else {
             "Saved connection selected".into()
         };
-        if has_secret && let Some(store) = self.profile_store.clone() {
-            let runtime = self.runtime.clone();
-            cx.spawn(async move |this, cx| {
-                let loaded = runtime
-                    .spawn_blocking(move || store.load(profile_id))
-                    .await?;
-                this.update(cx, |this, cx| {
-                    if this.draft.selected_profile != Some(profile_id) {
-                        return;
-                    }
-                    let password_is_empty = this.draft.password.read(cx).is_empty();
-                    match loaded {
-                        Ok(loaded) if password_is_empty => {
-                            this.hydrate_connection_fields(
-                                loaded.config.kind,
-                                loaded.config.url,
-                                cx,
-                            );
-                            this.error = None;
-                            this.status = "Saved connection selected".into();
-                        }
-                        Ok(_) => {
-                            // The user started editing before the keyring
-                            // returned. Never overwrite their new password.
-                            this.error = None;
-                            this.status = "Saved connection selected".into();
-                        }
-                        Err(error) if password_is_empty => {
-                            this.status = "Saved password unavailable · enter it again".into();
-                            this.error = Some(error.to_string());
-                        }
-                        Err(_) => {}
-                    }
-                    cx.notify();
-                })?;
-                Ok::<(), anyhow::Error>(())
-            })
-            .detach();
+        if has_saved_password {
+            self.hydrate_saved_credential(profile_id, cx);
         }
         cx.notify();
     }
 
+    fn hydrate_saved_credential(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
+        let Some(store) = self.profile_store.clone() else {
+            return;
+        };
+        self.credential_hydrating = true;
+        self.credential_hydration_generation += 1;
+        let hydration_generation = self.credential_hydration_generation;
+        let requested_fields = self.connection_fields(cx);
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime.spawn_blocking(move || store.load(profile_id)).await?;
+            this.update(cx, |this, cx| {
+                if this.credential_hydration_generation != hydration_generation { return; }
+                this.credential_hydrating = false;
+                if !hydration_matches_current_draft(
+                    this.draft.selected_profile,
+                    Some(profile_id),
+                    &this.connection_fields(cx),
+                    &requested_fields,
+                ) {
+                    this.status = "Connection details changed · saved password not restored".into();
+                    this.error = None;
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(loaded) => {
+                        let mut fields = ConnectionFields::from_url(loaded.config.url)
+                            .unwrap_or_else(|_| ConnectionFields::new(loaded.config.kind));
+                        this.draft.password.update(cx, |value, cx| {
+                            value.zeroize();
+                            *value = std::mem::take(&mut fields.password);
+                            cx.notify();
+                        });
+                        this.status = "Saved connection selected · password restored".into();
+                        this.error = None;
+                    }
+                    Err(_) => this.set_error("Saved connection password is unavailable in the credential vault. Import old passwords or enter it once and Save.".into()),
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        }).detach();
+    }
+
     pub(super) fn save_connection(&mut self, cx: &mut Context<Self>) {
+        if self.saving_connection || self.vault_busy {
+            return;
+        }
         let Some(store) = self.profile_store.clone() else {
             self.set_error("Connection profile storage is unavailable".into());
             cx.notify();
             return;
         };
         let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let fields = self.connection_fields(cx);
+        let mut fields = self.connection_fields(cx);
+        let mut requested_fields = fields.clone();
         let (kind, url) = match fields.url() {
             Ok(url) => (fields.kind, url),
             Err(error) => {
@@ -270,34 +412,56 @@ impl DbxApp {
                 return;
             }
         };
-        let mut draft = ConnectionProfileDraft::new(name, kind, url.clone())
-            .with_environment(self.draft.environment);
+        let mut draft =
+            ConnectionProfileDraft::new(name, kind, url).with_environment(self.draft.environment);
         if !fields.password.is_empty() {
-            draft = draft.with_secret(fields.password.clone());
+            draft = draft.with_secret(std::mem::take(&mut fields.password));
         }
         if let Some(id) = self.draft.selected_profile {
             draft = draft.with_id(id);
         }
-        match store.save(draft) {
-            Ok(profile) => {
-                self.draft.selected_profile = Some(profile.id);
-                // Rehydrate from the entered URL rather than the scrubbed
-                // profile so a newly entered password remains in the draft.
-                self.hydrate_connection_fields(profile.kind, url, cx);
-                match store.list() {
-                    Ok(profiles) => self.saved_connections = profiles,
-                    Err(error) => {
-                        self.set_error(error.to_string());
-                        cx.notify();
-                        return;
-                    }
-                }
-                self.error = None;
-                self.status = format!("Saved connection ‘{}’", profile.name);
-            }
-            Err(error) => self.set_error(error.to_string()),
-        }
+        let selected_profile = self.draft.selected_profile;
+        let runtime = self.runtime.clone();
+        self.saving_connection = true;
+        self.error = None;
+        self.status = "Saving connection…".into();
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let (save_result, list_result) = runtime
+                .spawn_blocking(move || {
+                    let save_result = store.save(draft);
+                    let list_result = store.list();
+                    (save_result, list_result)
+                })
+                .await?;
+            this.update(cx, |this, cx| {
+                this.saving_connection = false;
+                if let Ok(profiles) = list_result {
+                    this.saved_connections = profiles;
+                }
+                let unchanged = hydration_matches_current_draft(
+                    this.draft.selected_profile,
+                    selected_profile,
+                    &this.connection_fields(cx),
+                    &requested_fields,
+                );
+                match save_result {
+                    Ok(profile) if unchanged => {
+                        this.draft.selected_profile = Some(profile.id);
+                        this.status = format!("Saved connection ‘{}’", profile.name);
+                        this.error = None;
+                    }
+                    Ok(_) => {}
+                    Err(error) if unchanged => this.set_error(error.to_string()),
+                    Err(_) => {}
+                }
+                requested_fields.password.zeroize();
+                requested_fields.connection_string.zeroize();
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     pub(super) fn choose_sqlite_file(&mut self, cx: &mut Context<Self>) {
@@ -346,7 +510,18 @@ impl DbxApp {
         .detach();
     }
 
+    fn cancel_credential_hydration(&mut self) {
+        self.credential_hydration_generation =
+            self.credential_hydration_generation.saturating_add(1);
+        self.credential_hydrating = false;
+    }
+
     pub(super) fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.credential_hydrating {
+            self.set_error("Saved connection password is still loading".into());
+            cx.notify();
+            return;
+        }
         let (kind, _, config) = match self.resolve_draft(cx) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -491,6 +666,11 @@ impl DbxApp {
     }
 
     pub(super) fn test_connection(&mut self, cx: &mut Context<Self>) {
+        if self.credential_hydrating {
+            self.set_error("Saved connection password is still loading".into());
+            cx.notify();
+            return;
+        }
         let (kind, _, config) = match self.resolve_draft(cx) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -553,6 +733,7 @@ impl DbxApp {
     }
 
     pub(super) fn begin_new_connection(&mut self, cx: &mut Context<Self>) {
+        self.cancel_credential_hydration();
         self.draft.selected_profile = None;
         self.draft.environment = ConnectionEnvironment::default();
         self.draft.connection_name.update(cx, |name, cx| {
@@ -567,5 +748,36 @@ impl DbxApp {
         self.connection_picker_open = true;
         self.error = None;
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydration_only_applies_to_the_selected_unchanged_draft() {
+        let profile = Uuid::new_v4();
+        let fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
+        assert!(hydration_matches_current_draft(
+            Some(profile),
+            Some(profile),
+            &fields,
+            &fields,
+        ));
+        assert!(!hydration_matches_current_draft(
+            Some(Uuid::new_v4()),
+            Some(profile),
+            &fields,
+            &fields,
+        ));
+        let mut edited_fields = fields.clone();
+        edited_fields.host = "edited-host".into();
+        assert!(!hydration_matches_current_draft(
+            Some(profile),
+            Some(profile),
+            &edited_fields,
+            &fields,
+        ));
     }
 }

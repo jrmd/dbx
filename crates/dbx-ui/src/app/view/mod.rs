@@ -1,6 +1,7 @@
 mod chrome;
 mod connection;
 mod data;
+mod diagram;
 mod overlays;
 mod query;
 
@@ -22,9 +23,11 @@ impl Render for DbxApp {
         div()
             .size_full()
             .flex()
-            .bg(THEME.canvas)
-            .text_color(THEME.text)
-            .on_action(cx.listener(Self::run_query_action))
+            .bg(theme().canvas)
+            .text_color(theme().text)
+            .capture_key_down(cx.listener(|this, event, window, cx| {
+                this.dismiss_overlay_on_escape(event, window, cx)
+            }))
             .on_action(cx.listener(Self::refresh_action))
             .when(connected, |view| view.child(self.render_app_rail(cx)))
             .child(

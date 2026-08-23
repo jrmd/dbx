@@ -10,7 +10,7 @@ use gpui_component::{
     table::{Column as DataColumn, TableDelegate, TableEvent, TableState},
 };
 
-use crate::theme::{Icon, THEME, icon};
+use crate::theme::{Icon, icon, theme};
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
@@ -36,6 +36,90 @@ impl Default for ResultTableDelegate {
 }
 
 impl ResultTableDelegate {
+    /// Return the underlying value for a data column (not the synthetic row-number column).
+    ///
+    /// Keeping this at the delegate boundary means callers can add selection, copy, or export
+    /// controls without reaching through the virtualized table implementation.
+    pub(super) fn cell_value(&self, row_ix: usize, data_column_ix: usize) -> Option<&CellValue> {
+        self.result
+            .as_ref()?
+            .rows
+            .get(row_ix)?
+            .values
+            .get(data_column_ix)
+    }
+
+    /// Return a complete underlying row, preserving `NULL` values and duplicate column names.
+    pub(super) fn row_values(&self, row_ix: usize) -> Option<&[CellValue]> {
+        Some(self.result.as_ref()?.rows.get(row_ix)?.values.as_slice())
+    }
+
+    /// Return a data column in result order, preserving `NULL` values.
+    pub(super) fn column_values(&self, data_column_ix: usize) -> Option<Vec<&CellValue>> {
+        let result = self.result.as_ref()?;
+        result.columns.get(data_column_ix)?;
+        Some(
+            result
+                .rows
+                .iter()
+                .filter_map(|row| row.values.get(data_column_ix))
+                .collect(),
+        )
+    }
+
+    /// Render one cell for a plain-text clipboard target. `NULL` is intentionally visible,
+    /// while an empty text value remains empty.
+    pub(super) fn cell_as_plain_text(
+        &self,
+        row_ix: usize,
+        data_column_ix: usize,
+    ) -> Option<String> {
+        self.cell_value(row_ix, data_column_ix).map(plain_cell_text)
+    }
+
+    /// Render a single row as TSV, using quoted empty strings and a bare `NULL` sentinel so
+    /// downstream consumers can distinguish database NULL from an empty text value.
+    pub(super) fn row_as_tsv(&self, row_ix: usize) -> Option<String> {
+        self.row_values(row_ix).map(|row| delimited_row(row, '\t'))
+    }
+
+    /// Render one data column as a headered TSV document. The header makes a copied column
+    /// useful on its own, while `NULL` and empty text retain the same representation as rows
+    /// and full-result exports.
+    pub(super) fn column_as_tsv(&self, data_column_ix: usize) -> Option<String> {
+        let result = self.result.as_deref()?;
+        let column = result.columns.get(data_column_ix)?;
+        let values = self.column_values(data_column_ix)?;
+
+        Some(delimited_column(
+            column.name.as_str(),
+            values.into_iter(),
+            '\t',
+        ))
+    }
+
+    /// Render the complete result as a headered TSV document.
+    pub(super) fn result_as_tsv(&self) -> Option<String> {
+        self.result
+            .as_deref()
+            .map(|result| delimited_result(result, '\t'))
+    }
+
+    /// Render the complete result as a headered RFC 4180-compatible CSV document.
+    pub(super) fn result_as_csv(&self) -> Option<String> {
+        self.result
+            .as_deref()
+            .map(|result| delimited_result(result, ','))
+    }
+
+    /// Render a lossless JSON result envelope.
+    ///
+    /// A columns-plus-rows shape preserves duplicate SQL aliases and keeps JSON `null` distinct
+    /// from an empty string, unlike a name-keyed object per row.
+    pub(super) fn result_as_json(&self) -> Option<String> {
+        self.result.as_deref().map(json_result)
+    }
+
     fn row_number_column() -> DataColumn {
         DataColumn::new(ROW_NUMBER_COLUMN_KEY, "#")
             .width(44.)
@@ -157,6 +241,111 @@ impl ResultTableDelegate {
     }
 }
 
+const NULL_SENTINEL: &str = "NULL";
+
+fn plain_cell_text(value: &CellValue) -> String {
+    value.to_string()
+}
+
+fn delimited_row(values: &[CellValue], delimiter: char) -> String {
+    values
+        .iter()
+        .map(|value| delimited_cell(value, delimiter))
+        .collect::<Vec<_>>()
+        .join(&delimiter.to_string())
+}
+
+fn delimited_result(result: &QueryResult, delimiter: char) -> String {
+    let mut lines = Vec::with_capacity(result.rows.len() + 1);
+    lines.push(delimited_text_row(
+        result.columns.iter().map(|column| column.name.as_str()),
+        delimiter,
+    ));
+    lines.extend(
+        result
+            .rows
+            .iter()
+            .map(|row| delimited_row(&row.values, delimiter)),
+    );
+    lines.join("\n")
+}
+
+fn delimited_column<'a>(
+    header: &str,
+    values: impl Iterator<Item = &'a CellValue>,
+    delimiter: char,
+) -> String {
+    std::iter::once(quote_delimited_text(header, delimiter, false))
+        .chain(values.map(|value| delimited_cell(value, delimiter)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn delimited_cell(value: &CellValue, delimiter: char) -> String {
+    match value {
+        CellValue::Null => NULL_SENTINEL.to_owned(),
+        value => quote_delimited_text(&plain_cell_text(value), delimiter, true),
+    }
+}
+
+fn delimited_text_row<'a>(values: impl Iterator<Item = &'a str>, delimiter: char) -> String {
+    values
+        .map(|value| quote_delimited_text(value, delimiter, false))
+        .collect::<Vec<_>>()
+        .join(&delimiter.to_string())
+}
+
+fn quote_delimited_text(value: &str, delimiter: char, protect_null_sentinel: bool) -> String {
+    let needs_quotes = value.is_empty()
+        || (protect_null_sentinel && value == NULL_SENTINEL)
+        || value.contains(delimiter)
+        || value.contains('"')
+        || value.contains('\r')
+        || value.contains('\n');
+    if !needs_quotes {
+        return value.to_owned();
+    }
+
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn json_result(result: &QueryResult) -> String {
+    let columns = result
+        .columns
+        .iter()
+        .map(|column| {
+            serde_json::json!({
+                "name": column.name,
+                "data_type": column.data_type,
+            })
+        })
+        .collect::<Vec<_>>();
+    let rows = result
+        .rows
+        .iter()
+        .map(|row| row.values.iter().map(json_cell_value).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    serde_json::json!({ "columns": columns, "rows": rows }).to_string()
+}
+
+fn json_cell_value(value: &CellValue) -> serde_json::Value {
+    match value {
+        CellValue::Null => serde_json::Value::Null,
+        CellValue::Boolean(value) => serde_json::Value::Bool(*value),
+        CellValue::Integer(value) => serde_json::Value::from(*value),
+        CellValue::Unsigned(value) => serde_json::Value::from(*value),
+        CellValue::Real(value) => serde_json::Number::from_f64(*value)
+            .map(serde_json::Value::Number)
+            // JSON has no NaN or infinity; keeping their text avoids silently turning a real
+            // database value into a NULL in an export.
+            .unwrap_or_else(|| serde_json::Value::String(value.to_string())),
+        CellValue::Text(value) => serde_json::Value::String(value.clone()),
+        CellValue::Bytes(_) => serde_json::Value::String(plain_cell_text(value)),
+        CellValue::Json(value) => value.clone(),
+    }
+}
+
 impl TableDelegate for ResultTableDelegate {
     fn columns_count(&self, _cx: &App) -> usize {
         self.columns.len()
@@ -180,8 +369,8 @@ impl TableDelegate for ResultTableDelegate {
     ) -> Stateful<Div> {
         div()
             .id("dbx-result-header")
-            .bg(THEME.panel_raised)
-            .border_color(THEME.border_strong)
+            .bg(theme().panel_raised)
+            .border_color(theme().border_strong)
     }
 
     fn render_th(
@@ -196,7 +385,7 @@ impl TableDelegate for ResultTableDelegate {
             .items_center()
             .px(px(8.))
             .text_size(px(10.))
-            .text_color(THEME.text_muted)
+            .text_color(theme().text_muted)
             .truncate()
             .child(self.columns[col_ix].name.clone())
     }
@@ -209,11 +398,11 @@ impl TableDelegate for ResultTableDelegate {
     ) -> Stateful<Div> {
         div()
             .id(("dbx-result-row", row_ix))
-            .border_color(THEME.border)
+            .border_color(theme().border)
             .bg(if row_ix.is_multiple_of(2) {
-                THEME.canvas
+                theme().canvas
             } else {
-                THEME.grid_alternate
+                theme().grid_alternate
             })
     }
 
@@ -225,7 +414,7 @@ impl TableDelegate for ResultTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let (text, text_color) = if col_ix == 0 {
-            ((row_ix + 1).to_string(), THEME.text_muted)
+            ((row_ix + 1).to_string(), theme().text_muted)
         } else {
             self.result
                 .as_ref()
@@ -233,12 +422,12 @@ impl TableDelegate for ResultTableDelegate {
                 .and_then(|row| row.values.get(col_ix - 1))
                 .map(|value| {
                     if matches!(value, CellValue::Null) {
-                        ("NULL".to_owned(), THEME.text_muted)
+                        ("NULL".to_owned(), theme().text_muted)
                     } else {
-                        (value.to_string(), THEME.text)
+                        (value.to_string(), theme().text)
                     }
                 })
-                .unwrap_or_else(|| ("—".to_owned(), THEME.text_muted))
+                .unwrap_or_else(|| ("—".to_owned(), theme().text_muted))
         };
         let foreign_key = self.foreign_key_for_cell(row_ix, col_ix);
 
@@ -262,8 +451,8 @@ impl TableDelegate for ResultTableDelegate {
                     .compact()
                     .ghost()
                     .tooltip("Open referenced row")
-                    .text_color(THEME.accent)
-                    .child(icon(Icon::ArrowRight, THEME.accent))
+                    .text_color(theme().accent)
+                    .child(icon(Icon::ArrowRight, theme().accent))
                     .on_click(cx.listener(move |_, _, _, cx| {
                         cx.stop_propagation();
                         cx.emit(TableEvent::DoubleClickedCell(row_ix, col_ix));
@@ -285,7 +474,7 @@ impl TableDelegate for ResultTableDelegate {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(THEME.text_muted)
+            .text_color(theme().text_muted)
             .child("No rows returned")
     }
 
@@ -323,6 +512,37 @@ pub(super) fn foreign_key_target_table(
 mod tests {
     use super::*;
     use dbx_core::RowData;
+
+    fn export_result() -> QueryResult {
+        QueryResult {
+            columns: vec![
+                ColumnInfo::result("id", 0, "INTEGER"),
+                ColumnInfo::result("note", 1, "TEXT"),
+                ColumnInfo::result("note", 2, "TEXT"),
+            ],
+            rows: vec![
+                RowData::new(vec![
+                    CellValue::Integer(7),
+                    CellValue::Null,
+                    CellValue::Text(String::new()),
+                ]),
+                RowData::new(vec![
+                    CellValue::Integer(8),
+                    CellValue::Text("comma, tab\t quote\" newline\n".into()),
+                    CellValue::Text("NULL".into()),
+                ]),
+            ],
+            rows_affected: None,
+            truncated: false,
+            elapsed_ms: 0,
+        }
+    }
+
+    fn delegate_with_export_result() -> ResultTableDelegate {
+        let mut delegate = ResultTableDelegate::default();
+        delegate.set_result(Some(Arc::new(export_result())), &HashMap::new(), &[], &[]);
+        delegate
+    }
 
     #[test]
     fn foreign_key_target_resolves_the_referenced_schema() {
@@ -383,6 +603,7 @@ mod tests {
                 CellValue::Integer(42),
             ])],
             rows_affected: None,
+            truncated: false,
             elapsed_ms: 0,
         };
         let mut delegate = ResultTableDelegate::default();
@@ -412,6 +633,7 @@ mod tests {
             columns: vec![ColumnInfo::result("customer_id", 0, "INTEGER")],
             rows: vec![RowData::new(vec![CellValue::Null])],
             rows_affected: None,
+            truncated: false,
             elapsed_ms: 0,
         };
         let mut delegate = ResultTableDelegate::default();
@@ -423,5 +645,94 @@ mod tests {
         );
 
         assert!(delegate.foreign_key_for_cell(0, 1).is_none());
+    }
+
+    #[test]
+    fn result_accessors_retain_database_nulls_and_data_column_order() {
+        let delegate = delegate_with_export_result();
+
+        assert_eq!(delegate.cell_value(0, 1), Some(&CellValue::Null));
+        assert_eq!(delegate.cell_as_plain_text(0, 1).as_deref(), Some("NULL"));
+        assert_eq!(delegate.cell_as_plain_text(0, 2).as_deref(), Some(""));
+        assert_eq!(delegate.row_values(1).unwrap()[0], CellValue::Integer(8));
+        assert_eq!(
+            delegate.column_values(0).unwrap(),
+            vec![&CellValue::Integer(7), &CellValue::Integer(8)]
+        );
+        assert!(delegate.cell_value(8, 0).is_none());
+        assert!(delegate.column_values(8).is_none());
+    }
+
+    #[test]
+    fn delimited_exports_escape_controls_and_preserve_null_vs_empty_text() {
+        let delegate = delegate_with_export_result();
+
+        assert_eq!(delegate.row_as_tsv(0).as_deref(), Some("7\tNULL\t\"\""));
+        assert_eq!(
+            delegate.result_as_csv().as_deref(),
+            Some("id,note,note\n7,NULL,\"\"\n8,\"comma, tab\t quote\"\" newline\n\",\"NULL\"")
+        );
+        assert_eq!(
+            delegate.result_as_tsv().as_deref(),
+            Some(
+                "id\tnote\tnote\n7\tNULL\t\"\"\n8\t\"comma, tab\t quote\"\" newline\n\"\t\"NULL\""
+            )
+        );
+    }
+
+    #[test]
+    fn column_tsv_export_includes_its_header_and_preserves_null_vs_empty_text() {
+        let delegate = delegate_with_export_result();
+
+        assert_eq!(
+            delegate.column_as_tsv(1).as_deref(),
+            Some("note\nNULL\n\"comma, tab\t quote\"\" newline\n\"")
+        );
+        assert_eq!(
+            delegate.column_as_tsv(2).as_deref(),
+            Some("note\n\"\"\n\"NULL\"")
+        );
+    }
+
+    #[test]
+    fn column_tsv_export_returns_none_without_a_result_or_for_an_invalid_column() {
+        let empty_delegate = ResultTableDelegate::default();
+        assert!(empty_delegate.column_as_tsv(0).is_none());
+
+        let delegate = delegate_with_export_result();
+        assert!(delegate.column_as_tsv(8).is_none());
+    }
+
+    #[test]
+    fn json_export_is_positional_to_preserve_duplicate_aliases_and_nulls() {
+        let delegate = delegate_with_export_result();
+        let exported: serde_json::Value =
+            serde_json::from_str(&delegate.result_as_json().unwrap()).unwrap();
+
+        assert_eq!(exported["columns"][1]["name"], "note");
+        assert_eq!(exported["columns"][2]["name"], "note");
+        assert!(exported["rows"][0][1].is_null());
+        assert_eq!(exported["rows"][0][2], "");
+        assert_eq!(exported["rows"][1][2], "NULL");
+    }
+
+    #[test]
+    fn empty_result_exports_its_headers_instead_of_disappearing() {
+        let mut delegate = ResultTableDelegate::default();
+        delegate.set_result(
+            Some(Arc::new(QueryResult {
+                columns: vec![ColumnInfo::result("id", 0, "INTEGER")],
+                rows: Vec::new(),
+                rows_affected: None,
+                truncated: false,
+                elapsed_ms: 0,
+            })),
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+
+        assert_eq!(delegate.result_as_csv().as_deref(), Some("id"));
+        assert_eq!(delegate.result_as_tsv().as_deref(), Some("id"));
     }
 }

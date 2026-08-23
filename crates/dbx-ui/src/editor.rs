@@ -20,11 +20,11 @@ use gpui::{
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, Size, StatefulInteractiveElement as _,
     Style, Subscription, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, rgba, size,
+    fill, point, prelude::*, px, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme::THEME;
+use crate::theme::theme;
 use gpui_component::input::{
     MoveEnd, MoveHome, MoveToNextWord, MoveToPreviousWord, SelectToEndOfLine, SelectToNextWordEnd,
     SelectToPreviousWordStart, SelectToStartOfLine,
@@ -71,6 +71,8 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Undo,
+        Redo,
         ShowCharacterPalette,
     ]
 );
@@ -97,6 +99,10 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-c", Copy, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("ctrl-x", Cut, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-z", Undo, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-cmd-z", Redo, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("home", Home, Some(TEXT_EDITOR_CONTEXT)),
         KeyBinding::new("end", End, Some(TEXT_EDITOR_CONTEXT)),
         // Keep DBX's custom renderer on the same navigation contract as the
@@ -148,6 +154,348 @@ pub enum EditorLanguage {
     #[default]
     PlainText,
     Sql,
+    Json,
+}
+
+/// The source used when executing text from an editor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum QueryExecutionScope {
+    /// Run a non-empty selection, otherwise the SQL statement around the caret.
+    #[default]
+    SelectionOrStatement,
+    /// Run the whole document exactly as written.
+    Document,
+    /// Run a non-empty selection, otherwise the line containing the caret.
+    /// This is suitable for Redis and other line-oriented command editors.
+    SelectionOrCurrentLine,
+}
+
+/// Conservative safety classification for SQL execution.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+pub enum SqlExecutionKind {
+    /// A query that is safe to run without modifying database state.
+    Read,
+    /// A statement that may modify state and should be described honestly.
+    MutationRisk,
+    /// A broad or irreversible statement that should require confirmation.
+    Destructive,
+}
+
+/// Return the execution range selected by the user, or the appropriate
+/// fallback for the requested scope. All ranges are valid UTF-8 byte ranges.
+#[allow(dead_code)]
+pub fn execution_range(
+    text: &str,
+    selection: Range<usize>,
+    cursor: usize,
+    scope: QueryExecutionScope,
+) -> Range<usize> {
+    let selection = clamp_range(text, selection);
+    if !selection.is_empty() {
+        return selection;
+    }
+    match scope {
+        QueryExecutionScope::Document => 0..text.len(),
+        QueryExecutionScope::SelectionOrStatement => sql_statement_range(text, cursor),
+        QueryExecutionScope::SelectionOrCurrentLine => {
+            let cursor = clamp_boundary(text, cursor);
+            line_start(text, cursor)..line_end(text, cursor)
+        }
+    }
+}
+
+/// Return the SQL statement surrounding `cursor`, ignoring terminators in
+/// quoted strings, comments, and PostgreSQL dollar-quoted bodies.
+#[allow(dead_code)]
+pub fn sql_statement_range(text: &str, cursor: usize) -> Range<usize> {
+    let cursor = clamp_boundary(text, cursor);
+    let boundaries = sql_statement_boundaries(text);
+    // A caret immediately after a terminator belongs to the next statement;
+    // a caret on the terminator itself remains with the preceding statement.
+    // If there is no next statement (only trailing whitespace), keep the last
+    // executable statement active instead of returning an empty range.
+    let end_index = boundaries.partition_point(|boundary| *boundary <= cursor);
+    let start = boundaries[end_index.saturating_sub(1)];
+    let end = boundaries.get(end_index).copied().unwrap_or(text.len());
+    let candidate = start..end;
+    if !text[candidate.clone()].trim().is_empty() {
+        return candidate;
+    }
+
+    boundaries[..end_index]
+        .windows(2)
+        .rev()
+        .map(|pair| pair[0]..pair[1])
+        .find(|range| !text[range.clone()].trim().is_empty())
+        .unwrap_or(candidate)
+}
+
+/// Count non-empty SQL statements while ignoring semicolons in lexical
+/// regions such as quoted strings, comments, and dollar-quoted bodies.
+#[allow(dead_code)]
+pub fn sql_statement_count(text: &str) -> usize {
+    sql_statement_ranges(text)
+        .into_iter()
+        .filter(|range| {
+            lex_sql(&text[range.clone()])
+                .iter()
+                .any(|token| token.kind != SqlTokenKind::Comment)
+        })
+        .count()
+}
+
+/// Classify a SQL script conservatively. Any risky statement determines the
+/// script's result; unfamiliar syntax is deliberately treated as mutation
+/// risk rather than read-only.
+#[allow(dead_code)]
+pub fn sql_execution_kind(text: &str) -> SqlExecutionKind {
+    sql_statement_ranges(text)
+        .into_iter()
+        .filter_map(|range| sql_statement_kind(&text[range]))
+        .max()
+        .unwrap_or(SqlExecutionKind::MutationRisk)
+}
+
+/// Whether successful execution may have changed the relational catalogue.
+///
+/// This intentionally errs on the side of refreshing schema-derived UI. The
+/// lexical pass ignores comments, strings, quoted identifiers, and
+/// dollar-quoted bodies, so examples or procedure bodies do not spuriously
+/// invalidate an open database diagram.
+#[allow(dead_code)]
+pub fn sql_may_change_schema(text: &str) -> bool {
+    sql_statement_ranges(text).into_iter().any(|range| {
+        sql_words_with_depth(&text[range]).iter().any(|(word, _)| {
+            matches!(
+                word.as_str(),
+                "CREATE"
+                    | "ALTER"
+                    | "DROP"
+                    | "RENAME"
+                    | "ATTACH"
+                    | "DETACH"
+                    | "DO"
+                    | "CALL"
+                    | "EXEC"
+                    | "EXECUTE"
+            )
+        })
+    })
+}
+
+fn sql_statement_ranges(text: &str) -> Vec<Range<usize>> {
+    let boundaries = sql_statement_boundaries(text);
+    boundaries
+        .windows(2)
+        .map(|pair| pair[0]..pair[1])
+        .filter(|range| !text[range.clone()].trim().is_empty())
+        .collect()
+}
+
+fn sql_statement_kind(text: &str) -> Option<SqlExecutionKind> {
+    let words = sql_words_with_depth(text);
+    let top_level_words: Vec<_> = words
+        .iter()
+        .filter(|(_, depth)| *depth == 0)
+        .map(|(word, _)| word.as_str())
+        .collect();
+    let first = top_level_words.first()?;
+    if words
+        .iter()
+        .any(|(word, _)| matches!(word.as_str(), "DROP" | "TRUNCATE" | "ALTER"))
+    {
+        return Some(SqlExecutionKind::Destructive);
+    }
+    // MySQL's REPLACE deletes a conflicting row before inserting; MERGE/CALL
+    // and EXEC may run arbitrary write paths. Require confirmation rather
+    // than attempting dialect-specific parser completeness here.
+    if words.iter().any(|(word, _)| {
+        matches!(
+            word.as_str(),
+            "MERGE" | "REPLACE" | "CALL" | "EXEC" | "EXECUTE"
+        )
+    }) {
+        return Some(SqlExecutionKind::Destructive);
+    }
+    for (index, (word, depth)) in words.iter().enumerate() {
+        if matches!(word.as_str(), "DELETE" | "UPDATE") {
+            return Some(
+                if words[index + 1..]
+                    .iter()
+                    .any(|(word, where_depth)| where_depth == depth && word == "WHERE")
+                {
+                    SqlExecutionKind::MutationRisk
+                } else {
+                    SqlExecutionKind::Destructive
+                },
+            );
+        }
+    }
+    if words.iter().any(|(word, _)| word == "INSERT") {
+        return Some(SqlExecutionKind::MutationRisk);
+    }
+    if matches!(*first, "SELECT" | "VALUES")
+        || (*first == "WITH"
+            && top_level_words
+                .iter()
+                .skip(1)
+                .any(|word| matches!(*word, "SELECT" | "VALUES")))
+    {
+        return Some(SqlExecutionKind::Read);
+    }
+    Some(SqlExecutionKind::MutationRisk)
+}
+
+/// Return identifier-like tokens with their parenthesis depth. `lex_sql` has
+/// already protected strings, comments, and dollar-quoted bodies; the depth
+/// pass applies the same protection while tracking only real SQL grouping.
+fn sql_words_with_depth(text: &str) -> Vec<(String, usize)> {
+    lex_sql(text)
+        .into_iter()
+        .filter(|token| token.kind != SqlTokenKind::Comment)
+        .map(|token| {
+            (
+                text[token.range.clone()].to_ascii_uppercase(),
+                sql_parenthesis_depth_at(text, token.range.start),
+            )
+        })
+        .collect()
+}
+
+fn sql_parenthesis_depth_at(text: &str, target: usize) -> usize {
+    let bytes = text.as_bytes();
+    let target = clamp_boundary(text, target);
+    let mut depth = 0usize;
+    let mut index = 0;
+    while index < target {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == quote {
+                        index += 1;
+                        if index < bytes.len() && bytes[index] == quote {
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'$' => {
+                index = dollar_quoted_end(text, index).unwrap_or(index + 1);
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    depth
+}
+
+fn sql_statement_boundaries(text: &str) -> Vec<usize> {
+    let mut boundaries = vec![0];
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[index];
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == quote {
+                        index += 1;
+                        if index < bytes.len() && bytes[index] == quote {
+                            index += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'$' => {
+                if let Some(end) = dollar_quoted_end(text, index) {
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            b';' => {
+                boundaries.push(index + 1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    if boundaries.last().copied() != Some(text.len()) {
+        boundaries.push(text.len());
+    }
+    boundaries
+}
+
+#[allow(dead_code)]
+fn dollar_quoted_end(text: &str, start: usize) -> Option<usize> {
+    let remainder = &text[start..];
+    let tag_end = remainder[1..].find('$')? + 1;
+    let delimiter = &remainder[..=tag_end];
+    let tag = &delimiter[1..delimiter.len() - 1];
+    if !tag.is_empty()
+        && !(tag.starts_with(|character: char| character == '_' || character.is_ascii_alphabetic())
+            && tag
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    remainder[delimiter.len()..]
+        .find(delimiter)
+        .map(|offset| start + delimiter.len() + offset + delimiter.len())
+        .or(Some(text.len()))
 }
 
 /// The lexical categories understood by the built-in SQL highlighter.
@@ -171,6 +519,65 @@ pub enum SqlTokenKind {
 pub struct SqlToken {
     pub kind: SqlTokenKind,
     pub range: Range<usize>,
+}
+
+/// The lexical categories understood by the built-in JSON highlighter.
+///
+/// JSON values are lexed, rather than parsed, so a partially typed document
+/// remains highlighted and completely editable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JsonTokenKind {
+    Property,
+    String,
+    Number,
+    Boolean,
+    Null,
+}
+
+/// A token returned by [`lex_json`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsonToken {
+    pub kind: JsonTokenKind,
+    pub range: Range<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct HighlightToken {
+    range: Range<usize>,
+    kind: HighlightTokenKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HighlightTokenKind {
+    Sql(SqlTokenKind),
+    Json(JsonTokenKind),
+}
+
+impl From<SqlToken> for HighlightToken {
+    fn from(token: SqlToken) -> Self {
+        Self {
+            range: token.range,
+            kind: HighlightTokenKind::Sql(token.kind),
+        }
+    }
+}
+
+impl From<JsonToken> for HighlightToken {
+    fn from(token: JsonToken) -> Self {
+        Self {
+            range: token.range,
+            kind: HighlightTokenKind::Json(token.kind),
+        }
+    }
+}
+
+impl HighlightToken {
+    fn color(&self) -> gpui::Hsla {
+        match self.kind {
+            HighlightTokenKind::Sql(kind) => sql_token_color(kind),
+            HighlightTokenKind::Json(kind) => json_token_color(kind),
+        }
+    }
 }
 
 /// The part of a SQL statement that a completion menu should search.
@@ -367,6 +774,68 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
         }
 
         index += 1;
+    }
+
+    tokens
+}
+
+/// Lex JSON into UTF-8-safe ranges suitable for syntax highlighting.
+///
+/// This deliberately accepts incomplete strings and partially written values:
+/// the editor needs useful feedback while a JSON document is still being
+/// composed, not only after it is valid. Object keys are recognised by a
+/// following colon; punctuation and unknown text retain the base colour.
+pub fn lex_json(text: &str) -> Vec<JsonToken> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        let start = chars[index].0;
+        match chars[index].1 {
+            '"' => {
+                let end = consume_json_string(&chars, index);
+                let end_byte = byte_end(&chars, end, text.len());
+                let mut next = end;
+                while next < chars.len() && chars[next].1.is_whitespace() {
+                    next += 1;
+                }
+                let kind = if next < chars.len() && chars[next].1 == ':' {
+                    JsonTokenKind::Property
+                } else {
+                    JsonTokenKind::String
+                };
+                push_json_token(&mut tokens, kind, start, end_byte);
+                index = end;
+            }
+            '-' | '0'..='9' if consume_json_number(&chars, index).is_some() => {
+                let end = consume_json_number(&chars, index).unwrap_or(index + 1);
+                push_json_token(
+                    &mut tokens,
+                    JsonTokenKind::Number,
+                    start,
+                    byte_end(&chars, end, text.len()),
+                );
+                index = end;
+            }
+            character if character.is_ascii_alphabetic() => {
+                let mut end = index + 1;
+                while end < chars.len() && chars[end].1.is_ascii_alphabetic() {
+                    end += 1;
+                }
+                let end_byte = byte_end(&chars, end, text.len());
+                let kind = match &text[start..end_byte] {
+                    "true" | "false" => Some(JsonTokenKind::Boolean),
+                    "null" => Some(JsonTokenKind::Null),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    push_json_token(&mut tokens, kind, start, end_byte);
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
     }
 
     tokens
@@ -1291,6 +1760,25 @@ fn is_column_completion_keyword(word: &str) -> bool {
 }
 
 /// A native single-line or multiline text editor.
+const HISTORY_LIMIT: usize = 100;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EditorSnapshot {
+    text: String,
+    selection: Range<usize>,
+    selection_reversed: bool,
+}
+
+impl EditorSnapshot {
+    fn from_editor(editor: &TextEditor, cx: &App) -> Self {
+        Self {
+            text: editor.text(cx),
+            selection: editor.selected_range.clone(),
+            selection_reversed: editor.selection_reversed,
+        }
+    }
+}
+
 pub struct TextEditor {
     /// The surrounding view owns this entity and can observe it for changes.
     value: Entity<String>,
@@ -1321,6 +1809,8 @@ pub struct TextEditor {
     /// to resolve the next character under the pointer.
     selection_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    undo_history: Vec<EditorSnapshot>,
+    redo_history: Vec<EditorSnapshot>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1379,6 +1869,8 @@ impl TextEditor {
             last_bounds: None,
             selection_bounds: None,
             is_selecting: false,
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
             _subscriptions: vec![observed, focus, blur],
         }
     }
@@ -1386,6 +1878,11 @@ impl TextEditor {
     /// Create a multiline SQL editor backed by an existing value entity.
     pub fn new_sql(value: Entity<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_with_language(value, true, EditorLanguage::Sql, window, cx)
+    }
+
+    /// Create a multiline JSON editor backed by an existing value entity.
+    pub fn new_json(value: Entity<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_language(value, true, EditorLanguage::Json, window, cx)
     }
 
     /// Paint this editor as a password field without changing its value.
@@ -1442,6 +1939,7 @@ impl TextEditor {
     /// Replace the current value and put the caret at its end.
     #[allow(dead_code)]
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.record_history(cx);
         let text = normalize_value(&text.into(), self.multiline);
         let cursor = text.len();
         self.content = text.clone();
@@ -1459,6 +1957,52 @@ impl TextEditor {
     #[allow(dead_code)]
     pub fn selected_range(&self) -> Range<usize> {
         self.selected_range.clone()
+    }
+
+    /// The selected text, if there is a non-empty UTF-8 selection.
+    #[allow(dead_code)]
+    pub fn selected_text(&self, cx: &App) -> Option<String> {
+        let text = self.text(cx);
+        (!self.selected_range.is_empty()).then(|| text[self.selected_range.clone()].to_owned())
+    }
+
+    /// Resolve the text DBX should execute for the supplied scope.
+    #[allow(dead_code)]
+    pub fn execution_text(&self, scope: QueryExecutionScope, cx: &App) -> String {
+        let text = self.text(cx);
+        let range = execution_range(
+            &text,
+            self.selected_range.clone(),
+            self.cursor_offset(),
+            scope,
+        );
+        text[range].to_owned()
+    }
+
+    /// Resolve the UTF-8 byte range DBX should execute for the supplied scope.
+    #[allow(dead_code)]
+    pub fn execution_range(&self, scope: QueryExecutionScope, cx: &App) -> Range<usize> {
+        let text = self.text(cx);
+        execution_range(
+            &text,
+            self.selected_range.clone(),
+            self.cursor_offset(),
+            scope,
+        )
+    }
+
+    /// Return the painted location immediately below the caret for a
+    /// completion popover. Before the editor has been laid out this safely
+    /// falls back to the origin, allowing callers to render without a fixed
+    /// query-editor-specific offset.
+    #[allow(dead_code)]
+    pub fn completion_anchor(&self) -> Point<Pixels> {
+        completion_anchor(
+            &self.content,
+            self.cursor_offset_internal(),
+            self.last_bounds,
+            &self.last_layout,
+        )
     }
 
     /// The UTF-8 byte offset where the next edit will be inserted.
@@ -1528,6 +2072,10 @@ impl TextEditor {
         let text = self.text(cx);
         let range = clamp_range(&text, range);
         let inserted = normalize_value(inserted, self.multiline);
+        if text[range.clone()] == inserted {
+            return;
+        }
+        self.record_history(cx);
         let next = replace_selection(&text, range.clone(), &inserted);
         let cursor = range.start + inserted.len();
         self.selected_range = cursor..cursor;
@@ -1543,6 +2091,54 @@ impl TextEditor {
             *value = text;
             cx.notify();
         });
+    }
+
+    fn record_history(&mut self, cx: &mut Context<Self>) {
+        let snapshot = EditorSnapshot::from_editor(self, cx);
+        if self.undo_history.last() != Some(&snapshot) {
+            self.undo_history.push(snapshot);
+            if self.undo_history.len() > HISTORY_LIMIT {
+                self.undo_history.remove(0);
+            }
+        }
+        self.redo_history.clear();
+    }
+
+    fn restore_snapshot(&mut self, snapshot: EditorSnapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.text.clone();
+        self.selected_range = clamp_range(&snapshot.text, snapshot.selection);
+        self.selection_reversed = snapshot.selection_reversed;
+        self.marked_range = None;
+        self.set_text_without_selection(snapshot.text, cx);
+        cx.notify();
+    }
+
+    /// Undo the most recent local text replacement, including IME commits.
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.undo_history.pop() else {
+            return;
+        };
+        self.redo_history
+            .push(EditorSnapshot::from_editor(self, cx));
+        self.restore_snapshot(snapshot, cx);
+    }
+
+    /// Redo a replacement reversed by [`Self::undo`].
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.redo_history.pop() else {
+            return;
+        };
+        self.undo_history
+            .push(EditorSnapshot::from_editor(self, cx));
+        self.restore_snapshot(snapshot, cx);
+    }
+
+    fn undo_action(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        self.undo(cx);
+    }
+
+    fn redo_action(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        self.redo(cx);
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -1835,6 +2431,28 @@ fn selection_hit_bounds(
     }
 }
 
+fn completion_anchor(
+    text: &str,
+    cursor: usize,
+    bounds: Option<Bounds<Pixels>>,
+    layout: &[ShapedLine],
+) -> Point<Pixels> {
+    let Some(bounds) = bounds else {
+        return point(px(0.), px(0.));
+    };
+    let cursor = clamp_boundary(text, cursor);
+    let (line, column) = line_and_column(text, cursor);
+    let line_height = bounds.size.height / layout.len().max(1) as f32;
+    let x = layout
+        .get(line)
+        .map(|line| line.x_for_index(column))
+        .unwrap_or(px(0.));
+    point(
+        bounds.left() + x,
+        bounds.top() + line_height * (line + 1).min(layout.len().max(1)) as f32,
+    )
+}
+
 fn mouse_selection_active(is_selecting: bool, dragging: bool) -> bool {
     is_selecting && dragging
 }
@@ -1935,6 +2553,9 @@ impl EntityInputHandler for TextEditor {
 
         let inserted = normalize_value(text, self.multiline);
         let start = range.start;
+        if content[range.clone()] != inserted {
+            self.record_history(cx);
+        }
         let next = replace_selection(&content, range.clone(), &inserted);
         self.set_text_without_selection(next, cx);
         self.marked_range = (!inserted.is_empty()).then_some(start..start + inserted.len());
@@ -2127,7 +2748,17 @@ impl Element for TextEditorText {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let mut lines = Vec::new();
         let mut line_start = 0;
-        let sql_tokens = (editor.language == EditorLanguage::Sql).then(|| lex_sql(&text));
+        let syntax_tokens = match editor.language {
+            EditorLanguage::PlainText => Vec::new(),
+            EditorLanguage::Sql => lex_sql(&text)
+                .into_iter()
+                .map(HighlightToken::from)
+                .collect(),
+            EditorLanguage::Json => lex_json(&text)
+                .into_iter()
+                .map(HighlightToken::from)
+                .collect(),
+        };
 
         for (line, painted_line) in text.split('\n').zip(painted_text.split('\n')) {
             let marked_range = editor.marked_range.as_ref().and_then(|range| {
@@ -2146,7 +2777,7 @@ impl Element for TextEditorText {
                 0,
                 &style,
                 editor.language,
-                sql_tokens.as_deref().unwrap_or(&[]),
+                &syntax_tokens,
                 marked_range.as_ref(),
                 &editor.diagnostics,
             );
@@ -2237,7 +2868,7 @@ impl Element for TextEditorText {
                             paint_bounds.top() + line_height * (line + 1) as f32,
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    theme().selection,
                 ));
             }
         }
@@ -2312,16 +2943,25 @@ impl Element for TextEditorText {
 /// mode obvious at call sites.  It should match the mode passed to
 /// [`TextEditor::new`].
 pub fn input(editor: Entity<TextEditor>, focus: FocusHandle, multiline: bool) -> impl IntoElement {
-    input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT)
+    input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false)
 }
 
 /// Render the SQL editor with both its text-editing and completion contexts.
+#[allow(dead_code)]
 pub fn sql_input(
     editor: Entity<TextEditor>,
     focus: FocusHandle,
     multiline: bool,
 ) -> impl IntoElement {
-    input_with_context(editor, focus, multiline, SQL_TEXT_EDITOR_CONTEXT)
+    input_with_context(editor, focus, multiline, SQL_TEXT_EDITOR_CONTEXT, false)
+}
+
+/// Render the query SQL editor so it fills a resizable parent pane.
+///
+/// This intentionally does not alter [`sql_input`]: row and JSON editors
+/// retain their compact, fixed multiline height.
+pub fn sql_input_fill(editor: Entity<TextEditor>, focus: FocusHandle) -> impl IntoElement {
+    input_with_context(editor, focus, true, SQL_TEXT_EDITOR_CONTEXT, true)
 }
 
 fn input_with_context(
@@ -2329,6 +2969,7 @@ fn input_with_context(
     focus: FocusHandle,
     multiline: bool,
     key_context: &'static str,
+    fill_height: bool,
 ) -> impl IntoElement {
     div()
         .id(gpui::SharedString::from(format!(
@@ -2343,15 +2984,18 @@ fn input_with_context(
         // compact inputs visibly jump under the pointer.
         .w_full()
         .min_w_0()
-        .h(if multiline { px(204.) } else { px(32.) })
+        .when(fill_height, |this| this.flex_1().min_h_0().h_full())
+        .when(!fill_height, |this| {
+            this.h(if multiline { px(204.) } else { px(32.) })
+        })
         .p(if multiline { px(10.) } else { px(7.) })
         .overflow_hidden()
-        .bg(THEME.canvas)
+        .bg(theme().canvas)
         .border_1()
-        .border_color(THEME.border_strong)
+        .border_color(theme().border_strong)
         .rounded(px(5.))
         .text_size(px(12.))
-        .text_color(THEME.text)
+        .text_color(theme().text)
         .on_action({
             let editor = editor.clone();
             move |action: &Backspace, window, cx| {
@@ -2504,6 +3148,18 @@ fn input_with_context(
         })
         .on_action({
             let editor = editor.clone();
+            move |action: &Undo, window, cx| {
+                editor.update(cx, |editor, cx| editor.undo_action(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &Redo, window, cx| {
+                editor.update(cx, |editor, cx| editor.redo_action(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
             move |action: &ShowCharacterPalette, window, cx| {
                 editor.update(cx, |editor, cx| {
                     editor.show_character_palette(action, window, cx)
@@ -2547,20 +3203,25 @@ fn editor_text_runs(
     line_start: usize,
     style: &gpui::TextStyle,
     language: EditorLanguage,
-    tokens: &[SqlToken],
+    tokens: &[HighlightToken],
     marked_range: Option<&Range<usize>>,
     diagnostics: &[Range<usize>],
 ) -> Vec<TextRun> {
     let base = style.to_run(line.len());
     let runs = match language {
         EditorLanguage::PlainText => vec![base],
-        EditorLanguage::Sql => sql_runs(line, line_start, tokens, &base),
+        EditorLanguage::Sql | EditorLanguage::Json => syntax_runs(line, line_start, tokens, &base),
     };
     let runs = apply_marked_runs(line.len(), line_start, marked_range, runs);
     apply_diagnostic_runs(line.len(), line_start, diagnostics, runs)
 }
 
-fn sql_runs(line: &str, line_start: usize, tokens: &[SqlToken], base: &TextRun) -> Vec<TextRun> {
+fn syntax_runs(
+    line: &str,
+    line_start: usize,
+    tokens: &[HighlightToken],
+    base: &TextRun,
+) -> Vec<TextRun> {
     let line_end = line_start + line.len();
     let mut runs = Vec::new();
     let mut offset = line_start;
@@ -2586,7 +3247,7 @@ fn sql_runs(line: &str, line_start: usize, tokens: &[SqlToken], base: &TextRun) 
         }
         runs.push(TextRun {
             len: end - start,
-            color: sql_token_color(token.kind),
+            color: token.color(),
             ..base.clone()
         });
         offset = end;
@@ -2683,7 +3344,7 @@ fn apply_diagnostic_runs(
                 result.push(TextRun {
                     len: end - start,
                     underline: Some(UnderlineStyle {
-                        color: Some(THEME.danger.into()),
+                        color: Some(theme().danger.into()),
                         thickness: px(1.),
                         wavy: true,
                     }),
@@ -2705,15 +3366,22 @@ fn apply_diagnostic_runs(
 
 fn sql_token_color(kind: SqlTokenKind) -> gpui::Hsla {
     match kind {
-        // DBX's dark editor palette: restrained purple keywords, cyan types,
-        // green strings, warm numeric/parameter literals, and blue names.
-        SqlTokenKind::Keyword => gpui::rgb(0xc792ea).into(),
-        SqlTokenKind::String => gpui::rgb(0xc3e88d).into(),
-        SqlTokenKind::Comment => gpui::rgb(0x6b7482).into(),
-        SqlTokenKind::Number => gpui::rgb(0xf78c6c).into(),
-        SqlTokenKind::Parameter => gpui::rgb(0xffcb6b).into(),
-        SqlTokenKind::Identifier => gpui::rgb(0x82aaff).into(),
-        SqlTokenKind::Type => gpui::rgb(0x89ddff).into(),
+        SqlTokenKind::Keyword => theme().sql_keyword.into(),
+        SqlTokenKind::String => theme().sql_string.into(),
+        SqlTokenKind::Comment => theme().sql_comment.into(),
+        SqlTokenKind::Number => theme().sql_number.into(),
+        SqlTokenKind::Parameter => theme().sql_parameter.into(),
+        SqlTokenKind::Identifier => theme().sql_identifier.into(),
+        SqlTokenKind::Type => theme().sql_type.into(),
+    }
+}
+
+fn json_token_color(kind: JsonTokenKind) -> gpui::Hsla {
+    match kind {
+        JsonTokenKind::Property => theme().sql_identifier.into(),
+        JsonTokenKind::String => theme().sql_string.into(),
+        JsonTokenKind::Number => theme().sql_number.into(),
+        JsonTokenKind::Boolean | JsonTokenKind::Null => theme().sql_keyword.into(),
     }
 }
 
@@ -2790,6 +3458,92 @@ fn push_sql_token(tokens: &mut Vec<SqlToken>, kind: SqlTokenKind, start: usize, 
             range: start..end,
         });
     }
+}
+
+fn push_json_token(tokens: &mut Vec<JsonToken>, kind: JsonTokenKind, start: usize, end: usize) {
+    if start < end {
+        tokens.push(JsonToken {
+            kind,
+            range: start..end,
+        });
+    }
+}
+
+fn consume_json_string(chars: &[(usize, char)], mut index: usize) -> usize {
+    index += 1;
+    while index < chars.len() {
+        match chars[index].1 {
+            '\\' => index = (index + 2).min(chars.len()),
+            '"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn consume_json_number(chars: &[(usize, char)], mut index: usize) -> Option<usize> {
+    if chars.get(index)?.1 == '-' {
+        index += 1;
+    }
+    let first = chars.get(index)?.1;
+    if first == '0' {
+        index += 1;
+    } else if first.is_ascii_digit() {
+        index += 1;
+        while chars
+            .get(index)
+            .is_some_and(|(_, character)| character.is_ascii_digit())
+        {
+            index += 1;
+        }
+    } else {
+        return None;
+    }
+
+    if chars
+        .get(index)
+        .is_some_and(|(_, character)| *character == '.')
+    {
+        let fraction_start = index + 1;
+        index = fraction_start;
+        while chars
+            .get(index)
+            .is_some_and(|(_, character)| character.is_ascii_digit())
+        {
+            index += 1;
+        }
+        // Retain a trailing decimal point while the value is being edited.
+        if index == fraction_start {
+            index = fraction_start;
+        }
+    }
+
+    if chars
+        .get(index)
+        .is_some_and(|(_, character)| matches!(*character, 'e' | 'E'))
+    {
+        let exponent_start = index;
+        index += 1;
+        if chars
+            .get(index)
+            .is_some_and(|(_, character)| matches!(*character, '+' | '-'))
+        {
+            index += 1;
+        }
+        while chars
+            .get(index)
+            .is_some_and(|(_, character)| character.is_ascii_digit())
+        {
+            index += 1;
+        }
+        // Highlight an incomplete exponent too; validity remains the
+        // database's concern at save time.
+        if index == exponent_start + 1 {
+            index = exponent_start + 1;
+        }
+    }
+
+    Some(index)
 }
 
 fn consume_quoted(chars: &[(usize, char)], mut index: usize, quote: char) -> usize {
@@ -3315,6 +4069,206 @@ mod tests {
     }
 
     #[test]
+    fn sql_execution_uses_the_statement_at_the_caret() {
+        let text = "SELECT 1;\nSELECT 🦀 FROM users;\nSELECT 3";
+        let cursor = text.find("🦀").unwrap();
+        let range = execution_range(
+            text,
+            0..0,
+            cursor,
+            QueryExecutionScope::SelectionOrStatement,
+        );
+        assert_eq!(&text[range], "\nSELECT 🦀 FROM users;");
+
+        let selection = text.find("SELECT 3").unwrap()..text.len();
+        let range = execution_range(
+            text,
+            selection,
+            cursor,
+            QueryExecutionScope::SelectionOrStatement,
+        );
+        assert_eq!(&text[range], "SELECT 3");
+    }
+
+    #[test]
+    fn sql_execution_keeps_the_last_statement_after_its_terminator() {
+        let statement = "SELECT * FROM missing_table;";
+        assert_eq!(
+            sql_statement_range(statement, statement.len()),
+            0..statement.len()
+        );
+
+        let with_trailing_whitespace = "SELECT 1;\n  ";
+        assert_eq!(
+            &with_trailing_whitespace
+                [sql_statement_range(with_trailing_whitespace, with_trailing_whitespace.len(),)],
+            "SELECT 1;"
+        );
+    }
+
+    #[test]
+    fn sql_execution_ignores_terminators_inside_lexical_regions() {
+        let text = "SELECT ';', $$BEGIN; END$$ /* ; */ -- ;\n; SELECT 2;";
+        let first_end = text.find(" SELECT 2").unwrap();
+        assert_eq!(sql_statement_range(text, 10), 0..first_end);
+        let second = text.find("SELECT 2").unwrap();
+        assert_eq!(&text[sql_statement_range(text, second)], " SELECT 2;");
+    }
+
+    #[test]
+    fn statement_count_ignores_lexical_semicolons_and_empty_statements() {
+        assert_eq!(
+            sql_statement_count("; SELECT ';'; $$BEGIN; END$$; -- ;\n"),
+            2
+        );
+        assert_eq!(
+            sql_statement_count("-- comment only\n/* still comment */"),
+            0
+        );
+    }
+
+    #[test]
+    fn schema_change_detection_is_lexer_aware_and_conservative() {
+        assert!(sql_may_change_schema(
+            "SELECT 1; CREATE TABLE audit_log (id int)"
+        ));
+        assert!(sql_may_change_schema(
+            "ALTER TABLE users ADD COLUMN active boolean"
+        ));
+        assert!(sql_may_change_schema("CALL install_schema()"));
+        assert!(!sql_may_change_schema(
+            "SELECT 'CREATE TABLE decoy'; -- DROP TABLE decoy\nSELECT 2"
+        ));
+        assert!(!sql_may_change_schema(
+            "SELECT $$ALTER TABLE decoy ADD COLUMN value int$$"
+        ));
+    }
+
+    #[test]
+    fn execution_kind_is_conservative_about_writes() {
+        assert_eq!(sql_execution_kind("SELECT 1"), SqlExecutionKind::Read);
+        assert_eq!(
+            sql_execution_kind("SELECT 1; UPDATE users SET active = TRUE"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind("DELETE FROM users"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind("DELETE FROM users WHERE id = 1"),
+            SqlExecutionKind::MutationRisk
+        );
+        assert_eq!(
+            sql_execution_kind("UPDATE users SET active = TRUE"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind("UPDATE users SET active = TRUE WHERE id = 1"),
+            SqlExecutionKind::MutationRisk
+        );
+        assert_eq!(
+            sql_execution_kind("WITH doomed AS (SELECT id FROM users) DELETE FROM users"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH changed AS (SELECT id FROM users) UPDATE users SET active = TRUE"
+            ),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH matched AS (SELECT id FROM users) DELETE FROM users WHERE id = 1"
+            ),
+            SqlExecutionKind::MutationRisk
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted"
+            ),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH changed AS (UPDATE users SET active = TRUE WHERE id = 1 RETURNING *) SELECT * FROM changed"
+            ),
+            SqlExecutionKind::MutationRisk
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH selected AS (SELECT id FROM users WHERE active = TRUE) SELECT * FROM selected"
+            ),
+            SqlExecutionKind::Read
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH selected AS (SELECT 'DELETE FROM users', $$UPDATE users$$) /* DELETE */ SELECT * FROM selected"
+            ),
+            SqlExecutionKind::Read
+        );
+        assert_eq!(
+            sql_execution_kind("MERGE INTO users USING incoming ON users.id = incoming.id"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind("REPLACE INTO users(id) VALUES (1)"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind("DROP TABLE users"),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind("EXPLAIN SELECT 1"),
+            SqlExecutionKind::MutationRisk
+        );
+    }
+
+    #[test]
+    fn execution_scope_supports_document_and_line_or_selection_commands() {
+        let text = "SET one\nGET two\nDEL three";
+        assert_eq!(
+            execution_range(text, 0..0, 9, QueryExecutionScope::SelectionOrCurrentLine),
+            8..15
+        );
+        assert_eq!(
+            execution_range(text, 0..0, 9, QueryExecutionScope::Document),
+            0..text.len()
+        );
+    }
+
+    #[test]
+    fn history_is_bounded_and_keeps_utf8_snapshots() {
+        let mut history = Vec::new();
+        for index in 0..=HISTORY_LIMIT {
+            history.push(EditorSnapshot {
+                text: format!("{index}🦀"),
+                selection: 0..0,
+                selection_reversed: false,
+            });
+            if history.len() > HISTORY_LIMIT {
+                history.remove(0);
+            }
+        }
+        assert_eq!(history.len(), HISTORY_LIMIT);
+        assert_eq!(history.first().unwrap().text, "1🦀");
+        assert!(
+            history
+                .iter()
+                .all(|snapshot| snapshot.text.is_char_boundary(snapshot.selection.end))
+        );
+    }
+
+    #[test]
+    fn completion_anchor_has_a_safe_pre_layout_fallback() {
+        assert_eq!(
+            completion_anchor("SELECT 🦀", 8, None, &[]),
+            point(px(0.), px(0.))
+        );
+    }
+
+    #[test]
     fn single_line_values_replace_newlines_without_changing_other_text() {
         assert_eq!(normalize_value("a\nb\r\nc", false), "a b  c");
         assert_eq!(normalize_value("a\nb", true), "a\nb");
@@ -3486,7 +4440,7 @@ mod tests {
     #[test]
     fn editor_bindings_are_scoped_to_the_text_editor_context() {
         let bindings = default_key_bindings();
-        assert_eq!(bindings.len(), 28);
+        assert_eq!(bindings.len(), 32);
         assert!(bindings.iter().all(|binding| binding.predicate().is_some()));
         assert_eq!(TEXT_INPUT_CONTEXT, TEXT_EDITOR_CONTEXT);
     }
@@ -3585,6 +4539,72 @@ mod tests {
                 (SqlTokenKind::String, "$$BEGIN; SELECT 1; END$$"),
                 (SqlTokenKind::String, "$body$UPDATE users$body$"),
                 (SqlTokenKind::Parameter, "$2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_lexer_highlights_properties_escapes_and_unicode() {
+        let text = r#"{"café": "say \"hi\" to 🦀", "nested": {"城市": "東京"}}"#;
+        let tokens = lex_json(text);
+        let values: Vec<_> = tokens
+            .iter()
+            .map(|token| (token.kind, &text[token.range.clone()]))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                (JsonTokenKind::Property, "\"café\""),
+                (JsonTokenKind::String, "\"say \\\"hi\\\" to 🦀\""),
+                (JsonTokenKind::Property, "\"nested\""),
+                (JsonTokenKind::Property, "\"城市\""),
+                (JsonTokenKind::String, "\"東京\""),
+            ]
+        );
+        assert!(tokens.iter().all(|token| {
+            text.is_char_boundary(token.range.start) && text.is_char_boundary(token.range.end)
+        }));
+    }
+
+    #[test]
+    fn json_lexer_highlights_numbers_and_literals() {
+        let text = r#"[-0, 42, 3.14, -2.5e+3, 6E-2, true, false, null]"#;
+        let tokens = lex_json(text);
+        let values: Vec<_> = tokens
+            .iter()
+            .map(|token| (token.kind, &text[token.range.clone()]))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                (JsonTokenKind::Number, "-0"),
+                (JsonTokenKind::Number, "42"),
+                (JsonTokenKind::Number, "3.14"),
+                (JsonTokenKind::Number, "-2.5e+3"),
+                (JsonTokenKind::Number, "6E-2"),
+                (JsonTokenKind::Boolean, "true"),
+                (JsonTokenKind::Boolean, "false"),
+                (JsonTokenKind::Null, "null"),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_lexer_keeps_incomplete_strings_highlighted() {
+        let text = r#"{"draft": "still typing 🦀"#;
+        let tokens = lex_json(text);
+        let values: Vec<_> = tokens
+            .iter()
+            .map(|token| (token.kind, &text[token.range.clone()]))
+            .collect();
+
+        assert_eq!(
+            values,
+            vec![
+                (JsonTokenKind::Property, "\"draft\""),
+                (JsonTokenKind::String, "\"still typing 🦀"),
             ]
         );
     }

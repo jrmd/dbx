@@ -142,7 +142,7 @@ Redis has no tables or SQL schema. Browse by key pattern, show key type and TTL,
 
 DBX is a privileged client. The connector boundary is responsible for parameter binding, identifier quoting, TLS defaults, timeout/cancellation propagation, and redacted errors. The application boundary is responsible for confirmation UX, affected-row expectations, and not persisting secrets in workspace state.
 
-Named profile metadata is persisted as versioned JSON in the platform configuration directory and re-read for each operation rather than cached as the source of truth. Passwords are removed from stored URLs and kept in the OS keychain. When the keychain is unavailable, saving a secret-bearing profile fails visibly; DBX does not silently degrade to a memory-only saved credential. Connection URLs shown in the UI and logs must redact passwords and tokens. Certificate verification stays enabled by default. Users should connect with least-privilege accounts and should be able to label a connection as read-only; a label alone is not a server-side permission.
+Named profile metadata is persisted as versioned, password-free JSON in the platform configuration directory and re-read for each operation rather than cached as the source of truth. Normal saved credentials live in the encrypted, app-owned DBX Vault, using Argon2id + XChaCha20-Poly1305. The vault is unlocked once in-app per launch; its passphrase is never stored or recoverable. Selecting a saved connection eagerly hydrates its credential. Keychain/Secret Service is accessed only after an explicit **Import old system passwords** action; imports are non-destructive and never overwrite an existing vault credential. Connection URLs shown in the UI and logs must redact passwords and tokens. Certificate verification stays enabled by default. Users should connect with least-privilege accounts and should be able to label a connection as read-only; a label alone is not a server-side permission.
 
 Potentially destructive SQL should be visually distinct, but DBX cannot reliably classify every hand-written statement. Users remain responsible for the selected connection. Audit history should store redacted metadata (timestamp, connection label, duration, outcome), not secrets or full result sets, unless an explicit future setting says otherwise.
 
@@ -167,6 +167,6 @@ The safest vertical slices are:
 - PostgreSQL and MySQL adapter parity for metadata, paging, filters, and writes.
 - Relational SQL console with cancellation and result limits.
 - Redis keyspace browser and command-aware value editor.
-- Keychain/TLS hardening, conflict handling, accessibility, transfer progress/streaming for very large files, and future migration tooling.
+- Vault/TLS hardening, conflict handling, accessibility, transfer progress/streaming for very large files, and future migration tooling.
 
 Each slice should keep connector-specific code behind the core contracts and add an integration test before widening the UI surface.

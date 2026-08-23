@@ -1,7 +1,7 @@
 //! Durable connection profiles for the DBX desktop client.
 //!
 //! The profile document contains only connection metadata.  Passwords and
-//! other userinfo secrets are kept in the operating system credential store.
+//! other userinfo secrets are kept in the passphrase-encrypted DBX Vault.
 //! A secret-bearing profile is not saved when that durable store is unavailable.
 //! `ProfileStore` reads the document for each operation instead of retaining a
 //! second, in-memory copy of profiles.
@@ -19,12 +19,15 @@ use std::{
 use dbx_core::{ConnectionConfig, DatabaseKind};
 use keyring::{Entry, Error as KeyringError};
 use percent_encoding::percent_decode_str;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::connection_fields::normalize_connection_string;
+use crate::connection_fields::{normalize_connection_string, set_url_password};
+use crate::vault::{CredentialVault, VaultError};
 
 /// Version of the on-disk profile document.
 pub const PROFILE_FILE_VERSION: u32 = 1;
@@ -65,9 +68,6 @@ impl fmt::Display for ConnectionEnvironment {
 /// Name of the profile file below the platform configuration directory.
 pub const PROFILE_FILE_NAME: &str = "connections.json";
 
-/// Service name used for credentials in the platform keyring.
-pub const KEYRING_SERVICE: &str = "dev.dbx.app.connections";
-
 /// Errors returned by a secret backend.
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum SecretStoreError {
@@ -86,50 +86,73 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), SecretStoreError>;
 }
 
-/// The default secret backend.
-///
-/// Keyring calls are synchronous, as required by the `keyring` crate. If the
-/// platform credential service is unavailable, saving fails instead of
-/// silently keeping a connection secret only in process memory.
+/// Adapter from profile operations to the local passphrase vault. Normal
+/// profile operations never invoke the operating-system keyring.
+#[derive(Clone)]
+pub struct VaultSecretStore {
+    vault: Arc<CredentialVault>,
+}
+
+impl VaultSecretStore {
+    pub fn new(vault: Arc<CredentialVault>) -> Self {
+        Self { vault }
+    }
+}
+
+/// Explicit legacy adapter used only by [`ProfileStore::migrate_legacy_keyring`].
+/// It is never selected by the normal profile-store constructors.
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub struct SystemSecretStore;
 
-impl fmt::Debug for SystemSecretStore {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("SystemSecretStore").finish()
-    }
-}
-
+#[allow(dead_code)]
 impl SystemSecretStore {
-    pub fn new() -> Self {
-        Self
+    pub fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+        match Entry::new("dev.dbx.app.connections", key).and_then(|entry| entry.get_password()) {
+            Ok(secret) => Ok(Some(secret)),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(error) => Err(SecretStoreError::Message(error.to_string())),
+        }
     }
 }
 
-impl SecretStore for SystemSecretStore {
+/// Summary of one explicit, non-destructive legacy-keyring import.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LegacyMigrationOutcome {
+    pub imported: usize,
+    pub unavailable: usize,
+    pub already_in_vault: usize,
+}
+
+impl fmt::Debug for VaultSecretStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VaultSecretStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SecretStore for VaultSecretStore {
     fn set(&self, key: &str, secret: &str) -> Result<(), SecretStoreError> {
-        Entry::new(KEYRING_SERVICE, key)
-            .and_then(|entry| entry.set_password(secret))
-            .map_err(keyring_error)
+        self.vault
+            .set(key, SecretString::from(secret.to_owned()))
+            .map_err(vault_error)
     }
 
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        match Entry::new(KEYRING_SERVICE, key).and_then(|entry| entry.get_password()) {
-            Ok(secret) => Ok(Some(secret)),
-            Err(KeyringError::NoEntry) => Ok(None),
-            Err(error) => Err(keyring_error(error)),
-        }
+        self.vault
+            .get(key)
+            .map(|value| value.map(|secret| secret.expose_secret().to_owned()))
+            .map_err(vault_error)
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        match Entry::new(KEYRING_SERVICE, key).and_then(|entry| entry.delete_credential()) {
-            Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
-            Err(error) => Err(keyring_error(error)),
-        }
+        self.vault.delete(key).map_err(vault_error)
     }
 }
 
-fn keyring_error(error: KeyringError) -> SecretStoreError {
+fn vault_error(error: VaultError) -> SecretStoreError {
     SecretStoreError::Message(error.to_string())
 }
 
@@ -148,7 +171,7 @@ pub struct SavedConnection {
 }
 
 impl SavedConnection {
-    /// Whether this profile has a password stored in the keyring/session
+    /// Whether this profile has a password stored in the vault/session
     /// backend.
     pub fn has_secret(&self) -> bool {
         self.secret_key.is_some()
@@ -185,6 +208,15 @@ impl fmt::Debug for ConnectionProfileDraft {
             .field("config", &self.config)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .finish()
+    }
+}
+
+impl Drop for ConnectionProfileDraft {
+    fn drop(&mut self) {
+        self.config.url.zeroize();
+        if let Some(secret) = self.secret.as_mut() {
+            secret.zeroize();
+        }
     }
 }
 
@@ -268,6 +300,7 @@ pub type ProfileResult<T> = Result<T, ProfileError>;
 pub struct ProfileStore {
     path: PathBuf,
     secrets: Arc<dyn SecretStore>,
+    vault: Option<Arc<CredentialVault>>,
     operation_lock: Arc<Mutex<()>>,
 }
 
@@ -287,19 +320,72 @@ impl ProfileStore {
         Ok(Self::at(default_profile_path()?))
     }
 
-    /// Open a profile store at an explicit file path using the system keyring.
+    /// Open a profile store at an explicit file path using its sibling DBX Vault.
     pub fn at(path: impl Into<PathBuf>) -> Self {
-        Self::with_secret_store(path, Arc::new(SystemSecretStore::new()))
+        let path = path.into();
+        let vault = Arc::new(CredentialVault::at(vault_path(&path)));
+        Self {
+            path,
+            secrets: Arc::new(VaultSecretStore::new(vault.clone())),
+            vault: Some(vault),
+            operation_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Construct a store with an injected secret backend.  This is useful for
     /// tests and for an application-managed credential provider.
+    #[cfg(test)]
     pub fn with_secret_store(path: impl Into<PathBuf>, secrets: Arc<dyn SecretStore>) -> Self {
         Self {
             path: path.into(),
             secrets,
+            vault: None,
             operation_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// The default local credential vault, when this store was not constructed
+    /// with a test or migration secret adapter.
+    pub fn vault(&self) -> Option<Arc<CredentialVault>> {
+        self.vault.clone()
+    }
+
+    /// Copy recoverable old keyring credentials into an already-unlocked local
+    /// vault. Legacy credentials are retained for rollback, and this method is
+    /// never invoked by normal profile operations.
+    #[allow(dead_code)]
+    pub fn migrate_legacy_keyring(&self) -> ProfileResult<LegacyMigrationOutcome> {
+        let _lock = self.lock()?;
+        let vault = self
+            .vault
+            .as_ref()
+            .ok_or_else(|| ProfileError::Invalid("profile store has no local vault".into()))?;
+        // Imports are only possible while the vault is unlocked, including
+        // when no stored profile has a legacy credential.
+        vault
+            .get("__dbx_vault_state_probe__")
+            .map_err(vault_error)?;
+        let legacy = SystemSecretStore;
+        let mut outcome = LegacyMigrationOutcome::default();
+        for profile in self.read_document()?.connections {
+            let Some(key) = profile.secret_key else {
+                continue;
+            };
+            if vault.get(&key).map_err(vault_error)?.is_some() {
+                outcome.already_in_vault += 1;
+                continue;
+            }
+            match legacy.get(&key)? {
+                Some(mut secret) => {
+                    let vault_secret = SecretString::from(std::mem::take(&mut secret));
+                    secret.zeroize();
+                    vault.set(key, vault_secret).map_err(vault_error)?;
+                    outcome.imported += 1;
+                }
+                None => outcome.unavailable += 1,
+            }
+        }
+        Ok(outcome)
     }
 
     #[cfg(test)]
@@ -326,6 +412,7 @@ impl ProfileStore {
     }
 
     /// Find a profile by ID without loading its secret.
+    #[cfg(test)]
     pub fn get(&self, id: Uuid) -> ProfileResult<Option<SavedConnection>> {
         let _lock = self.lock()?;
         Ok(self
@@ -337,11 +424,11 @@ impl ProfileStore {
     }
 
     /// Save a new profile or update the profile identified by `draft.id`.
-    pub fn save(&self, draft: ConnectionProfileDraft) -> ProfileResult<SavedConnection> {
+    pub fn save(&self, mut draft: ConnectionProfileDraft) -> ProfileResult<SavedConnection> {
         let _lock = self.lock()?;
         validate_name(&draft.name)?;
         let (url, embedded_secret) = scrub_url(&draft.config.url)?;
-        let secret = draft.secret.or(embedded_secret);
+        let secret = draft.secret.take().or(embedded_secret).map(Zeroizing::new);
         let id = draft.id.unwrap_or_else(Uuid::new_v4);
         let mut document = self.read_document()?;
         let existing = document
@@ -359,13 +446,31 @@ impl ProfileStore {
         });
         let replacement = StoredConnection {
             id,
-            name: draft.name,
+            name: std::mem::take(&mut draft.name),
             kind: draft.config.kind,
             url,
             environment: draft.environment,
             max_connections: draft.config.max_connections,
             connect_timeout_ms: draft.config.connect_timeout_ms,
             secret_key: new_secret_key.clone(),
+        };
+
+        // Replacing an existing password mutates the vault before the profile
+        // metadata can be atomically written. Retain its prior state so a
+        // metadata failure does not leave the connection pointing at a new
+        // credential it never committed to use.
+        let prior_secret = if secret.is_some() && existing.is_some() {
+            Some(
+                self.secrets
+                    .get(
+                        new_secret_key
+                            .as_deref()
+                            .expect("an existing password replacement has a vault key"),
+                    )?
+                    .map(Zeroizing::new),
+            )
+        } else {
+            None
         };
 
         if let Some(secret) = &secret {
@@ -390,11 +495,19 @@ impl ProfileStore {
         }
 
         if let Err(error) = self.write_document(&document) {
-            // Avoid leaving a newly created keyring entry behind when the
-            // profile file could not be atomically replaced.  If this was an
-            // update using the same key, the previous credential remains
-            // valid and is intentionally not deleted here.
-            if existing.is_none()
+            if let Some(previous) = &prior_secret {
+                let key = new_secret_key
+                    .as_deref()
+                    .expect("an existing password replacement has a vault key");
+                match previous {
+                    Some(secret) => {
+                        let _ = self.secrets.set(key, secret);
+                    }
+                    None => {
+                        let _ = self.secrets.delete(key);
+                    }
+                }
+            } else if existing.is_none()
                 && let Some(key) = &new_secret_key
             {
                 let _ = self.secrets.delete(key);
@@ -416,10 +529,11 @@ impl ProfileStore {
             .ok_or(ProfileError::NotFound(id))?;
         let profile = stored.clone().into_public();
         let url = if let Some(secret_key) = stored.secret_key {
-            let secret = self
-                .secrets
-                .get(&secret_key)?
-                .ok_or(ProfileError::MissingSecret(id))?;
+            let secret = Zeroizing::new(
+                self.secrets
+                    .get(&secret_key)?
+                    .ok_or(ProfileError::MissingSecret(id))?,
+            );
             add_password(&stored.url, &secret)?
         } else {
             stored.url
@@ -446,9 +560,21 @@ impl ProfileStore {
             return Ok(false);
         };
         let removed = document.connections.remove(index);
-        self.write_document(&document)?;
-        if let Some(secret_key) = removed.secret_key {
-            self.secrets.delete(&secret_key)?;
+        let prior_secret = if let Some(secret_key) = &removed.secret_key {
+            Some(self.secrets.get(secret_key)?.map(Zeroizing::new))
+        } else {
+            None
+        };
+        if let Some(secret_key) = &removed.secret_key {
+            // Remove the secret before committing metadata; if this fails the
+            // profile remains intact rather than becoming an orphan.
+            self.secrets.delete(secret_key)?;
+        }
+        if let Err(error) = self.write_document(&document) {
+            if let (Some(secret_key), Some(Some(secret))) = (&removed.secret_key, &prior_secret) {
+                let _ = self.secrets.set(secret_key, secret);
+            }
+            return Err(error);
         }
         Ok(true)
     }
@@ -582,11 +708,17 @@ fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
     let mut parsed = Url::parse(&normalized)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
-    let secret = parsed.password().map(|password| {
-        percent_decode_str(password)
-            .decode_utf8_lossy()
-            .into_owned()
-    });
+    let secret = parsed
+        .password()
+        .map(|password| {
+            percent_decode_str(password)
+                .decode_utf8()
+                .map(|secret| secret.into_owned())
+                .map_err(|_| {
+                    ProfileError::Invalid("connection URL password is not valid UTF-8".into())
+                })
+        })
+        .transpose()?;
     if secret.is_some() {
         parsed
             .set_password(None)
@@ -600,8 +732,7 @@ fn add_password(raw: &str, secret: &str) -> ProfileResult<String> {
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
     let mut parsed = Url::parse(&normalized)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
-    parsed
-        .set_password(Some(secret))
+    set_url_password(&mut parsed, Some(secret))
         .map_err(|_| ProfileError::Invalid("connection URL has invalid userinfo".into()))?;
     Ok(parsed.to_string())
 }
@@ -652,6 +783,13 @@ fn default_profile_path() -> ProfileResult<PathBuf> {
         .join(PROFILE_FILE_NAME))
 }
 
+fn vault_path(profile_path: &Path) -> PathBuf {
+    profile_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("credentials.vault")
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent_was_missing = !parent.exists();
@@ -680,7 +818,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary_path, path)?;
-        sync_directory(parent)
+        // Rename is the commit point. A post-rename directory-sync failure
+        // cannot safely be reported as a failed metadata write.
+        let _ = sync_directory(parent);
+        Ok(())
     })();
 
     if write_result.is_err() {
@@ -707,6 +848,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSecretStore {
         values: Mutex<HashMap<String, String>>,
+        fail_delete: bool,
     }
 
     impl SecretStore for FakeSecretStore {
@@ -728,6 +870,9 @@ mod tests {
         }
 
         fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+            if self.fail_delete {
+                return Err(SecretStoreError::Message("delete failed".into()));
+            }
             self.values.lock().expect("fake store lock").remove(key);
             Ok(())
         }
@@ -769,6 +914,37 @@ mod tests {
     }
 
     #[test]
+    fn default_vault_profile_store_relaunches_without_keyring_and_keeps_json_secret_free() {
+        let directory = tempfile::tempdir().expect("temporary profile directory");
+        let path = directory.path().join(PROFILE_FILE_NAME);
+        let store = ProfileStore::at(&path);
+        let vault = store.vault().expect("default vault");
+        vault.create("vault passphrase").expect("create vault");
+        let password = "p@ss:word/?#%[]é";
+        let saved = store
+            .save(ConnectionProfileDraft::new(
+                "Vault PostgreSQL",
+                DatabaseKind::PostgreSQL,
+                format!("postgres://alice:{password}@example.test/app"),
+            ))
+            .expect("save into vault");
+        let json = fs::read_to_string(&path).expect("read profile JSON");
+        assert!(!json.contains(password));
+
+        let reloaded = ProfileStore::at(&path);
+        let vault = reloaded.vault().expect("default vault");
+        vault.unlock("vault passphrase").expect("unlock vault");
+        assert_eq!(
+            reloaded
+                .load(saved.id)
+                .expect("load saved profile")
+                .config
+                .url,
+            "postgres://alice:p%40ss%3Aword%2F%3F%23%25%5B%5D%C3%A9@example.test/app"
+        );
+    }
+
+    #[test]
     fn encoded_password_is_decoded_before_keyring_storage_and_reencoded_on_load() {
         let (_directory, store, secrets) = test_store();
         let saved = store
@@ -786,6 +962,28 @@ mod tests {
         assert_eq!(
             store.load(saved.id).unwrap().config.url,
             "postgres://alice:p%40ss%2Fword@example.test/app"
+        );
+    }
+
+    #[test]
+    fn raw_postgres_password_reserved_characters_round_trip_through_profile_connection_url() {
+        let (_directory, store, secrets) = test_store();
+        let password = "p@ss:word/[?]#%✓";
+        let saved = store
+            .save(ConnectionProfileDraft::new(
+                "Reserved password",
+                DatabaseKind::PostgreSQL,
+                format!("postgres://alice:{password}@example.test/app"),
+            ))
+            .expect("save profile");
+
+        assert_eq!(
+            secrets.get(&keyring_key(saved.id)).unwrap(),
+            Some(password.to_owned())
+        );
+        assert_eq!(
+            store.load(saved.id).unwrap().config.url,
+            "postgres://alice:p%40ss%3Aword%2F%5B%3F%5D%23%25%E2%9C%93@example.test/app"
         );
     }
 
@@ -857,6 +1055,36 @@ mod tests {
         assert!(secrets.get(&key).unwrap().is_none());
         assert!(store.list().unwrap().is_empty());
         assert!(!store.delete(saved.id).unwrap());
+    }
+
+    #[test]
+    fn failed_secret_delete_keeps_the_profile_metadata_and_credential() {
+        let directory = tempfile::tempdir().expect("temporary profile directory");
+        let secrets = Arc::new(FakeSecretStore {
+            values: Mutex::new(HashMap::new()),
+            fail_delete: true,
+        });
+        let store = ProfileStore::with_secret_store(
+            directory.path().join(PROFILE_FILE_NAME),
+            secrets.clone(),
+        );
+        let saved = store
+            .save(ConnectionProfileDraft::new(
+                "Staging",
+                DatabaseKind::PostgreSQL,
+                "postgres://user:secret@example.test/app",
+            ))
+            .expect("save profile");
+
+        assert!(matches!(
+            store.delete(saved.id),
+            Err(ProfileError::Secret(_))
+        ));
+        assert!(store.get(saved.id).unwrap().is_some());
+        assert_eq!(
+            secrets.get(&keyring_key(saved.id)).unwrap(),
+            Some("secret".into())
+        );
     }
 
     #[test]

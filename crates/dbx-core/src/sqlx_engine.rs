@@ -1,19 +1,21 @@
 use std::time::Instant;
 
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use sqlx::{
     Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
     mysql::{MySqlArguments, MySqlPoolOptions, MySqlRow},
     postgres::{PgArguments, PgPool, PgPoolOptions, PgRow},
     sqlite::{SqliteArguments, SqlitePoolOptions, SqliteRow},
 };
+use sqlx::{Either, Executor};
 use tokio::sync::RwLock;
 
 use crate::engine::{exec_result, query_result, row_limit};
 use crate::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError, EntityKind, ExecResult,
-    ForeignKeyInfo, QueryOptions, QueryResult, ReferentialAction, Result, RowData, SqlStatement,
-    TableInfo, TableRef, TableStructure,
+    ForeignKeyInfo, QueryOptions, QueryResult, ReferentialAction, RelationalSchema,
+    RelationalTable, Result, RowData, SqlStatement, TableInfo, TableRef, TableStructure,
+    split_sql_statements,
 };
 use async_trait::async_trait;
 
@@ -144,8 +146,9 @@ impl SqlxEngine {
     ) -> Result<QueryResult> {
         let started = Instant::now();
         let limit = row_limit(options);
-        let mut columns = Vec::new();
+        let mut columns = self.describe_columns(&statement.sql).await;
         let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
+        let mut truncated = false;
         match &self.pool_snapshot().await {
             SqlxPool::Postgres(pool) => {
                 let mut rows = bind_postgres_query(statement).fetch(pool);
@@ -154,7 +157,9 @@ impl SqlxEngine {
                         columns = result_columns(row.columns());
                     }
                     output.push(RowData::new(decode_postgres_row(&row)?));
-                    if limit.is_some_and(|limit| output.len() >= limit) {
+                    if limit.is_some_and(|limit| output.len() > limit) {
+                        output.pop();
+                        truncated = true;
                         break;
                     }
                 }
@@ -166,7 +171,9 @@ impl SqlxEngine {
                         columns = result_columns(row.columns());
                     }
                     output.push(RowData::new(decode_mysql_row(&row)?));
-                    if limit.is_some_and(|limit| output.len() >= limit) {
+                    if limit.is_some_and(|limit| output.len() > limit) {
+                        output.pop();
+                        truncated = true;
                         break;
                     }
                 }
@@ -178,13 +185,149 @@ impl SqlxEngine {
                         columns = result_columns(row.columns());
                     }
                     output.push(RowData::new(decode_sqlite_row(&row)?));
-                    if limit.is_some_and(|limit| output.len() >= limit) {
+                    if limit.is_some_and(|limit| output.len() > limit) {
+                        output.pop();
+                        truncated = true;
                         break;
                     }
                 }
             }
         }
-        Ok(query_result(columns, output, None, started))
+        Ok(query_result(columns, output, None, truncated, started))
+    }
+
+    /// SQLx's raw stream exposes both returned rows and per-statement query
+    /// results. This is intentionally used only for free-form SQL: prepared
+    /// statements continue through `query_with_statement` so parameters remain
+    /// safely bound.
+    async fn query_raw(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
+        let started = Instant::now();
+        let limit = row_limit(options);
+        let mut columns = self.describe_columns(sql).await;
+        let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
+        let mut rows_affected = None;
+        let mut truncated = false;
+        let statements = split_sql_statements(sql);
+        let mut statement_index = 0usize;
+        let mut statement_returned_rows = false;
+
+        match &self.pool_snapshot().await {
+            SqlxPool::Postgres(pool) => {
+                let mut events = sqlx::raw_sql(sql).fetch_many(pool);
+                while let Some(event) = events.try_next().await? {
+                    match event {
+                        Either::Left(result) => {
+                            record_statement_outcome(
+                                &mut rows_affected,
+                                result.rows_affected(),
+                                statements.get(statement_index).map(String::as_str),
+                                statement_returned_rows,
+                            );
+                            statement_index += 1;
+                            statement_returned_rows = false;
+                        }
+                        Either::Right(row) => {
+                            statement_returned_rows = true;
+                            capture_result_columns(&mut columns, row.columns())?;
+                            push_bounded_row(
+                                &mut output,
+                                &mut truncated,
+                                limit,
+                                &mut columns,
+                                || decode_postgres_row(&row),
+                            )?;
+                        }
+                    }
+                }
+            }
+            SqlxPool::MySql(pool) => {
+                let mut events = sqlx::raw_sql(sql).fetch_many(pool);
+                while let Some(event) = events.try_next().await? {
+                    match event {
+                        Either::Left(result) => {
+                            record_statement_outcome(
+                                &mut rows_affected,
+                                result.rows_affected(),
+                                statements.get(statement_index).map(String::as_str),
+                                statement_returned_rows,
+                            );
+                            statement_index += 1;
+                            statement_returned_rows = false;
+                        }
+                        Either::Right(row) => {
+                            statement_returned_rows = true;
+                            capture_result_columns(&mut columns, row.columns())?;
+                            push_bounded_row(
+                                &mut output,
+                                &mut truncated,
+                                limit,
+                                &mut columns,
+                                || decode_mysql_row(&row),
+                            )?;
+                        }
+                    }
+                }
+            }
+            SqlxPool::SQLite(pool) => {
+                let mut events = sqlx::raw_sql(sql).fetch_many(pool);
+                while let Some(event) = events.try_next().await? {
+                    match event {
+                        Either::Left(result) => {
+                            record_statement_outcome(
+                                &mut rows_affected,
+                                result.rows_affected(),
+                                statements.get(statement_index).map(String::as_str),
+                                statement_returned_rows,
+                            );
+                            statement_index += 1;
+                            statement_returned_rows = false;
+                        }
+                        Either::Right(row) => {
+                            statement_returned_rows = true;
+                            capture_result_columns(&mut columns, row.columns())?;
+                            push_bounded_row(
+                                &mut output,
+                                &mut truncated,
+                                limit,
+                                &mut columns,
+                                || decode_sqlite_row(&row),
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(query_result(
+            columns,
+            output,
+            rows_affected,
+            truncated,
+            started,
+        ))
+    }
+
+    /// Description is best-effort because DDL and scripts commonly have no
+    /// result shape. It is still valuable for zero-row SELECTs, where rows do
+    /// not otherwise expose their columns.
+    async fn describe_columns(&self, sql: &str) -> Vec<ColumnInfo> {
+        match &self.pool_snapshot().await {
+            SqlxPool::Postgres(pool) => pool
+                .describe(sql)
+                .await
+                .map(|description| result_columns(description.columns()))
+                .unwrap_or_default(),
+            SqlxPool::MySql(pool) => pool
+                .describe(sql)
+                .await
+                .map(|description| result_columns(description.columns()))
+                .unwrap_or_default(),
+            SqlxPool::SQLite(pool) => pool
+                .describe(sql)
+                .await
+                .map(|description| result_columns(description.columns()))
+                .unwrap_or_default(),
+        }
     }
 
     async fn execute_statement(&self, statement: &SqlStatement) -> Result<ExecResult> {
@@ -368,10 +511,37 @@ impl SqlxEngine {
     }
 
     async fn table_structure_sql(&self, table: &TableRef) -> Result<TableStructure> {
+        let (columns, foreign_keys) =
+            tokio::try_join!(self.describe_sql_table(table), self.foreign_keys(table),)?;
         Ok(TableStructure {
-            columns: self.describe_sql_table(table).await?,
-            foreign_keys: self.foreign_keys(table).await?,
+            columns,
+            foreign_keys,
         })
+    }
+
+    async fn relational_schema_sql(&self) -> Result<RelationalSchema> {
+        let (database, tables) =
+            tokio::try_join!(self.current_sql_database(), self.list_sql_tables(),)?;
+        let mut tables = futures_util::stream::iter(tables)
+            .map(|table| async move {
+                let structure = self
+                    .table_structure_sql(&TableRef {
+                        schema: table.schema.clone(),
+                        name: table.name.clone(),
+                    })
+                    .await?;
+                Ok::<_, DbxError>(RelationalTable { table, structure })
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
+        tables.sort_by(|left, right| {
+            left.table
+                .schema
+                .cmp(&right.table.schema)
+                .then_with(|| left.table.name.cmp(&right.table.name))
+        });
+        Ok(RelationalSchema { database, tables })
     }
 
     async fn list_sql_databases(&self) -> Result<Vec<String>> {
@@ -469,6 +639,185 @@ impl SqlxEngine {
     }
 }
 
+fn statement_likely_returns_rows(statement: &str) -> bool {
+    top_level_operation_keyword(statement).is_some_and(|keyword| {
+        [
+            "SELECT", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "PRAGMA",
+        ]
+        .iter()
+        .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn top_level_operation_keyword(statement: &str) -> Option<&str> {
+    let words = top_level_sql_words(statement);
+    let first = *words.first()?;
+    if !first.eq_ignore_ascii_case("WITH") {
+        return Some(first);
+    }
+
+    words.into_iter().skip(1).find(|word| {
+        [
+            "SELECT", "VALUES", "TABLE", "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "CALL",
+            "EXEC", "EXECUTE",
+        ]
+        .iter()
+        .any(|candidate| word.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn top_level_sql_words(sql: &str) -> Vec<&str> {
+    #[derive(Clone)]
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
+        Backtick,
+        LineComment,
+        BlockComment(usize),
+        DollarQuote(Vec<u8>),
+    }
+
+    let bytes = sql.as_bytes();
+    let mut words = Vec::new();
+    let mut state = State::Normal;
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match &mut state {
+            State::Normal => match bytes[index] {
+                b'\'' => {
+                    state = State::SingleQuote;
+                    index += 1;
+                }
+                b'"' => {
+                    state = State::DoubleQuote;
+                    index += 1;
+                }
+                b'`' => {
+                    state = State::Backtick;
+                    index += 1;
+                }
+                b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                    state = State::LineComment;
+                    index += 2;
+                }
+                b'#' => {
+                    state = State::LineComment;
+                    index += 1;
+                }
+                b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                    state = State::BlockComment(1);
+                    index += 2;
+                }
+                b'$' if postgres_dollar_quote(bytes, index).is_some() => {
+                    let delimiter = postgres_dollar_quote(bytes, index).expect("checked above");
+                    index += delimiter.len();
+                    state = State::DollarQuote(delimiter);
+                }
+                b'(' => {
+                    depth += 1;
+                    index += 1;
+                }
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    index += 1;
+                }
+                byte if depth == 0 && (byte.is_ascii_alphabetic() || byte == b'_') => {
+                    let start = index;
+                    index += 1;
+                    while bytes
+                        .get(index)
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                    {
+                        index += 1;
+                    }
+                    words.push(&sql[start..index]);
+                }
+                _ => index += 1,
+            },
+            State::SingleQuote => {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        state = State::Normal;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            State::DoubleQuote => {
+                if bytes[index] == b'"' {
+                    if bytes.get(index + 1) == Some(&b'"') {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        state = State::Normal;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            State::Backtick => {
+                if bytes[index] == b'`' {
+                    if bytes.get(index + 1) == Some(&b'`') {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        state = State::Normal;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            State::LineComment => {
+                if matches!(bytes[index], b'\n' | b'\r') {
+                    state = State::Normal;
+                }
+                index += 1;
+            }
+            State::BlockComment(comment_depth) => {
+                if bytes[index..].starts_with(b"/*") {
+                    *comment_depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    *comment_depth -= 1;
+                    index += 2;
+                    if *comment_depth == 0 {
+                        state = State::Normal;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            State::DollarQuote(delimiter) => {
+                if bytes[index..].starts_with(delimiter) {
+                    index += delimiter.len();
+                    state = State::Normal;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+    words
+}
+
+fn postgres_dollar_quote(bytes: &[u8], start: usize) -> Option<Vec<u8>> {
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    (bytes.get(end) == Some(&b'$')).then(|| bytes[start..=end].to_vec())
+}
+
 #[async_trait]
 impl crate::Engine for SqlxEngine {
     fn kind(&self) -> DatabaseKind {
@@ -499,9 +848,12 @@ impl crate::Engine for SqlxEngine {
         self.table_structure_sql(table).await
     }
 
+    async fn relational_schema(&self) -> Result<RelationalSchema> {
+        self.relational_schema_sql().await
+    }
+
     async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
-        self.query_with_statement(&SqlStatement::new(sql, Vec::new()), options)
-            .await
+        self.query_raw(sql, options).await
     }
 
     async fn query_statement(
@@ -515,6 +867,94 @@ impl crate::Engine for SqlxEngine {
     async fn execute(&self, statement: &SqlStatement) -> Result<ExecResult> {
         self.execute_statement(statement).await
     }
+}
+
+fn add_rows_affected(total: &mut Option<u64>, rows_affected: u64) {
+    *total = Some(total.unwrap_or(0).saturating_add(rows_affected));
+}
+
+fn record_statement_outcome(
+    total: &mut Option<u64>,
+    rows_affected: u64,
+    statement: Option<&str>,
+    returned_rows: bool,
+) {
+    // SQLx emits a query-result event after a row stream. SQLite populates
+    // that event with the connection's previous change count for SELECT, so
+    // counting it would make a read appear to have modified data. A statement
+    // that produced rows, or is recognizably row-producing but happened to be
+    // empty, contributes no affected-row count. Mutation/DDL events remain
+    // additive across scripts.
+    if !returned_rows && !statement.is_some_and(statement_likely_returns_rows) {
+        add_rows_affected(total, rows_affected);
+    }
+}
+
+fn push_bounded_row(
+    output: &mut Vec<RowData>,
+    truncated: &mut bool,
+    limit: Option<usize>,
+    columns: &mut [ColumnInfo],
+    decode: impl FnOnce() -> Result<Vec<CellValue>>,
+) -> Result<()> {
+    if limit.is_some_and(|limit| output.len() >= limit) {
+        *truncated = true;
+        return Ok(());
+    }
+    let values = decode()?;
+    refine_dynamic_column_types(columns, &values);
+    output.push(RowData::new(values));
+    Ok(())
+}
+
+fn refine_dynamic_column_types(columns: &mut [ColumnInfo], values: &[CellValue]) {
+    for (column, value) in columns.iter_mut().zip(values) {
+        if !matches!(
+            column.data_type.trim().to_ascii_uppercase().as_str(),
+            "" | "NULL" | "UNKNOWN"
+        ) {
+            continue;
+        }
+        let inferred = match value {
+            CellValue::Null => continue,
+            CellValue::Boolean(_) => "BOOLEAN",
+            CellValue::Integer(_) => "INTEGER",
+            CellValue::Unsigned(_) => "UNSIGNED",
+            CellValue::Real(_) => "REAL",
+            CellValue::Text(_) => "TEXT",
+            CellValue::Bytes(_) => "BLOB",
+            CellValue::Json(_) => "JSON",
+        };
+        column.data_type = inferred.into();
+    }
+}
+
+fn capture_result_columns<C: Column>(
+    columns: &mut Vec<ColumnInfo>,
+    row_columns: &[C],
+) -> Result<()> {
+    let row_columns = result_columns(row_columns);
+    if columns.is_empty() {
+        *columns = row_columns;
+        return Ok(());
+    }
+    // SQLite often describes computed expressions with a placeholder type,
+    // then reports the concrete runtime type with the row (for example
+    // `sqlite_version()` is described differently from its TEXT result).
+    // Column count and names define the grid shape; runtime types may refine
+    // the description without making the result incompatible.
+    let same_shape = columns.len() == row_columns.len()
+        && columns
+            .iter()
+            .zip(&row_columns)
+            .all(|(described, observed)| described.name == observed.name);
+    if same_shape {
+        *columns = row_columns;
+        return Ok(());
+    }
+    Err(DbxError::Decode(
+        "query returned multiple result shapes; execute each SELECT separately".into(),
+    ))
 }
 
 fn is_sqlite_memory_url(url: &str) -> bool {

@@ -6,7 +6,7 @@
 	<key>CFBundleExecutable</key>
 	<string>dbx</string>
 	<key>CFBundleIdentifier</key>
-	<string>dbx.jrmd.app</string>
+	<string>dev.jrmd.dbx</string>
 	<key>CFBundleName</key>
 	<string>DBX</string>
 	<key>CFBundleDisplayName</key>

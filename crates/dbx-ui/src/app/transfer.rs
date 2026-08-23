@@ -337,30 +337,24 @@ impl DbxApp {
             .session(session_id)
             .and_then(|session| session.current_database.clone())
             .unwrap_or_else(|| "the active database".into());
-        let receiver = window.prompt(
-            PromptLevel::Warning,
-            "Run this database SQL dump?",
-            Some(format!(
+        let return_focus = window.focused(cx);
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: "Run this database SQL dump?".into(),
+            detail: format!(
                 "Every statement in ‘{file_name}’ will run against {connection_name}. Review the file first if you did not create it."
-            ).as_str()),
-            &[
-                PromptButton::cancel("Cancel"),
-                PromptButton::ok("Run dump"),
-            ],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if matches!(receiver.await, Ok(1)) {
-                this.update(cx, |this, cx| {
-                    this.execute_database_import(session_id, path, cx)
-                })?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+            ),
+            confirm_label: "Run dump",
+            tone: ConfirmationTone::Warning,
+            action: ConfirmationAction::DatabaseImport { session_id, path },
+            focus: focus.clone(),
+            return_focus,
+        });
+        focus.focus(window, cx);
+        cx.notify();
     }
 
-    fn execute_database_import(
+    pub(super) fn execute_database_import(
         &mut self,
         session_id: SessionId,
         path: PathBuf,
@@ -631,28 +625,26 @@ impl DbxApp {
                 "Import data",
             ),
         };
-        let receiver = window.prompt(
-            PromptLevel::Warning,
-            &message,
-            Some(&detail),
-            &[
-                PromptButton::cancel("Cancel"),
-                PromptButton::ok(confirmation),
-            ],
-            cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if matches!(receiver.await, Ok(1)) {
-                this.update(cx, |this, cx| {
-                    this.execute_table_import(session_id, table, path, cx)
-                })?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        let return_focus = window.focused(cx);
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: message,
+            detail,
+            confirm_label: confirmation,
+            tone: ConfirmationTone::Warning,
+            action: ConfirmationAction::TableImport {
+                session_id,
+                table,
+                path,
+            },
+            focus: focus.clone(),
+            return_focus,
+        });
+        focus.focus(window, cx);
+        cx.notify();
     }
 
-    fn execute_table_import(
+    pub(super) fn execute_table_import(
         &mut self,
         session_id: SessionId,
         table: TableInfo,

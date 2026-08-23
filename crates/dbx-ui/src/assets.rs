@@ -6,9 +6,12 @@ pub const ICON_DATABASE: &str = "icons/database.svg";
 pub const ICON_TABLE: &str = "icons/table.svg";
 pub const ICON_QUERY: &str = "icons/query.svg";
 pub const ICON_STRUCTURE: &str = "icons/structure.svg";
+pub const ICON_DIAGRAM: &str = "icons/diagram.svg";
 pub const ICON_SEARCH: &str = "icons/search.svg";
 pub const ICON_REFRESH: &str = "icons/refresh.svg";
 pub const ICON_SETTINGS: &str = "icons/settings.svg";
+pub const ICON_SUN: &str = "icons/sun.svg";
+pub const ICON_MOON: &str = "icons/moon.svg";
 pub const ICON_ADD: &str = "icons/add.svg";
 pub const ICON_CLOSE: &str = "icons/close.svg";
 pub const ICON_MORE: &str = "icons/more.svg";
@@ -31,9 +34,12 @@ impl AssetSource for Assets {
             ICON_TABLE => include_bytes!("../assets/icons/table.svg").as_slice(),
             ICON_QUERY => include_bytes!("../assets/icons/query.svg").as_slice(),
             ICON_STRUCTURE => include_bytes!("../assets/icons/structure.svg").as_slice(),
+            ICON_DIAGRAM => include_bytes!("../assets/icons/diagram.svg").as_slice(),
             ICON_SEARCH => include_bytes!("../assets/icons/search.svg").as_slice(),
             ICON_REFRESH => include_bytes!("../assets/icons/refresh.svg").as_slice(),
             ICON_SETTINGS => include_bytes!("../assets/icons/settings.svg").as_slice(),
+            ICON_SUN => include_bytes!("../assets/icons/sun.svg").as_slice(),
+            ICON_MOON => include_bytes!("../assets/icons/moon.svg").as_slice(),
             ICON_ADD => include_bytes!("../assets/icons/add.svg").as_slice(),
             ICON_CLOSE => include_bytes!("../assets/icons/close.svg").as_slice(),
             ICON_MORE => include_bytes!("../assets/icons/more.svg").as_slice(),
@@ -58,9 +64,12 @@ impl AssetSource for Assets {
                 "table.svg",
                 "query.svg",
                 "structure.svg",
+                "diagram.svg",
                 "search.svg",
                 "refresh.svg",
                 "settings.svg",
+                "sun.svg",
+                "moon.svg",
                 "add.svg",
                 "close.svg",
                 "more.svg",
@@ -83,7 +92,7 @@ impl AssetSource for Assets {
 mod tests {
     use gpui::AssetSource;
 
-    use super::{Assets, LOGO, LOGO_BYTES};
+    use super::{Assets, ICON_DIAGRAM, ICON_MOON, ICON_SUN, LOGO, LOGO_BYTES};
 
     #[test]
     fn loads_and_lists_the_embedded_logo() {
@@ -96,6 +105,23 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|asset| asset.as_ref() == LOGO)
+        );
+        assert!(assets.load(ICON_SUN).unwrap().is_some());
+        assert!(assets.load(ICON_MOON).unwrap().is_some());
+        assert!(assets.load(ICON_DIAGRAM).unwrap().is_some());
+        assert!(
+            assets
+                .list("icons")
+                .unwrap()
+                .iter()
+                .any(|asset| asset.as_ref() == "sun.svg")
+        );
+        assert!(
+            assets
+                .list("icons")
+                .unwrap()
+                .iter()
+                .any(|asset| asset.as_ref() == "diagram.svg")
         );
         assert!(
             LOGO_BYTES
