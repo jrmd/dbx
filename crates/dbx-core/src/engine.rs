@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError, ExecResult, Filter,
-    InsertRequest, Order, Page, QueryResult, Result, SqlStatement, TableInfo, TableRef,
-    TableStructure, UpdateRequest, build_create_table, build_delete, build_drop_table,
+    InsertRequest, Order, Page, QueryResult, RelationalSchema, Result, SqlStatement, TableInfo,
+    TableRef, TableStructure, UpdateRequest, build_create_table, build_delete, build_drop_table,
     build_insert, build_select, build_truncate_table, build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
@@ -50,6 +50,9 @@ pub trait Engine: Send + Sync {
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
 
     async fn table_structure(&self, table: &TableRef) -> Result<TableStructure>;
+
+    /// Load a complete relational metadata snapshot for the active database.
+    async fn relational_schema(&self) -> Result<RelationalSchema>;
 
     async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult>;
 
@@ -117,6 +120,10 @@ impl DatabaseEngine {
 
     pub async fn table_structure(&self, table: &TableRef) -> Result<TableStructure> {
         Engine::table_structure(self, table).await
+    }
+
+    pub async fn relational_schema(&self) -> Result<RelationalSchema> {
+        Engine::relational_schema(self).await
     }
 
     pub async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
@@ -290,6 +297,13 @@ impl Engine for DatabaseEngine {
         }
     }
 
+    async fn relational_schema(&self) -> Result<RelationalSchema> {
+        match self {
+            Self::Sql(engine) => engine.relational_schema().await,
+            Self::Redis(engine) => engine.relational_schema().await,
+        }
+    }
+
     async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
         match self {
             Self::Sql(engine) => engine.query(sql, options).await,
@@ -340,12 +354,14 @@ pub(crate) fn query_result(
     columns: Vec<ColumnInfo>,
     rows: Vec<crate::RowData>,
     rows_affected: Option<u64>,
+    truncated: bool,
     started: std::time::Instant,
 ) -> QueryResult {
     QueryResult {
         columns,
         rows,
         rows_affected,
+        truncated,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     }
 }

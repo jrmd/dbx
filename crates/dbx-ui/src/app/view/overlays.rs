@@ -21,161 +21,111 @@ impl DbxApp {
         let output_name_focus = output_name_editor.read(cx).focus_handle();
         let output_name = dialog.output_name.read(cx).clone();
         let can_export = selected_count > 0 && !output_name.trim().is_empty();
+        let app = cx.entity();
 
-        let table_rows = tables.into_iter().map(|table| {
-            let key = table_selection_key(&table);
-            let selected = selected_tables.contains(&key);
-            let label = table_sidebar_label(&table, None);
-            div()
-                .id(SharedString::from(format!(
+        let table_rows =
+            tables.into_iter().map(|table| {
+                let key = table_selection_key(&table);
+                let selected = selected_tables.contains(&key);
+                let label = table_sidebar_label(&table, None);
+                Button::new(SharedString::from(format!(
                     "database-export-{}",
                     table_sidebar_id(&table)
                 )))
                 .h(px(30.))
+                .w_full()
                 .px(px(8.))
                 .rounded(px(5.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
+                .with_size(Size::Small)
+                .compact()
+                .ghost()
+                .selected(selected)
                 .bg(if selected {
-                    THEME.accent_soft
+                    theme().accent_soft
                 } else {
-                    THEME.panel
+                    theme().panel
                 })
                 .text_color(if selected {
-                    THEME.text
+                    theme().text
                 } else {
-                    THEME.text_muted
+                    theme().text_muted
                 })
                 .cursor_pointer()
-                .hover(|style| style.bg(THEME.panel_raised))
                 .child(
                     div()
                         .size(px(14.))
                         .rounded(px(3.))
                         .border_1()
                         .border_color(if selected {
-                            THEME.accent
+                            theme().accent
                         } else {
-                            THEME.border_strong
+                            theme().border_strong
                         })
-                        .bg(if selected { THEME.accent } else { THEME.canvas })
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(10.))
-                        .text_color(THEME.canvas)
-                        .child(if selected { "✓" } else { "" }),
+                        .bg(if selected {
+                            theme().accent
+                        } else {
+                            theme().canvas
+                        })
+                        .flex(),
                 )
-                .child(icon(Icon::Table, THEME.text_muted).size(px(14.)))
+                .child(icon(Icon::Table, theme().text_muted).size(px(14.)))
                 .child(div().flex_1().truncate().child(label))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_database_export_table(key.clone(), cx)
                 }))
-        });
+            });
 
         let format_choices = [DumpFormat::Sql, DumpFormat::Csv, DumpFormat::Tsv]
             .into_iter()
             .map(|choice| {
                 let selected = choice == format;
-                div()
-                    .id(SharedString::from(format!(
-                        "database-export-format-{choice}"
-                    )))
-                    .px(px(10.))
-                    .py(px(6.))
-                    .rounded(px(5.))
-                    .bg(if selected {
-                        THEME.accent_soft
-                    } else {
-                        THEME.panel_raised
-                    })
-                    .text_color(if selected {
-                        THEME.accent
-                    } else {
-                        THEME.text_muted
-                    })
-                    .text_size(px(10.))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(THEME.accent_soft).text_color(THEME.text))
-                    .child(choice.to_string())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_database_export_format(choice, cx)
-                    }))
+                Button::new(SharedString::from(format!(
+                    "database-export-format-{choice}"
+                )))
+                .label(choice.to_string())
+                .px(px(10.))
+                .rounded(px(5.))
+                .with_size(Size::XSmall)
+                .compact()
+                .ghost()
+                .selected(selected)
+                .bg(if selected {
+                    theme().accent_soft
+                } else {
+                    theme().panel_raised
+                })
+                .text_color(if selected {
+                    theme().accent
+                } else {
+                    theme().text_muted
+                })
+                .text_size(px(10.))
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.set_database_export_format(choice, cx)),
+                )
             });
 
-        let schema_toggle = div()
-            .id("database-export-schema-only")
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .text_size(px(10.))
-            .text_color(if format == DumpFormat::Sql {
-                THEME.text
-            } else {
-                THEME.text_muted
-            })
-            .when(format == DumpFormat::Sql, |view| {
-                view.cursor_pointer().on_click(
-                    cx.listener(|this, _, _, cx| this.toggle_database_export_schema_only(cx)),
-                )
-            })
-            .child(
-                div()
-                    .size(px(14.))
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(if schema_only && format == DumpFormat::Sql {
-                        THEME.accent
-                    } else {
-                        THEME.border_strong
-                    })
-                    .bg(if schema_only && format == DumpFormat::Sql {
-                        THEME.accent
-                    } else {
-                        THEME.canvas
-                    })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(10.))
-                    .text_color(THEME.canvas)
-                    .child(if schema_only && format == DumpFormat::Sql {
-                        "✓"
-                    } else {
-                        ""
-                    }),
-            )
-            .child("Schema only");
+        let schema_toggle = gpui_component::checkbox::Checkbox::new("database-export-schema-only")
+            .label("Schema only")
+            .checked(schema_only)
+            .disabled(format != DumpFormat::Sql)
+            .with_size(Size::Small)
+            .on_click({
+                let app = app.clone();
+                move |_, _, cx| {
+                    app.update(cx, |this, cx| this.toggle_database_export_schema_only(cx))
+                }
+            });
 
-        let gzip_toggle = div()
-            .id("database-export-gzip")
-            .flex()
-            .items_center()
-            .gap(px(7.))
-            .text_size(px(10.))
-            .text_color(THEME.text)
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_database_export_gzip(cx)))
-            .child(
-                div()
-                    .size(px(14.))
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(if gzipped {
-                        THEME.accent
-                    } else {
-                        THEME.border_strong
-                    })
-                    .bg(if gzipped { THEME.accent } else { THEME.canvas })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(10.))
-                    .text_color(THEME.canvas)
-                    .child(if gzipped { "✓" } else { "" }),
-            )
-            .child("Gzip output");
+        let gzip_toggle = gpui_component::checkbox::Checkbox::new("database-export-gzip")
+            .label("Gzip output")
+            .checked(gzipped)
+            .with_size(Size::Small)
+            .on_click({
+                let app = app.clone();
+                move |_, _, cx| app.update(cx, |this, cx| this.toggle_database_export_gzip(cx))
+            });
 
         let select_all_label = if all_selected {
             "Clear all"
@@ -205,23 +155,25 @@ impl DbxApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(gpui::rgba(0x00000088))
+            .bg(theme().overlay)
             .child(
                 div()
                     .id("database-export-dialog")
                     .w(px(560.))
                     .max_h(px(680.))
-                    .p(px(18.))
                     .rounded(px(10.))
                     .border_1()
-                    .border_color(THEME.border_strong)
-                    .bg(THEME.panel_raised)
-                    .overflow_y_scroll()
+                    .border_color(theme().border_strong)
+                    .bg(theme().panel)
+                    .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .gap(px(12.))
                     .child(
                         div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .border_b_1()
+                            .border_color(theme().border)
                             .flex()
                             .items_start()
                             .justify_between()
@@ -234,27 +186,23 @@ impl DbxApp {
                                         div()
                                             .text_size(px(16.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(THEME.text)
+                                            .text_color(theme().text)
                                             .child("Export database"),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(10.))
-                                            .text_color(THEME.text_muted)
+                                            .text_color(theme().text_muted)
                                             .child(destination_label),
                                     ),
                             )
                             .child(
-                                div()
-                                    .id("close-database-export")
-                                    .size(px(24.))
-                                    .rounded(px(5.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(THEME.panel))
-                                    .child(icon(Icon::Close, THEME.text_muted).size(px(12.)))
+                                Button::new("close-database-export")
+                                    .with_size(Size::XSmall)
+                                    .compact()
+                                    .ghost()
+                                    .tooltip("Close export")
+                                    .child(icon(Icon::Close, theme().text_muted))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.cancel_database_export(cx)
                                     })),
@@ -262,6 +210,9 @@ impl DbxApp {
                     )
                     .child(
                         div()
+                            .px(px(16.))
+                            .pt(px(14.))
+                            .pb(px(8.))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -269,20 +220,17 @@ impl DbxApp {
                                 div()
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(THEME.text_muted)
+                                    .text_color(theme().text_muted)
                                     .child(format!("TABLES · {selected_count} selected")),
                             )
                             .child(
-                                div()
-                                    .id("database-export-select-all")
-                                    .px(px(8.))
-                                    .py(px(4.))
-                                    .rounded(px(4.))
-                                    .text_size(px(10.))
-                                    .text_color(THEME.accent)
+                                Button::new("database-export-select-all")
+                                    .label(select_all_label)
+                                    .with_size(Size::XSmall)
+                                    .compact()
+                                    .ghost()
+                                    .text_color(theme().accent)
                                     .cursor_pointer()
-                                    .hover(|style| style.bg(THEME.accent_soft))
-                                    .child(select_all_label)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_all_database_export_tables(cx)
                                     })),
@@ -291,12 +239,13 @@ impl DbxApp {
                     .child(
                         div()
                             .id("database-export-table-list")
+                            .mx(px(16.))
                             .h(px(190.))
                             .p(px(5.))
                             .rounded(px(6.))
                             .border_1()
-                            .border_color(THEME.border)
-                            .bg(THEME.canvas)
+                            .border_color(theme().border)
+                            .bg(theme().canvas)
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
@@ -305,6 +254,8 @@ impl DbxApp {
                     )
                     .child(
                         div()
+                            .px(px(16.))
+                            .pt(px(12.))
                             .flex()
                             .flex_col()
                             .gap(px(6.))
@@ -312,7 +263,7 @@ impl DbxApp {
                                 div()
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(THEME.text_muted)
+                                    .text_color(theme().text_muted)
                                     .child("OUTPUT FORMAT"),
                             )
                             .child(div().flex().gap(px(5.)).children(format_choices))
@@ -320,6 +271,8 @@ impl DbxApp {
                     )
                     .child(
                         div()
+                            .px(px(16.))
+                            .pt(px(12.))
                             .flex()
                             .flex_col()
                             .gap(px(5.))
@@ -327,13 +280,19 @@ impl DbxApp {
                                 div()
                                     .text_size(px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(THEME.text_muted)
+                                    .text_color(theme().text_muted)
                                     .child("OUTPUT NAME"),
                             )
-                            .child(editor::input(output_name_editor, output_name_focus, false)),
+                            .child(editor::input(
+                                output_name_editor,
+                                output_name_focus.clone(),
+                                false,
+                            )),
                     )
                     .child(
                         div()
+                            .px(px(16.))
+                            .py(px(12.))
                             .flex()
                             .items_center()
                             .gap(px(8.))
@@ -342,23 +301,17 @@ impl DbxApp {
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(10.))
-                                    .text_color(THEME.text_muted)
+                                    .text_color(theme().text_muted)
                                     .truncate()
                                     .child(output_directory),
                             )
                             .child(
-                                div()
-                                    .id("database-export-choose-folder")
-                                    .px(px(9.))
-                                    .py(px(6.))
-                                    .rounded(px(5.))
-                                    .border_1()
-                                    .border_color(THEME.border)
-                                    .text_size(px(10.))
-                                    .text_color(THEME.text)
+                                button(
+                                    "database-export-choose-folder",
+                                    "Choose folder…",
+                                    ButtonKind::Quiet,
+                                )
                                     .cursor_pointer()
-                                    .hover(|style| style.border_color(THEME.accent))
-                                    .child("Choose folder…")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.choose_database_export_directory(cx)
                                     })),
@@ -366,15 +319,19 @@ impl DbxApp {
                     )
                     .child(
                         div()
+                            .px(px(16.))
+                            .py(px(12.))
+                            .border_t_1()
+                            .border_color(theme().border)
+                            .bg(theme().panel_raised)
                             .flex()
                             .items_center()
                             .justify_between()
-                            .pt(px(4.))
                             .child(
                                 div()
                                     .max_w(px(340.))
                                     .text_size(px(9.))
-                                    .text_color(THEME.text_muted)
+                                    .text_color(theme().text_muted)
                                     .child(if format == DumpFormat::Sql {
                                         "SQL includes table columns, primary keys, and selected foreign keys."
                                     } else {
@@ -386,52 +343,263 @@ impl DbxApp {
                                     .flex()
                                     .gap(px(7.))
                                     .child(
-                                        div()
-                                            .id("cancel-database-export")
-                                            .px(px(10.))
-                                            .py(px(7.))
-                                            .rounded(px(5.))
-                                            .border_1()
-                                            .border_color(THEME.border)
-                                            .text_size(px(10.))
-                                            .text_color(THEME.text)
+                                        button(
+                                            "cancel-database-export",
+                                            "Cancel",
+                                            ButtonKind::Quiet,
+                                        )
                                             .cursor_pointer()
-                                            .child("Cancel")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.cancel_database_export(cx)
                                             })),
                                     )
                                     .child(
-                                        div()
-                                            .id("run-database-export")
-                                            .px(px(11.))
-                                            .py(px(7.))
-                                            .rounded(px(5.))
-                                            .bg(if can_export {
-                                                THEME.accent
-                                            } else {
-                                                THEME.panel
-                                            })
-                                            .text_size(px(10.))
-                                            .text_color(if can_export {
-                                                THEME.canvas
-                                            } else {
-                                                THEME.text_muted
-                                            })
-                                            .when(can_export, |view| {
-                                                view.cursor_pointer().on_click(cx.listener(
+                                        button(
+                                            "run-database-export",
+                                            format!("Export {selected_count} table{}", if selected_count == 1 { "" } else { "s" }),
+                                            ButtonKind::Primary,
+                                        )
+                                            .disabled(!can_export)
+                                            .when(can_export, |button| {
+                                                button.cursor_pointer().on_click(cx.listener(
                                                     |this, _, _, cx| {
                                                         this.execute_database_export(cx)
                                                     },
                                                 ))
-                                            })
-                                            .child(format!("Export {selected_count} table{}", if selected_count == 1 { "" } else { "s" })),
+                                            }),
                                     ),
                             ),
-                    ),
+                    )
+                    .focus_trap("database-export-focus-trap", &output_name_focus),
             );
 
         deferred(overlay).with_priority(30).into_any_element()
+    }
+
+    pub(super) fn render_confirmation_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = self.confirmation_dialog.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = dialog.title.clone();
+        let detail = dialog.detail.clone();
+        let confirm_label = dialog.confirm_label;
+        let tone = dialog.tone;
+        let focus = dialog.focus.clone();
+        let (tone_label, tone_color, confirm_kind) = match tone {
+            ConfirmationTone::Warning => ("Review action", theme().warning, ButtonKind::Primary),
+            ConfirmationTone::Danger => ("Destructive", theme().danger, ButtonKind::Danger),
+        };
+
+        let overlay = div()
+            .absolute()
+            .top(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme().overlay)
+            .child(
+                div()
+                    .id("confirmation-dialog")
+                    .w(px(420.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme().border_strong)
+                    .bg(theme().panel)
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .border_b_1()
+                            .border_color(theme().border)
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(7.))
+                                    .child(
+                                        div()
+                                            .text_size(px(15.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme().text)
+                                            .child(title),
+                                    )
+                                    .child(badge(tone_label, tone_color)),
+                            )
+                            .child(
+                                Button::new("close-confirmation")
+                                    .with_size(Size::XSmall)
+                                    .compact()
+                                    .ghost()
+                                    .tooltip("Cancel")
+                                    .child(icon(Icon::Close, theme().text_muted))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_confirmation(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(16.))
+                            .text_size(px(12.))
+                            .text_color(theme().text_muted)
+                            .line_height(gpui::relative(1.5))
+                            .child(detail),
+                    )
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(12.))
+                            .border_t_1()
+                            .border_color(theme().border)
+                            .bg(theme().panel_raised)
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.))
+                            .child(
+                                button("cancel-confirmation", "Cancel", ButtonKind::Quiet)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_confirmation(window, cx)
+                                    })),
+                            )
+                            .child(
+                                button("confirm-action", confirm_label, confirm_kind)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_pending_action(window, cx)
+                                    })),
+                            ),
+                    )
+                    .focus_trap("confirmation-focus-trap", &focus),
+            );
+
+        deferred(overlay).with_priority(40).into_any_element()
+    }
+
+    pub(super) fn render_mutation_error_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(dialog) = self.mutation_error_dialog.as_ref() else {
+            return div().into_any_element();
+        };
+        let title = dialog.title.clone();
+        let detail = dialog.detail.clone();
+        let focus = dialog.focus.clone();
+
+        let overlay = div()
+            .absolute()
+            .top(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme().overlay)
+            .child(
+                div()
+                    .id("mutation-error-dialog")
+                    .w(px(460.))
+                    .max_h(px(520.))
+                    .rounded(px(10.))
+                    .border_1()
+                    .border_color(theme().border_strong)
+                    .bg(theme().panel)
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .border_b_1()
+                            .border_color(theme().border)
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme().text)
+                                    .child(title),
+                            )
+                            .child(badge("Save failed", theme().danger)),
+                    )
+                    .child(
+                        div()
+                            .id("mutation-error-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .px(px(16.))
+                            .py(px(16.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(theme().text_muted)
+                                    .line_height(gpui::relative(1.5))
+                                    .child(
+                                        "This row change could not be applied. Your draft is still open.",
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .p(px(12.))
+                                    .rounded(px(6.))
+                                    .border_1()
+                                    .border_color(theme().border)
+                                    .bg(theme().canvas)
+                                    .text_size(px(11.))
+                                    .text_color(theme().danger)
+                                    .line_height(gpui::relative(1.5))
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(12.))
+                            .border_t_1()
+                            .border_color(theme().border)
+                            .bg(theme().panel_raised)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(px(9.))
+                                    .text_color(theme().text_muted)
+                                    .child("Correct the value or expression, then try again."),
+                            )
+                            .child(
+                                button("dismiss-mutation-error", "Back to row", ButtonKind::Primary)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dismiss_mutation_error(window, cx)
+                                    })),
+                            ),
+                    )
+                    .focus_trap("mutation-error-focus-trap", &focus),
+            );
+
+        deferred(overlay).with_priority(50).into_any_element()
     }
 
     pub(super) fn render_table_context_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -465,11 +633,21 @@ impl DbxApp {
                         .p(px(6.))
                         .rounded(px(8.))
                         .border_1()
-                        .border_color(THEME.border_strong)
-                        .bg(THEME.panel_raised)
+                        .border_color(theme().border_strong)
+                        .bg(theme().panel_raised)
                         .text_size(px(12.))
                         .on_mouse_down_out(
                             cx.listener(|this, _, _, cx| this.close_table_context_menu(cx)),
+                        )
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .pt(px(5.))
+                                .pb(px(7.))
+                                .text_size(px(10.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme().text_muted)
+                                .child(table_sidebar_label(&menu.table, None)),
                         )
                         .child(
                             div()
@@ -478,7 +656,7 @@ impl DbxApp {
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(THEME.accent_soft))
+                                .hover(|style| style.bg(theme().accent_soft))
                                 .child("Open structure")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.table_context_menu = None;
@@ -491,21 +669,13 @@ impl DbxApp {
                         )
                         .child(
                             div()
-                                .px(px(8.))
-                                .py(px(6.))
-                                .text_size(px(10.))
-                                .text_color(THEME.text_muted)
-                                .child(table_sidebar_label(&menu.table, None)),
-                        )
-                        .child(
-                            div()
                                 .id("context-open-table")
                                 .px(px(8.))
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(THEME.accent_soft))
-                                .child("Open")
+                                .hover(|style| style.bg(theme().accent_soft))
+                                .child("Open data")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.table_context_menu = None;
                                     this.select_table_for(
@@ -523,7 +693,7 @@ impl DbxApp {
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .cursor_pointer()
-                                .hover(|style| style.bg(THEME.accent_soft))
+                                .hover(|style| style.bg(theme().accent_soft))
                                 .child("Refresh table")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.table_context_menu = None;
@@ -535,7 +705,16 @@ impl DbxApp {
                                     )
                                 })),
                         )
-                        .child(div().my(px(4.)).border_t_1().border_color(THEME.border))
+                        .child(div().my(px(4.)).border_t_1().border_color(theme().border))
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(4.))
+                                .text_size(px(9.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme().text_muted)
+                                .child("TRANSFER"),
+                        )
                         .child(
                             div()
                                 .id("context-export-table")
@@ -543,13 +722,13 @@ impl DbxApp {
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .text_color(if transfer_enabled {
-                                    THEME.text
+                                    theme().text
                                 } else {
-                                    THEME.text_muted
+                                    theme().text_muted
                                 })
                                 .when(transfer_enabled, |view| {
                                     view.cursor_pointer()
-                                        .hover(|style| style.bg(THEME.accent_soft))
+                                        .hover(|style| style.bg(theme().accent_soft))
                                 })
                                 .child("Export data…")
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -567,13 +746,13 @@ impl DbxApp {
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .text_color(if transfer_enabled {
-                                    THEME.text
+                                    theme().text
                                 } else {
-                                    THEME.text_muted
+                                    theme().text_muted
                                 })
                                 .when(transfer_enabled, |view| {
                                     view.cursor_pointer()
-                                        .hover(|style| style.bg(THEME.accent_soft))
+                                        .hover(|style| style.bg(theme().accent_soft))
                                 })
                                 .child("Import data…")
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -584,7 +763,16 @@ impl DbxApp {
                                     }
                                 })),
                         )
-                        .child(div().my(px(4.)).border_t_1().border_color(THEME.border))
+                        .child(div().my(px(4.)).border_t_1().border_color(theme().border))
+                        .child(
+                            div()
+                                .px(px(8.))
+                                .py(px(4.))
+                                .text_size(px(9.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme().text_muted)
+                                .child("DESTRUCTIVE"),
+                        )
                         .child(
                             div()
                                 .id("context-truncate-table")
@@ -592,13 +780,12 @@ impl DbxApp {
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .text_color(if destructive_enabled {
-                                    THEME.warning
+                                    theme().warning
                                 } else {
-                                    THEME.text_muted
+                                    theme().text_muted
                                 })
                                 .when(destructive_enabled, |view| {
-                                    view.cursor_pointer()
-                                        .hover(|style| style.bg(THEME.accent_soft))
+                                    view.cursor_pointer().hover(|style| style.bg(theme().panel))
                                 })
                                 .child("Truncate table…")
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -620,13 +807,12 @@ impl DbxApp {
                                 .py(px(7.))
                                 .rounded(px(5.))
                                 .text_color(if destructive_enabled {
-                                    THEME.danger
+                                    theme().danger
                                 } else {
-                                    THEME.text_muted
+                                    theme().text_muted
                                 })
                                 .when(destructive_enabled, |view| {
-                                    view.cursor_pointer()
-                                        .hover(|style| style.bg(THEME.accent_soft))
+                                    view.cursor_pointer().hover(|style| style.bg(theme().panel))
                                 })
                                 .child("Delete table…")
                                 .on_click(cx.listener(move |this, _, window, cx| {

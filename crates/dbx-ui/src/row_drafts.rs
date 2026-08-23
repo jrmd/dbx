@@ -8,14 +8,14 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dbx_core::{CellValue, ColumnInfo};
+use dbx_core::{CellValue, ColumnInfo, MutationValue, validate_sql_expression};
 use gpui::{App, AppContext, Context, Entity, SharedString, Window};
 use gpui_component::{
     IndexPath,
     select::{SearchableVec, SelectState},
 };
 
-use crate::editor::TextEditor;
+use crate::editor::{EditorLanguage, TextEditor};
 
 /// A stable identity for one field in a row draft.
 pub type FieldId = u64;
@@ -33,13 +33,15 @@ fn next_field_id() -> FieldId {
 /// The state of a field's current value.
 ///
 /// `Default` is meaningful for inserts: the field is omitted from the insert
-/// request and the database supplies its default expression.  The core
-/// mutation model has no SQL-`DEFAULT` value variant, so using `Default` for
-/// an update is rejected by [`changed_fields`].
+/// request and the database supplies its default expression. `Sql` is an
+/// explicit escape hatch for one validated database expression; ordinary
+/// values remain parameterized. Using `Default` for an update is rejected by
+/// [`changed_fields`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FieldValueState {
     #[default]
     Value,
+    Sql,
     Null,
     Default,
 }
@@ -48,12 +50,35 @@ pub enum FieldValueState {
 pub type FieldState = FieldValueState;
 
 impl FieldValueState {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Value => "Value",
+            Self::Sql => "SQL",
+            Self::Null => "NULL",
+            Self::Default => "Default",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "Value" => Some(Self::Value),
+            "SQL" => Some(Self::Sql),
+            "NULL" => Some(Self::Null),
+            "Default" => Some(Self::Default),
+            _ => None,
+        }
+    }
+
     pub const fn is_null(self) -> bool {
         matches!(self, Self::Null)
     }
 
     pub const fn is_default(self) -> bool {
         matches!(self, Self::Default)
+    }
+
+    pub const fn is_sql(self) -> bool {
+        matches!(self, Self::Sql)
     }
 }
 
@@ -302,9 +327,19 @@ pub struct FieldRow {
     pub original: Option<CellValue>,
     pub value: Entity<String>,
     pub editor: Entity<TextEditor>,
+    /// A single-line SQL editor shares the canonical value entity with the
+    /// typed editor. Switching modes keeps the user's text losslessly while
+    /// changing how it is highlighted and submitted.
+    pub sql_editor: Entity<TextEditor>,
     /// A native select for database enum columns. The text editor remains
     /// available as the canonical value entity for validation and mutation.
     pub enum_selector: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    /// Boolean columns use a native true/false selector instead of accepting
+    /// a loose collection of textual aliases in the primary editing path.
+    pub boolean_selector: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
+    /// One compact selector replaces the repeated Value / NULL / Default
+    /// button cluster when a column supports more than one value state.
+    pub state_selector: Option<Entity<SelectState<SearchableVec<SharedString>>>>,
     pub state: FieldValueState,
     pub default_expression: Option<String>,
     pub editable: bool,
@@ -331,7 +366,7 @@ impl FieldRow {
         let initial_text = original
             .as_ref()
             .filter(|value| !matches!(value, CellValue::Null))
-            .map(ToString::to_string)
+            .map(field_editor_text)
             .unwrap_or_default();
         Self::with_state(
             column,
@@ -385,8 +420,25 @@ impl FieldRow {
         cx: &mut Context<T>,
     ) -> Self {
         let initial_text = initial_text.into();
+        let is_insert = original.is_none();
+        let value_kind = field_value_kind(&column);
         let value = cx.new(|_| initial_text.clone());
-        let editor = cx.new(|editor_cx| TextEditor::new(value.clone(), false, window, editor_cx));
+        let editor = cx.new(|editor_cx| {
+            if value_kind == FieldValueKind::Json {
+                TextEditor::new_json(value.clone(), window, editor_cx)
+            } else {
+                TextEditor::new(value.clone(), false, window, editor_cx)
+            }
+        });
+        let sql_editor = cx.new(|editor_cx| {
+            TextEditor::new_with_language(
+                value.clone(),
+                false,
+                EditorLanguage::Sql,
+                window,
+                editor_cx,
+            )
+        });
         let enum_selector = if column.enum_values.is_empty() {
             None
         } else {
@@ -406,13 +458,48 @@ impl FieldRow {
                 SelectState::new(items, selected_index.map(IndexPath::new), window, select_cx)
             }))
         };
+        let boolean_selector = if value_kind == FieldValueKind::Boolean {
+            let options = ["true", "false"];
+            let selected_index = options
+                .iter()
+                .position(|option| option.eq_ignore_ascii_case(initial_text.trim()));
+            let items = SearchableVec::new(
+                options
+                    .into_iter()
+                    .map(SharedString::from)
+                    .collect::<Vec<_>>(),
+            );
+            Some(cx.new(|select_cx| {
+                SelectState::new(items, selected_index.map(IndexPath::new), window, select_cx)
+            }))
+        } else {
+            None
+        };
+        let state_options = field_state_options(is_insert, column.nullable);
+        let state_selector = if state_options.is_empty() {
+            None
+        } else {
+            let selected_index = state_options.iter().position(|option| *option == state);
+            let items = SearchableVec::new(
+                state_options
+                    .into_iter()
+                    .map(|option| SharedString::from(option.label()))
+                    .collect::<Vec<_>>(),
+            );
+            Some(cx.new(|select_cx| {
+                SelectState::new(items, selected_index.map(IndexPath::new), window, select_cx)
+            }))
+        };
         Self {
             id: next_field_id(),
             column,
             original,
             value,
             editor,
+            sql_editor,
             enum_selector,
+            boolean_selector,
+            state_selector,
             state,
             default_expression,
             editable: true,
@@ -451,6 +538,10 @@ impl FieldRow {
         self.state = FieldValueState::Value;
     }
 
+    pub fn value_kind(&self) -> FieldValueKind {
+        field_value_kind(&self.column)
+    }
+
     /// Snapshot this entity-backed field into pure data.
     pub fn draft(&self, cx: &App) -> FieldDraft {
         FieldDraft {
@@ -463,6 +554,29 @@ impl FieldRow {
             editable: self.editable,
         }
     }
+}
+
+fn field_editor_text(value: &CellValue) -> String {
+    match value {
+        CellValue::Json(value) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        value => value.to_string(),
+    }
+}
+
+/// Valid value modes for one field. SQL is always explicit and available on
+/// SQL-backed row mutations; NULL and database omission remain constrained by
+/// column/mutation semantics.
+pub fn field_state_options(is_insert: bool, nullable: bool) -> Vec<FieldValueState> {
+    let mut options = vec![FieldValueState::Value, FieldValueState::Sql];
+    if nullable {
+        options.push(FieldValueState::Null);
+    }
+    if is_insert {
+        options.push(FieldValueState::Default);
+    }
+    options
 }
 
 /// Ordered collection of fields for one row or one insert form.
@@ -586,7 +700,7 @@ impl RowDraftModel {
 
 /// A column/value pair ready for `UpdateRequest.assignments` or an
 /// `InsertRequest`'s `columns`/`values` vectors.
-pub type FieldAssignment = (String, CellValue);
+pub type FieldAssignment = (String, MutationValue);
 
 /// Whether pure fields are being resolved for an update or an insert.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,7 +715,7 @@ pub enum FieldDraftMode {
 pub struct ResolvedField {
     pub id: FieldId,
     pub column: String,
-    pub value: Option<CellValue>,
+    pub value: Option<MutationValue>,
     pub state: FieldValueState,
 }
 
@@ -627,6 +741,13 @@ pub enum FieldValidationError {
         field_index: usize,
         column: String,
     },
+    InvalidSqlExpression {
+        field_id: FieldId,
+        field_index: usize,
+        column: String,
+        input: String,
+        reason: String,
+    },
     InvalidValue {
         field_id: FieldId,
         field_index: usize,
@@ -644,6 +765,7 @@ impl FieldValidationError {
             | Self::UnknownColumn { field_id, .. }
             | Self::NullNotAllowed { field_id, .. }
             | Self::DefaultNotSupportedForUpdate { field_id, .. }
+            | Self::InvalidSqlExpression { field_id, .. }
             | Self::InvalidValue { field_id, .. } => *field_id,
         }
     }
@@ -654,6 +776,7 @@ impl FieldValidationError {
             | Self::UnknownColumn { field_index, .. }
             | Self::NullNotAllowed { field_index, .. }
             | Self::DefaultNotSupportedForUpdate { field_index, .. }
+            | Self::InvalidSqlExpression { field_index, .. }
             | Self::InvalidValue { field_index, .. } => *field_index,
         }
     }
@@ -698,6 +821,20 @@ impl fmt::Display for FieldValidationError {
                 "Field {} ({:?}) cannot use DEFAULT during an update",
                 field_index + 1,
                 column
+            ),
+            Self::InvalidSqlExpression {
+                field_index,
+                column,
+                input,
+                reason,
+                ..
+            } => write!(
+                formatter,
+                "Field {} ({:?}) has invalid SQL expression {:?}: {}",
+                field_index + 1,
+                column,
+                input,
+                reason
             ),
             Self::InvalidValue {
                 field_index,
@@ -764,7 +901,7 @@ fn resolve_field_drafts(
                             column: column.name.clone(),
                         });
                     }
-                    Some(CellValue::Null)
+                    Some(MutationValue::Parameter(CellValue::Null))
                 }
                 FieldValueState::Default => {
                     if mode == FieldDraftMode::Update {
@@ -775,6 +912,18 @@ fn resolve_field_drafts(
                         });
                     }
                     None
+                }
+                FieldValueState::Sql => {
+                    let expression = validate_sql_expression(&draft.current).map_err(|error| {
+                        FieldValidationError::InvalidSqlExpression {
+                            field_id: draft.id,
+                            field_index,
+                            column: column.name.clone(),
+                            input: draft.current.clone(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    Some(MutationValue::Expression(expression.to_owned()))
                 }
                 FieldValueState::Value => {
                     let parsed = parse_field_value(column, &draft.current).map_err(|error| {
@@ -794,7 +943,7 @@ fn resolve_field_drafts(
                             column: column.name.clone(),
                         });
                     }
-                    Some(parsed)
+                    Some(MutationValue::Parameter(parsed))
                 }
             };
 
@@ -848,8 +997,10 @@ pub fn changed_fields(
                 if unchanged_text {
                     return None;
                 }
-                resolved.value.and_then(|value| {
-                    (draft.original.as_ref() != Some(&value)).then_some((resolved.column, value))
+                resolved.value.and_then(|value| match &value {
+                    MutationValue::Parameter(value) => (draft.original.as_ref() != Some(value))
+                        .then_some((resolved.column, MutationValue::Parameter(value.clone()))),
+                    MutationValue::Expression(_) => Some((resolved.column, value)),
                 })
             })
             .collect(),
@@ -887,6 +1038,7 @@ pub fn extract_insert_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{IntoElement, Render, TestAppContext, div};
 
     fn column(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {
         ColumnInfo {
@@ -897,6 +1049,55 @@ mod tests {
             ordinal: 0,
             primary_key: false,
         }
+    }
+
+    struct FieldRowHarness {
+        field: FieldRow,
+    }
+
+    impl Render for FieldRowHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn boolean_fields_build_a_true_false_selector(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| FieldRowHarness {
+            field: FieldRow::new_update(
+                column("enabled", "BOOLEAN", false),
+                CellValue::Boolean(false),
+                window,
+                cx,
+            ),
+        });
+
+        cx.update(|_, cx| {
+            let field = &view.read(cx).field;
+            let selector = field
+                .boolean_selector
+                .as_ref()
+                .expect("boolean field should have a selector");
+            assert_eq!(
+                selector.read(cx).selected_value().map(ToString::to_string),
+                Some("false".into())
+            );
+            assert!(field.enum_selector.is_none());
+        });
+    }
+
+    #[test]
+    fn field_state_labels_round_trip_for_compact_selectors() {
+        for state in [
+            FieldValueState::Value,
+            FieldValueState::Sql,
+            FieldValueState::Null,
+            FieldValueState::Default,
+        ] {
+            assert_eq!(FieldValueState::from_label(state.label()), Some(state));
+        }
+        assert_eq!(FieldValueState::from_label("Unknown"), None);
     }
 
     #[test]
@@ -976,8 +1177,11 @@ mod tests {
         assert_eq!(
             changed_fields(&drafts, &columns).unwrap(),
             vec![
-                ("name".into(), CellValue::Text("Grace".into())),
-                ("active".into(), CellValue::Null),
+                (
+                    "name".into(),
+                    MutationValue::Parameter(CellValue::Text("Grace".into()))
+                ),
+                ("active".into(), MutationValue::Parameter(CellValue::Null)),
             ]
         );
     }
@@ -1005,10 +1209,120 @@ mod tests {
         assert_eq!(
             insert_values(&drafts, &columns).unwrap(),
             vec![
-                ("name".into(), CellValue::Text("Ada".into())),
-                ("note".into(), CellValue::Null),
+                (
+                    "name".into(),
+                    MutationValue::Parameter(CellValue::Text("Ada".into()))
+                ),
+                ("note".into(), MutationValue::Parameter(CellValue::Null)),
             ]
         );
+    }
+
+    #[test]
+    fn field_state_options_keep_sql_explicit_in_insert_and_update_modes() {
+        assert_eq!(
+            field_state_options(false, false),
+            vec![FieldValueState::Value, FieldValueState::Sql]
+        );
+        assert_eq!(
+            field_state_options(false, true),
+            vec![
+                FieldValueState::Value,
+                FieldValueState::Sql,
+                FieldValueState::Null,
+            ]
+        );
+        assert_eq!(
+            field_state_options(true, true),
+            vec![
+                FieldValueState::Value,
+                FieldValueState::Sql,
+                FieldValueState::Null,
+                FieldValueState::Default,
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_expressions_are_extracted_without_parsing_as_column_values() {
+        let columns = vec![
+            column("id", "UUID", false),
+            column("updated_at", "TIMESTAMPTZ", false),
+        ];
+        let insert = vec![
+            FieldDraft::new(1, "id", None, "uuidv7()", FieldValueState::Sql, None),
+            FieldDraft::new(2, "updated_at", None, " NOW() ", FieldValueState::Sql, None),
+        ];
+        assert_eq!(
+            insert_values(&insert, &columns).unwrap(),
+            vec![
+                ("id".into(), MutationValue::Expression("uuidv7()".into())),
+                (
+                    "updated_at".into(),
+                    MutationValue::Expression("NOW()".into())
+                ),
+            ]
+        );
+
+        let update = vec![FieldDraft::new(
+            3,
+            "updated_at",
+            Some(CellValue::Text("2026-08-23T12:00:00Z".into())),
+            "NOW()",
+            FieldValueState::Sql,
+            None,
+        )];
+        assert_eq!(
+            changed_fields(&update, &columns[1..]).unwrap(),
+            vec![(
+                "updated_at".into(),
+                MutationValue::Expression("NOW()".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn unsafe_or_empty_sql_expressions_fail_before_the_mutation_runs() {
+        let columns = vec![column("id", "UUID", false)];
+        for expression in ["", "uuidv7(); DROP TABLE users"] {
+            let error = insert_values(
+                &[FieldDraft::new(
+                    1,
+                    "id",
+                    None,
+                    expression,
+                    FieldValueState::Sql,
+                    None,
+                )],
+                &columns,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                FieldValidationError::InvalidSqlExpression { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn default_remains_insert_only() {
+        let columns = vec![column("id", "INTEGER", false)];
+        let error = changed_fields(
+            &[FieldDraft::new(
+                1,
+                "id",
+                Some(CellValue::Integer(1)),
+                "",
+                FieldValueState::Default,
+                None,
+            )],
+            &columns,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FieldValidationError::DefaultNotSupportedForUpdate { .. }
+        ));
     }
 
     #[test]
@@ -1037,6 +1351,27 @@ mod tests {
             None,
         )];
 
+        assert!(changed_fields(&drafts, &columns).unwrap().is_empty());
+    }
+
+    #[test]
+    fn json_values_open_pretty_without_becoming_false_changes() {
+        let original = CellValue::Json(serde_json::json!({
+            "enabled": true,
+            "nested": { "count": 2 }
+        }));
+        let pretty = field_editor_text(&original);
+        assert!(pretty.contains('\n'));
+
+        let columns = vec![column("payload", "JSONB", false)];
+        let drafts = vec![FieldDraft::new(
+            1,
+            "payload",
+            Some(original),
+            pretty,
+            FieldValueState::Value,
+            None,
+        )];
         assert!(changed_fields(&drafts, &columns).unwrap().is_empty());
     }
 

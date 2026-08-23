@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use crate::{
     CellValue, ColumnInfo, CreateTableRequest, DatabaseKind, DbxError, Filter, FilterOperator,
-    InsertRequest, Order, OrderDirection, Page, Result, TableRef, UpdateRequest,
+    InsertRequest, MutationValue, Order, OrderDirection, Page, Result, TableRef, UpdateRequest,
 };
 
 /// A parameterized SQL statement. Values are kept separately so a caller can
@@ -129,14 +129,15 @@ pub fn build_insert(kind: DatabaseKind, request: &InsertRequest) -> Result<SqlSt
         statement.push_str(&quote_identifier(kind, column)?);
     }
     statement.push_str(") VALUES (");
-    for index in 0..request.values.len() {
+    let mut params = Vec::with_capacity(request.values.len());
+    for (index, value) in request.values.iter().enumerate() {
         if index > 0 {
             statement.push_str(", ");
         }
-        statement.push_str(&placeholder(kind, index + 1));
+        append_mutation_value(kind, &mut statement, &mut params, value)?;
     }
     statement.push(')');
-    Ok(SqlStatement::new(statement, request.values.clone()))
+    Ok(SqlStatement::new(statement, params))
 }
 
 /// Build one multi-row `INSERT` for bulk loading, for example during CSV/TSV
@@ -227,8 +228,8 @@ pub fn build_update_with_columns(
         if index > 0 {
             statement.push_str(", ");
         }
-        let placeholder = placeholder(kind, params.len() + 1);
         let value_sql = if kind == DatabaseKind::PostgreSQL
+            && matches!(value, MutationValue::Parameter(_))
             && columns
                 .iter()
                 .find(|metadata| metadata.name == *column)
@@ -239,12 +240,15 @@ pub fn build_update_with_columns(
                 .find(|metadata| metadata.name == *column)
                 .map(|metadata| metadata.data_type.as_str())
                 .ok_or_else(|| DbxError::Parse("enum column metadata disappeared".into()))?;
+            let placeholder = placeholder(kind, params.len() + 1);
             format!(
                 "CAST({placeholder} AS {})",
                 quote_identifier(kind, enum_type)?
             )
         } else {
-            placeholder
+            let mut value_sql = String::new();
+            append_mutation_value(kind, &mut value_sql, &mut params, value)?;
+            value_sql
         };
         write!(
             statement,
@@ -253,10 +257,63 @@ pub fn build_update_with_columns(
             value_sql
         )
         .map_err(|error| DbxError::Parse(error.to_string()))?;
-        params.push(value.clone());
+        if let MutationValue::Parameter(value) = value
+            && kind == DatabaseKind::PostgreSQL
+            && columns
+                .iter()
+                .find(|metadata| metadata.name == *column)
+                .is_some_and(|metadata| !metadata.enum_values.is_empty())
+        {
+            params.push(value.clone());
+        }
     }
     append_filters(kind, &mut statement, &mut params, &request.filters)?;
     Ok(SqlStatement::new(statement, params))
+}
+
+fn append_mutation_value(
+    kind: DatabaseKind,
+    statement: &mut String,
+    params: &mut Vec<CellValue>,
+    value: &MutationValue,
+) -> Result<()> {
+    match value {
+        MutationValue::Parameter(value) => {
+            statement.push_str(&placeholder(kind, params.len() + 1));
+            params.push(value.clone());
+        }
+        MutationValue::Expression(expression) => {
+            statement.push_str(validate_sql_expression(expression)?)
+        }
+    }
+    Ok(())
+}
+
+/// Validate a mutation SQL expression before it is interpolated into an
+/// otherwise parameterized `INSERT` or `UPDATE`. The returned slice is
+/// trimmed and safe for the deliberately narrow expression position.
+pub fn validate_sql_expression(expression: &str) -> Result<&str> {
+    if expression.contains(['\n', '\r']) {
+        return Err(DbxError::Parse(
+            "mutation expression must be a single non-empty SQL expression without comments or statement separators"
+                .into(),
+        ));
+    }
+    let expression = expression.trim();
+    if expression.is_empty()
+        || expression.contains('\0')
+        || expression.contains(';')
+        || expression.contains("--")
+        || expression.contains('#')
+        || expression.contains("/*")
+        || expression.contains("*/")
+    {
+        return Err(DbxError::Parse(
+            "mutation expression must be a single non-empty SQL expression without comments or statement separators"
+                .into(),
+        ));
+    }
+    Ok(expression)
 }
 
 pub fn build_delete(

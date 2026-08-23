@@ -14,7 +14,7 @@ DBX is an early, runnable MVP. It already has a native connection picker, simult
 ## Implemented in this milestone
 
 - Native GPUI application shell with IME-aware text editing and SQL syntax highlighting.
-- Named connection profiles persisted as atomic, versioned JSON metadata; passwords are stripped from URLs and stored only in the OS keyring.
+- Named connection profiles persisted as atomic, versioned password-free JSON metadata; normal saved credentials are encrypted in the app-owned DBX Vault with Argon2id + XChaCha20-Poly1305.
 - Isolated simultaneous connection sessions with switchable, closable tabs and generation-safe asynchronous updates.
 - Native SQLite file selection through the operating system file portal.
 - PostgreSQL, MySQL, and SQLite connections through SQLx, plus Redis through redis-rs.
@@ -81,12 +81,11 @@ make run
 
 The first run creates a self-signed `DBX Local Development` code-signing
 identity in the Mac login keychain, then reuses it to sign a stable
-`target/macos/DBX.app` bundle with identifier `dbx.jrmd.app`. This is only for
+`target/macos/DBX.app` bundle with identifier `dev.jrmd.dbx`. This is only for
 local development; it does not require an Apple Developer account and does not
-produce a distributable or notarized app. Launching the same signed bundle on
-every run gives macOS a stable app identity for Keychain access. The first
-access to an existing credential may still require choosing `Always Allow`
-once, especially if it was created by an older unsigned build.
+produce a distributable or notarized app. This signing identity is unrelated to
+DBX credential storage: normal saved credentials remain in the app-owned DBX
+Vault, not Keychain.
 
 Use `DBX_FOREGROUND=1 make run` when you want the app's stdout/stderr in the
 terminal. `make cargo-build` and `make cargo-run` remain available for the raw
@@ -132,7 +131,7 @@ Never commit a real connection string, password, certificate private key, or loc
 
 DBX handles credentials and potentially destructive commands, so an MVP must be honest about what it does and does not protect:
 
-- Named profile metadata lives in the platform configuration directory rather than a process-only cache. Passwords are never written to the profile JSON; if the OS keyring is unavailable, saving a secret-bearing profile fails visibly instead of silently retaining the secret only in memory.
+- Named profile metadata lives in the platform configuration directory rather than a process-only cache and never includes passwords. Normal saved credentials are encrypted in the app-owned DBX Vault with Argon2id + XChaCha20-Poly1305. The vault is unlocked once in-app per launch; its passphrase is never stored or recoverable. Selecting a saved connection eagerly hydrates its credential. Keychain/Secret Service is read only after an explicit **Import old system passwords** action, and imports are non-destructive: an existing vault credential is never overwritten.
 - TLS certificate verification is enabled by default. An insecure or certificate-bypass option, if ever added, must be conspicuous and scoped to one connection.
 - Query text, parameters, result values, and credentials must not be written to logs or crash reports by default. Diagnostics should redact connection URLs and secrets.
 - GUI filters and edits use bound parameters wherever the target engine supports them. Identifiers are quoted by the connector, never interpolated from unchecked text.

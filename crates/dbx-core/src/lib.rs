@@ -17,15 +17,15 @@ pub use engine::{DatabaseEngine, Engine, QueryOptions};
 pub use error::{DbxError, Result};
 pub use model::{
     CellValue, ColumnInfo, ConnectionConfig, CreateColumn, CreateTableRequest, DatabaseKind,
-    EntityKind, ExecResult, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Order,
-    OrderDirection, Page, QueryResult, ReferentialAction, RowData, TableInfo, TableRef,
-    TableStructure, UpdateRequest,
+    EntityKind, ExecResult, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, MutationValue,
+    Order, OrderDirection, Page, QueryResult, ReferentialAction, RelationalSchema, RelationalTable,
+    RowData, TableInfo, TableRef, TableStructure, UpdateRequest,
 };
 pub use redis_engine::RedisEngine;
 pub use sql::{
     SqlStatement, build_create_table, build_delete, build_drop_table, build_insert,
     build_multi_row_insert, build_select, build_truncate_table, build_update,
-    build_update_with_columns, quote_identifier,
+    build_update_with_columns, quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::{
@@ -54,14 +54,20 @@ mod tests {
         let request = InsertRequest {
             table: TableRef::in_schema("public", "user\"events"),
             columns: vec!["display name".into(), "count".into()],
-            values: vec![CellValue::Text("O'Reilly".into()), CellValue::Integer(3)],
+            values: vec![
+                CellValue::Text("O'Reilly".into()).into(),
+                CellValue::Integer(3).into(),
+            ],
         };
         let statement = build_insert(DatabaseKind::PostgreSQL, &request).unwrap();
         assert_eq!(
             statement.sql,
             "INSERT INTO \"public\".\"user\"\"events\" (\"display name\", \"count\") VALUES ($1, $2)"
         );
-        assert_eq!(statement.params, request.values);
+        assert_eq!(
+            statement.params,
+            vec![CellValue::Text("O'Reilly".into()), CellValue::Integer(3)]
+        );
         assert!(!statement.sql.contains("O'Reilly"));
     }
 
@@ -84,7 +90,15 @@ mod tests {
             insert.sql,
             "INSERT INTO \"public\".\"events\" (\"id\", \"enabled\", \"note\", \"payload\") VALUES ($1, $2, $3, $4)"
         );
-        assert_eq!(insert.params, request.values);
+        assert_eq!(
+            insert.params,
+            vec![
+                CellValue::Integer(7),
+                CellValue::Boolean(true),
+                CellValue::Null,
+                CellValue::Json(serde_json::json!({ "ok": true })),
+            ]
+        );
 
         let update = UpdateRequest::for_primary_key(
             TableRef::new("events"),
@@ -107,6 +121,99 @@ mod tests {
                 CellValue::Integer(7)
             ]
         );
+    }
+
+    #[test]
+    fn mutation_builders_interleave_parameters_and_sql_expressions() {
+        let request = InsertRequest::new_with_mutation_values(
+            TableRef::new("events"),
+            vec![
+                "id".into(),
+                "name".into(),
+                "created_at".into(),
+                "enabled".into(),
+            ],
+            vec![
+                MutationValue::expression("uuidv7()"),
+                MutationValue::parameter(CellValue::Text("launch".into())),
+                MutationValue::expression("NOW()"),
+                MutationValue::parameter(CellValue::Boolean(true)),
+            ],
+        );
+
+        for (kind, expected_sql) in [
+            (
+                DatabaseKind::PostgreSQL,
+                "INSERT INTO \"events\" (\"id\", \"name\", \"created_at\", \"enabled\") VALUES (uuidv7(), $1, NOW(), $2)",
+            ),
+            (
+                DatabaseKind::MySQL,
+                "INSERT INTO `events` (`id`, `name`, `created_at`, `enabled`) VALUES (uuidv7(), ?, NOW(), ?)",
+            ),
+            (
+                DatabaseKind::SQLite,
+                "INSERT INTO \"events\" (\"id\", \"name\", \"created_at\", \"enabled\") VALUES (uuidv7(), ?, NOW(), ?)",
+            ),
+        ] {
+            let statement = build_insert(kind, &request).unwrap();
+            assert_eq!(statement.sql, expected_sql);
+            assert_eq!(
+                statement.params,
+                vec![CellValue::Text("launch".into()), CellValue::Boolean(true)]
+            );
+        }
+
+        let update = UpdateRequest::new_with_mutation_values(
+            TableRef::new("events"),
+            vec![
+                ("created_at".into(), MutationValue::expression("NOW()")),
+                (
+                    "name".into(),
+                    MutationValue::parameter(CellValue::Text("launch".into())),
+                ),
+            ],
+            vec![Filter::new(
+                "id",
+                FilterOperator::Equals,
+                Some(CellValue::Integer(7)),
+            )],
+        );
+        let statement = build_update(DatabaseKind::PostgreSQL, &update).unwrap();
+        assert_eq!(
+            statement.sql,
+            "UPDATE \"events\" SET \"created_at\" = NOW(), \"name\" = $1 WHERE \"id\" = $2"
+        );
+        assert_eq!(
+            statement.params,
+            vec![CellValue::Text("launch".into()), CellValue::Integer(7)]
+        );
+    }
+
+    #[test]
+    fn mutation_expressions_reject_statement_separators_and_comments() {
+        for expression in [
+            "",
+            "  ",
+            "NOW(); DELETE FROM events",
+            "NOW() -- comment",
+            "/* comment */ NOW()",
+            "NOW()\n",
+            "NOW()#comment",
+            "NOW()\0",
+        ] {
+            assert!(
+                validate_sql_expression(expression).is_err(),
+                "{expression:?}"
+            );
+        }
+        assert_eq!(validate_sql_expression("  uuidv7()  ").unwrap(), "uuidv7()");
+
+        let request = InsertRequest::new_with_mutation_values(
+            TableRef::new("events"),
+            vec!["id".into()],
+            vec![MutationValue::expression("uuidv7(); SELECT 1")],
+        );
+        assert!(build_insert(DatabaseKind::PostgreSQL, &request).is_err());
     }
 
     #[test]
@@ -137,7 +244,10 @@ mod tests {
             request
                 .assignments
                 .iter()
-                .map(|(_, value)| value.clone())
+                .filter_map(|(_, value)| match value {
+                    MutationValue::Parameter(value) => Some(value.clone()),
+                    MutationValue::Expression(_) => None,
+                })
                 .chain(
                     request
                         .filters
@@ -146,6 +256,20 @@ mod tests {
                 )
                 .collect::<Vec<_>>()
         );
+
+        let expression_request = UpdateRequest::for_primary_key_with_mutation_values(
+            TableRef::in_schema("public", "orders"),
+            vec![("status".into(), MutationValue::expression("next_status()"))],
+            vec![("id".into(), CellValue::Integer(7))],
+        );
+        let statement =
+            build_update_with_columns(DatabaseKind::PostgreSQL, &expression_request, &columns)
+                .unwrap();
+        assert_eq!(
+            statement.sql,
+            "UPDATE \"public\".\"orders\" SET \"status\" = next_status() WHERE \"id\" = $1"
+        );
+        assert_eq!(statement.params, vec![CellValue::Integer(7)]);
     }
 
     #[test]
@@ -213,7 +337,7 @@ mod tests {
             DatabaseKind::SQLite,
             &UpdateRequest {
                 table: TableRef::new("items"),
-                assignments: vec![("name".into(), CellValue::Text("new".into()))],
+                assignments: vec![("name".into(), CellValue::Text("new".into()).into())],
                 filters: Vec::new(),
             },
         )
@@ -227,7 +351,7 @@ mod tests {
             DatabaseKind::SQLite,
             &UpdateRequest {
                 table: TableRef::new("items"),
-                assignments: vec![("name".into(), CellValue::Text("new".into()))],
+                assignments: vec![("name".into(), CellValue::Text("new".into()).into())],
                 filters: vec![Filter::new(
                     "name",
                     FilterOperator::Contains,
@@ -486,7 +610,7 @@ mod tests {
         let error = engine
             .update(&UpdateRequest {
                 table: TableRef::new("people"),
-                assignments: vec![("name".into(), CellValue::Text("unsafe".into()))],
+                assignments: vec![("name".into(), CellValue::Text("unsafe".into()).into())],
                 filters: vec![Filter::new(
                     "name",
                     FilterOperator::Equals,
@@ -527,6 +651,176 @@ mod tests {
                 .iter()
                 .any(|table| table.name == "people")
         );
+    }
+
+    #[tokio::test]
+    async fn raw_sql_query_reports_outcomes_metadata_and_truncation() {
+        let engine = DatabaseEngine::connect(
+            ConnectionConfig::new(DatabaseKind::SQLite, "sqlite::memory:").with_max_connections(1),
+        )
+        .await
+        .unwrap();
+
+        let ddl = engine
+            .query(
+                "CREATE TABLE query_outcomes (id INTEGER PRIMARY KEY, name TEXT)",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ddl.rows_affected, Some(0));
+        assert!(!ddl.truncated);
+
+        let dml = engine
+            .query(
+                "INSERT INTO query_outcomes (name) VALUES ('Ada')",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dml.rows_affected, Some(1));
+
+        let computed = engine
+            .query("SELECT sqlite_version()", QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(computed.rows.len(), 1);
+        assert_eq!(computed.columns.len(), 1);
+        assert_eq!(computed.columns[0].data_type, "TEXT");
+        assert_eq!(computed.rows_affected, None);
+
+        let empty = engine
+            .query(
+                "SELECT id, name FROM query_outcomes WHERE 1 = 0",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.rows_affected, None);
+        assert_eq!(
+            empty
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "name"]
+        );
+
+        engine
+            .query(
+                "INSERT INTO query_outcomes (name) VALUES ('Grace'), ('Linus')",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        let bounded = engine
+            .query(
+                "SELECT id FROM query_outcomes ORDER BY id",
+                QueryOptions { max_rows: Some(2) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded.rows.len(), 2);
+        assert_eq!(bounded.rows_affected, None);
+        assert!(bounded.truncated);
+    }
+
+    #[tokio::test]
+    async fn raw_sql_multi_statement_success_and_failure_have_documented_sqlite_semantics() {
+        let engine = DatabaseEngine::connect(
+            ConnectionConfig::new(DatabaseKind::SQLite, "sqlite::memory:").with_max_connections(1),
+        )
+        .await
+        .unwrap();
+
+        let success = engine
+            .query(
+                "CREATE TABLE script_outcomes (value TEXT); \
+                 INSERT INTO script_outcomes VALUES ('first'); \
+                 INSERT INTO script_outcomes VALUES ('second')",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(success.rows_affected, Some(2));
+
+        // SQLite raw scripts execute each statement in autocommit mode unless
+        // callers provide explicit BEGIN/COMMIT. A later failure therefore
+        // leaves earlier successful statements durable.
+        let error = engine
+            .query(
+                "INSERT INTO script_outcomes VALUES ('durable'); \
+                 INSERT INTO missing_table VALUES ('fails')",
+                QueryOptions::default(),
+            )
+            .await;
+        assert!(error.is_err());
+        let rows = engine
+            .query(
+                "SELECT value FROM script_outcomes WHERE value = 'durable'",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn raw_sql_mixed_select_and_dml_preserves_both_outcomes() {
+        let engine = DatabaseEngine::connect(ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        engine
+            .query(
+                "CREATE TABLE mixed_outcomes (value TEXT)",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        engine
+            .query(
+                "INSERT INTO mixed_outcomes VALUES ('seed')",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        let result = engine
+            .query(
+                "SELECT 'before'; INSERT INTO mixed_outcomes VALUES ('after')",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows_affected, Some(1));
+
+        let empty_result = engine
+            .query(
+                "select value from mixed_outcomes where 0; insert into mixed_outcomes values ('after empty')",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(empty_result.rows.is_empty());
+        assert_eq!(empty_result.columns[0].name, "value");
+        assert_eq!(empty_result.rows_affected, Some(1));
+
+        let cte_insert = engine
+            .query(
+                "WITH seed(value) AS (VALUES ('from cte')) INSERT INTO mixed_outcomes SELECT value FROM seed",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(cte_insert.rows.is_empty());
+        assert_eq!(cte_insert.rows_affected, Some(1));
     }
 
     #[tokio::test]
@@ -587,6 +881,42 @@ mod tests {
                 on_update: Some(ReferentialAction::Cascade),
                 on_delete: Some(ReferentialAction::SetNull),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_relational_schema_is_ordered_and_includes_foreign_keys() {
+        let engine = DatabaseEngine::connect(ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        engine
+            .execute_sql("CREATE TABLE zebra (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE alpha (id INTEGER PRIMARY KEY, zebra_id INTEGER REFERENCES zebra(id))",
+            )
+            .await
+            .unwrap();
+
+        let schema = engine.relational_schema().await.unwrap();
+        assert_eq!(schema.database, "main");
+        assert_eq!(
+            schema
+                .tables
+                .iter()
+                .map(|table| table.table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "zebra"]
+        );
+        assert_eq!(schema.tables[0].structure.foreign_keys.len(), 1);
+        assert_eq!(
+            schema.tables[0].structure.foreign_keys[0].referenced_table,
+            "zebra"
         );
     }
 }

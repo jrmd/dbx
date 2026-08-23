@@ -220,6 +220,22 @@ pub struct TableStructure {
     pub foreign_keys: Vec<ForeignKeyInfo>,
 }
 
+/// A point-in-time snapshot of the relational metadata available to a
+/// connection. This lets consumers inspect an entire schema without
+/// coordinating independent table and constraint requests themselves.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RelationalSchema {
+    pub database: String,
+    pub tables: Vec<RelationalTable>,
+}
+
+/// Structural metadata for one table or view in a [`RelationalSchema`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RelationalTable {
+    pub table: TableInfo,
+    pub structure: TableStructure,
+}
+
 /// A row is kept as a positional vector to preserve duplicate/aliased column
 /// names returned by arbitrary SQL.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -250,6 +266,36 @@ pub enum CellValue {
 }
 
 impl Eq for CellValue {}
+
+/// A value used by an insert or update mutation.
+///
+/// Parameters retain the database driver's normal binding and escaping. SQL
+/// expressions are deliberately opt-in and validated by the statement builder
+/// before they are emitted into a mutation statement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum MutationValue {
+    Parameter(CellValue),
+    Expression(String),
+}
+
+impl MutationValue {
+    /// Create a parameterized mutation value.
+    pub fn parameter(value: CellValue) -> Self {
+        Self::Parameter(value)
+    }
+
+    /// Create an explicit SQL expression for a mutation value.
+    pub fn expression(expression: impl Into<String>) -> Self {
+        Self::Expression(expression.into())
+    }
+}
+
+impl From<CellValue> for MutationValue {
+    fn from(value: CellValue) -> Self {
+        Self::Parameter(value)
+    }
+}
 
 impl fmt::Display for CellValue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -303,6 +349,9 @@ pub struct QueryResult {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<RowData>,
     pub rows_affected: Option<u64>,
+    /// True when the configured row limit omitted additional result rows.
+    #[serde(default)]
+    pub truncated: bool,
     pub elapsed_ms: u64,
 }
 
@@ -312,6 +361,7 @@ impl QueryResult {
             columns: Vec::new(),
             rows: Vec::new(),
             rows_affected,
+            truncated: false,
             elapsed_ms,
         }
     }
@@ -395,14 +445,23 @@ impl Filter {
 pub struct InsertRequest {
     pub table: TableRef,
     pub columns: Vec<String>,
-    pub values: Vec<CellValue>,
+    pub values: Vec<MutationValue>,
 }
 
 impl InsertRequest {
-    /// Construct an insert from a complete row. Each value is paired with
-    /// its target column so callers can submit more than one field while
-    /// retaining the request's parameterized representation.
+    /// Construct a parameterized insert from a complete row.
     pub fn from_row(table: TableRef, values: Vec<(String, CellValue)>) -> Self {
+        Self::from_mutation_row(
+            table,
+            values
+                .into_iter()
+                .map(|(column, value)| (column, value.into()))
+                .collect(),
+        )
+    }
+
+    /// Construct an insert from a complete row with explicit mutation values.
+    pub fn from_mutation_row(table: TableRef, values: Vec<(String, MutationValue)>) -> Self {
         let (columns, values): (Vec<_>, Vec<_>) = values.into_iter().unzip();
         Self {
             table,
@@ -413,6 +472,15 @@ impl InsertRequest {
 
     /// Construct an insert from an explicit column/value split.
     pub fn new(table: TableRef, columns: Vec<String>, values: Vec<CellValue>) -> Self {
+        Self::new_with_mutation_values(table, columns, values.into_iter().map(Into::into).collect())
+    }
+
+    /// Construct an insert with explicit parameter or SQL expression values.
+    pub fn new_with_mutation_values(
+        table: TableRef,
+        columns: Vec<String>,
+        values: Vec<MutationValue>,
+    ) -> Self {
         Self {
             table,
             columns,
@@ -429,7 +497,7 @@ impl InsertRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateRequest {
     pub table: TableRef,
-    pub assignments: Vec<(String, CellValue)>,
+    pub assignments: Vec<(String, MutationValue)>,
     pub filters: Vec<Filter>,
 }
 
@@ -438,6 +506,22 @@ impl UpdateRequest {
     pub fn new(
         table: TableRef,
         assignments: Vec<(String, CellValue)>,
+        filters: Vec<Filter>,
+    ) -> Self {
+        Self::new_with_mutation_values(
+            table,
+            assignments
+                .into_iter()
+                .map(|(column, value)| (column, value.into()))
+                .collect(),
+            filters,
+        )
+    }
+
+    /// Construct an update with explicit parameter or SQL expression values.
+    pub fn new_with_mutation_values(
+        table: TableRef,
+        assignments: Vec<(String, MutationValue)>,
         filters: Vec<Filter>,
     ) -> Self {
         Self {
@@ -452,6 +536,22 @@ impl UpdateRequest {
     pub fn for_primary_key(
         table: TableRef,
         assignments: Vec<(String, CellValue)>,
+        primary_key: Vec<(String, CellValue)>,
+    ) -> Self {
+        Self::for_primary_key_with_mutation_values(
+            table,
+            assignments
+                .into_iter()
+                .map(|(column, value)| (column, value.into()))
+                .collect(),
+            primary_key,
+        )
+    }
+
+    /// Construct a primary-key guarded update with explicit mutation values.
+    pub fn for_primary_key_with_mutation_values(
+        table: TableRef,
+        assignments: Vec<(String, MutationValue)>,
         primary_key: Vec<(String, CellValue)>,
     ) -> Self {
         let filters = primary_key

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 APP_DIR="${DBX_APP_DIR:-$ROOT_DIR/target/macos/DBX.app}"
-BUNDLE_ID="${DBX_BUNDLE_ID:-dbx.jrmd.app}"
+BUNDLE_ID="${DBX_BUNDLE_ID:-dev.jrmd.dbx}"
 SIGNING_NAME="${DBX_SIGNING_NAME:-DBX Local Development}"
 KEYCHAIN="${DBX_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 CARGO_BIN="${CARGO:-cargo}"
@@ -71,11 +71,13 @@ create_local_identity() {
 		die "openssl is unavailable, so the local identity must be created in Keychain Access"
 	fi
 
-	local temp_dir key_file cert_file bundle_file
+	local temp_dir key_file cert_file bundle_file bundle_password
 	temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/dbx-signing.XXXXXX")"
 	key_file="$temp_dir/dbx-local.key.pem"
 	cert_file="$temp_dir/dbx-local.cert.pem"
 	bundle_file="$temp_dir/dbx-local.identity.p12"
+	bundle_password="$(openssl rand -hex 32)"
+	[[ -n "$bundle_password" ]] || die "could not generate a PKCS#12 password"
 
 	cleanup_temp_identity() {
 		rm -rf -- "$temp_dir"
@@ -102,13 +104,16 @@ create_local_identity() {
 		-inkey "$key_file" \
 		-in "$cert_file" \
 		-out "$bundle_file" \
-		-passout pass: \
+		-keypbe PBE-SHA1-3DES \
+		-certpbe PBE-SHA1-3DES \
+		-macalg sha1 \
+		-passout "pass:$bundle_password" \
 		>/dev/null 2>&1 \
 		|| die "could not package the local code-signing identity"
 
 	security import "$bundle_file" \
 		-k "$KEYCHAIN" \
-		-P "" \
+		-P "$bundle_password" \
 		-T /usr/bin/codesign \
 		>/dev/null \
 		|| {

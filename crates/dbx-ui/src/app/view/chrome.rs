@@ -1,4 +1,5 @@
 use super::super::*;
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 
 impl DbxApp {
     pub(super) fn render_workspace(
@@ -12,11 +13,12 @@ impl DbxApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .bg(THEME.canvas)
+            .bg(theme().canvas)
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .child(self.render_sidebar(cx))
                     .child(self.render_main(window, cx)),
@@ -24,6 +26,8 @@ impl DbxApp {
             .child(self.render_status(cx))
             .child(self.render_table_context_menu(cx))
             .child(self.render_database_export_dialog(window, cx))
+            .child(self.render_confirmation_dialog(cx))
+            .child(self.render_mutation_error_dialog(cx))
     }
 
     pub(super) fn render_app_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -35,8 +39,8 @@ impl DbxApp {
             .flex_col()
             .items_center()
             .border_r_1()
-            .border_color(THEME.border)
-            .bg(THEME.rail)
+            .border_color(theme().border)
+            .bg(theme().rail)
             .child(
                 div()
                     .h(px(42.))
@@ -45,7 +49,7 @@ impl DbxApp {
                     .items_center()
                     .justify_center()
                     .border_b_1()
-                    .border_color(THEME.border)
+                    .border_color(theme().border)
                     .child(img(self.logo.clone()).id("rail-logo").size(px(24.))),
             )
             .child(
@@ -84,7 +88,7 @@ impl DbxApp {
                     .mb(px(11.))
                     .size(px(7.))
                     .rounded_full()
-                    .bg(THEME.success),
+                    .bg(theme().success),
             )
     }
 
@@ -100,7 +104,7 @@ impl DbxApp {
                     session.pane = Pane::Data;
                 }
             }
-            Pane::Query => return,
+            Pane::Query | Pane::Diagram => return,
             Pane::Structure => {
                 let table = self.session(session_id).and_then(|session| {
                     session.selected_table.as_ref().and_then(|selected| {
@@ -133,8 +137,8 @@ impl DbxApp {
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(THEME.border)
-            .bg(THEME.rail)
+            .border_color(theme().border)
+            .bg(theme().rail)
             .when(!connected, |view| {
                 view.child(
                     div()
@@ -191,18 +195,25 @@ impl DbxApp {
                     .flex()
                     .items_center()
                     .gap(px(5.))
-                    .when(connected && !self.compact_layout, |view| {
-                        view.child(self.rail_button(
-                            "refresh",
-                            Icon::Refresh,
-                            false,
-                            cx.listener(|this, _, _, cx| this.refresh_table(cx)),
-                        ))
-                    })
                     .child(
-                        button("connections", "New connection", ButtonKind::Primary)
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx))),
+                        Button::new("toggle-appearance")
+                            .with_size(Size::XSmall)
+                            .compact()
+                            .ghost()
+                            .tooltip(match self.appearance {
+                                Appearance::Light => "Use dark appearance",
+                                Appearance::Dark => "Use light appearance",
+                            })
+                            .child(icon(
+                                match self.appearance {
+                                    Appearance::Light => Icon::Moon,
+                                    Appearance::Dark => Icon::Sun,
+                                },
+                                theme().text_muted,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_appearance(window, cx)
+                            })),
                     )
                     .child(window_close_button().on_click(|_, _, cx| cx.quit())),
             )
@@ -247,9 +258,9 @@ impl DbxApp {
                         .flex_none()
                         .cursor_pointer()
                         .child(div().size(px(5.)).rounded_full().bg(if busy {
-                            THEME.warning
+                            theme().warning
                         } else {
-                            THEME.success
+                            theme().success
                         }))
                         .when(saved, |tab| tab.child(environment_badge(environment)))
                         .child(
@@ -263,8 +274,8 @@ impl DbxApp {
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .hover(|style| style.bg(THEME.panel_raised))
-                                .child(icon(Icon::Close, THEME.text_muted))
+                                .hover(|style| style.bg(theme().panel_raised))
+                                .child(icon(Icon::Close, theme().text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.close_session(session_id, cx)
@@ -288,8 +299,8 @@ impl DbxApp {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .hover(|style| style.bg(THEME.panel_raised))
-                    .child(icon(Icon::Add, THEME.accent))
+                    .hover(|style| style.bg(theme().panel_raised))
+                    .child(icon(Icon::Add, theme().accent))
                     .on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx))),
             )
     }
@@ -314,6 +325,8 @@ impl DbxApp {
         };
         let schema_options = schema_filter_options(kind, &tables);
         let visible_tables = schema_filtered_tables(kind, &tables, selected_schema.as_deref());
+        let explorer_actions = cx.entity().downgrade();
+        let table_count = visible_tables.len();
         div()
             .w(if self.compact_layout {
                 px(180.)
@@ -324,8 +337,8 @@ impl DbxApp {
             .flex()
             .flex_col()
             .border_r_1()
-            .border_color(THEME.border)
-            .bg(THEME.panel)
+            .border_color(theme().border)
+            .bg(theme().panel)
             .child(
                 div()
                     .px(px(10.))
@@ -334,7 +347,7 @@ impl DbxApp {
                     .flex_col()
                     .gap(px(7.))
                     .border_b_1()
-                    .border_color(THEME.border)
+                    .border_color(theme().border)
                     .child(
                         div()
                             .flex()
@@ -345,93 +358,113 @@ impl DbxApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(7.))
-                                    .child(icon(Icon::Search, THEME.text_muted))
+                                    .child(icon(Icon::Database, theme().text_muted))
                                     .child(
                                         div()
                                             .text_size(px(10.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(THEME.text_muted)
+                                            .text_color(theme().text_muted)
                                             .child(if kind == DatabaseKind::Redis {
                                                 "KEYSPACE"
                                             } else {
                                                 "EXPLORER"
                                             }),
-                                    ),
+                                    )
+                                    .when(!self.compact_layout, |view| {
+                                        view.child(
+                                            div()
+                                                .text_size(px(9.))
+                                                .text_color(theme().text_muted)
+                                                .child(format!("{table_count}")),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .child(
-                                        div()
-                                            .id("refresh-tables")
-                                            .size(px(24.))
-                                            .rounded(px(5.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(THEME.panel_raised))
-                                            .child(icon(Icon::Refresh, THEME.accent))
+                                        Button::new("refresh-tables")
+                                            .with_size(Size::XSmall)
+                                            .compact()
+                                            .ghost()
+                                            .tooltip("Refresh explorer")
+                                            .child(icon(Icon::Refresh, theme().accent))
                                             .on_click(cx.listener(move |this, _, _window, cx| {
                                                 this.refresh_tables_for(session_id, cx)
                                             })),
                                     )
-                                    .child(
-                                        div()
-                                            .id("create-table")
-                                            .size(px(24.))
-                                            .rounded(px(5.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .hover(|style| style.bg(THEME.panel_raised))
-                                            .child(icon(Icon::Add, THEME.accent))
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.create_table_template_for(
-                                                    session_id, window, cx,
-                                                )
-                                            })),
-                                    )
                                     .when(kind.is_sql(), |view| {
+                                        let open_diagram = explorer_actions.clone();
+                                        let export_database = explorer_actions.clone();
+                                        let import_database = explorer_actions.clone();
                                         view.child(
-                                            div()
-                                                .id("export-database")
-                                                .px(px(7.))
-                                                .py(px(5.))
-                                                .rounded(px(5.))
-                                                .text_size(px(9.))
-                                                .text_color(THEME.accent)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(THEME.accent_soft))
-                                                .child("Export")
+                                            Button::new("create-table")
+                                                .with_size(Size::XSmall)
+                                                .compact()
+                                                .ghost()
+                                                .tooltip("New table")
+                                                .child(icon(Icon::Add, theme().accent))
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
-                                                        this.begin_database_export(
+                                                        this.create_table_template_for(
                                                             session_id, window, cx,
                                                         )
                                                     },
                                                 )),
                                         )
                                         .child(
-                                            div()
-                                                .id("import-database")
-                                                .px(px(7.))
-                                                .py(px(5.))
-                                                .rounded(px(5.))
-                                                .text_size(px(9.))
-                                                .text_color(THEME.text_muted)
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(THEME.panel_raised))
-                                                .child("Import")
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.begin_database_import(
-                                                            session_id, window, cx,
-                                                        )
-                                                    },
-                                                )),
+                                            Button::new("explorer-more")
+                                                .with_size(Size::XSmall)
+                                                .compact()
+                                                .ghost()
+                                                .tooltip("Explorer actions")
+                                                .child(icon(Icon::More, theme().text_muted))
+                                                .dropdown_menu(move |menu, _, _| {
+                                                    let open_diagram = open_diagram.clone();
+                                                    let export_database = export_database.clone();
+                                                    let import_database = import_database.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new("Open database diagram")
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ = open_diagram.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        this.open_diagram_for(
+                                                                            session_id, window, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }),
+                                                    )
+                                                    .separator()
+                                                    .item(
+                                                        PopupMenuItem::new("Export database…")
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ = export_database.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        this.begin_database_export(
+                                                                            session_id, window, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("Import database…")
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ = import_database.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        this.begin_database_import(
+                                                                            session_id, window, cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }),
+                                                    )
+                                                }),
                                         )
                                     }),
                             ),
@@ -439,89 +472,127 @@ impl DbxApp {
                     .when(databases.len() > 1, |view| {
                         view.child(
                             div()
-                                .id("database-switcher-scroll")
                                 .flex()
+                                .items_center()
                                 .gap(px(4.))
-                                .overflow_x_scroll()
-                                .children(databases.into_iter().map(|database| {
-                                    let selected =
-                                        current_database.as_deref() == Some(database.as_str());
-                                    let label = if kind == DatabaseKind::Redis {
-                                        format!("db{database}")
-                                    } else {
-                                        database.clone()
-                                    };
+                                .child(
                                     div()
-                                        .id(SharedString::from(format!("db-{database}")))
-                                        .px(px(7.))
-                                        .py(px(3.))
-                                        .rounded(px(4.))
-                                        .bg(if selected {
-                                            THEME.accent_soft
-                                        } else {
-                                            THEME.panel_raised
-                                        })
-                                        .text_color(if selected {
-                                            THEME.accent
-                                        } else {
-                                            THEME.text_muted
-                                        })
+                                        .w(px(44.))
+                                        .flex_none()
                                         .text_size(px(9.))
-                                        .cursor_pointer()
-                                        .hover(|style| {
-                                            style.bg(THEME.panel_raised).text_color(THEME.text)
-                                        })
-                                        .child(label)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.switch_database_for(
-                                                session_id,
-                                                database.clone(),
-                                                cx,
-                                            )
-                                        }))
-                                })),
+                                        .text_color(theme().text_muted)
+                                        .child("Database"),
+                                )
+                                .child(
+                                    div()
+                                        .id("database-switcher-scroll")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .gap(px(4.))
+                                        .overflow_x_scroll()
+                                        .children(databases.into_iter().map(|database| {
+                                            let selected = current_database.as_deref()
+                                                == Some(database.as_str());
+                                            let label = if kind == DatabaseKind::Redis {
+                                                format!("db{database}")
+                                            } else {
+                                                database.clone()
+                                            };
+                                            div()
+                                                .id(SharedString::from(format!("db-{database}")))
+                                                .px(px(7.))
+                                                .py(px(3.))
+                                                .rounded(px(4.))
+                                                .bg(if selected {
+                                                    theme().accent_soft
+                                                } else {
+                                                    theme().panel_raised
+                                                })
+                                                .text_color(if selected {
+                                                    theme().accent
+                                                } else {
+                                                    theme().text_muted
+                                                })
+                                                .text_size(px(9.))
+                                                .cursor_pointer()
+                                                .hover(|style| {
+                                                    style
+                                                        .bg(theme().panel_raised)
+                                                        .text_color(theme().text)
+                                                })
+                                                .child(label)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.switch_database_for(
+                                                        session_id,
+                                                        database.clone(),
+                                                        cx,
+                                                    )
+                                                }))
+                                        })),
+                                ),
                         )
                     })
                     .when(kind == DatabaseKind::PostgreSQL, |view| {
                         view.child(
                             div()
-                                .id("schema-filter-scroll")
                                 .flex()
+                                .items_center()
                                 .gap(px(4.))
-                                .overflow_x_scroll()
-                                .children(schema_options.into_iter().map(|schema| {
-                                    let selected = selected_schema.as_deref() == schema.as_deref();
-                                    let label = schema.as_deref().unwrap_or("All").to_owned();
-                                    let schema_id = schema_filter_id(schema.as_deref());
+                                .child(
                                     div()
-                                        .id(SharedString::from(schema_id))
-                                        .px(px(7.))
-                                        .py(px(3.))
-                                        .rounded(px(4.))
-                                        .bg(if selected {
-                                            THEME.accent_soft
-                                        } else {
-                                            THEME.panel_raised
-                                        })
-                                        .text_color(if selected {
-                                            THEME.accent
-                                        } else {
-                                            THEME.text_muted
-                                        })
+                                        .w(px(44.))
+                                        .flex_none()
                                         .text_size(px(9.))
-                                        .cursor_pointer()
-                                        .hover(|style| {
-                                            style.bg(THEME.panel_raised).text_color(THEME.text)
-                                        })
-                                        .child(label)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.select_schema_filter_for(
-                                                session_id,
-                                                schema.clone(),
-                                                cx,
-                                            )
-                                        }))
-                                })),
+                                        .text_color(theme().text_muted)
+                                        .child("Schema"),
+                                )
+                                .child(
+                                    div()
+                                        .id("schema-filter-scroll")
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .gap(px(4.))
+                                        .overflow_x_scroll()
+                                        .children(schema_options.into_iter().map(|schema| {
+                                            let selected =
+                                                selected_schema.as_deref() == schema.as_deref();
+                                            let label =
+                                                schema.as_deref().unwrap_or("All").to_owned();
+                                            let schema_id = schema_filter_id(schema.as_deref());
+                                            div()
+                                                .id(SharedString::from(schema_id))
+                                                .px(px(7.))
+                                                .py(px(3.))
+                                                .rounded(px(4.))
+                                                .bg(if selected {
+                                                    theme().accent_soft
+                                                } else {
+                                                    theme().panel_raised
+                                                })
+                                                .text_color(if selected {
+                                                    theme().accent
+                                                } else {
+                                                    theme().text_muted
+                                                })
+                                                .text_size(px(9.))
+                                                .cursor_pointer()
+                                                .hover(|style| {
+                                                    style
+                                                        .bg(theme().panel_raised)
+                                                        .text_color(theme().text)
+                                                })
+                                                .child(label)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.select_schema_filter_for(
+                                                        session_id,
+                                                        schema.clone(),
+                                                        cx,
+                                                    )
+                                                }))
+                                        })),
+                                ),
                         )
                     }),
             )
@@ -544,21 +615,21 @@ impl DbxApp {
                             .px(px(8.))
                             .rounded(px(5.))
                             .bg(if selected {
-                                THEME.accent_soft
+                                theme().accent_soft
                             } else {
-                                THEME.panel
+                                theme().panel
                             })
                             .text_color(if selected {
-                                THEME.accent
+                                theme().accent
                             } else {
-                                THEME.text_muted
+                                theme().text_muted
                             })
                             .text_size(px(11.))
                             .flex()
                             .items_center()
                             .gap(px(7.))
                             .cursor_pointer()
-                            .hover(|style| style.bg(THEME.panel_raised).text_color(THEME.text))
+                            .hover(|style| style.bg(theme().panel_raised).text_color(theme().text))
                             .child(icon(
                                 if table.kind == EntityKind::Table {
                                     Icon::Table
@@ -566,9 +637,9 @@ impl DbxApp {
                                     Icon::Search
                                 },
                                 if selected {
-                                    THEME.accent
+                                    theme().accent
                                 } else {
-                                    THEME.text_muted
+                                    theme().text_muted
                                 },
                             ))
                             .child(div().truncate().child(label))
@@ -609,6 +680,7 @@ impl DbxApp {
                 Pane::Data => self.render_data(cx).into_any_element(),
                 Pane::Structure => self.render_structure(cx).into_any_element(),
                 Pane::Query => self.render_query(window, cx).into_any_element(),
+                Pane::Diagram => self.render_diagram(window, cx).into_any_element(),
             })
     }
 
@@ -622,20 +694,20 @@ impl DbxApp {
                     .secondary_tabs
                     .iter()
                     .map(|tab| {
-                        let label = match &tab.kind {
+                        let (label, kind) = match &tab.kind {
                             SecondaryTabKind::Query(_) => {
                                 query_number += 1;
-                                format!("Query {query_number}")
+                                (format!("Query {query_number}"), Icon::Query)
                             }
-                            SecondaryTabKind::Structure(structure) => {
-                                format!("{} structure", structure.table.name)
+                            SecondaryTabKind::Structure(structure) => (
+                                format!("{} structure", structure.table.name),
+                                Icon::Structure,
+                            ),
+                            SecondaryTabKind::Diagram(_) => {
+                                ("Database diagram".into(), Icon::Diagram)
                             }
                         };
-                        (
-                            tab.id,
-                            label,
-                            matches!(&tab.kind, SecondaryTabKind::Query(_)),
-                        )
+                        (tab.id, label, kind)
                     })
                     .collect::<Vec<_>>();
                 (session.active_secondary_tab, tabs)
@@ -651,8 +723,8 @@ impl DbxApp {
             .gap(px(3.))
             .overflow_x_scroll()
             .border_b_1()
-            .border_color(THEME.border)
-            .bg(THEME.panel)
+            .border_color(theme().border)
+            .bg(theme().panel)
             .child(
                 div()
                     .id("document-data")
@@ -664,28 +736,28 @@ impl DbxApp {
                     .rounded_t(px(5.))
                     .border_1()
                     .border_color(if active_secondary_tab.is_none() {
-                        THEME.border_strong
+                        theme().border_strong
                     } else {
-                        THEME.panel
+                        theme().panel
                     })
                     .bg(if active_secondary_tab.is_none() {
-                        THEME.canvas
+                        theme().canvas
                     } else {
-                        THEME.panel
+                        theme().panel
                     })
                     .text_color(if active_secondary_tab.is_none() {
-                        THEME.text
+                        theme().text
                     } else {
-                        THEME.text_muted
+                        theme().text_muted
                     })
                     .text_size(px(11.))
                     .cursor_pointer()
                     .child(icon(
                         Icon::Table,
                         if active_secondary_tab.is_none() {
-                            THEME.accent
+                            theme().accent
                         } else {
-                            THEME.text_muted
+                            theme().text_muted
                         },
                     ))
                     .child("Data")
@@ -693,7 +765,7 @@ impl DbxApp {
                         cx.listener(move |this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
                     ),
             )
-            .children(tabs.into_iter().map(|(tab_id, label, is_query)| {
+            .children(tabs.into_iter().map(|(tab_id, label, kind)| {
                 let selected = active_secondary_tab == Some(tab_id);
                 div()
                     .id(SharedString::from(format!("document-{tab_id}")))
@@ -705,28 +777,28 @@ impl DbxApp {
                     .rounded_t(px(5.))
                     .border_1()
                     .border_color(if selected {
-                        THEME.border_strong
+                        theme().border_strong
                     } else {
-                        THEME.panel
+                        theme().panel
                     })
-                    .bg(if selected { THEME.canvas } else { THEME.panel })
-                    .text_color(if selected {
-                        THEME.text
+                    .bg(if selected {
+                        theme().canvas
                     } else {
-                        THEME.text_muted
+                        theme().panel
+                    })
+                    .text_color(if selected {
+                        theme().text
+                    } else {
+                        theme().text_muted
                     })
                     .text_size(px(11.))
                     .cursor_pointer()
                     .child(icon(
-                        if is_query {
-                            Icon::Query
-                        } else {
-                            Icon::Structure
-                        },
+                        kind,
                         if selected {
-                            THEME.accent
+                            theme().accent
                         } else {
-                            THEME.text_muted
+                            theme().text_muted
                         },
                     ))
                     .child(label)
@@ -739,19 +811,23 @@ impl DbxApp {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(THEME.text_muted)
-                            .hover(|style| style.bg(THEME.panel_raised).text_color(THEME.danger))
-                            .child(icon(Icon::Close, THEME.text_muted))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .text_color(theme().text_muted)
+                            .hover(|style| {
+                                style.bg(theme().panel_raised).text_color(theme().danger)
+                            })
+                            .child(icon(Icon::Close, theme().text_muted))
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 if let Some(session_id) = session_id {
-                                    this.close_secondary_tab_for(session_id, tab_id, cx);
+                                    this.request_close_secondary_tab_for(
+                                        session_id, tab_id, window, cx,
+                                    );
                                 }
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(session_id) = session_id {
-                            this.activate_secondary_tab_for(session_id, tab_id, cx);
+                            this.activate_secondary_tab_for(session_id, tab_id, window, cx);
                         }
                     }))
             }))
@@ -765,10 +841,10 @@ impl DbxApp {
                     .items_center()
                     .justify_center()
                     .rounded(px(5.))
-                    .text_color(THEME.text_muted)
+                    .text_color(theme().text_muted)
                     .cursor_pointer()
-                    .hover(|style| style.bg(THEME.accent_soft).text_color(THEME.accent))
-                    .child(icon(Icon::Add, THEME.text_muted))
+                    .hover(|style| style.bg(theme().accent_soft).text_color(theme().accent))
+                    .child(icon(Icon::Add, theme().text_muted))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(session_id) = session_id {
                             this.add_query_tab_for(session_id, window, cx);
@@ -778,48 +854,61 @@ impl DbxApp {
     }
 
     fn render_status(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (error, status, result, table_pagination) = self
-            .active_session()
-            .map(|session| {
-                if let Some((error, status, result)) =
-                    session.active_secondary_tab.and_then(|tab_id| {
-                        session
-                            .secondary_tabs
-                            .iter()
-                            .find(|tab| tab.id == tab_id)
-                            .and_then(|tab| {
-                                let SecondaryTabKind::Query(query) = &tab.kind else {
-                                    return None;
-                                };
-                                Some((
+        let (error, status, result, table_pagination) =
+            self.active_session()
+                .map(|session| {
+                    if let Some(tab) = session.active_secondary_tab.and_then(|tab_id| {
+                        session.secondary_tabs.iter().find(|tab| tab.id == tab_id)
+                    }) {
+                        match &tab.kind {
+                            SecondaryTabKind::Query(query) => {
+                                return (
                                     query.error.clone(),
                                     query.status.clone(),
                                     query.result.clone(),
-                                ))
-                            })
-                    })
-                {
-                    return (error, status, result, None);
-                }
-                let table_pagination = (session.kind.is_sql()
-                    && session.selected_table.is_some()
-                    && session.pane == Pane::Data
-                    && session.active_secondary_tab.is_none()
-                    && session.result.is_some())
-                .then_some((
-                    session.id,
-                    session.table_page,
-                    session.table_has_next_page,
-                    session.busy,
-                ));
-                (
-                    session.error.clone(),
-                    session.status.clone(),
-                    session.result.clone(),
-                    table_pagination,
-                )
-            })
-            .unwrap_or_else(|| (self.error.clone(), self.status.clone(), None, None));
+                                    None,
+                                );
+                            }
+                            SecondaryTabKind::Diagram(diagram) => {
+                                let status = if diagram.busy && diagram.document.is_some() {
+                                    "Refreshing database diagram…".into()
+                                } else if diagram.busy {
+                                    "Building database diagram…".into()
+                                } else if let Some(selected) = &diagram.selected_node {
+                                    format!("Selected {selected} · double-click to open data")
+                                } else if let Some(document) = &diagram.document {
+                                    format!(
+                                        "{} tables · {} relationships",
+                                        document.nodes.len(),
+                                        document.edges.len()
+                                    )
+                                } else {
+                                    "Database diagram".into()
+                                };
+                                return (diagram.error.clone(), status, None, None);
+                            }
+                            SecondaryTabKind::Structure(_) => {}
+                        }
+                    }
+                    let table_pagination = (session.kind.is_sql()
+                        && session.selected_table.is_some()
+                        && session.pane == Pane::Data
+                        && session.active_secondary_tab.is_none()
+                        && session.result.is_some())
+                    .then_some((
+                        session.id,
+                        session.table_page,
+                        session.table_has_next_page,
+                        session.busy,
+                    ));
+                    (
+                        session.error.clone(),
+                        session.status.clone(),
+                        session.result.clone(),
+                        table_pagination,
+                    )
+                })
+                .unwrap_or_else(|| (self.error.clone(), self.status.clone(), None, None));
         let result_summary = result
             .as_ref()
             .map(|result| {
@@ -873,10 +962,10 @@ impl DbxApp {
             .items_center()
             .justify_between()
             .border_t_1()
-            .border_color(THEME.border)
-            .bg(THEME.panel)
+            .border_color(theme().border)
+            .bg(theme().panel)
             .text_size(px(10.))
-            .text_color(THEME.text_muted)
+            .text_color(theme().text_muted)
             .child(
                 div()
                     .min_w_0()
@@ -917,16 +1006,16 @@ impl DbxApp {
             .compact()
             .outline()
             .disabled(!enabled)
-            .border_color(THEME.border)
+            .border_color(theme().border)
             .bg(if enabled {
-                THEME.panel_raised
+                theme().panel_raised
             } else {
-                THEME.panel
+                theme().panel
             })
             .text_color(if enabled {
-                THEME.text
+                theme().text
             } else {
-                THEME.text_muted
+                theme().text_muted
             })
             .when(enabled, |view| view.cursor_pointer())
             .on_click(listener)
@@ -947,18 +1036,18 @@ impl DbxApp {
             .items_center()
             .justify_center()
             .bg(if selected {
-                THEME.accent_soft
+                theme().accent_soft
             } else {
-                THEME.rail
+                theme().rail
             })
             .cursor_pointer()
-            .hover(|style| style.bg(THEME.panel_raised))
+            .hover(|style| style.bg(theme().panel_raised))
             .child(icon(
                 kind,
                 if selected {
-                    THEME.accent
+                    theme().accent
                 } else {
-                    THEME.text_muted
+                    theme().text_muted
                 },
             ))
             .on_click(listener)

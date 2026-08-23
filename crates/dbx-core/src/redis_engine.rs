@@ -117,8 +117,8 @@ impl RedisEngine {
         }
 
         let (columns, rows) = redis_value_rows(command_name, value)?;
-        let rows = limit_rows(rows, options);
-        Ok(query_result(columns, rows, None, started))
+        let (rows, truncated) = limit_rows(rows, options);
+        Ok(query_result(columns, rows, None, truncated, started))
     }
 
     /// Convert a SCAN reply into the stable keyspace grid shape. Redis SCAN
@@ -132,7 +132,7 @@ impl RedisEngine {
         started: Instant,
     ) -> Result<QueryResult> {
         let keys = redis_scan_keys(value)?;
-        let keys = limit_values(keys, options);
+        let (keys, truncated) = limit_values(keys, options);
         let mut rows = Vec::with_capacity(keys.len());
 
         if !keys.is_empty() {
@@ -161,7 +161,13 @@ impl RedisEngine {
             }
         }
 
-        Ok(query_result(redis_scan_columns(), rows, None, started))
+        Ok(query_result(
+            redis_scan_columns(),
+            rows,
+            None,
+            truncated,
+            started,
+        ))
     }
 
     async fn execute_command(&self, statement: &SqlStatement) -> Result<ExecResult> {
@@ -250,6 +256,13 @@ impl crate::Engine for RedisEngine {
         Ok(TableStructure {
             columns: self.describe_table(table).await?,
             foreign_keys: Vec::new(),
+        })
+    }
+
+    async fn relational_schema(&self) -> Result<crate::RelationalSchema> {
+        Err(DbxError::Unsupported {
+            operation: "relational_schema".into(),
+            kind: self.kind(),
         })
     }
 
@@ -437,17 +450,20 @@ fn unwrap_redis_container(value: Value) -> Value {
     }
 }
 
-fn limit_rows(rows: Vec<RowData>, options: QueryOptions) -> Vec<RowData> {
-    rows.into_iter()
-        .take(row_limit(options).unwrap_or(usize::MAX))
-        .collect()
+fn limit_rows(rows: Vec<RowData>, options: QueryOptions) -> (Vec<RowData>, bool) {
+    let Some(limit) = row_limit(options) else {
+        return (rows, false);
+    };
+    let truncated = rows.len() > limit;
+    (rows.into_iter().take(limit).collect(), truncated)
 }
 
-fn limit_values(values: Vec<Value>, options: QueryOptions) -> Vec<Value> {
-    values
-        .into_iter()
-        .take(row_limit(options).unwrap_or(usize::MAX))
-        .collect()
+fn limit_values(values: Vec<Value>, options: QueryOptions) -> (Vec<Value>, bool) {
+    let Some(limit) = row_limit(options) else {
+        return (values, false);
+    };
+    let truncated = values.len() > limit;
+    (values.into_iter().take(limit).collect(), truncated)
 }
 
 fn is_nested_value(value: &Value) -> bool {
@@ -587,5 +603,18 @@ mod tests {
         .unwrap();
         assert_eq!(columns.len(), 1);
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn redis_limits_report_omitted_rows() {
+        let rows = vec![RowData::default(), RowData::default()];
+        let (rows, truncated) = limit_rows(rows, QueryOptions { max_rows: Some(1) });
+        assert_eq!(rows.len(), 1);
+        assert!(truncated);
+
+        let values = vec![Value::Int(1), Value::Int(2)];
+        let (values, truncated) = limit_values(values, QueryOptions { max_rows: Some(2) });
+        assert_eq!(values.len(), 2);
+        assert!(!truncated);
     }
 }

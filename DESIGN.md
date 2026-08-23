@@ -11,7 +11,8 @@ colors:
   border-strong: "#343b47"
   text: "#f1f5f9"
   text-muted: "#94a3b8"
-  accent: "#3b82f6"
+  accent: "#2563eb"
+  accent-foreground: "#ffffff"
   accent-soft: "#10294d"
   focus-ring: "#60a5fa"
   success: "#22c55e"
@@ -19,11 +20,21 @@ colors:
   danger: "#ef4444"
   sql-keyword: "#c792ea"
   sql-string: "#c3e88d"
-  sql-comment: "#6b7482"
+  sql-comment: "#737e8c"
   sql-number: "#f78c6c"
   sql-parameter: "#ffcb6b"
   sql-identifier: "#82aaff"
   sql-type: "#89ddff"
+  light-canvas: "#f7f9fc"
+  light-panel: "#ffffff"
+  light-panel-raised: "#f0f4f8"
+  light-rail: "#ebf0f6"
+  light-border: "#d8dee8"
+  light-border-strong: "#b6c2d1"
+  light-text: "#16202f"
+  light-text-muted: "#52657b"
+  light-accent: "#1d5fd1"
+  light-accent-soft: "#e5f0ff"
 typography:
   display:
     fontSize: "18px"
@@ -96,7 +107,7 @@ components:
 
 DBX is an operator's cockpit: a compact, near-black workbench where database identity, navigation, data, and row context stay simultaneously visible. It uses crisp one-pixel separators, small label-first typography, and a restrained blue action language to make a large amount of state immediately scannable instead of decorative.
 
-The interface is intentionally native and dense. Surfaces are layered only enough to establish panes; the visual rhythm comes from alignment, a four-pixel spacing scale, and compact controls. Green is health, amber is work-in-progress or caution, and red is reserved for destructive actions. SQL is the one place where a broader semantic spectrum earns its space.
+The interface is intentionally native and dense. Surfaces are layered only enough to establish panes; the visual rhythm comes from alignment, a four-pixel spacing scale, and compact controls. Green is health, amber is work-in-progress or caution, and red is reserved for destructive actions. Structured SQL and JSON editors are the one place where a broader semantic spectrum earns its space.
 
 **Key Characteristics:**
 
@@ -107,7 +118,14 @@ The interface is intentionally native and dense. Surfaces are layered only enoug
 
 ## Colors
 
-The palette is a low-glare charcoal console: cool white text sits on layered black surfaces, with purposeful semantic color for action and state.
+The default palette is a low-glare charcoal console: cool white text sits on layered black surfaces, with purposeful semantic color for action and state. A first-class light appearance maps the same roles onto cool paper, white panels, blue-slate dividers, and ink text; it is composed rather than mechanically inverted.
+
+### Appearance modes
+
+- **Dark:** Black Canvas, Instrument Panel, Raised Utility Surface, and Navigation Rail remain the default low-glare working environment.
+- **Light:** Cool Paper (`light-canvas`) holds the workspace, white (`light-panel`) carries panes, Pale Utility (`light-panel-raised`) distinguishes controls, and Blue-Slate dividers preserve the pane hierarchy.
+- **Parity:** blue still means action/location, green still means health, amber still means caution, and red still means destructive. Grid alternation, focus visibility, editor syntax, overlays, and disabled states must be checked in both appearances.
+- **Control:** the compact sun/moon action in the top bar switches appearance immediately and persists the choice. It replaces the duplicated top-bar refresh action rather than adding another competing control.
 
 ### Primary
 
@@ -130,7 +148,7 @@ The palette is a low-glare charcoal console: cool white text sits on layered bla
 - **Connection Green** (`success`): live connection health and trusted persistence notices.
 - **Caution Amber** (`warning`): busy status and destructive-but-recoverable operations.
 - **Destructive Red** (`danger`): irreversible operations and error emphasis.
-- **SQL Spectrum** (`sql-keyword`, `sql-string`, `sql-comment`, `sql-number`, `sql-parameter`, `sql-identifier`, `sql-type`): lexical meaning in the query editor only.
+- **Structured-editor spectrum** (`sql-keyword`, `sql-string`, `sql-comment`, `sql-number`, `sql-parameter`, `sql-identifier`, `sql-type`): lexical meaning in SQL editors and the corresponding JSON token roles.
 
 **The Sparse Accent Rule.** Use Command Blue to identify an action or current location; never use it as a general panel fill.
 
@@ -155,7 +173,7 @@ The palette is a low-glare charcoal console: cool white text sits on layered bla
 
 The desktop shell is fixed-context and pane-based: the 46px rail remains on the left, the top bar is 42px, primary connection tabs occupy the remaining top-bar width with horizontal overflow, and the status line is 26px. The supplied DBX logo asset anchors the top-bar identity while disconnected and the rail identity in a live workspace, avoiding duplicate marks. While disconnected, the shell retains that identity but hides rail controls that require a database context. In a live workspace, the explorer is 224px wide (180px in compact layout); the inspector remains alongside the grid when space permits. Connection setup is a centered, scrollable form capped at 900px, containing a 170px engine chooser (124px in compact layout).
 
-Spacing follows the exact 4px, 8px, 12px, 16px token rhythm. Do not introduce a competing scale. Data and query panes use 36–38px headers; the SQL editor reserves 224px including its shell; multiline fields are 204px high.
+Spacing follows the exact 4px, 8px, 12px, 16px token rhythm. Do not introduce a competing scale. Data and query panes use 36–38px headers; the query editor initially reserves 224px including its shell and can be resized vertically between a compact working minimum and roughly half the workspace; multiline row-value fields are 204px high.
 
 At widths below 1180px, DBX enters its narrow-workspace behavior and removes the row inspector to protect the primary data canvas. At widths below 900px, the compact layout narrows the explorer and engine chooser, reduces top-bar identity copy, removes the refresh control, and reduces connection-form padding from 24px to 12px. Connection tabs remain horizontally scrollable rather than wrapping or sacrificing their identity.
 
@@ -185,17 +203,25 @@ The button family is compact, square-shouldered, and action-ranked.
 
 - **Style:** Black Canvas fill, Assertive Divider border, 5px radius, 32px high with 7px padding for single-line fields.
 - **Connection modes:** Details and Connection String are equal modes, not a primary form with an escape hatch. Details exposes labeled Host, Port, User, Password, and Database fields. SQLite replaces network details with a database-file field and a native Choose file action.
-- **Saved connections:** Save requires the user-visible connection name. Persist connection metadata under that name and use it for the OS-keyring lookup; do not place the password in the saved JSON profile.
+- **Saved connections:** Save requires the user-visible connection name. Persist password-free metadata under that name; DBX Vault encrypts normal saved credentials with Argon2id + XChaCha20-Poly1305 and is unlocked once in-app per launch. The passphrase is never stored or recoverable, and selecting a saved connection eagerly hydrates its credential. Only **Import old system passwords** reads Keychain/Secret Service; imports are non-destructive and never overwrite a vault entry.
 - **Multiline SQL:** same field treatment at 204px high with 10px padding, horizontal/vertical scrolling, selection tint, and a 2px blue caret.
-- **Syntax:** SQL token colors distinguish keyword, string, comment, number, parameter, identifier, and type while base text stays Operational White.
+- **Row value modes:** one compact selector switches between a bound Value, an explicit single SQL expression, nullable SQL NULL, and insert-only database Default. Ordinary values remain parameterized; SQL is visually and behaviorally explicit.
+- **Typed row controls:** Boolean fields use a native true/false selector. JSON and JSONB values open in a multiline editor, pretty-print existing documents, and retain valid incomplete input while typing.
+- **Syntax:** SQL token colors distinguish keyword, string, comment, number, parameter, identifier, and type. JSON reuses that semantic spectrum for property names, strings, numbers, booleans, and null while base text stays Operational White.
+
+### Dialogs
+
+- **Mutation errors:** insert and update failures use one focus-trapped dialog with the exact database or validation detail, a clear recovery action, and explicit confirmation that the draft remains open. The dialog never discards entered values.
+- **Hierarchy:** blocking errors and destructive confirmations are centered transient surfaces; routine field guidance stays inline in the inspector.
 
 ### Navigation
 
 - **App rail:** 46px wide with the supplied DBX logo asset, embedded compile-time 16px SVG line icons including dedicated Structure and Refresh glyphs, 24px icon hit areas, and a persistent green/offline status dot at the bottom. Icons inherit their semantic color from the consuming control. While disconnected, hide controls that operate on a database rather than presenting unavailable actions.
 - **Top bar:** 42px rail-toned strip; show the supplied DBX logo with the DBX title while disconnected, and retain connection tabs to preserve multi-connection context once a workspace is active.
+- **Appearance action:** a single compact sun/moon action sits with window-level controls, is available before and after connection, and names the appearance it will switch to in its tooltip.
 - **Connection tabs:** 32px high, 6px top corners, icon + health dot + engine badge + muted metadata. Active tabs use the standard panel and stronger border, with a full-width 2px Command Blue bottom indicator; inactive tabs use the rail.
-- **Document tabs:** each connection owns a 36px, horizontally scrollable row containing the persistent Data document plus independently closable Query and table-bound Structure documents. Active documents use the canvas, strong border, and Command Blue icon; the compact add action opens another query without replacing existing work.
-- **Pane tabs and explorer entries:** active state uses Blue Selection Well with Command Blue icon/text; unselected entries stay muted until hover. When a PostgreSQL schema filter is active, table labels omit that redundant schema prefix; the All view remains qualified.
+- **Document tabs:** each connection owns a 36px, horizontally scrollable row containing the persistent Data document plus independently closable Query, table-bound Structure, and database Diagram documents. Active documents use the canvas, strong border, and Command Blue icon; the compact add action opens another query without replacing existing work.
+- **Explorer:** the header keeps Refresh and New Table visible for quick routine work. Diagram, Export, and Import live in one compact overflow menu rather than competing for header width. Database and schema filter rows remain labelled, horizontally scrollable chip rows; they never wrap into the table list. Active entries use Blue Selection Well with Command Blue icon/text; unselected entries stay muted until hover. When a PostgreSQL schema filter is active, table labels omit that redundant schema prefix; the All view remains qualified.
 
 ### Cards / Containers
 
@@ -209,6 +235,25 @@ The button family is compact, square-shouldered, and action-ranked.
 - **Style:** fully rounded Raised Utility Surface with 8px horizontal and 4px vertical padding, 10px medium text.
 - **Meaning:** color the label by semantic state; do not make every badge blue.
 
+### Query Workbench
+
+- **Execution scope:** Run executes the selection when present, otherwise the SQL statement at the caret (or the current Redis command line). Run All is an explicit secondary action. The editor and result grid share a vertically resizable split so either can become the primary working surface.
+- **Safety:** destructive SQL and non-atomic multi-statement scripts require a focused confirmation before execution. Cancelling, switching databases, closing a query document, or closing its connection invalidates the active request so a late result cannot overwrite newer state.
+- **Outcome:** keep the previous result visible while a newer request runs or fails, but mark it as stale. The result header distinguishes returned rows, affected rows, elapsed time, database provenance, truncation, cancellation, and full database errors without relying on the global status line.
+- **Result interaction:** cells, rows, and columns are keyboard-selectable and copy with explicit NULL versus empty-string semantics. Complete results can be copied or exported as TSV, CSV, or lossless positional JSON.
+- **History and recovery:** executed queries are stored locally in a bounded, connection-scoped, credential-free history. Loading history never executes it. Non-empty query documents ask before closing and recently closed text can be reopened within the connection session.
+- **Keyboard model:** Cmd/Ctrl+Enter runs the current scope, Cmd/Ctrl+Shift+Enter runs the document, Escape cancels an active request, and ordinary editor undo/redo remains available. Shortcut labels use platform-neutral copy unless the platform is known.
+- **Dialect truthfulness:** SQL connections use SQL syntax, completion, formatting, and statement scope. Redis presents a command editor, disables SQL-only affordances, and executes the selected text or current command line.
+
+### Database Diagram
+
+- **Scope:** the database diagram is a connection-scoped, independently closable document tab for relational engines. It loads the current database schema without adding an app-rail destination.
+- **Diagram language:** deterministic table cards show the qualified table name and compact PK/FK column markings. Relationship lines connect the corresponding columns and retain a stable layout across refreshes. Large tables use bounded detail, preserving relationship-bearing columns and summarising the remainder instead of creating an unbounded canvas.
+- **Navigation:** the diagram scrolls in both directions, uses grab-to-pan, and supplies compact zoom, reset/Fit, and refresh controls. When the canvas is focused, arrows pan, Shift+arrows move farther, +/− zoom, F fits, 0 resets, and R refreshes. The shortcut legend stays pinned to the viewport while the scene moves. Selecting a card gives it a quiet blue emphasis; double-clicking it drills into that table's existing data workflow.
+- **Schema scope:** PostgreSQL diagrams start from the Explorer's active schema and provide a compact multi-select schema picker. Changing it projects the retained metadata snapshot in memory, preserves selected-to-selected cross-schema relationships, and applies identically to the canvas, SVG, and PNG exports without re-querying the database.
+- **State:** retain a previously loaded scene while refresh work is pending and clearly identify loading, stale, empty, and error states. Schema-changing actions invalidate the document rather than presenting stale metadata as current.
+- **Export:** the on-screen scene is the canonical SVG scene. SVG and PNG exports are generated from that same scene, use the active light/dark palette, and preserve the table and relationship content shown to the operator.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -219,13 +264,18 @@ The button family is compact, square-shouldered, and action-ranked.
 - **Do** keep the DBX logo asset visible in the contextual rail or top-bar identity while hiding database-only rail controls until a connection is active.
 - **Do** treat Details and Connection String as equal setup modes, and keep Test Connection non-mutating.
 - **Do** scope document tabs to their connection and preserve the Data document while Query and Structure documents are independently closable.
+- **Do** keep Explorer routine actions compact: Refresh and New Table visible, Diagram/Export/Import in overflow, and labelled database/schema filter rows horizontally scrollable.
+- **Do** keep diagram cards, relationship routing, and exports deterministic; use one SVG scene for on-screen rendering and SVG/PNG output.
+- **Do** preserve query result provenance and clearly label stale, limited, failed, and cancelled outcomes.
 - **Do** let narrow layouts hide secondary inspection before shrinking primary data and query work below usable density.
+- **Do** validate semantic contrast and selected, hover, disabled, error, grid, editor, menu, and dialog states in both light and dark appearances.
 
 ### Don't:
 
 - **Don't** introduce shadows, glass effects, oversized cards, or decorative gradients; depth is tonal and border-led.
 - **Don't** use blue as ambient decoration or apply semantic success/warning/danger colors without a state meaning.
 - **Don't** wrap multi-connection tabs into ambiguous rows; retain horizontal scrolling and concise metadata.
+- **Don't** turn the Explorer header into a row of text actions or make the diagram a competing global navigation destination.
 - **Don't** repeat an active PostgreSQL schema prefix in explorer table labels; retain qualification only in the All view.
 - **Don't** replace the authored geometric icon vocabulary with emoji, mixed icon sets, or browser-shaped controls.
 - **Don't** save a connection password in profile JSON or use Test Connection to persist, open, or change a database.
