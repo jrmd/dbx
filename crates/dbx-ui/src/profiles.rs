@@ -434,6 +434,7 @@ impl ProfileStore {
 
     /// Delete a profile and its associated credential.  Returns `true` when a
     /// profile existed and `false` when the ID was already absent.
+    #[allow(dead_code)] // Retained as a tested profile-store capability for future profile management UI.
     pub fn delete(&self, id: Uuid) -> ProfileResult<bool> {
         let _lock = self.lock()?;
         let mut document = self.read_document()?;

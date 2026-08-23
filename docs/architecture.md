@@ -36,6 +36,33 @@ DBX is not a migration runner, backup system, monitoring console, or distributed
 └───────────────┴────────────────┴───────────────┴───────────────┘
 ```
 
+## UI source ownership
+
+`dbx-ui` keeps one external GPUI interface: `DbxApp::new` plus its `Render`
+implementation. The implementation is a private module tree organized by the
+behavior each module hides:
+
+- `app.rs` owns shared application/session state and coordinates navigation,
+  table browsing, query execution, and row mutations.
+- `app/connection.rs` owns the connection draft, saved-profile, keyring
+  hydration, Test Connection, and session-opening workflow.
+- `app/transfer.rs` owns database/table import and export prompts,
+  confirmations, background work, and generation-safe result application.
+- `app/sql_completion.rs` owns SQL tokenization, scope/source inference,
+  dialect-aware candidate ranking, and its focused regression tests.
+- `app/result_table.rs` is the shared virtualized table adapter for browsed and
+  ad-hoc results, including remembered widths and foreign-key cell behavior.
+- `app/view/` owns GPUI element construction, split into `connection`, `chrome`,
+  `overlays`, `data`, and `query` surfaces. Focus/key contexts stay beside the
+  view node that receives them.
+
+Keep new behavior with the workflow that owns its invariants. In particular,
+database and keyring I/O stays outside rendering, stale async results remain
+guarded by their request generation (and draft fingerprint where applicable),
+and Redis retains its command/keyspace semantics. Do not add another engine or
+runtime adapter seam until a second real adapter or deterministic test adapter
+requires one.
+
 GPUI models and views should receive small, immutable result snapshots or streams of bounded pages. They should not hold a driver connection or call a blocking client directly. A session owns the lifetime of a connector task and sends cancellation when a tab closes, a new query supersedes an old one, or the user presses Stop.
 
 ## Core contracts
