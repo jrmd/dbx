@@ -554,64 +554,65 @@ impl DbxApp {
         let runtime = self.runtime.clone();
         cx.notify();
 
-        cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    let engine = Arc::new(DatabaseEngine::connect(config).await?);
-                    let tables = engine.list_tables().await?;
-                    let databases = engine.list_databases().await.unwrap_or_default();
-                    let current_database = engine.current_database().await.ok();
-                    let schema_filter = default_schema_filter(kind, &tables);
-                    let initial_table =
-                        schema_filtered_tables(kind, &tables, schema_filter.as_deref())
-                            .into_iter()
-                            .next();
-                    let initial = if let Some(table) = initial_table {
-                        let table_ref = table_ref(&table);
-                        let structure = engine.table_structure(&table_ref).await?;
-                        let mut result = if kind.is_sql() {
-                            Some(
-                                engine
-                                    .query_table(
-                                        &table_ref,
-                                        &[],
-                                        &[],
-                                        &[],
-                                        Some(table_browse_page(0)),
-                                        QueryOptions::default(),
-                                    )
-                                    .await?,
+        let task = runtime.spawn(async move {
+            let engine = Arc::new(DatabaseEngine::connect(config).await?);
+            let tables = engine.list_tables().await?;
+            let databases = engine.list_databases().await.unwrap_or_default();
+            let current_database = engine.current_database().await.ok();
+            let schema_filter = default_schema_filter(kind, &tables);
+            let initial_table = schema_filtered_tables(kind, &tables, schema_filter.as_deref())
+                .into_iter()
+                .next();
+            let initial = if let Some(table) = initial_table {
+                let table_ref = table_ref(&table);
+                let structure = engine.table_structure(&table_ref).await?;
+                let mut result = if kind.is_sql() {
+                    Some(
+                        engine
+                            .query_table(
+                                &table_ref,
+                                &[],
+                                &[],
+                                &[],
+                                Some(table_browse_page(0)),
+                                QueryOptions::default(),
                             )
-                        } else {
-                            Some(
-                                engine
-                                    .query("SCAN 0 COUNT 100", QueryOptions::default())
-                                    .await?,
-                            )
-                        };
-                        let has_next_page = if kind.is_sql() {
-                            result
-                                .as_mut()
-                                .map(trim_table_browse_result)
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
-                        Some((table_ref, structure, result, has_next_page))
-                    } else {
-                        None
-                    };
-                    Ok::<_, dbx_core::DbxError>((
-                        engine,
-                        tables,
-                        databases,
-                        current_database,
-                        schema_filter,
-                        initial,
-                    ))
-                })
-                .await?;
+                            .await?,
+                    )
+                } else {
+                    Some(
+                        engine
+                            .query("SCAN 0 COUNT 100", QueryOptions::default())
+                            .await?,
+                    )
+                };
+                let has_next_page = if kind.is_sql() {
+                    result
+                        .as_mut()
+                        .map(trim_table_browse_result)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                Some((table_ref, structure, result, has_next_page))
+            } else {
+                None
+            };
+            Ok::<_, dbx_core::DbxError>((
+                engine,
+                tables,
+                databases,
+                current_database,
+                schema_filter,
+                initial,
+            ))
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
 
+        cx.spawn(async move |this, cx| {
+            let result = task.await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
