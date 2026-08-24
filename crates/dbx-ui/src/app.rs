@@ -332,6 +332,53 @@ impl CompletionItemKind {
     }
 }
 
+#[derive(Default)]
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl AbortOnDrop {
+    fn replace(&mut self, handle: tokio::task::AbortHandle) {
+        self.cancel();
+        self.0 = Some(handle);
+    }
+
+    fn cancel(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[derive(Default)]
+struct BackgroundTaskSet(Vec<tokio::task::AbortHandle>);
+
+impl BackgroundTaskSet {
+    fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
+        self.0.push(task.abort_handle());
+    }
+
+    fn cancel_all(&mut self) {
+        for handle in self.0.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for BackgroundTaskSet {
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
 struct QueryTab {
     query_text: Entity<String>,
     query_editor: Entity<TextEditor>,
@@ -352,7 +399,7 @@ struct QueryTab {
     executed_range: Option<Range<usize>>,
     execution_scope: Option<editor::QueryExecutionScope>,
     executed_database: Option<String>,
-    abort_handle: Option<tokio::task::AbortHandle>,
+    abort_handle: AbortOnDrop,
     /// The query text a failed run was executed against plus the byte range
     /// its error message points at. Highlighting only paints while the editor
     /// still holds that exact text, so any edit clears it.
@@ -425,7 +472,7 @@ impl QueryTab {
             executed_range: None,
             execution_scope: None,
             executed_database: None,
-            abort_handle: None,
+            abort_handle: AbortOnDrop::default(),
             error_highlight: None,
             request_generation: 0,
             completion_signature: None,
@@ -451,10 +498,14 @@ impl QueryTab {
 
     fn invalidate_request(&mut self) {
         self.request_generation = self.request_generation.saturating_add(1);
-        if let Some(handle) = self.abort_handle.take() {
-            handle.abort();
-        }
+        self.abort_handle.cancel();
         self.busy = false;
+    }
+}
+
+impl Drop for QueryTab {
+    fn drop(&mut self) {
+        self.abort_handle.cancel();
     }
 }
 
@@ -538,57 +589,7 @@ struct DiagramTab {
     focus: FocusHandle,
     drag_anchor: Option<DiagramDragAnchor>,
     request_generation: u64,
-    abort_handle: Option<tokio::task::AbortHandle>,
-    base_scene: DiagramBaseSceneCache,
-}
-
-/// The colours that affect a diagram's stable SVG scene.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct DiagramPaletteKey([String; 8]);
-
-impl DiagramPaletteKey {
-    pub(super) fn new(colors: [String; 8]) -> Self {
-        Self(colors)
-    }
-}
-
-/// Caches the selection-independent image that GPUI decodes asynchronously.
-#[derive(Default)]
-struct DiagramBaseSceneCache {
-    entry: Option<DiagramBaseScene>,
-}
-
-struct DiagramBaseScene {
-    document: Arc<DiagramDocument>,
-    palette: DiagramPaletteKey,
-    image: Arc<Image>,
-}
-
-impl DiagramBaseSceneCache {
-    fn image_for<F>(
-        &mut self,
-        document: Arc<DiagramDocument>,
-        palette: DiagramPaletteKey,
-        factory: F,
-    ) -> Arc<Image>
-    where
-        F: FnOnce() -> Arc<Image>,
-    {
-        if let Some(entry) = self.entry.as_ref()
-            && Arc::ptr_eq(&entry.document, &document)
-            && entry.palette == palette
-        {
-            return entry.image.clone();
-        }
-
-        let image = factory();
-        self.entry = Some(DiagramBaseScene {
-            document,
-            palette,
-            image: image.clone(),
-        });
-        image
-    }
+    abort_handle: AbortOnDrop,
 }
 
 #[derive(Clone, Copy)]
@@ -618,17 +619,20 @@ impl DiagramTab {
             focus: cx.focus_handle(),
             drag_anchor: None,
             request_generation: 0,
-            abort_handle: None,
-            base_scene: DiagramBaseSceneCache::default(),
+            abort_handle: AbortOnDrop::default(),
         }
     }
 
     fn invalidate_request(&mut self) {
         self.request_generation = self.request_generation.saturating_add(1);
-        if let Some(handle) = self.abort_handle.take() {
-            handle.abort();
-        }
+        self.abort_handle.cancel();
         self.busy = false;
+    }
+}
+
+impl Drop for DiagramTab {
+    fn drop(&mut self) {
+        self.abort_handle.cancel();
     }
 }
 
@@ -693,6 +697,10 @@ struct ConnectionSession {
     status: String,
     error: Option<String>,
     request_generation: u64,
+    /// Tokio work captures an `Arc<DatabaseEngine>`. Keep abort handles here
+    /// so closing a connection cancels that work before dropping the session
+    /// instead of leaving closed pools alive until every query completes.
+    background_tasks: BackgroundTaskSet,
 }
 
 impl ConnectionSession {
@@ -759,7 +767,16 @@ impl ConnectionSession {
             status: "Connecting…".into(),
             error: None,
             request_generation: 0,
+            background_tasks: BackgroundTaskSet::default(),
         }
+    }
+
+    fn track_background_task<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
+        self.background_tasks.track(task);
+    }
+
+    fn cancel_background_tasks(&mut self) {
+        self.background_tasks.cancel_all();
     }
 
     fn set_result(&mut self, result: Option<QueryResult>, cx: &mut Context<DbxApp>) {
@@ -786,6 +803,12 @@ impl ConnectionSession {
     fn clear_grid_selection(&self, cx: &mut Context<DbxApp>) {
         self.data_grid
             .update(cx, |table, cx| table.clear_selection(cx));
+    }
+}
+
+impl Drop for ConnectionSession {
+    fn drop(&mut self) {
+        self.cancel_background_tasks();
     }
 }
 
@@ -1214,6 +1237,7 @@ impl DbxApp {
             self.mutation_error_dialog = None;
         }
         self.sessions[index].request_generation += 1;
+        self.sessions[index].cancel_background_tasks();
         for tab in &mut self.sessions[index].secondary_tabs {
             match &mut tab.kind {
                 SecondaryTabKind::Query(query) => query.invalidate_request(),
@@ -1456,11 +1480,13 @@ impl DbxApp {
             session.pane = Pane::Structure;
         }
         let runtime = self.runtime.clone();
+        let task = runtime.spawn(async move { engine.table_structure(&table_ref).await });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { engine.table_structure(&table_ref).await })
-                .await?;
+            let result = task.await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
@@ -1589,7 +1615,7 @@ impl DbxApp {
         diagram.request_generation = diagram.request_generation.saturating_add(1);
         let generation = diagram.request_generation;
         let task = runtime.spawn(async move { engine.relational_schema().await });
-        diagram.abort_handle = Some(task.abort_handle());
+        diagram.abort_handle.replace(task.abort_handle());
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -1609,7 +1635,7 @@ impl DbxApp {
                     return;
                 }
                 diagram.busy = false;
-                diagram.abort_handle = None;
+                diagram.abort_handle.clear();
                 match result {
                     Ok(Ok(schema)) => {
                         let source_schema = Arc::new(schema);
@@ -1824,20 +1850,6 @@ impl DbxApp {
         };
         diagram.selected_node = node_id;
         cx.notify();
-    }
-
-    pub(super) fn diagram_base_scene_image_for<F>(
-        &mut self,
-        session_id: SessionId,
-        document: Arc<DiagramDocument>,
-        palette: DiagramPaletteKey,
-        factory: F,
-    ) -> Option<Arc<Image>>
-    where
-        F: FnOnce() -> Arc<Image>,
-    {
-        self.active_diagram_tab_mut(session_id)
-            .map(|diagram| diagram.base_scene.image_for(document, palette, factory))
     }
 
     /// Drill into a table from the diagram using the same data-loading path as
@@ -2223,36 +2235,38 @@ impl DbxApp {
         for row_id in filter_row_ids {
             self.watch_filter_row_for(session_id, row_id, window, cx);
         }
+        let task = runtime.spawn(async move {
+            let structure = engine.table_structure(&table_ref).await?;
+            let (result, has_next_page) = if kind.is_sql() {
+                let mut result = engine
+                    .query_table(
+                        &table_ref,
+                        &[],
+                        &filters,
+                        &[],
+                        Some(table_browse_page(0)),
+                        QueryOptions::default(),
+                    )
+                    .await?;
+                let has_next_page = trim_table_browse_result(&mut result);
+                (result, has_next_page)
+            } else {
+                (
+                    engine
+                        .query("SCAN 0 COUNT 100", QueryOptions::default())
+                        .await?,
+                    false,
+                )
+            };
+            Ok::<_, dbx_core::DbxError>((structure, result, has_next_page))
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    let structure = engine.table_structure(&table_ref).await?;
-                    let (result, has_next_page) = if kind.is_sql() {
-                        let mut result = engine
-                            .query_table(
-                                &table_ref,
-                                &[],
-                                &filters,
-                                &[],
-                                Some(table_browse_page(0)),
-                                QueryOptions::default(),
-                            )
-                            .await?;
-                        let has_next_page = trim_table_browse_result(&mut result);
-                        (result, has_next_page)
-                    } else {
-                        (
-                            engine
-                                .query("SCAN 0 COUNT 100", QueryOptions::default())
-                                .await?,
-                            false,
-                        )
-                    };
-                    Ok::<_, dbx_core::DbxError>((structure, result, has_next_page))
-                })
-                .await?;
+            let result = task.await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
@@ -2623,41 +2637,43 @@ impl DbxApp {
         session.request_generation += 1;
         let generation = session.request_generation;
         let result_table = table.clone();
+        let task = runtime.spawn(async move {
+            if kind.is_sql() {
+                let mut result = engine
+                    .query_table(
+                        &table,
+                        &[],
+                        &filters,
+                        &[],
+                        Some(table_browse_page(page)),
+                        QueryOptions::default(),
+                    )
+                    .await?;
+                let has_next_page = trim_table_browse_result(&mut result);
+                Ok::<_, dbx_core::DbxError>((result, has_next_page))
+            } else {
+                let pattern = filters
+                    .first()
+                    .and_then(|filter| filter.value.as_ref())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "*".into());
+                let pattern = redis_command_word(&pattern);
+                let result = engine
+                    .query(
+                        &format!("SCAN 0 MATCH {pattern} COUNT 100"),
+                        QueryOptions::default(),
+                    )
+                    .await?;
+                Ok((result, false))
+            }
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    if kind.is_sql() {
-                        let mut result = engine
-                            .query_table(
-                                &table,
-                                &[],
-                                &filters,
-                                &[],
-                                Some(table_browse_page(page)),
-                                QueryOptions::default(),
-                            )
-                            .await?;
-                        let has_next_page = trim_table_browse_result(&mut result);
-                        Ok::<_, dbx_core::DbxError>((result, has_next_page))
-                    } else {
-                        let pattern = filters
-                            .first()
-                            .and_then(|filter| filter.value.as_ref())
-                            .map(ToString::to_string)
-                            .unwrap_or_else(|| "*".into());
-                        let pattern = redis_command_word(&pattern);
-                        let result = engine
-                            .query(
-                                &format!("SCAN 0 MATCH {pattern} COUNT 100"),
-                                QueryOptions::default(),
-                            )
-                            .await?;
-                        Ok((result, false))
-                    }
-                })
-                .await?;
+            let result = task.await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
@@ -3161,7 +3177,7 @@ impl DbxApp {
         let executed_query = query.clone();
         let task = runtime
             .spawn(async move { engine.query(&executed_query, QueryOptions::default()).await });
-        query_tab.abort_handle = Some(task.abort_handle());
+        query_tab.abort_handle.replace(task.abort_handle());
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -3183,7 +3199,7 @@ impl DbxApp {
                         return;
                     }
                     query_tab.busy = false;
-                    query_tab.abort_handle = None;
+                    query_tab.abort_handle.clear();
                     match result {
                         Ok(Ok(result)) => {
                             query_tab.status = query_result_status(&result);
@@ -3541,11 +3557,13 @@ impl DbxApp {
         let expected_kind = session.kind;
 
         let runtime = self.runtime.clone();
+        let task = runtime.spawn(async move { engine.list_tables().await });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
 
         cx.spawn(async move |this, cx| {
-            let tables = runtime
-                .spawn(async move { engine.list_tables().await })
-                .await??;
+            let tables = task.await??;
 
             this.update(cx, |this, cx| {
                 let request_is_current = this.session(session_id).is_some_and(|session| {
@@ -3615,23 +3633,26 @@ impl DbxApp {
         let request_engine = engine.clone();
         let expected_engine = engine;
         let runtime = self.runtime.clone();
+        let task = runtime.spawn(async move {
+            let mut metadata = HashMap::new();
+            for table in tables
+                .into_iter()
+                .filter(|table| matches!(table.kind, EntityKind::Table | EntityKind::View))
+                .take(MAX_COMPLETION_METADATA_TABLES)
+            {
+                let table_ref = table_ref(&table);
+                if let Ok(columns) = request_engine.describe_table(&table_ref).await {
+                    metadata.insert(completion_table_key(&table_ref), columns);
+                }
+            }
+            metadata
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
+
         cx.spawn(async move |this, cx| {
-            let metadata = runtime
-                .spawn(async move {
-                    let mut metadata = HashMap::new();
-                    for table in tables
-                        .into_iter()
-                        .filter(|table| matches!(table.kind, EntityKind::Table | EntityKind::View))
-                        .take(MAX_COMPLETION_METADATA_TABLES)
-                    {
-                        let table_ref = table_ref(&table);
-                        if let Ok(columns) = request_engine.describe_table(&table_ref).await {
-                            metadata.insert(completion_table_key(&table_ref), columns);
-                        }
-                    }
-                    metadata
-                })
-                .await?;
+            let metadata = task.await?;
 
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
@@ -3694,16 +3715,20 @@ impl DbxApp {
         session.status = format!("Switching to {database}…");
         session.error = None;
         let runtime = self.runtime.clone();
+        let task = runtime.spawn({
+            let target = database.clone();
+            async move {
+                engine.use_database(&target).await?;
+                let tables = engine.list_tables().await?;
+                Ok::<_, dbx_core::DbxError>(tables)
+            }
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let target = database.clone();
-            let result = runtime
-                .spawn(async move {
-                    engine.use_database(&target).await?;
-                    let tables = engine.list_tables().await?;
-                    Ok::<_, dbx_core::DbxError>(tables)
-                })
-                .await;
+            let result = task.await;
 
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
@@ -4275,15 +4300,18 @@ impl DbxApp {
         session.status = "Applying row change…".into();
         session.request_generation += 1;
         let generation = session.request_generation;
+        let task = runtime.spawn(async move {
+            match request {
+                Mutation::Insert(request) => engine.insert(&request).await,
+                Mutation::Update(request) => engine.update(&request).await,
+            }
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = runtime
-                .spawn(async move {
-                    match request {
-                        Mutation::Insert(request) => engine.insert(&request).await,
-                        Mutation::Update(request) => engine.update(&request).await,
-                    }
-                })
+            let outcome = task
                 .await
                 .map_err(|error| format!("Row mutation task failed: {error}"))
                 .and_then(|outcome| outcome.map_err(|error| error.to_string()));
@@ -4405,11 +4433,13 @@ impl DbxApp {
         session.status = "Deleting row…".into();
         session.request_generation += 1;
         let generation = session.request_generation;
+        let task = runtime.spawn(async move { engine.delete(&table, &filters).await });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let outcome = runtime
-                .spawn(async move { engine.delete(&table, &filters).await })
-                .await?;
+            let outcome = task.await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session(session_id) else {
                     return;
@@ -4647,19 +4677,21 @@ impl DbxApp {
         };
         session.request_generation += 1;
         let generation = session.request_generation;
+        let task = runtime.spawn(async move {
+            let outcome = match action {
+                TableAction::Truncate => engine.truncate_table(&action_target).await,
+                TableAction::Drop => engine.drop_table(&action_target).await,
+            }?;
+            let tables = engine.list_tables().await?;
+            Ok::<_, dbx_core::DbxError>((outcome, tables))
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    let outcome = match action {
-                        TableAction::Truncate => engine.truncate_table(&action_target).await,
-                        TableAction::Drop => engine.drop_table(&action_target).await,
-                    }?;
-                    let tables = engine.list_tables().await?;
-                    Ok::<_, dbx_core::DbxError>((outcome, tables))
-                })
-                .await?;
+            let result = task.await?;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
@@ -5148,100 +5180,67 @@ fn remap_diagram_scroll_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
-    #[test]
-    fn diagram_base_scene_reuses_the_image_across_selection_changes() {
-        let document = Arc::new(DiagramDocument {
-            database: "test".into(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            width: 1.0,
-            height: 1.0,
-        });
-        let palette = DiagramPaletteKey::new(core::array::from_fn(|_| "#101010".to_owned()));
-        let factory_calls = Cell::new(0);
-        let mut cache = DiagramBaseSceneCache::default();
+    struct DropProbe(Arc<AtomicBool>);
 
-        let unselected = cache.image_for(document.clone(), palette.clone(), || {
-            factory_calls.set(factory_calls.get() + 1);
-            Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()))
-        });
-        // Selection belongs to the overlay; it must not produce another base scene.
-        let _selected_node = Some("orders".to_owned());
-        let selected = cache.image_for(document, palette, || {
-            factory_calls.set(factory_calls.get() + 1);
-            Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()))
-        });
-
-        assert!(Arc::ptr_eq(&unselected, &selected));
-        assert_eq!(factory_calls.get(), 1);
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     #[test]
-    fn diagram_base_scene_rebuilds_once_when_the_palette_changes() {
-        let document = Arc::new(DiagramDocument {
-            database: "test".into(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            width: 1.0,
-            height: 1.0,
+    fn tab_abort_guard_cancels_inflight_work_when_its_owner_drops() {
+        let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let probe = DropProbe(dropped.clone());
+        let task = runtime.spawn(async move {
+            let _probe = probe;
+            started_tx.send(()).expect("signal task start");
+            std::future::pending::<()>().await;
         });
-        let factory_calls = Cell::new(0);
-        let mut cache = DiagramBaseSceneCache::default();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
 
-        let light = cache.image_for(
-            document.clone(),
-            DiagramPaletteKey::new(core::array::from_fn(|_| "#f0f0f0".to_owned())),
-            || {
-                factory_calls.set(factory_calls.get() + 1);
-                Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()))
-            },
-        );
-        let dark = cache.image_for(
-            document,
-            DiagramPaletteKey::new(core::array::from_fn(|_| "#101010".to_owned())),
-            || {
-                factory_calls.set(factory_calls.get() + 1);
-                Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()))
-            },
-        );
+        let mut guard = AbortOnDrop::default();
+        guard.replace(task.abort_handle());
+        drop(guard);
 
-        assert!(!Arc::ptr_eq(&light, &dark));
-        assert_eq!(factory_calls.get(), 2);
+        let error = runtime
+            .block_on(task)
+            .expect_err("dropping the tab owner should cancel its task");
+        assert!(error.is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn diagram_base_scene_rebuilds_once_when_the_document_changes() {
-        let first_document = Arc::new(DiagramDocument {
-            database: "test".into(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            width: 1.0,
-            height: 1.0,
+    fn connection_task_set_cancels_inflight_work_when_its_owner_drops() {
+        let runtime = tokio::runtime::Runtime::new().expect("create test runtime");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let probe = DropProbe(dropped.clone());
+        let task = runtime.spawn(async move {
+            let _probe = probe;
+            started_tx.send(()).expect("signal task start");
+            std::future::pending::<()>().await;
         });
-        let second_document = Arc::new(DiagramDocument {
-            database: "test".into(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            width: 1.0,
-            height: 1.0,
-        });
-        let palette = DiagramPaletteKey::new(core::array::from_fn(|_| "#101010".to_owned()));
-        let factory_calls = Cell::new(0);
-        let mut cache = DiagramBaseSceneCache::default();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("task should start");
 
-        let first = cache.image_for(first_document, palette.clone(), || {
-            factory_calls.set(factory_calls.get() + 1);
-            Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()))
-        });
-        let second = cache.image_for(second_document, palette, || {
-            factory_calls.set(factory_calls.get() + 1);
-            Arc::new(Image::from_bytes(ImageFormat::Svg, b"<svg/>".to_vec()))
-        });
+        let mut tasks = BackgroundTaskSet::default();
+        tasks.track(&task);
+        drop(tasks);
 
-        assert!(!Arc::ptr_eq(&first, &second));
-        assert_eq!(factory_calls.get(), 2);
+        let error = runtime
+            .block_on(task)
+            .expect_err("dropping the connection owner should cancel its tasks");
+        assert!(error.is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! This module deliberately has no view state: callers load a
 //! [`RelationalSchema`], retain the resulting [`DiagramDocument`], and use the
-//! same SVG for both the on-screen image and file export.
+//! same vector scene for the native on-screen canvas and file export.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -11,8 +11,8 @@ use dbx_core::{ColumnInfo, ForeignKeyInfo, RelationalSchema, TableInfo};
 use gpui::SvgRenderer;
 
 const NODE_WIDTH: f32 = 292.0;
-const HEADER_HEIGHT: f32 = 42.0;
-const ROW_HEIGHT: f32 = 23.0;
+pub(crate) const HEADER_HEIGHT: f32 = 42.0;
+pub(crate) const ROW_HEIGHT: f32 = 23.0;
 const COLUMN_LIMIT: usize = 18;
 const HORIZONTAL_GAP: f32 = 116.0;
 const VERTICAL_GAP: f32 = 54.0;
@@ -64,6 +64,9 @@ pub struct DiagramEdge {
     pub source_columns: Vec<String>,
     pub target_columns: Vec<String>,
     pub path: String,
+    /// Orthogonal route points used by the native GPUI canvas. Keeping the
+    /// geometry in the document avoids reparsing SVG in the render loop.
+    pub points: Vec<(f32, f32)>,
     pub self_referential: bool,
 }
 
@@ -188,6 +191,7 @@ impl DiagramDocument {
                 let target_node = node_by_id[&target];
                 let self_referential = source == target;
                 let path = edge_path(source_node, target_node, foreign_key, self_referential);
+                let points = edge_path_points(&path);
                 edges.push(DiagramEdge {
                     id: format!("{source}:{index}"),
                     source: source.clone(),
@@ -195,6 +199,7 @@ impl DiagramDocument {
                     source_columns: foreign_key.columns.clone(),
                     target_columns: foreign_key.referenced_columns.clone(),
                     path,
+                    points,
                     self_referential,
                 });
             }
@@ -219,7 +224,7 @@ impl DiagramDocument {
     }
 
     /// Serializes the canonical vector representation. This is intentionally
-    /// the single rendering source for the interactive surface and export.
+    /// the export representation of the same geometry used by the native view.
     pub fn svg(&self, palette: DiagramPalette<'_>, selected: Option<&str>) -> String {
         let mut svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.0}" height="{:.0}" viewBox="0 0 {:.0} {:.0}" role="img" aria-label="Entity relationship diagram for {}"><defs><marker id="relation-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" viewBox="0 0 8 8" orient="auto"><path d="M 0 0 L 8 4 L 0 8 z" fill="{}"/></marker></defs><rect width="100%" height="100%" fill="{}"/>"#,
@@ -242,13 +247,13 @@ impl DiagramDocument {
             svg.push_str(&format!(r#"<path d="{}" fill="none" stroke="{}" stroke-width="1.5" stroke-linejoin="round" marker-end="url(#relation-arrow)" data-self-referential="{}"><title>{} → {} ({})</title></path>"#, edge.path, palette.relation, edge.self_referential, escape(&edge.source), escape(&edge.target), column_pairs));
         }
         for node in &self.nodes {
-            let selected = selected == Some(node.id.as_str());
-            let stroke = if selected {
+            let is_selected = selected == Some(node.id.as_str());
+            let stroke = if is_selected {
                 palette.accent
             } else {
                 palette.border
             };
-            let stroke_width = if selected { 2.0 } else { 1.0 };
+            let stroke_width = if is_selected { 2.0 } else { 1.0 };
             svg.push_str(&format!(r#"<g data-table="{}"><title>{}</title><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="8" fill="{}" stroke="{}" stroke-width="{}"/><path d="M {:.1} {:.1} h {:.1} v {:.1} h -{:.1} z" fill="{}"/><text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="14" font-weight="600">{}</text><text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="10">{}</text>"#,
                 escape(&node.id), escape(&display_table(&node.table)), node.x, node.y, node.width, node.height, palette.surface, stroke, stroke_width,
                 node.x, node.y, node.width, HEADER_HEIGHT, node.width, palette.surface_muted,
@@ -276,72 +281,6 @@ impl DiagramDocument {
         }
         svg.push_str("</svg>");
         svg
-    }
-
-    /// Serializes a transparent, accent-coloured overlay for one table.
-    ///
-    /// The overlay contains every direct inbound, outbound, and self-referential
-    /// relationship for `selected`, together with outlines for the selected
-    /// table and its direct neighbours. `stroke` is used directly instead of
-    /// relying on an alpha mask, so the overlay retains the base diagram's
-    /// coordinate system even when the SVG renderer caps a large raster.
-    pub fn selection_overlay_svg(&self, selected: Option<&str>, stroke: &str) -> Option<String> {
-        let selected = selected?;
-        if !self.nodes.iter().any(|node| node.id == selected) {
-            return None;
-        }
-        let stroke = escape(stroke);
-
-        let incident_edges = self
-            .edges
-            .iter()
-            .filter(|edge| edge.source == selected || edge.target == selected)
-            .collect::<Vec<_>>();
-        let endpoint_ids =
-            incident_edges
-                .iter()
-                .fold(BTreeSet::from([selected]), |mut endpoints, edge| {
-                    endpoints.insert(edge.source.as_str());
-                    endpoints.insert(edge.target.as_str());
-                    endpoints
-                });
-        let mut svg = format!(
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.0}" height="{:.0}" viewBox="0 0 {:.0} {:.0}" aria-hidden="true"><defs><marker id="selection-relation-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" viewBox="0 0 8 8" orient="auto"><path d="M 0 0 L 8 4 L 0 8 z" fill="{}"/></marker></defs>"#,
-            self.width, self.height, self.width, self.height, stroke,
-        );
-        for edge in incident_edges {
-            svg.push_str(&format!(
-                r#"<path d="{}" fill="none" stroke="{}" stroke-width="2" stroke-linejoin="round" marker-end="url(#selection-relation-arrow)" data-edge="{}" data-self-referential="{}"/>"#,
-                edge.path,
-                stroke,
-                escape(&edge.id),
-                edge.self_referential,
-            ));
-        }
-        for node in self
-            .nodes
-            .iter()
-            .filter(|node| endpoint_ids.contains(node.id.as_str()))
-        {
-            let (role, stroke_width) = if node.id == selected {
-                ("selected", "3")
-            } else {
-                ("related", "1.5")
-            };
-            svg.push_str(&format!(
-                r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="8" fill="none" stroke="{}" stroke-width="{}" data-role="{}" data-table="{}"/>"#,
-                node.x,
-                node.y,
-                node.width,
-                node.height,
-                stroke,
-                stroke_width,
-                role,
-                escape(&node.id),
-            ));
-        }
-        svg.push_str("</svg>");
-        Some(svg)
     }
 
     /// Rasterizes the canonical SVG without a second visual implementation.
@@ -664,6 +603,44 @@ fn edge_path(
             target.x + target.width
         )
     }
+}
+
+fn edge_path_points(path: &str) -> Vec<(f32, f32)> {
+    let mut tokens = path.split_whitespace();
+    let mut points = Vec::new();
+    let mut current = (0.0, 0.0);
+
+    while let Some(command) = tokens.next() {
+        match command {
+            "M" => {
+                let Some(x) = tokens.next().and_then(|value| value.parse::<f32>().ok()) else {
+                    break;
+                };
+                let Some(y) = tokens.next().and_then(|value| value.parse::<f32>().ok()) else {
+                    break;
+                };
+                current = (x, y);
+                points.push(current);
+            }
+            "H" => {
+                let Some(x) = tokens.next().and_then(|value| value.parse::<f32>().ok()) else {
+                    break;
+                };
+                current.0 = x;
+                points.push(current);
+            }
+            "V" => {
+                let Some(y) = tokens.next().and_then(|value| value.parse::<f32>().ok()) else {
+                    break;
+                };
+                current.1 = y;
+                points.push(current);
+            }
+            _ => break,
+        }
+    }
+
+    points
 }
 
 fn exposed_vertical_port(node: &DiagramNode, other: &DiagramNode) -> Option<f32> {
@@ -1071,156 +1048,6 @@ mod tests {
     }
 
     #[test]
-    fn selection_overlay_contains_only_incident_relationships_and_endpoints() {
-        let accounts = table("accounts", vec![column("id", 0, true)], vec![]);
-        let orders = table(
-            "orders",
-            vec![column("id", 0, true), column("account_id", 1, false)],
-            vec![foreign(&["account_id"], "accounts", &["id"])],
-        );
-        let payments = table(
-            "payments",
-            vec![column("id", 0, true), column("order_id", 1, false)],
-            vec![foreign(&["order_id"], "orders", &["id"])],
-        );
-        let audits = table("audits", vec![column("id", 0, true)], vec![]);
-        let logs = table(
-            "logs",
-            vec![column("id", 0, true), column("audit_id", 1, false)],
-            vec![foreign(&["audit_id"], "audits", &["id"])],
-        );
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![accounts, orders, payments, audits, logs],
-        });
-
-        let overlay = document
-            .selection_overlay_svg(Some("public.orders"), "#c0ffee")
-            .expect("known table has an overlay");
-
-        assert!(overlay.contains("data-edge=\"public.orders:0\""));
-        assert!(overlay.contains("data-edge=\"public.payments:0\""));
-        assert!(!overlay.contains("data-edge=\"public.logs:0\""));
-        for table in ["public.accounts", "public.orders", "public.payments"] {
-            assert!(overlay.contains(&format!("data-table=\"{table}\"")));
-        }
-        assert!(
-            overlay
-                .contains("stroke-width=\"3\" data-role=\"selected\" data-table=\"public.orders\"")
-        );
-        for table in ["public.accounts", "public.payments"] {
-            assert!(overlay.contains(&format!(
-                "stroke-width=\"1.5\" data-role=\"related\" data-table=\"{table}\""
-            )));
-        }
-        for table in ["public.audits", "public.logs"] {
-            assert!(!overlay.contains(&format!("data-table=\"{table}\"")));
-        }
-        assert!(overlay.contains("marker-end=\"url(#selection-relation-arrow)\""));
-        assert!(overlay.contains("stroke-width=\"2\" stroke-linejoin"));
-        assert_eq!(overlay.matches("#c0ffee").count(), 6);
-        assert!(
-            !document
-                .svg(palette(), None)
-                .contains("selection-relation-arrow")
-        );
-    }
-
-    #[test]
-    fn selection_overlay_handles_self_relationships_and_is_deterministic() {
-        let tree = table(
-            "tree<&",
-            vec![column("id", 0, true), column("parent_id", 1, false)],
-            vec![foreign(&["parent_id"], "tree<&", &["id"])],
-        );
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![tree.clone()],
-        });
-        let reversed = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![tree],
-        });
-
-        let overlay = document
-            .selection_overlay_svg(Some("public.tree<&"), "#c0ffee")
-            .expect("known table has an overlay");
-        assert!(overlay.contains("data-edge=\"public.tree&lt;&amp;:0\""));
-        assert!(overlay.contains("data-self-referential=\"true\""));
-        assert_eq!(overlay.matches("data-table=").count(), 1);
-        assert!(overlay.contains("stroke-width=\"3\" data-role=\"selected\""));
-        assert_eq!(
-            Some(overlay),
-            reversed.selection_overlay_svg(Some("public.tree<&"), "#c0ffee")
-        );
-        assert_eq!(document.selection_overlay_svg(None, "#c0ffee"), None);
-        assert_eq!(
-            document.selection_overlay_svg(Some("public.missing"), "#c0ffee"),
-            None
-        );
-    }
-
-    #[test]
-    fn selection_overlay_preserves_large_document_dimensions_and_stroke() {
-        let document = DiagramDocument {
-            database: "db".into(),
-            nodes: vec![node("selected", 44.0, 44.0, NODE_WIDTH, 75.0)],
-            edges: vec![],
-            width: 4097.0,
-            height: 256.0,
-        };
-        let dimensions = "width=\"4097\" height=\"256\" viewBox=\"0 0 4097 256\"";
-        let canonical = document.svg(palette(), None);
-        let overlay = document
-            .selection_overlay_svg(Some("selected"), "#c0ffee")
-            .expect("known table has an overlay");
-
-        assert!(canonical.contains(dimensions));
-        assert!(overlay.contains(dimensions));
-        assert!(overlay.contains("fill=\"#c0ffee\""));
-        assert!(overlay.contains("stroke=\"#c0ffee\""));
-
-        let escaped_stroke = document
-            .selection_overlay_svg(Some("selected"), r##"url(#accent<&")"##)
-            .expect("known table has an overlay");
-        assert!(escaped_stroke.contains("fill=\"url(#accent&lt;&amp;&quot;)\""));
-    }
-
-    #[test]
-    fn selection_overlay_shares_the_capped_svg_raster_coordinate_space() {
-        // GPUI renders smooth SVGs at 2x. This width therefore exceeds its
-        // 8192px pixmap cap, while the short height keeps the test allocation
-        // bounded to roughly 32 MiB across the two decoded frames.
-        let document = DiagramDocument {
-            database: "db".into(),
-            nodes: vec![node("selected", 1_024.0, 44.0, NODE_WIDTH, 75.0)],
-            edges: vec![],
-            width: 4_097.0,
-            height: 256.0,
-        };
-        let canonical = document.svg(palette(), None);
-        let overlay = document
-            .selection_overlay_svg(Some("selected"), "#c0ffee")
-            .expect("known table has an overlay");
-        let renderer = SvgRenderer::new(Arc::new(()));
-
-        let canonical_image = renderer
-            .render_single_frame(canonical.as_bytes(), 1.0)
-            .expect("canonical SVG should decode");
-        let overlay_image = renderer
-            .render_single_frame(overlay.as_bytes(), 1.0)
-            .expect("overlay SVG should decode");
-        let canonical_size = canonical_image.size(0);
-        let overlay_size = overlay_image.size(0);
-
-        assert_eq!(canonical_size, overlay_size);
-        assert_eq!(u32::from(canonical_size.width), 8_192);
-        assert!(u32::from(canonical_size.height) < 512);
-        assert!(canonical.contains("viewBox=\"0 0 4097 256\""));
-        assert!(overlay.contains("viewBox=\"0 0 4097 256\""));
-    }
-
-    #[test]
     fn referenced_columns_remain_visible_without_becoming_foreign_keys() {
         let mut parent_columns = (0..20)
             .map(|index| column(&format!("column_{index}"), index, index == 0))
@@ -1300,15 +1127,17 @@ mod tests {
     fn vertically_stacked_cards_connect_through_their_facing_borders() {
         let source = node("child", 100.0, 100.0, 100.0, 100.0);
         let target = node("parent", 100.0, 300.0, 100.0, 100.0);
+        let path = edge_path(
+            &source,
+            &target,
+            &foreign(&["parent_id"], "parent", &["id"]),
+            false,
+        );
 
+        assert_eq!(path, "M 150.0 200.0 V 300.0");
         assert_eq!(
-            edge_path(
-                &source,
-                &target,
-                &foreign(&["parent_id"], "parent", &["id"]),
-                false
-            ),
-            "M 150.0 200.0 V 300.0"
+            edge_path_points(&path),
+            vec![(150.0, 200.0), (150.0, 300.0)]
         );
     }
 

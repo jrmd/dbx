@@ -1,11 +1,12 @@
 use super::super::*;
-use crate::diagram::DiagramPalette;
-use gpui::{CursorStyle, MouseButton};
+use crate::diagram::{DiagramPalette, HEADER_HEIGHT, ROW_HEIGHT};
+use gpui::{CursorStyle, MouseButton, PathBuilder, canvas};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::tooltip::Tooltip;
+const DIAGRAM_VIEWPORT_OVERSCAN: f32 = 256.0;
 
 #[derive(Clone)]
 struct DiagramColors {
@@ -44,19 +45,6 @@ impl DiagramColors {
             accent: &self.accent,
             relation: &self.relation,
         }
-    }
-
-    fn cache_key(&self) -> DiagramPaletteKey {
-        DiagramPaletteKey::new([
-            self.canvas.clone(),
-            self.surface.clone(),
-            self.surface_muted.clone(),
-            self.border.clone(),
-            self.text.clone(),
-            self.muted_text.clone(),
-            self.accent.clone(),
-            self.relation.clone(),
-        ])
     }
 }
 
@@ -520,64 +508,216 @@ impl DbxApp {
                 )
                 .into_any_element(),
             Some(document) => {
-                let colors = DiagramColors::current();
-                let base_document = document.clone();
-                let base_colors = colors.clone();
-                let image = self
-                    .diagram_base_scene_image_for(
-                        session_id,
-                        document.clone(),
-                        colors.cache_key(),
-                        move || {
-                            Arc::new(Image::from_bytes(
-                                ImageFormat::Svg,
-                                base_document.svg(base_colors.palette(), None).into_bytes(),
-                            ))
-                        },
-                    )
-                    .expect("active diagram tab remains available while rendering");
-                let selection_overlay = document
-                    .selection_overlay_svg(selected_node.as_deref(), &colors.accent)
-                    .map(|svg| Arc::new(Image::from_bytes(ImageFormat::Svg, svg.into_bytes())));
                 let scene_padding = DIAGRAM_SCENE_PADDING;
                 let scene_width = document.width * zoom + scene_padding * 2.0;
                 let scene_height = document.height * zoom + scene_padding * 2.0;
-                let node_hitboxes = document.nodes.iter().map(|node| {
-                    let node_id = node.id.clone();
-                    let table = node.table.clone();
-                    let label = format!("{} — double-click to open data", node.id);
-                    let node_focus = focus.clone();
-                    div()
-                        .id(SharedString::from(format!("diagram-node-{}", node.id)))
-                        .absolute()
-                        .left(px(scene_padding + node.x * zoom))
-                        .top(px(scene_padding + node.y * zoom))
-                        .w(px(node.width * zoom))
-                        .h(px(node.height * zoom))
-                        .rounded(px(7.))
-                        .cursor_pointer()
-                        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
-                        .hover(|style| style.bg(theme().selection))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |_, _, window, cx| {
-                                node_focus.focus(window, cx);
-                                // A card press belongs to selection/drill-in, not canvas panning.
-                                cx.stop_propagation();
-                            }),
+                let visible_scene = diagram_visible_scene_bounds(
+                    &document,
+                    zoom,
+                    scroll_offset,
+                    available_width,
+                    available_height,
+                );
+                let related_node_ids = selected_node
+                    .as_deref()
+                    .map(|selected| {
+                        document
+                            .edges
+                            .iter()
+                            .filter(|edge| edge.source == selected || edge.target == selected)
+                            .flat_map(|edge| [edge.source.clone(), edge.target.clone()])
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                let edge_routes = document
+                    .edges
+                    .iter()
+                    .filter(|edge| diagram_edge_intersects_scene(&edge.points, visible_scene))
+                    .map(|edge| DiagramEdgeRoute {
+                        points: edge.points.clone(),
+                        highlighted: selected_node.as_deref().is_some_and(|selected| {
+                            edge.source == selected || edge.target == selected
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                let relationships = diagram_relationship_canvas(
+                    edge_routes,
+                    zoom,
+                    theme().text_muted,
+                    theme().accent,
+                )
+                .absolute()
+                .left(px(scene_padding))
+                .top(px(scene_padding))
+                .w(px(document.width * zoom))
+                .h(px(document.height * zoom));
+                let node_cards = document
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        diagram_rect_intersects_scene(
+                            node.x,
+                            node.y,
+                            node.width,
+                            node.height,
+                            visible_scene,
                         )
-                        .on_click(cx.listener(move |this, event, window, cx| {
-                            let double_click = matches!(
-                                event,
-                                gpui::ClickEvent::Mouse(mouse) if mouse.up.click_count > 1
-                            );
-                            if double_click {
-                                this.open_diagram_table_for(session_id, table.clone(), window, cx);
+                    })
+                    .map(|node| {
+                        let node_id = node.id.clone();
+                        let table = node.table.clone();
+                        let label = format!("{} — double-click to open data", node.id);
+                        let selected = selected_node.as_deref() == Some(node.id.as_str());
+                        let related = related_node_ids.contains(node.id.as_str());
+                        let node_focus = focus.clone();
+                        let title_size = (14.0 * zoom).max(7.0);
+                        let schema_size = (10.0 * zoom).max(6.0);
+                        let row_size = (11.0 * zoom).max(6.0);
+                        let key_size = (10.0 * zoom).max(6.0);
+                        let horizontal_padding = (12.0 * zoom).max(4.0);
+                        let key_width = (26.0 * zoom).max(12.0);
+                        let schema = node
+                            .table
+                            .schema
+                            .clone()
+                            .unwrap_or_else(|| "default".into());
+                        let rows = node.columns.iter().map(|column| {
+                            let key = if column.primary_key {
+                                "PK"
+                            } else if column.foreign_key {
+                                "FK"
                             } else {
-                                this.select_diagram_node_for(session_id, Some(node_id.clone()), cx);
-                            }
-                        }))
-                });
+                                ""
+                            };
+                            let data_type = format!(
+                                "{}{}",
+                                column.data_type,
+                                if column.nullable { "" } else { " · not null" }
+                            );
+                            div()
+                                .h(px(ROW_HEIGHT * zoom))
+                                .px(px(horizontal_padding))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .text_size(px(row_size))
+                                .child(
+                                    div()
+                                        .w(px(key_width))
+                                        .flex_none()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_size(px(key_size))
+                                        .text_color(theme().accent)
+                                        .child(key),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme().text)
+                                        .child(column.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .ml(px((8.0 * zoom).max(2.0)))
+                                        .max_w(px(node.width * zoom * 0.46))
+                                        .truncate()
+                                        .text_color(theme().text_muted)
+                                        .child(data_type),
+                                )
+                        });
+                        let omitted_row = (node.omitted_columns > 0).then(|| {
+                            div()
+                                .h(px(ROW_HEIGHT * zoom))
+                                .px(px(horizontal_padding))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .text_size(px(row_size))
+                                .text_color(theme().text_muted)
+                                .child(format!("+{} more columns", node.omitted_columns))
+                        });
+
+                        div()
+                            .id(SharedString::from(format!("diagram-node-{}", node.id)))
+                            .absolute()
+                            .left(px(scene_padding + node.x * zoom))
+                            .top(px(scene_padding + node.y * zoom))
+                            .w(px(node.width * zoom))
+                            .h(px(node.height * zoom))
+                            .overflow_hidden()
+                            .rounded(px((8.0 * zoom).max(3.0)))
+                            .border_1()
+                            .border_color(theme().border_strong)
+                            .bg(theme().panel)
+                            .when(related && !selected, |view| {
+                                view.border_color(theme().accent.alpha(0.72))
+                            })
+                            .when(selected, |view| {
+                                view.border_2().border_color(theme().accent)
+                            })
+                            .cursor_pointer()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(label.clone()).build(window, cx)
+                            })
+                            .hover(|style| style.bg(theme().selection))
+                            .child(
+                                div()
+                                    .h(px(HEADER_HEIGHT * zoom))
+                                    .px(px(horizontal_padding))
+                                    .flex_none()
+                                    .flex()
+                                    .flex_col()
+                                    .justify_center()
+                                    .bg(theme().panel_raised)
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_size(px(title_size))
+                                            .text_color(theme().text)
+                                            .child(node.table.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(schema_size))
+                                            .text_color(theme().text_muted)
+                                            .child(schema),
+                                    ),
+                            )
+                            .children(rows)
+                            .when_some(omitted_row, |view, row| view.child(row))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_, _, window, cx| {
+                                    node_focus.focus(window, cx);
+                                    // A card press belongs to selection/drill-in, not canvas panning.
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_click(cx.listener(move |this, event, window, cx| {
+                                let double_click = matches!(
+                                    event,
+                                    gpui::ClickEvent::Mouse(mouse) if mouse.up.click_count > 1
+                                );
+                                if double_click {
+                                    this.open_diagram_table_for(
+                                        session_id,
+                                        table.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                } else {
+                                    this.select_diagram_node_for(
+                                        session_id,
+                                        Some(node_id.clone()),
+                                        cx,
+                                    );
+                                }
+                            }))
+                    });
                 div()
                     .id("diagram-scroll")
                     .flex_1()
@@ -628,29 +768,8 @@ impl DbxApp {
                             .relative()
                             .w(px(scene_width))
                             .h(px(scene_height))
-                            .child(
-                                img(image)
-                                    .absolute()
-                                    .left(px(scene_padding))
-                                    .top(px(scene_padding))
-                                    .w(px(document.width * zoom))
-                                    .h(px(document.height * zoom))
-                                    .object_fit(gpui::ObjectFit::Fill),
-                            )
-                            // Selection stays below hitboxes, so its async decode cannot blank the base
-                            // scene or intercept table presses.
-                            .when_some(selection_overlay, |scene, overlay| {
-                                scene.child(
-                                    img(overlay)
-                                        .absolute()
-                                        .left(px(scene_padding))
-                                        .top(px(scene_padding))
-                                        .w(px(document.width * zoom))
-                                        .h(px(document.height * zoom))
-                                        .object_fit(gpui::ObjectFit::Fill),
-                                )
-                            })
-                            .children(node_hitboxes),
+                            .child(relationships)
+                            .children(node_cards),
                     )
                     .into_any_element()
             }
@@ -807,6 +926,175 @@ impl DbxApp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DiagramSceneBounds {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+fn diagram_visible_scene_bounds(
+    document: &DiagramDocument,
+    zoom: f32,
+    scroll_offset: Point<Pixels>,
+    available_width: f32,
+    available_height: f32,
+) -> DiagramSceneBounds {
+    let zoom = zoom.max(0.01);
+    let document_width = document.width.max(1.0);
+    let document_height = document.height.max(1.0);
+    let scroll_x = (-f32::from(scroll_offset.x)).max(0.0);
+    let scroll_y = (-f32::from(scroll_offset.y)).max(0.0);
+    let viewport_left = ((scroll_x - DIAGRAM_SCENE_PADDING) / zoom).clamp(0.0, document_width);
+    let viewport_top = ((scroll_y - DIAGRAM_SCENE_PADDING) / zoom).clamp(0.0, document_height);
+    let viewport_right = ((scroll_x - DIAGRAM_SCENE_PADDING + available_width.max(1.0)) / zoom)
+        .clamp(0.0, document_width);
+    let viewport_bottom = ((scroll_y - DIAGRAM_SCENE_PADDING + available_height.max(1.0)) / zoom)
+        .clamp(0.0, document_height);
+
+    DiagramSceneBounds {
+        left: (viewport_left - DIAGRAM_VIEWPORT_OVERSCAN).max(0.0),
+        top: (viewport_top - DIAGRAM_VIEWPORT_OVERSCAN).max(0.0),
+        right: (viewport_right + DIAGRAM_VIEWPORT_OVERSCAN).min(document_width),
+        bottom: (viewport_bottom + DIAGRAM_VIEWPORT_OVERSCAN).min(document_height),
+    }
+}
+
+fn diagram_rect_intersects_scene(
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    scene: DiagramSceneBounds,
+) -> bool {
+    left < scene.right
+        && left + width > scene.left
+        && top < scene.bottom
+        && top + height > scene.top
+}
+
+fn diagram_edge_intersects_scene(points: &[(f32, f32)], scene: DiagramSceneBounds) -> bool {
+    const EDGE_CULL_MARGIN: f32 = 40.0;
+    let expanded = DiagramSceneBounds {
+        left: scene.left - EDGE_CULL_MARGIN,
+        top: scene.top - EDGE_CULL_MARGIN,
+        right: scene.right + EDGE_CULL_MARGIN,
+        bottom: scene.bottom + EDGE_CULL_MARGIN,
+    };
+    points.windows(2).any(|segment| {
+        let left = segment[0].0.min(segment[1].0);
+        let top = segment[0].1.min(segment[1].1);
+        let right = segment[0].0.max(segment[1].0);
+        let bottom = segment[0].1.max(segment[1].1);
+        left <= expanded.right
+            && right >= expanded.left
+            && top <= expanded.bottom
+            && bottom >= expanded.top
+    })
+}
+
+struct DiagramPaintedEdge {
+    line: gpui::Path<Pixels>,
+    arrow: Option<gpui::Path<Pixels>>,
+    highlighted: bool,
+}
+
+struct DiagramEdgeRoute {
+    points: Vec<(f32, f32)>,
+    highlighted: bool,
+}
+
+fn diagram_relationship_canvas(
+    routes: Vec<DiagramEdgeRoute>,
+    zoom: f32,
+    color: Rgba,
+    highlight_color: Rgba,
+) -> gpui::Canvas<Vec<DiagramPaintedEdge>> {
+    canvas(
+        move |bounds, _, _| {
+            routes
+                .into_iter()
+                .filter_map(|route| {
+                    diagram_painted_edge(bounds, &route.points, zoom, route.highlighted)
+                })
+                .collect::<Vec<_>>()
+        },
+        move |_, edges, window, _| {
+            for edge in edges {
+                let edge_color = if edge.highlighted {
+                    highlight_color
+                } else {
+                    color
+                };
+                window.paint_path(edge.line, edge_color);
+                if let Some(arrow) = edge.arrow {
+                    window.paint_path(arrow, edge_color);
+                }
+            }
+        },
+    )
+}
+
+fn diagram_painted_edge(
+    bounds: gpui::Bounds<Pixels>,
+    points: &[(f32, f32)],
+    zoom: f32,
+    highlighted: bool,
+) -> Option<DiagramPaintedEdge> {
+    let first = *points.first()?;
+    let to_canvas = |(x, y): (f32, f32)| {
+        point(
+            bounds.origin.x + px(x * zoom),
+            bounds.origin.y + px(y * zoom),
+        )
+    };
+    let stroke_width = if highlighted { 2.0 } else { 1.5 };
+    let mut line = PathBuilder::stroke(px((stroke_width * zoom).max(1.0)));
+    line.move_to(to_canvas(first));
+    for point in points.iter().skip(1).copied() {
+        line.line_to(to_canvas(point));
+    }
+    let line = line.build().ok()?;
+
+    let arrow = points.windows(2).rev().find_map(|segment| {
+        let previous = segment[0];
+        let tip = segment[1];
+        let dx = tip.0 - previous.0;
+        let dy = tip.1 - previous.1;
+        let length = dx.hypot(dy);
+        if length <= f32::EPSILON {
+            return None;
+        }
+        let direction = (dx / length, dy / length);
+        let arrow_length = (8.0 * zoom).max(4.0);
+        let arrow_half_width = (4.0 * zoom).max(2.0);
+        let tip = to_canvas(tip);
+        let base = point(
+            tip.x - px(direction.0 * arrow_length),
+            tip.y - px(direction.1 * arrow_length),
+        );
+        let perpendicular = (-direction.1, direction.0);
+        let left = point(
+            base.x + px(perpendicular.0 * arrow_half_width),
+            base.y + px(perpendicular.1 * arrow_half_width),
+        );
+        let right = point(
+            base.x - px(perpendicular.0 * arrow_half_width),
+            base.y - px(perpendicular.1 * arrow_half_width),
+        );
+        let mut arrow = PathBuilder::fill();
+        arrow.add_polygon(&[tip, left, right], true);
+        arrow.build().ok()
+    });
+
+    Some(DiagramPaintedEdge {
+        line,
+        arrow,
+        highlighted,
+    })
+}
+
 fn color_hex(color: Rgba) -> String {
     format!("#{:06x}", u32::from(color) >> 8)
 }
@@ -858,5 +1146,57 @@ mod tests {
             compact_schema_name("a_very_long_schema_name"),
             "a_very_long_schema…"
         );
+    }
+
+    #[test]
+    fn native_diagram_viewport_keeps_render_work_bounded() {
+        let document = DiagramDocument {
+            database: "large".into(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            width: 100_000.0,
+            height: 80_000.0,
+        };
+        let visible = diagram_visible_scene_bounds(
+            &document,
+            1.0,
+            point(px(-50_000.0), px(-20_000.0)),
+            1_000.0,
+            600.0,
+        );
+
+        assert!(visible.right - visible.left <= 1_000.0 + DIAGRAM_VIEWPORT_OVERSCAN * 2.0);
+        assert!(visible.bottom - visible.top <= 600.0 + DIAGRAM_VIEWPORT_OVERSCAN * 2.0);
+        assert!(visible.left > 0.0);
+        assert!(visible.right < document.width);
+    }
+
+    #[test]
+    fn native_diagram_culls_offscreen_cards_and_relationships() {
+        let visible = DiagramSceneBounds {
+            left: 1_000.0,
+            top: 1_000.0,
+            right: 2_000.0,
+            bottom: 2_000.0,
+        };
+
+        assert!(diagram_rect_intersects_scene(
+            1_900.0, 1_900.0, 200.0, 200.0, visible
+        ));
+        assert!(!diagram_rect_intersects_scene(
+            100.0, 100.0, 200.0, 200.0, visible
+        ));
+        assert!(diagram_edge_intersects_scene(
+            &[(500.0, 1_500.0), (2_500.0, 1_500.0)],
+            visible,
+        ));
+        assert!(!diagram_edge_intersects_scene(
+            &[(100.0, 100.0), (500.0, 100.0)],
+            visible,
+        ));
+        assert!(!diagram_edge_intersects_scene(
+            &[(500.0, 500.0), (2_500.0, 500.0), (2_500.0, 2_500.0)],
+            visible,
+        ));
     }
 }
