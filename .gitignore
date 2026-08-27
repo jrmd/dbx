@@ -39,3 +39,5 @@ Desktop.ini
 *.tmp
 *.bak
 *.orig
+
+.codegraph
