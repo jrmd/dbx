@@ -25,6 +25,8 @@ pub(super) enum CompletionItemKind {
     Table,
     Column,
     Function,
+    Command,
+    Key,
 }
 
 impl CompletionItemKind {
@@ -35,6 +37,8 @@ impl CompletionItemKind {
             Self::Table => "table",
             Self::Column => "column",
             Self::Function => "function",
+            Self::Command => "command",
+            Self::Key => "key",
         }
     }
 }
@@ -46,6 +50,24 @@ pub(super) struct SqlCompletionItem {
     pub(super) detail: String,
     search_text: String,
     pub(super) kind: CompletionItemKind,
+}
+
+impl SqlCompletionItem {
+    pub(super) fn new(
+        label: impl Into<String>,
+        insert_text: impl Into<String>,
+        detail: impl Into<String>,
+        search_text: impl Into<String>,
+        kind: CompletionItemKind,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            insert_text: insert_text.into(),
+            detail: detail.into(),
+            search_text: search_text.into(),
+            kind,
+        }
+    }
 }
 
 pub(super) struct SqlCompletionRequest<'a> {
@@ -134,6 +156,9 @@ pub(super) fn sql_completion_items(
         active_schema_filter,
     } = sources;
     let prefix = context.prefix.trim_matches(['"', '`']).to_ascii_lowercase();
+    let append_separator = completion_needs_separator(query_text, context.replacement_range.end);
+    let offer_keywords =
+        !prefix.is_empty() && context.quote.is_none() && context.qualifier.is_none();
     let mut items = Vec::new();
     let mut seen = HashSet::new();
 
@@ -153,13 +178,18 @@ pub(super) fn sql_completion_items(
 
     match area {
         SqlCompletionArea::General => {
-            push_sql_keywords(&mut push);
+            push_sql_keywords(&mut push, append_separator);
             if sql_is_create_table_columns(query_text, cursor) {
-                push_sql_types(&mut push);
+                push_sql_types(&mut push, append_separator);
             }
             push_sql_functions(&mut push);
         }
-        SqlCompletionArea::Type => push_sql_types(&mut push),
+        SqlCompletionArea::Type => {
+            push_sql_types(&mut push, append_separator);
+            if offer_keywords {
+                push_sql_keywords(&mut push, append_separator);
+            }
+        }
         SqlCompletionArea::Table => {
             push_table_candidates(
                 &mut push,
@@ -169,6 +199,9 @@ pub(super) fn sql_completion_items(
                 context,
                 active_schema_filter,
             );
+            if offer_keywords {
+                push_sql_keywords(&mut push, append_separator);
+            }
         }
         SqlCompletionArea::Column => {
             if context.qualifier.is_none() {
@@ -283,6 +316,9 @@ pub(super) fn sql_completion_items(
             // they make no sense at all.
             if context.qualifier.is_none() {
                 push_sql_functions(&mut push);
+            }
+            if offer_keywords {
+                push_sql_keywords(&mut push, append_separator);
             }
         }
     }
@@ -1180,11 +1216,20 @@ fn infer_insert_columns(query_text: &str) -> HashSet<String> {
         .collect()
 }
 
-fn push_sql_keywords(push: &mut impl FnMut(SqlCompletionItem)) {
+fn completion_needs_separator(query_text: &str, replacement_end: usize) -> bool {
+    query_text
+        .get(replacement_end..)
+        .and_then(|suffix| suffix.chars().next())
+        .is_none_or(|character| {
+            !character.is_whitespace() && !matches!(character, ',' | ')' | ';' | '.')
+        })
+}
+
+fn push_sql_keywords(push: &mut impl FnMut(SqlCompletionItem), append_separator: bool) {
     for keyword in editor::sql_completion_keywords() {
         push(SqlCompletionItem {
             label: (*keyword).into(),
-            insert_text: (*keyword).into(),
+            insert_text: format!("{keyword}{}", if append_separator { " " } else { "" }),
             detail: "SQL keyword".into(),
             search_text: (*keyword).into(),
             kind: CompletionItemKind::Keyword,
@@ -1192,11 +1237,11 @@ fn push_sql_keywords(push: &mut impl FnMut(SqlCompletionItem)) {
     }
 }
 
-fn push_sql_types(push: &mut impl FnMut(SqlCompletionItem)) {
+fn push_sql_types(push: &mut impl FnMut(SqlCompletionItem), append_separator: bool) {
     for sql_type in editor::sql_completion_types() {
         push(SqlCompletionItem {
             label: (*sql_type).into(),
-            insert_text: (*sql_type).into(),
+            insert_text: format!("{sql_type}{}", if append_separator { " " } else { "" }),
             detail: "SQL type".into(),
             search_text: (*sql_type).into(),
             kind: CompletionItemKind::Type,
@@ -1472,6 +1517,84 @@ mod tests {
         assert_eq!(
             completion_identifier(DatabaseKind::PostgreSQL, "display name", Some('"')),
             "display name"
+        );
+    }
+
+    #[test]
+    fn keyword_completion_inserts_exactly_one_separator_when_needed() {
+        let tables = Vec::new();
+        let columns = HashMap::new();
+        let items_for = |query: &str, cursor: usize| {
+            let context = editor::sql_completion_context(query, cursor).unwrap();
+            sql_completion_items(
+                query,
+                cursor,
+                &context,
+                SqlCompletionRequest {
+                    database_kind: DatabaseKind::PostgreSQL,
+                    tables: &tables,
+                    completion_columns: &columns,
+                    selected_table: None,
+                    active_columns: &[],
+                    result: None,
+                    active_schema_filter: None,
+                },
+            )
+        };
+        let select_text = |items: Vec<SqlCompletionItem>| {
+            items
+                .into_iter()
+                .find(|item| item.label == "SELECT")
+                .expect("SELECT completion")
+                .insert_text
+        };
+
+        assert_eq!(select_text(items_for("SEL", 3)), "SELECT ");
+        assert_eq!(select_text(items_for("SEL *", 3)), "SELECT");
+        assert_eq!(select_text(items_for("SEL,", 3)), "SELECT");
+        assert_eq!(select_text(items_for("SEL*", 3)), "SELECT ");
+    }
+
+    #[test]
+    fn keyword_completion_continues_matching_after_the_first_clause() {
+        let tables = Vec::new();
+        let columns = HashMap::new();
+        let items_for = |query: &str| {
+            let cursor = query.len();
+            let context = editor::sql_completion_context(query, cursor).unwrap();
+            sql_completion_items(
+                query,
+                cursor,
+                &context,
+                SqlCompletionRequest {
+                    database_kind: DatabaseKind::PostgreSQL,
+                    tables: &tables,
+                    completion_columns: &columns,
+                    selected_table: None,
+                    active_columns: &[],
+                    result: None,
+                    active_schema_filter: None,
+                },
+            )
+        };
+        let has_keyword = |query: &str, keyword: &str| {
+            items_for(query)
+                .iter()
+                .any(|item| item.kind == CompletionItemKind::Keyword && item.label == keyword)
+        };
+
+        let missing = [
+            ("SELECT * FR", "FROM"),
+            ("SELECT id FROM users WH", "WHERE"),
+            ("SELECT * FROM users JO", "JOIN"),
+            ("SELECT * FROM users ORDER B", "BY"),
+        ]
+        .into_iter()
+        .filter(|(query, keyword)| !has_keyword(query, keyword))
+        .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "missing keyword completions: {missing:?}"
         );
     }
 
