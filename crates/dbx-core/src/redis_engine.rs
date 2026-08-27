@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use redis::{Client, Cmd, Value, aio::MultiplexedConnection};
 
+use crate::RedisCommandCatalog;
 use crate::engine::{exec_result, query_result, row_limit};
 use crate::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError, EntityKind, ExecResult,
@@ -71,6 +72,26 @@ impl RedisEngine {
 
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Discover this server's commands from its own runtime metadata.
+    ///
+    /// Redis 7+ documents command arguments through `COMMAND DOCS`. Older
+    /// servers (and deployments which restrict DOCS) still expose names via
+    /// `COMMAND`, so callers retain server-advertised command-name completion.
+    pub async fn command_catalog(&self) -> Result<RedisCommandCatalog> {
+        match self.send_command("COMMAND DOCS", &[]).await {
+            Ok(value) => match RedisCommandCatalog::from_command_docs(&value) {
+                Ok(catalog) => Ok(catalog),
+                Err(_) => self.command_catalog_fallback().await,
+            },
+            Err(_) => self.command_catalog_fallback().await,
+        }
+    }
+
+    async fn command_catalog_fallback(&self) -> Result<RedisCommandCatalog> {
+        let value = self.send_command("COMMAND", &[]).await?;
+        RedisCommandCatalog::from_command_metadata(&value)
     }
 
     /// Number of logical databases the server exposes. Falls back to the

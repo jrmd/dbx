@@ -614,6 +614,7 @@ impl DbxApp {
         cx.spawn(async move |this, cx| {
             let result = task.await?;
             this.update(cx, |this, cx| {
+                let connected = result.is_ok();
                 let Some(session) = this.session_mut(session_id) else {
                     return;
                 };
@@ -660,6 +661,9 @@ impl DbxApp {
                 }
                 cx.notify();
                 this.prefetch_completion_columns_for(session_id, cx);
+                if connected {
+                    this.prefetch_redis_command_catalog_for(session_id, cx);
+                }
             })?;
             Ok::<(), anyhow::Error>(())
         })

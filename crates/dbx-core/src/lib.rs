@@ -8,6 +8,7 @@
 mod engine;
 mod error;
 mod model;
+mod redis_catalog;
 mod redis_engine;
 mod sql;
 mod sqlx_engine;
@@ -21,6 +22,7 @@ pub use model::{
     Order, OrderDirection, Page, QueryResult, ReferentialAction, RelationalSchema, RelationalTable,
     RowData, TableInfo, TableRef, TableStructure, UpdateRequest,
 };
+pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
 pub use sql::{
     SqlStatement, build_create_table, build_delete, build_drop_table, build_insert,
