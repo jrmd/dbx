@@ -343,6 +343,78 @@ impl DatabaseKindUrlExt for DatabaseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::{ConnectionProfileDraft, ProfileStore};
+    use dbx_core::{ConnectionConfig, DatabaseEngine};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    async fn write_postgres_message(
+        stream: &mut TcpStream,
+        tag: u8,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        stream.write_all(&[tag]).await?;
+        stream
+            .write_all(&((body.len() + 4) as u32).to_be_bytes())
+            .await?;
+        stream.write_all(body).await
+    }
+
+    async fn capture_postgres_cleartext_password(
+        listener: TcpListener,
+        captured: oneshot::Sender<Vec<u8>>,
+        shutdown: oneshot::Receiver<()>,
+    ) -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept().await?;
+
+        let startup_length = stream.read_u32().await? as usize;
+        assert!(startup_length >= 8);
+        let mut startup = vec![0; startup_length - 4];
+        stream.read_exact(&mut startup).await?;
+        assert_eq!(&startup[..4], &196_608_u32.to_be_bytes());
+
+        write_postgres_message(&mut stream, b'R', &3_u32.to_be_bytes()).await?;
+
+        assert_eq!(stream.read_u8().await?, b'p');
+        let password_length = stream.read_u32().await? as usize;
+        assert!(password_length >= 5);
+        let mut password = vec![0; password_length - 4];
+        stream.read_exact(&mut password).await?;
+        assert_eq!(password.pop(), Some(0));
+        let _ = captured.send(password);
+
+        write_postgres_message(&mut stream, b'R', &0_u32.to_be_bytes()).await?;
+        write_postgres_message(&mut stream, b'Z', b"I").await?;
+        let _ = shutdown.await;
+        Ok(())
+    }
+
+    async fn password_sent_to_postgres(url_for_port: impl FnOnce(u16) -> String) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(capture_postgres_cleartext_password(
+            listener,
+            captured_tx,
+            shutdown_rx,
+        ));
+
+        let engine = DatabaseEngine::connect(
+            ConnectionConfig::new(DatabaseKind::PostgreSQL, url_for_port(port))
+                .with_max_connections(1)
+                .with_connect_timeout_ms(2_000),
+        )
+        .await
+        .unwrap();
+        let captured = captured_rx.await.unwrap();
+
+        drop(engine);
+        let _ = shutdown_tx.send(());
+        server.await.unwrap().unwrap();
+        captured
+    }
 
     #[test]
     fn builds_postgres_url_with_percent_encoded_credentials_and_database() {
@@ -356,6 +428,69 @@ mod tests {
             fields.url().unwrap(),
             "postgres://al%20ice%40example%3A%2F%3F%23%25%5B%5D%E2%9C%93:p%40ss%20word%3A%2F%3F%23%25%5B%5D%E2%9C%93@db.example.test:5432/team%2Fdata"
         );
+    }
+
+    #[tokio::test]
+    async fn postgres_receives_literal_reserved_character_password() {
+        let password = password_sent_to_postgres(|port| {
+            let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
+            fields.host = "127.0.0.1".into();
+            fields.port = port.to_string();
+            fields.username = "dbx_auth_probe".into();
+            fields.password = "% & <".into();
+            fields.database = "dbx_auth_probe".into();
+            format!("{}?sslmode=disable", fields.url().unwrap())
+        })
+        .await;
+
+        assert_eq!(password, b"% & <");
+    }
+
+    #[tokio::test]
+    async fn postgres_receives_literal_password_from_raw_and_encoded_connection_strings() {
+        let raw = password_sent_to_postgres(|port| {
+            ConnectionFields::from_url(format!(
+                "postgres://dbx_auth_probe:% & <@127.0.0.1:{port}/dbx_auth_probe?sslmode=disable"
+            ))
+            .unwrap()
+            .url()
+            .unwrap()
+        })
+        .await;
+        assert_eq!(raw, b"% & <");
+
+        let encoded = password_sent_to_postgres(|port| {
+            ConnectionFields::from_url(format!(
+                "postgres://dbx_auth_probe:%25%20%26%20%3C@127.0.0.1:{port}/dbx_auth_probe?sslmode=disable"
+            ))
+            .unwrap()
+            .url()
+            .unwrap()
+        })
+        .await;
+        assert_eq!(encoded, b"% & <");
+    }
+
+    #[tokio::test]
+    async fn postgres_receives_literal_password_after_profile_save_and_load() {
+        let password = password_sent_to_postgres(|port| {
+            let directory = tempfile::tempdir().unwrap();
+            let store = ProfileStore::at(directory.path().join("profiles.json"));
+            store.vault().unwrap().create("test vault passphrase").unwrap();
+            let saved = store
+                .save(ConnectionProfileDraft::new(
+                    "Auth probe",
+                    DatabaseKind::PostgreSQL,
+                    format!(
+                        "postgres://dbx_auth_probe:% & <@127.0.0.1:{port}/dbx_auth_probe?sslmode=disable"
+                    ),
+                ))
+                .unwrap();
+            store.load(saved.id).unwrap().config.url
+        })
+        .await;
+
+        assert_eq!(password, b"% & <");
     }
 
     #[test]
