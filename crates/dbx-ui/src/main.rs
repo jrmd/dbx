@@ -46,6 +46,7 @@ fn main() {
             cx.bind_keys([
                 KeyBinding::new("tab", app::VaultFocusNext, Some("VaultGate")),
                 KeyBinding::new("shift-tab", app::VaultFocusPrevious, Some("VaultGate")),
+                KeyBinding::new("enter", app::SubmitVault, Some("VaultGate")),
                 KeyBinding::new("cmd-enter", app::RunQuery, Some(editor::SQL_EDITOR_CONTEXT)),
                 KeyBinding::new(
                     "ctrl-enter",
