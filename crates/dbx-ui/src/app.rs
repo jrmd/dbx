@@ -24,8 +24,9 @@ use std::{
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
     DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Page,
-    QueryOptions, QueryResult, ReferentialAction, RelationalSchema, RowData, TableInfo, TableRef,
-    UpdateRequest, detect_file_format, export_database, export_table, import_database, import_file,
+    QueryOptions, QueryResult, RedisCommandCatalog, ReferentialAction, RelationalSchema, RowData,
+    TableInfo, TableRef, UpdateRequest, detect_file_format, export_database, export_table,
+    import_database, import_file,
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable as _, FontWeight,
@@ -684,6 +685,10 @@ struct ConnectionSession {
     /// supplies table names; columns are added as tables are opened or their
     /// structure is inspected, avoiding a metadata query for every keystroke.
     completion_columns: HashMap<String, Vec<ColumnInfo>>,
+    /// Authoritative command grammar discovered once from the connected
+    /// Redis/Valkey server. Completion only reads this cache; it never performs
+    /// network I/O while the user is typing.
+    redis_command_catalog: Option<Arc<RedisCommandCatalog>>,
     /// Databases reachable through this connection, for the sidebar switcher.
     databases: Vec<String>,
     /// Database the engine currently uses, if the backend reports one.
@@ -759,6 +764,7 @@ impl ConnectionSession {
             closed_queries: Vec::new(),
             tables: Vec::new(),
             completion_columns: HashMap::new(),
+            redis_command_catalog: None,
             databases: Vec::new(),
             current_database: None,
             schema_filter: None,
@@ -2798,6 +2804,7 @@ impl DbxApp {
                 let (replacement_range, items, signature) = redis_completion_items(
                     &query_text,
                     cursor,
+                    session.redis_command_catalog.as_deref(),
                     query_tab.result.as_deref(),
                     session.result.as_deref(),
                 )?;
@@ -3712,6 +3719,64 @@ impl DbxApp {
                 session.completion_columns.extend(metadata);
                 cx.notify();
             })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Discover the exact command grammar exposed by this Redis/Valkey server
+    /// once per connection. The editor keeps using its local fallback until
+    /// this background request finishes, and discovery failures never make an
+    /// otherwise healthy database connection unusable.
+    fn prefetch_redis_command_catalog_for(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, kind)) = self
+            .session(session_id)
+            .map(|session| (session.engine.clone(), session.kind))
+        else {
+            return;
+        };
+        let Some(engine) = engine else {
+            return;
+        };
+        if kind != DatabaseKind::Redis {
+            return;
+        }
+
+        let expected_engine = engine.clone();
+        let runtime = self.runtime.clone();
+        let task = runtime.spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.redis_command_catalog(),
+            )
+            .await
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
+
+        cx.spawn(async move |this, cx| {
+            let catalog = task.await?;
+            if let Ok(Ok(catalog)) = catalog {
+                this.update(cx, |this, cx| {
+                    let Some(session) = this.session_mut(session_id) else {
+                        return;
+                    };
+                    let same_engine = session
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &expected_engine));
+                    if session.kind != DatabaseKind::Redis || !same_engine {
+                        return;
+                    }
+                    session.redis_command_catalog = Some(Arc::new(catalog));
+                    cx.notify();
+                })?;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .detach();
@@ -5236,7 +5301,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn focused_redis_query_renders_completion_menu(cx: &mut gpui::TestAppContext) {
+    fn focused_redis_query_renders_runtime_catalog_completion_menu(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let session_id = Uuid::new_v4();
         let (app, cx) = cx.add_window_view(|window, cx| {
@@ -5255,6 +5320,15 @@ mod tests {
             query
                 .query_editor
                 .update(cx, |editor, cx| editor.set_text("", cx));
+            session.redis_command_catalog = Some(Arc::new(RedisCommandCatalog {
+                commands: vec![dbx_core::RedisCommand {
+                    name: "JSON.GET".into(),
+                    summary: Some("Get a value from a JSON document".into()),
+                    group: Some("json".into()),
+                    since: Some("1.0.0".into()),
+                    arguments: Vec::new(),
+                }],
+            }));
             session.secondary_tabs.push(SecondaryTab {
                 id: tab_id,
                 kind: SecondaryTabKind::Query(Box::new(query)),
@@ -5266,7 +5340,7 @@ mod tests {
             app
         });
 
-        cx.simulate_input("GE");
+        cx.simulate_input("JSON.G");
         cx.update(|window, cx| {
             let focus = app
                 .read(cx)
@@ -5278,15 +5352,15 @@ mod tests {
             let menu = app.update(cx, |app, cx| app.query_completion_for(session_id, cx));
             assert!(
                 menu.as_ref()
-                    .is_some_and(|menu| menu.items.iter().any(|item| item.label == "GET")),
-                "focused Redis query should resolve a GET candidate before painting"
+                    .is_some_and(|menu| menu.items.iter().any(|item| item.label == "JSON.GET")),
+                "focused Redis query should resolve a module command before painting"
             );
             window.draw(cx).clear(cx)
         });
 
         assert!(
             cx.debug_bounds("sql-completion-menu").is_some(),
-            "a focused Redis query with a partial command must paint its completion popup"
+            "a focused Redis query with a partial module command must paint its completion popup"
         );
 
         cx.simulate_keystrokes("tab");
@@ -5302,7 +5376,7 @@ mod tests {
                     SecondaryTabKind::Structure(_) | SecondaryTabKind::Diagram(_) => None,
                 })
         });
-        assert_eq!(query_text.as_deref(), Some("GET "));
+        assert_eq!(query_text.as_deref(), Some("JSON.GET "));
     }
 
     struct DropProbe(Arc<AtomicBool>);

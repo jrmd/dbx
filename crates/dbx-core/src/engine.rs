@@ -98,6 +98,17 @@ impl DatabaseEngine {
         }
     }
 
+    /// Discover the Redis commands available on this connected server.
+    pub async fn redis_command_catalog(&self) -> Result<crate::RedisCommandCatalog> {
+        match self {
+            Self::Redis(engine) => engine.command_catalog().await,
+            Self::Sql(_) => Err(DbxError::Unsupported {
+                operation: "redis_command_catalog".into(),
+                kind: self.kind(),
+            }),
+        }
+    }
+
     pub async fn list_tables(&self) -> Result<Vec<TableInfo>> {
         Engine::list_tables(self).await
     }
