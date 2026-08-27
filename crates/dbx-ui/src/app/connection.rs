@@ -326,6 +326,7 @@ impl DbxApp {
         cx: &mut Context<Self>,
     ) {
         self.cancel_credential_hydration();
+        self.compact_connection_form_open = true;
         let has_saved_password = profile.has_secret();
         let profile_id = profile.id;
         self.draft.selected_profile = Some(profile.id);
@@ -347,6 +348,57 @@ impl DbxApp {
         cx.notify();
     }
 
+    pub(super) fn select_saved_connection_in_compact_picker(
+        &mut self,
+        profile: SavedConnection,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_saved_connection(profile, cx);
+        // Keep the row under the pointer so a second click can complete the
+        // native double-click gesture. Editing is an explicit compact action.
+        self.compact_connection_form_open = false;
+        cx.notify();
+    }
+
+    pub(super) fn show_selected_connection_form(&mut self, cx: &mut Context<Self>) {
+        if self.draft.selected_profile.is_some() {
+            self.compact_connection_form_open = true;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn open_saved_connection(
+        &mut self,
+        profile: SavedConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let profile_id = profile.id;
+        if self.draft.selected_profile != Some(profile_id) {
+            self.select_saved_connection(profile.clone(), cx);
+        } else if profile.has_secret()
+            && !self.credential_hydrating
+            && self.draft.password.read(cx).is_empty()
+        {
+            self.hydrate_saved_credential(profile_id, cx);
+        }
+
+        if self.credential_hydrating {
+            let Some(window_handle) = window.window_handle().downcast::<DbxApp>() else {
+                self.set_error("Could not open the saved connection in this window".into());
+                cx.notify();
+                return;
+            };
+            self.credential_connect_window = Some(window_handle);
+            self.status = format!("Opening ‘{}’ after its password loads…", profile.name);
+            self.error = None;
+            cx.notify();
+            return;
+        }
+
+        self.connect(window, cx);
+    }
+
     fn hydrate_saved_credential(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
         let Some(store) = self.profile_store.clone() else {
             return;
@@ -358,8 +410,10 @@ impl DbxApp {
         let runtime = self.runtime.clone();
         cx.spawn(async move |this, cx| {
             let result = runtime.spawn_blocking(move || store.load(profile_id)).await?;
-            this.update(cx, |this, cx| {
-                if this.credential_hydration_generation != hydration_generation { return; }
+            let connect_window = this.update(cx, |this, cx| {
+                if this.credential_hydration_generation != hydration_generation {
+                    return None;
+                }
                 this.credential_hydrating = false;
                 if !hydration_matches_current_draft(
                     this.draft.selected_profile,
@@ -367,10 +421,11 @@ impl DbxApp {
                     &this.connection_fields(cx),
                     &requested_fields,
                 ) {
+                    this.credential_connect_window = None;
                     this.status = "Connection details changed · saved password not restored".into();
                     this.error = None;
                     cx.notify();
-                    return;
+                    return None;
                 }
                 match result {
                     Ok(loaded) => {
@@ -383,11 +438,21 @@ impl DbxApp {
                         });
                         this.status = "Saved connection selected · password restored".into();
                         this.error = None;
+                        let connect_window = this.credential_connect_window.take();
+                        cx.notify();
+                        connect_window
                     }
-                    Err(_) => this.set_error("Saved connection password is unavailable in the credential vault. Import old passwords or enter it once and Save.".into()),
+                    Err(_) => {
+                        this.credential_connect_window = None;
+                        this.set_error("Saved connection password is unavailable in the credential vault. Import old passwords or enter it once and Save.".into());
+                        cx.notify();
+                        None
+                    }
                 }
-                cx.notify();
             })?;
+            if let Some(window_handle) = connect_window {
+                window_handle.update(cx, |this, window, cx| this.connect(window, cx))?;
+            }
             Ok::<(), anyhow::Error>(())
         }).detach();
     }
@@ -514,6 +579,7 @@ impl DbxApp {
         self.credential_hydration_generation =
             self.credential_hydration_generation.saturating_add(1);
         self.credential_hydrating = false;
+        self.credential_connect_window = None;
     }
 
     pub(super) fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -739,6 +805,7 @@ impl DbxApp {
 
     pub(super) fn begin_new_connection(&mut self, cx: &mut Context<Self>) {
         self.cancel_credential_hydration();
+        self.compact_connection_form_open = true;
         self.draft.selected_profile = None;
         self.draft.environment = ConnectionEnvironment::default();
         self.draft.connection_name.update(cx, |name, cx| {
@@ -751,6 +818,19 @@ impl DbxApp {
             cx,
         );
         self.connection_picker_open = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    pub(super) fn show_saved_connections(&mut self, cx: &mut Context<Self>) {
+        self.cancel_credential_hydration();
+        self.compact_connection_form_open = false;
+        self.draft.selected_profile = None;
+        self.draft.password.update(cx, |value, cx| {
+            value.zeroize();
+            cx.notify();
+        });
+        self.status = "Choose a saved connection or create a new one".into();
         self.error = None;
         cx.notify();
     }
@@ -784,5 +864,25 @@ mod tests {
             &edited_fields,
             &fields,
         ));
+    }
+
+    #[test]
+    fn saved_connection_double_click_opens_while_single_click_selects() {
+        assert_eq!(
+            saved_connection_click_action(1),
+            SavedConnectionClickAction::Select
+        );
+        assert_eq!(
+            saved_connection_click_action(2),
+            SavedConnectionClickAction::Open
+        );
+    }
+
+    #[test]
+    fn compact_layout_prioritizes_saved_connections_until_the_form_is_requested() {
+        assert!(compact_connection_picker_visible(true, false, 2));
+        assert!(!compact_connection_picker_visible(true, true, 2));
+        assert!(!compact_connection_picker_visible(true, false, 0));
+        assert!(!compact_connection_picker_visible(false, false, 2));
     }
 }

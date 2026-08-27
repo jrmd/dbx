@@ -32,7 +32,8 @@ use gpui::{
     AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable as _, FontWeight,
     Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Point,
     Render, Rgba, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _,
-    Subscription, Window, WindowControlArea, anchored, deferred, div, img, point, prelude::*, px,
+    Subscription, Window, WindowControlArea, WindowHandle, anchored, deferred, div, img, point,
+    prelude::*, px,
 };
 use gpui_component::{
     Disableable as _, FocusTrapElement as _, InteractiveElementExt as _, Selectable as _,
@@ -101,7 +102,8 @@ gpui::actions!(
         DiagramFit,
         DiagramRefresh,
         VaultFocusNext,
-        VaultFocusPrevious
+        VaultFocusPrevious,
+        SubmitVault
     ]
 );
 
@@ -934,6 +936,28 @@ enum TableClickAction {
     OpenContextMenu,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SavedConnectionClickAction {
+    Select,
+    Open,
+}
+
+fn saved_connection_click_action(click_count: usize) -> SavedConnectionClickAction {
+    if click_count > 1 {
+        SavedConnectionClickAction::Open
+    } else {
+        SavedConnectionClickAction::Select
+    }
+}
+
+fn compact_connection_picker_visible(
+    compact_layout: bool,
+    compact_connection_form_open: bool,
+    saved_connection_count: usize,
+) -> bool {
+    compact_layout && !compact_connection_form_open && saved_connection_count > 0
+}
+
 pub struct DbxApp {
     runtime: Arc<tokio::runtime::Runtime>,
     logo: Arc<Image>,
@@ -945,6 +969,7 @@ pub struct DbxApp {
     vault_generation: u64,
     credential_hydrating: bool,
     credential_hydration_generation: u64,
+    credential_connect_window: Option<WindowHandle<DbxApp>>,
     profile_store: Option<ProfileStore>,
     saved_connections: Vec<SavedConnection>,
     query_history_store: Option<QueryHistoryStore>,
@@ -954,6 +979,7 @@ pub struct DbxApp {
     sessions: Vec<ConnectionSession>,
     active_session_id: Option<SessionId>,
     connection_picker_open: bool,
+    compact_connection_form_open: bool,
     table_context_menu: Option<TableContextMenu>,
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
@@ -991,6 +1017,7 @@ impl DbxApp {
             },
             Err(error) => (None, Vec::new(), Some(error.to_string())),
         };
+        let compact_connection_form_open = saved_connections.is_empty();
         let vault_state = profile_store
             .as_ref()
             .and_then(ProfileStore::vault)
@@ -1027,6 +1054,7 @@ impl DbxApp {
             vault_generation: 0,
             credential_hydrating: false,
             credential_hydration_generation: 0,
+            credential_connect_window: None,
             profile_store,
             saved_connections,
             query_history_store,
@@ -1034,6 +1062,7 @@ impl DbxApp {
             sessions: Vec::new(),
             active_session_id: None,
             connection_picker_open: false,
+            compact_connection_form_open,
             table_context_menu: None,
             database_export_dialog: None,
             confirmation_dialog: None,
@@ -1275,6 +1304,7 @@ impl DbxApp {
         if self.sessions.is_empty() {
             self.active_session_id = None;
             self.connection_picker_open = false;
+            self.compact_connection_form_open = self.saved_connections.is_empty();
             self.error = None;
             self.status = "Disconnected".into();
         }
@@ -5291,6 +5321,123 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    struct VaultEnterHarness {
+        editor: Entity<TextEditor>,
+        submitted: bool,
+    }
+
+    impl Render for VaultEnterHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let focus = self.editor.read(cx).focus_handle();
+            div()
+                .key_context("VaultGate")
+                .on_action(cx.listener(|this, _: &SubmitVault, _, cx| {
+                    this.submitted = true;
+                    cx.notify();
+                }))
+                .child(editor::input_with_key_context(
+                    self.editor.clone(),
+                    focus,
+                    false,
+                    "DbxTextEditor VaultGate",
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn enter_in_focused_vault_password_field_submits(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            cx.bind_keys(editor::default_key_bindings());
+            cx.bind_keys([gpui::KeyBinding::new(
+                "enter",
+                SubmitVault,
+                Some("VaultGate"),
+            )]);
+        });
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| String::new());
+            let editor = cx.new(|cx| TextEditor::new(value, false, window, cx).password());
+            VaultEnterHarness {
+                editor,
+                submitted: false,
+            }
+        });
+        cx.update(|window, cx| {
+            harness
+                .read(cx)
+                .editor
+                .read(cx)
+                .focus_handle()
+                .focus(window, cx);
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert!(cx.update(|_, cx| harness.read(cx).submitted));
+    }
+
+    #[gpui::test]
+    fn compact_picker_single_click_selects_without_replacing_the_list(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().expect("create profile directory");
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        let profile = store
+            .save(ConnectionProfileDraft::new(
+                "Local database",
+                DatabaseKind::PostgreSQL,
+                "postgres://developer@localhost:5432/app",
+            ))
+            .expect("save profile fixture");
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.compact_layout = true;
+                app.compact_connection_form_open = false;
+                app.select_saved_connection_in_compact_picker(profile.clone(), cx);
+                assert_eq!(app.draft.selected_profile, Some(profile.id));
+                assert!(!app.compact_connection_form_open);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn double_click_queues_open_while_saved_password_is_hydrating(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().expect("create profile directory");
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        store
+            .vault()
+            .expect("test store has a vault")
+            .create("test vault passphrase")
+            .expect("create test vault");
+        let profile = store
+            .save(
+                ConnectionProfileDraft::new(
+                    "Local database",
+                    DatabaseKind::PostgreSQL,
+                    "postgres://developer@localhost:5432/app",
+                )
+                .with_secret("secret"),
+            )
+            .expect("save profile fixture");
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.saved_connections = vec![profile.clone()];
+                app.draft.selected_profile = Some(profile.id);
+                app.credential_hydrating = true;
+                app.open_saved_connection(profile.clone(), window, cx);
+                assert!(app.credential_connect_window.is_some());
+                assert!(app.sessions.is_empty());
+            });
+        });
+    }
 
     #[test]
     fn redis_query_tabs_must_use_a_syntax_aware_editor_language() {

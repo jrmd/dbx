@@ -3219,6 +3219,20 @@ pub fn input(editor: Entity<TextEditor>, focus: FocusHandle, multiline: bool) ->
     input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false)
 }
 
+/// Render a standard DBX field with an additional shell-owned key context.
+///
+/// The caller supplies the complete combined context so a focused editor can
+/// participate in a containing workflow's shortcuts at the same dispatch
+/// depth as the editor's own bindings.
+pub fn input_with_key_context(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    multiline: bool,
+    key_context: &'static str,
+) -> impl IntoElement {
+    input_with_context(editor, focus, multiline, key_context, false)
+}
+
 /// Render the SQL editor with both its text-editing and completion contexts.
 #[allow(dead_code)]
 pub fn sql_input(
