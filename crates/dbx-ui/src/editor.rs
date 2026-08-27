@@ -154,6 +154,7 @@ pub enum EditorLanguage {
     #[default]
     PlainText,
     Sql,
+    Redis,
     Json,
 }
 
@@ -521,6 +522,25 @@ pub struct SqlToken {
     pub range: Range<usize>,
 }
 
+/// The lexical categories used by the Redis command editor. Redis input is
+/// line-oriented, so the first token on every line is a command and later
+/// tokens are classified without requiring a complete or valid command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RedisTokenKind {
+    Command,
+    Option,
+    String,
+    Number,
+    Identifier,
+}
+
+/// A UTF-8-safe token returned by [`lex_redis`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedisToken {
+    pub kind: RedisTokenKind,
+    pub range: Range<usize>,
+}
+
 /// The lexical categories understood by the built-in JSON highlighter.
 ///
 /// JSON values are lexed, rather than parsed, so a partially typed document
@@ -550,6 +570,7 @@ struct HighlightToken {
 #[derive(Clone, Copy, Debug)]
 enum HighlightTokenKind {
     Sql(SqlTokenKind),
+    Redis(RedisTokenKind),
     Json(JsonTokenKind),
 }
 
@@ -558,6 +579,15 @@ impl From<SqlToken> for HighlightToken {
         Self {
             range: token.range,
             kind: HighlightTokenKind::Sql(token.kind),
+        }
+    }
+}
+
+impl From<RedisToken> for HighlightToken {
+    fn from(token: RedisToken) -> Self {
+        Self {
+            range: token.range,
+            kind: HighlightTokenKind::Redis(token.kind),
         }
     }
 }
@@ -575,6 +605,7 @@ impl HighlightToken {
     fn color(&self) -> gpui::Hsla {
         match self.kind {
             HighlightTokenKind::Sql(kind) => sql_token_color(kind),
+            HighlightTokenKind::Redis(kind) => redis_token_color(kind),
             HighlightTokenKind::Json(kind) => json_token_color(kind),
         }
     }
@@ -779,6 +810,132 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
     tokens
 }
 
+/// Lex Redis command text into UTF-8-safe ranges suitable for highlighting.
+/// Quoted and backslash-escaped arguments remain one token even while they are
+/// incomplete, matching the command parser's editing-time behavior.
+pub fn lex_redis(text: &str) -> Vec<RedisToken> {
+    let mut tokens = Vec::new();
+    let mut line_start = 0;
+    for line_with_ending in text.split_inclusive('\n') {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        lex_redis_line(line, line_start, &mut tokens);
+        line_start += line_with_ending.len();
+    }
+    tokens
+}
+
+fn lex_redis_line(line: &str, line_start: usize, tokens: &mut Vec<RedisToken>) {
+    let mut cursor = 0;
+    let mut token_index = 0;
+    while cursor < line.len() {
+        while let Some(character) = line[cursor..].chars().next()
+            && character.is_whitespace()
+        {
+            cursor += character.len_utf8();
+        }
+        if cursor == line.len() {
+            break;
+        }
+
+        let start = cursor;
+        let mut end = line.len();
+        let mut quote = None;
+        let mut escaped = false;
+        for (relative, character) in line[start..].char_indices() {
+            let index = start + relative;
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if character == '\\' {
+                escaped = true;
+                continue;
+            }
+            if let Some(expected) = quote {
+                if character == expected {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+            } else if character.is_whitespace() {
+                end = index;
+                break;
+            }
+        }
+
+        let raw = &line[start..end];
+        tokens.push(RedisToken {
+            kind: redis_token_kind(raw, token_index),
+            range: line_start + start..line_start + end,
+        });
+        token_index += 1;
+        cursor = end;
+    }
+}
+
+fn redis_token_kind(raw: &str, token_index: usize) -> RedisTokenKind {
+    const OPTIONS: &[&str] = &[
+        "AGGREGATE",
+        "ASYNC",
+        "BLOCK",
+        "BYLEX",
+        "BYSCORE",
+        "CH",
+        "COUNT",
+        "ENTRIESREAD",
+        "EX",
+        "EXAT",
+        "FREQ",
+        "FULL",
+        "GET",
+        "HARD",
+        "IDLETIME",
+        "INCR",
+        "KEEPTTL",
+        "LIMIT",
+        "MATCH",
+        "MAX",
+        "MIN",
+        "MKSTREAM",
+        "NOACK",
+        "NOMKSTREAM",
+        "NX",
+        "PX",
+        "PXAT",
+        "RESET",
+        "REV",
+        "SAMPLES",
+        "SOFT",
+        "STORE",
+        "STREAMS",
+        "SUM",
+        "SYNC",
+        "TYPE",
+        "WEIGHTS",
+        "WITHSCORES",
+        "XX",
+    ];
+
+    if token_index == 0 {
+        RedisTokenKind::Command
+    } else if raw.starts_with(['\'', '"']) {
+        RedisTokenKind::String
+    } else if raw.parse::<f64>().is_ok() {
+        RedisTokenKind::Number
+    } else if OPTIONS
+        .iter()
+        .any(|option| raw.eq_ignore_ascii_case(option))
+    {
+        RedisTokenKind::Option
+    } else {
+        RedisTokenKind::Identifier
+    }
+}
+
 /// Lex JSON into UTF-8-safe ranges suitable for syntax highlighting.
 ///
 /// This deliberately accepts incomplete strings and partially written values:
@@ -854,7 +1011,8 @@ pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletion
         return None;
     }
 
-    if lex_sql(text).iter().any(|token| {
+    let tokens = lex_sql(text);
+    if tokens.iter().any(|token| {
         matches!(token.kind, SqlTokenKind::String | SqlTokenKind::Comment)
             && token.range.start <= cursor
             && cursor <= token.range.end
@@ -862,15 +1020,51 @@ pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletion
         return None;
     }
 
-    let start = completion_identifier_start(text, cursor);
-    let prefix = text[start..cursor].to_owned();
-    let qualifier = completion_qualifier(text, start);
-    let quote = text[..start]
-        .chars()
-        .next_back()
-        .filter(|character| matches!(character, '"' | '`'));
+    // A cursor immediately after a closed identifier is between tokens, not
+    // inside an editable prefix. Do not let the generic path reinterpret its
+    // closing delimiter as a fresh opening quote.
+    if tokens.iter().any(|token| {
+        token.kind == SqlTokenKind::Identifier
+            && cursor == token.range.end
+            && text[token.range.clone()]
+                .chars()
+                .next()
+                .is_some_and(|character| matches!(character, '"' | '`'))
+            && text[token.range.start..]
+                .chars()
+                .next()
+                .is_some_and(|quote| quoted_identifier_is_closed(&text[token.range.clone()], quote))
+    }) {
+        return None;
+    }
+
+    let quoted_identifier = quoted_completion_identifier(text, cursor, &tokens);
+    let (start, prefix, quote, replacement_end, qualifier_start) = quoted_identifier
+        .map(|quoted| {
+            (
+                quoted.range.start,
+                quoted.prefix,
+                Some(quoted.quote),
+                quoted.range.end,
+                quoted.qualifier_start,
+            )
+        })
+        .unwrap_or_else(|| {
+            let start = completion_identifier_start(text, cursor);
+            (
+                start,
+                text[start..cursor].to_owned(),
+                text[..start]
+                    .chars()
+                    .next_back()
+                    .filter(|character| matches!(character, '"' | '`')),
+                completion_identifier_end(text, cursor),
+                start,
+            )
+        });
+    let qualifier = completion_qualifier(text, qualifier_start);
     let previous_position = qualifier.as_ref().map_or_else(
-        || quote.map_or(start, |_| start.saturating_sub(1)),
+        || quote.map_or(start, |_| qualifier_start),
         |(_, qualifier_start)| *qualifier_start,
     );
     let previous_word = previous_sql_word(text, previous_position);
@@ -912,7 +1106,7 @@ pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletion
         prefix,
         qualifier: qualifier.map(|(qualifier, _)| qualifier),
         quote,
-        replacement_range: start..cursor,
+        replacement_range: start..replacement_end,
     })
 }
 
@@ -1659,6 +1853,77 @@ fn completion_identifier_start(text: &str, cursor: usize) -> usize {
         .unwrap_or(0)
 }
 
+fn completion_identifier_end(text: &str, cursor: usize) -> usize {
+    let cursor = clamp_boundary(text, cursor);
+    text[cursor..]
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!is_identifier_continue(character)).then_some(cursor + index)
+        })
+        .unwrap_or(text.len())
+}
+
+struct QuotedCompletionIdentifier {
+    prefix: String,
+    quote: char,
+    qualifier_start: usize,
+    range: Range<usize>,
+}
+
+/// Return the quoted identifier contents around `cursor`. Completion
+/// candidates intentionally insert raw identifier text when `quote` is set,
+/// so the delimiters stay outside the replacement range.
+///
+/// An unfinished identifier deliberately extends through the lexer token. The
+/// tolerant lexer keeps it available while the user is still typing, and a
+/// selected candidate retains the existing incomplete-quote behavior.
+fn quoted_completion_identifier(
+    text: &str,
+    cursor: usize,
+    tokens: &[SqlToken],
+) -> Option<QuotedCompletionIdentifier> {
+    let token = tokens.iter().find(|token| {
+        token.kind == SqlTokenKind::Identifier
+            && token.range.start < cursor
+            && cursor <= token.range.end
+            && text[token.range.clone()]
+                .chars()
+                .next()
+                .is_some_and(|character| matches!(character, '"' | '`'))
+    })?;
+    let quote = text[token.range.start..].chars().next()?;
+    let closed = quoted_identifier_is_closed(&text[token.range.clone()], quote);
+    let content_start = token.range.start + quote.len_utf8();
+    let prefix =
+        text[content_start..cursor].replace(&format!("{quote}{quote}"), &quote.to_string());
+    let content_end = if closed {
+        token.range.end - quote.len_utf8()
+    } else {
+        cursor
+    };
+
+    Some(QuotedCompletionIdentifier {
+        prefix,
+        quote,
+        qualifier_start: token.range.start,
+        range: content_start..content_end,
+    })
+}
+
+fn quoted_identifier_is_closed(raw: &str, quote: char) -> bool {
+    let mut characters = raw.chars();
+    debug_assert_eq!(characters.next(), Some(quote));
+    while let Some(character) = characters.next() {
+        if character != quote {
+            continue;
+        }
+        if characters.next() != Some(quote) {
+            return true;
+        }
+    }
+    false
+}
+
 fn completion_qualifier(text: &str, start: usize) -> Option<(String, usize)> {
     let (dot_start, dot) = text[..start]
         .char_indices()
@@ -1878,6 +2143,11 @@ impl TextEditor {
     /// Create a multiline SQL editor backed by an existing value entity.
     pub fn new_sql(value: Entity<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self::new_with_language(value, true, EditorLanguage::Sql, window, cx)
+    }
+
+    /// Create a multiline Redis command editor backed by an existing value.
+    pub fn new_redis(value: Entity<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_language(value, true, EditorLanguage::Redis, window, cx)
     }
 
     /// Create a multiline JSON editor backed by an existing value entity.
@@ -2754,6 +3024,10 @@ impl Element for TextEditorText {
                 .into_iter()
                 .map(HighlightToken::from)
                 .collect(),
+            EditorLanguage::Redis => lex_redis(&text)
+                .into_iter()
+                .map(HighlightToken::from)
+                .collect(),
             EditorLanguage::Json => lex_json(&text)
                 .into_iter()
                 .map(HighlightToken::from)
@@ -2763,18 +3037,17 @@ impl Element for TextEditorText {
         for (line, painted_line) in text.split('\n').zip(painted_text.split('\n')) {
             let marked_range = editor.marked_range.as_ref().and_then(|range| {
                 let range = marked_slice(line.len(), line_start, range)?;
-                if editor.password {
-                    Some(
-                        password_display_offset(line, range.start)
-                            ..password_display_offset(line, range.end),
-                    )
+                let range = if editor.password {
+                    password_display_offset(line, range.start)
+                        ..password_display_offset(line, range.end)
                 } else {
-                    Some(range)
-                }
+                    range
+                };
+                Some(line_start + range.start..line_start + range.end)
             });
             let runs = editor_text_runs(
                 painted_line,
-                0,
+                line_start,
                 &style,
                 editor.language,
                 &syntax_tokens,
@@ -3210,7 +3483,9 @@ fn editor_text_runs(
     let base = style.to_run(line.len());
     let runs = match language {
         EditorLanguage::PlainText => vec![base],
-        EditorLanguage::Sql | EditorLanguage::Json => syntax_runs(line, line_start, tokens, &base),
+        EditorLanguage::Sql | EditorLanguage::Redis | EditorLanguage::Json => {
+            syntax_runs(line, line_start, tokens, &base)
+        }
     };
     let runs = apply_marked_runs(line.len(), line_start, marked_range, runs);
     apply_diagnostic_runs(line.len(), line_start, diagnostics, runs)
@@ -3373,6 +3648,16 @@ fn sql_token_color(kind: SqlTokenKind) -> gpui::Hsla {
         SqlTokenKind::Parameter => theme().sql_parameter.into(),
         SqlTokenKind::Identifier => theme().sql_identifier.into(),
         SqlTokenKind::Type => theme().sql_type.into(),
+    }
+}
+
+fn redis_token_color(kind: RedisTokenKind) -> gpui::Hsla {
+    match kind {
+        RedisTokenKind::Command => theme().sql_keyword.into(),
+        RedisTokenKind::Option => theme().sql_type.into(),
+        RedisTokenKind::String => theme().sql_string.into(),
+        RedisTokenKind::Number => theme().sql_number.into(),
+        RedisTokenKind::Identifier => theme().sql_identifier.into(),
     }
 }
 
@@ -4302,6 +4587,36 @@ mod tests {
     }
 
     #[test]
+    fn later_line_runs_use_document_offsets_for_syntax_diagnostics_and_ime_marks() {
+        let text = "SELECT\nFROM users";
+        let tokens: Vec<_> = lex_sql(text)
+            .into_iter()
+            .map(HighlightToken::from)
+            .collect();
+        let style = gpui::TextStyle::default();
+        let second_line_start = "SELECT\n".len();
+        let diagnostics = std::iter::once(second_line_start + 5..text.len()).collect::<Vec<_>>();
+
+        let runs = editor_text_runs(
+            "FROM users",
+            second_line_start,
+            &style,
+            EditorLanguage::Sql,
+            &tokens,
+            Some(&(second_line_start..second_line_start + 4)),
+            &diagnostics,
+        );
+
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            [4, 1, 5]
+        );
+        assert_eq!(runs[0].color, sql_token_color(SqlTokenKind::Keyword));
+        assert!(runs[0].underline.as_ref().is_some_and(|style| !style.wavy));
+        assert!(runs[2].underline.as_ref().is_some_and(|style| style.wavy));
+    }
+
+    #[test]
     fn reveal_offset_moves_only_far_enough_to_show_the_caret() {
         assert_eq!(
             reveal_offset(px(0.), px(200.), px(100.), px(120.), px(122.)),
@@ -4478,6 +4793,49 @@ mod tests {
     }
 
     #[test]
+    fn redis_query_text_must_not_use_the_plain_text_paint_pipeline() {
+        let text = "GET \"user:name\" 42";
+        let tokens: Vec<_> = lex_redis(text)
+            .into_iter()
+            .map(HighlightToken::from)
+            .collect();
+        let style = gpui::TextStyle::default();
+
+        let runs = editor_text_runs(text, 0, &style, EditorLanguage::Redis, &tokens, None, &[]);
+
+        assert!(
+            runs.len() > 1,
+            "Redis commands, strings, and numbers need semantic runs"
+        );
+    }
+
+    #[test]
+    fn redis_lexer_is_line_aware_and_tolerates_quoted_unicode() {
+        let text = "get \"user:東京\" 42 NX\nSCAN 0 MATCH user:* COUNT 100";
+        let tokens = lex_redis(text);
+        let values = tokens
+            .iter()
+            .map(|token| (token.kind, &text[token.range.clone()]))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            values,
+            [
+                (RedisTokenKind::Command, "get"),
+                (RedisTokenKind::String, "\"user:東京\""),
+                (RedisTokenKind::Number, "42"),
+                (RedisTokenKind::Option, "NX"),
+                (RedisTokenKind::Command, "SCAN"),
+                (RedisTokenKind::Number, "0"),
+                (RedisTokenKind::Option, "MATCH"),
+                (RedisTokenKind::Identifier, "user:*"),
+                (RedisTokenKind::Option, "COUNT"),
+                (RedisTokenKind::Number, "100"),
+            ]
+        );
+    }
+
+    #[test]
     fn sql_lexer_is_unicode_safe_and_multiline_aware() {
         let text = "SELECT café FROM \"таблица\"\nWHERE city = 'Łódź\n第二行' AND score >= .5e+1";
         let tokens = lex_sql(text);
@@ -4649,8 +5007,120 @@ mod tests {
         assert_eq!(quoted.target, SqlCompletionTarget::Table);
         assert_eq!(quoted.quote, Some('"'));
         assert_eq!(quoted.prefix, "us");
+        assert_eq!(quoted.replacement_range, 15..17);
+
+        let quoted_qualified = sql_completion_context(
+            "SELECT \"analytics\".\"us",
+            "SELECT \"analytics\".\"us".len(),
+        )
+        .unwrap();
+        assert_eq!(quoted_qualified.target, SqlCompletionTarget::Column);
+        assert_eq!(quoted_qualified.qualifier.as_deref(), Some("analytics"));
+        assert_eq!(quoted_qualified.replacement_range, 20..22);
 
         assert!(sql_completion_context("\"\"\".\"", "\"\"\".\"".len()).is_none());
+    }
+
+    #[test]
+    fn completion_context_replaces_the_whole_identifier_around_the_caret() {
+        let text = "SELECT user_name FROM users";
+        let cursor = "SELECT user".len();
+        let context = sql_completion_context(text, cursor).expect("column completion");
+
+        assert_eq!(context.prefix, "user");
+        assert_eq!(context.replacement_range, 7..16);
+    }
+
+    #[test]
+    fn completion_context_replaces_a_quoted_identifier_with_spaces() {
+        let text = "SELECT \"order items\" FROM orders";
+        let cursor = "SELECT \"order".len();
+        let context = sql_completion_context(text, cursor).expect("column completion");
+
+        assert_eq!(context.prefix, "order");
+        assert_eq!(context.quote, Some('"'));
+        assert_eq!(context.replacement_range, 8..19);
+        assert_eq!(
+            format!(
+                "{}customer order{}",
+                &text[..context.replacement_range.start],
+                &text[context.replacement_range.end..]
+            ),
+            "SELECT \"customer order\" FROM orders"
+        );
+    }
+
+    #[test]
+    fn completion_context_replaces_an_escaped_quoted_identifier() {
+        let text = "SELECT \"customer\"\" name\" FROM orders";
+        let cursor = "SELECT \"customer\"\"".len();
+        let context = sql_completion_context(text, cursor).expect("column completion");
+
+        assert_eq!(context.prefix, "customer\"");
+        assert_eq!(context.quote, Some('"'));
+        assert_eq!(context.replacement_range, 8..23);
+        assert_eq!(
+            format!(
+                "{}customer id{}",
+                &text[..context.replacement_range.start],
+                &text[context.replacement_range.end..]
+            ),
+            "SELECT \"customer id\" FROM orders"
+        );
+    }
+
+    #[test]
+    fn completion_context_replaces_a_unicode_quoted_identifier() {
+        let text = "SELECT \"東京 orders\" FROM orders";
+        let cursor = "SELECT \"東京".len();
+        let context = sql_completion_context(text, cursor).expect("column completion");
+
+        assert_eq!(context.prefix, "東京");
+        assert_eq!(context.quote, Some('"'));
+        assert_eq!(context.replacement_range, 8..21);
+        assert_eq!(
+            format!(
+                "{}東京 customer{}",
+                &text[..context.replacement_range.start],
+                &text[context.replacement_range.end..]
+            ),
+            "SELECT \"東京 customer\" FROM orders"
+        );
+    }
+
+    #[test]
+    fn completion_context_keeps_unclosed_identifier_text_after_the_caret() {
+        let text = "SELECT \"us FROM users";
+        let cursor = "SELECT \"us".len();
+        let context = sql_completion_context(text, cursor).expect("column completion");
+
+        assert_eq!(context.prefix, "us");
+        assert_eq!(context.replacement_range, 8..10);
+        assert_eq!(
+            format!(
+                "{}accounts{}",
+                &text[..context.replacement_range.start],
+                &text[context.replacement_range.end..]
+            ),
+            "SELECT \"accounts FROM users"
+        );
+    }
+
+    #[test]
+    fn completion_context_handles_backtick_quoted_identifiers() {
+        let text = "SELECT `order items` FROM orders";
+        let cursor = "SELECT `order".len();
+        let context = sql_completion_context(text, cursor).expect("column completion");
+
+        assert_eq!(context.prefix, "order");
+        assert_eq!(context.quote, Some('`'));
+        assert_eq!(context.replacement_range, 8..19);
+    }
+
+    #[test]
+    fn completion_context_is_not_opened_after_a_closed_quoted_identifier() {
+        let text = "SELECT \"users\"";
+        assert!(sql_completion_context(text, text.len()).is_none());
     }
 
     #[test]

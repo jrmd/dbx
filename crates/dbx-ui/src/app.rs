@@ -8,6 +8,7 @@
 //! the private `app/` module tree documented in `docs/architecture.md`.
 
 mod connection;
+mod redis_completion;
 mod result_table;
 mod sql_completion;
 mod transfer;
@@ -64,6 +65,7 @@ use crate::{
     },
     vault::VaultState,
 };
+use redis_completion::redis_completion_items;
 use result_table::{ResultTableDelegate, foreign_key_target_table};
 use sql_completion::{
     CompletionItemKind, SqlCompletionItem, SqlCompletionRequest, completion_table_key,
@@ -314,7 +316,7 @@ impl SessionEditors {
 type SecondaryTabId = Uuid;
 
 struct SqlCompletionMenu {
-    context: editor::SqlCompletionContext,
+    replacement_range: Range<usize>,
     items: Vec<SqlCompletionItem>,
     selected: usize,
     signature: String,
@@ -328,6 +330,8 @@ impl CompletionItemKind {
             Self::Table => theme().accent,
             Self::Column => theme().success,
             Self::Function => theme().sql_number,
+            Self::Command => theme().sql_keyword,
+            Self::Key => theme().success,
         }
     }
 }
@@ -420,11 +424,11 @@ impl QueryTab {
         cx: &mut Context<DbxApp>,
     ) -> Self {
         let query_text = cx.new(|_| DbxApp::default_query(kind).to_owned());
-        let query_editor = cx.new(|cx| {
-            if kind.is_sql() {
-                TextEditor::new_sql(query_text.clone(), window, cx)
-            } else {
-                TextEditor::new(query_text.clone(), true, window, cx)
+        let query_editor = cx.new(|cx| match query_editor_language(kind) {
+            editor::EditorLanguage::Sql => TextEditor::new_sql(query_text.clone(), window, cx),
+            editor::EditorLanguage::Redis => TextEditor::new_redis(query_text.clone(), window, cx),
+            editor::EditorLanguage::PlainText | editor::EditorLanguage::Json => {
+                unreachable!("query tabs only use SQL or Redis syntax")
             }
         });
         let split_state = cx.new(|_| ResizableState::default());
@@ -500,6 +504,15 @@ impl QueryTab {
         self.request_generation = self.request_generation.saturating_add(1);
         self.abort_handle.cancel();
         self.busy = false;
+    }
+}
+
+fn query_editor_language(kind: DatabaseKind) -> editor::EditorLanguage {
+    match kind {
+        DatabaseKind::Redis => editor::EditorLanguage::Redis,
+        DatabaseKind::PostgreSQL | DatabaseKind::MySQL | DatabaseKind::SQLite => {
+            editor::EditorLanguage::Sql
+        }
     }
 }
 
@@ -1969,10 +1982,10 @@ impl DbxApp {
             return;
         };
         session.active_secondary_tab = Some(tab_id);
-        let diagram_focus = match &tab.kind {
-            SecondaryTabKind::Query(_) => {
+        let tab_focus = match &tab.kind {
+            SecondaryTabKind::Query(query) => {
                 session.pane = Pane::Query;
-                None
+                Some(query.query_editor.read(cx).focus_handle())
             }
             SecondaryTabKind::Structure(_) => {
                 session.pane = Pane::Structure;
@@ -1983,7 +1996,7 @@ impl DbxApp {
                 Some(diagram.focus.clone())
             }
         };
-        if let Some(focus) = diagram_focus {
+        if let Some(focus) = tab_focus {
             focus.focus(window, cx);
         }
         cx.notify();
@@ -2754,11 +2767,8 @@ impl DbxApp {
         session_id: SessionId,
         cx: &mut Context<Self>,
     ) -> Option<SqlCompletionMenu> {
-        let (tab_id, context, items, signature) = {
+        let (tab_id, replacement_range, items, signature) = {
             let session = self.session(session_id)?;
-            if !session.kind.is_sql() {
-                return None;
-            }
             let tab_id = session.active_secondary_tab?;
             let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
             let SecondaryTabKind::Query(query_tab) = &tab.kind else {
@@ -2766,23 +2776,35 @@ impl DbxApp {
             };
             let query_text = query_tab.query_text.read(cx).clone();
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
-            let context = editor::sql_completion_context(&query_text, cursor)?;
-            let items = sql_completion_items(
-                &query_text,
-                cursor,
-                &context,
-                SqlCompletionRequest {
-                    database_kind: session.kind,
-                    tables: &session.tables,
-                    completion_columns: &session.completion_columns,
-                    selected_table: session.selected_table.as_ref(),
-                    active_columns: &session.table_columns,
-                    result: session.result.as_deref(),
-                    active_schema_filter: session.schema_filter.as_deref(),
-                },
-            );
-            let signature = format!("{query_text}\u{0}{cursor}\u{0}{context:?}");
-            (tab_id, context, items, signature)
+            if session.kind.is_sql() {
+                let context = editor::sql_completion_context(&query_text, cursor)?;
+                let items = sql_completion_items(
+                    &query_text,
+                    cursor,
+                    &context,
+                    SqlCompletionRequest {
+                        database_kind: session.kind,
+                        tables: &session.tables,
+                        completion_columns: &session.completion_columns,
+                        selected_table: session.selected_table.as_ref(),
+                        active_columns: &session.table_columns,
+                        result: session.result.as_deref(),
+                        active_schema_filter: session.schema_filter.as_deref(),
+                    },
+                );
+                let signature = format!("{query_text}\u{0}{cursor}\u{0}{context:?}");
+                (tab_id, context.replacement_range, items, signature)
+            } else if session.kind == DatabaseKind::Redis {
+                let (replacement_range, items, signature) = redis_completion_items(
+                    &query_text,
+                    cursor,
+                    query_tab.result.as_deref(),
+                    session.result.as_deref(),
+                )?;
+                (tab_id, replacement_range, items, signature)
+            } else {
+                return None;
+            }
         };
 
         if items.is_empty() {
@@ -2811,7 +2833,7 @@ impl DbxApp {
         query_tab.completion_index = selected;
 
         Some(SqlCompletionMenu {
-            context,
+            replacement_range,
             items,
             selected,
             signature,
@@ -2892,7 +2914,14 @@ impl DbxApp {
                 let Some(item) = menu.items.get(menu.selected).cloned() else {
                     return;
                 };
-                self.accept_completion_for(session_id, tab_id, menu.context, item, window, cx);
+                self.accept_completion_for(
+                    session_id,
+                    tab_id,
+                    menu.replacement_range,
+                    item,
+                    window,
+                    cx,
+                );
                 cx.stop_propagation();
             }
             "escape" => {
@@ -2972,7 +3001,14 @@ impl DbxApp {
                 let Some(item) = menu.items.get(menu.selected).cloned() else {
                     return;
                 };
-                self.accept_completion_for(session_id, tab_id, menu.context, item, window, cx);
+                self.accept_completion_for(
+                    session_id,
+                    tab_id,
+                    menu.replacement_range,
+                    item,
+                    window,
+                    cx,
+                );
             }
         }
     }
@@ -2981,7 +3017,7 @@ impl DbxApp {
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        context: editor::SqlCompletionContext,
+        replacement_range: Range<usize>,
         item: SqlCompletionItem,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2999,8 +3035,16 @@ impl DbxApp {
         };
         let focus = query_editor.read(cx).focus_handle();
         query_editor.update(cx, |editor, cx| {
-            editor.replace_range(context.replacement_range, item.insert_text, cx);
+            editor.replace_range(replacement_range, item.insert_text, cx);
         });
+
+        // Accepting a candidate produces a new text/cursor signature. Dismiss
+        // that exact state so the item we just committed does not immediately
+        // reopen under the caret; the next edit or caret move changes the
+        // signature and makes completion available again.
+        let accepted_signature = self
+            .query_completion_for(session_id, cx)
+            .map(|menu| menu.signature);
         if let Some(session) = self.session_mut(session_id)
             && let Some(tab) = session
                 .secondary_tabs
@@ -3009,7 +3053,7 @@ impl DbxApp {
             && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
         {
             query_tab.completion_signature = None;
-            query_tab.completion_dismissed_signature = None;
+            query_tab.completion_dismissed_signature = accepted_signature;
             query_tab.completion_index = 0;
         }
         focus.focus(window, cx);
@@ -5182,6 +5226,84 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn redis_query_tabs_must_use_a_syntax_aware_editor_language() {
+        assert_eq!(
+            query_editor_language(DatabaseKind::Redis),
+            editor::EditorLanguage::Redis
+        );
+    }
+
+    #[gpui::test]
+    fn focused_redis_query_renders_completion_menu(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            let tab_id = Uuid::new_v4();
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Redis test".into(),
+                DatabaseKind::Redis,
+                ConnectionEnvironment::Local,
+                window,
+                cx,
+            );
+            let query = QueryTab::new(DatabaseKind::Redis, session_id, tab_id, window, cx);
+            query
+                .query_editor
+                .update(cx, |editor, cx| editor.set_text("", cx));
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Query(Box::new(query)),
+            });
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app.connection_picker_open = false;
+            app.activate_secondary_tab_for(session_id, tab_id, window, cx);
+            app
+        });
+
+        cx.simulate_input("GE");
+        cx.update(|window, cx| {
+            let focus = app
+                .read(cx)
+                .active_query_editor_for(session_id)
+                .expect("Redis query editor should be active")
+                .read(cx)
+                .focus_handle();
+            assert!(focus.is_focused(window), "Redis query editor lost focus");
+            let menu = app.update(cx, |app, cx| app.query_completion_for(session_id, cx));
+            assert!(
+                menu.as_ref()
+                    .is_some_and(|menu| menu.items.iter().any(|item| item.label == "GET")),
+                "focused Redis query should resolve a GET candidate before painting"
+            );
+            window.draw(cx).clear(cx)
+        });
+
+        assert!(
+            cx.debug_bounds("sql-completion-menu").is_some(),
+            "a focused Redis query with a partial command must paint its completion popup"
+        );
+
+        cx.simulate_keystrokes("tab");
+        let query_text = cx.update(|_, cx| {
+            app.read(cx)
+                .session(session_id)
+                .and_then(|session| {
+                    let tab_id = session.active_secondary_tab?;
+                    session.secondary_tabs.iter().find(|tab| tab.id == tab_id)
+                })
+                .and_then(|tab| match &tab.kind {
+                    SecondaryTabKind::Query(query) => Some(query.query_text.read(cx).clone()),
+                    SecondaryTabKind::Structure(_) | SecondaryTabKind::Diagram(_) => None,
+                })
+        });
+        assert_eq!(query_text.as_deref(), Some("GET "));
+    }
 
     struct DropProbe(Arc<AtomicBool>);
 

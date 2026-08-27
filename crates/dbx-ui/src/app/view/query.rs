@@ -63,7 +63,7 @@ impl DbxApp {
         let selected = menu.selected;
         let rows = menu.items.iter().enumerate().map(|(index, item)| {
             let item = item.clone();
-            let context = menu.context.clone();
+            let replacement_range = menu.replacement_range.clone();
             let item_kind = item.kind;
             div()
                 .id(SharedString::from(format!(
@@ -110,7 +110,7 @@ impl DbxApp {
                     this.accept_completion_for(
                         session_id,
                         tab_id,
-                        context.clone(),
+                        replacement_range.clone(),
                         item.clone(),
                         window,
                         cx,
@@ -125,6 +125,7 @@ impl DbxApp {
                 .child(
                     div()
                         .id("sql-completion-menu")
+                        .debug_selector(|| "sql-completion-menu".into())
                         .w(px(420.))
                         .max_h(px(300.))
                         .p(px(5.))
@@ -266,6 +267,7 @@ impl DbxApp {
                     window,
                     cx,
                 );
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(move |this, _: &CompletionDown, window, cx| {
                 this.handle_completion_action(
@@ -275,6 +277,7 @@ impl DbxApp {
                     window,
                     cx,
                 );
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(move |this, _: &CompletionEnter, window, cx| {
                 this.handle_completion_action(
@@ -284,6 +287,7 @@ impl DbxApp {
                     window,
                     cx,
                 );
+                cx.stop_propagation();
             }))
             .when(sql_dialect, |panel| {
                 panel.on_action(cx.listener(move |this, _: &FormatQuery, window, cx| {
