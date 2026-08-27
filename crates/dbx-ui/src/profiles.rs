@@ -843,6 +843,7 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_fields::ConnectionFields;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -966,14 +967,15 @@ mod tests {
     }
 
     #[test]
-    fn raw_postgres_password_reserved_characters_round_trip_through_profile_connection_url() {
+    fn raw_postgres_credentials_round_trip_through_profile_connection_url() {
         let (_directory, store, secrets) = test_store();
+        let username = "report%team@example";
         let password = "p@ss:word/[?]#%✓";
         let saved = store
             .save(ConnectionProfileDraft::new(
-                "Reserved password",
+                "Reserved credentials",
                 DatabaseKind::PostgreSQL,
-                format!("postgres://alice:{password}@example.test/app"),
+                format!("postgres://{username}:{password}@example.test/app"),
             ))
             .expect("save profile");
 
@@ -981,10 +983,18 @@ mod tests {
             secrets.get(&keyring_key(saved.id)).unwrap(),
             Some(password.to_owned())
         );
+        let json = fs::read_to_string(store.path()).expect("read profile file");
+        assert!(!json.contains(username));
+        assert!(!json.contains(password));
+
+        let loaded = store.load(saved.id).unwrap();
         assert_eq!(
-            store.load(saved.id).unwrap().config.url,
-            "postgres://alice:p%40ss%3Aword%2F%5B%3F%5D%23%25%E2%9C%93@example.test/app"
+            loaded.config.url,
+            "postgres://report%25team%40example:p%40ss%3Aword%2F%5B%3F%5D%23%25%E2%9C%93@example.test/app"
         );
+        let fields = ConnectionFields::from_url(loaded.config.url).unwrap();
+        assert_eq!(fields.username, username);
+        assert_eq!(fields.password, password);
     }
 
     #[test]

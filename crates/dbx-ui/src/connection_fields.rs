@@ -170,7 +170,7 @@ impl ConnectionFields {
         url.set_port(Some(port))
             .map_err(|_| ConnectionFieldsError::InvalidPort)?;
         if !self.username.is_empty() {
-            url.set_username(&self.username)
+            set_url_username(&mut url, &self.username)
                 .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         }
         if !self.password.is_empty() {
@@ -222,13 +222,13 @@ fn kind_for_scheme(scheme: &str) -> Result<DatabaseKind, ConnectionFieldsError> 
     }
 }
 
-/// Normalize a connection URL whose password contains characters that should
+/// Normalize a connection URL whose userinfo contains characters that should
 /// have been percent-encoded before the URL reached DBX.
 ///
 /// `url::Url` may reject or reinterpret an unescaped `#`, `?`, slash, or `@`
 /// in userinfo. Connection strings are commonly copied from password
 /// managers, though, so losing the whole form to `ConnectionFields::new` is a
-/// much worse failure mode than repairing the password in memory. We only
+/// much worse failure mode than repairing the credentials in memory. We only
 /// enter this recovery path for supported network schemes. The returned value
 /// is safe to persist/display as a URL, while the password remains in the
 /// caller's editable fields or secret store.
@@ -247,7 +247,7 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
             let username = decode(url.username())?;
             let password = url.password().map(decode).transpose()?;
             if password.is_some() {
-                url.set_username(&username)
+                set_url_username(&mut url, &username)
                     .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
                 set_url_password(&mut url, password.as_deref())
                     .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
@@ -290,7 +290,7 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
         if url.host_str().is_none() {
             continue;
         }
-        url.set_username(&decode(username)?)
+        set_url_username(&mut url, &decode(username)?)
             .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         let password = decode(password)?;
         set_url_password(&mut url, Some(&password))
@@ -299,6 +299,12 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     }
 
     Err(ConnectionFieldsError::InvalidUrl)
+}
+
+/// Set a decoded username on a URL without allowing a literal `%` to be
+/// mistaken for the start of an existing percent-escape.
+fn set_url_username(url: &mut Url, username: &str) -> Result<(), ()> {
+    url.set_username(&username.replace('%', "%25"))
 }
 
 /// Set a decoded password on a URL without allowing a literal `%` to be
@@ -342,14 +348,33 @@ mod tests {
     fn builds_postgres_url_with_percent_encoded_credentials_and_database() {
         let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
         fields.host = "db.example.test".into();
-        fields.username = "al ice@example".into();
-        fields.password = "p@ss word/#?".into();
+        fields.username = "al ice@example:/?#%[]✓".into();
+        fields.password = "p@ss word:/?#%[]✓".into();
         fields.database = "team/data".into();
 
         assert_eq!(
             fields.url().unwrap(),
-            "postgres://al%20ice%40example:p%40ss%20word%2F%23%3F@db.example.test:5432/team%2Fdata"
+            "postgres://al%20ice%40example%3A%2F%3F%23%25%5B%5D%E2%9C%93:p%40ss%20word%3A%2F%3F%23%25%5B%5D%E2%9C%93@db.example.test:5432/team%2Fdata"
         );
+    }
+
+    #[test]
+    fn preserves_literal_percent_escapes_in_structured_credentials() {
+        let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
+        fields.host = "db.example.test".into();
+        fields.username = "report%2Fowner".into();
+        fields.password = "pa%23ss".into();
+        fields.database = "analytics".into();
+
+        let connection_url = fields.url().unwrap();
+        assert_eq!(
+            connection_url,
+            "postgres://report%252Fowner:pa%2523ss@db.example.test:5432/analytics"
+        );
+
+        let round_trip = ConnectionFields::from_url(connection_url).unwrap();
+        assert_eq!(round_trip.username, fields.username);
+        assert_eq!(round_trip.password, fields.password);
     }
 
     #[test]
@@ -400,6 +425,19 @@ mod tests {
         assert_eq!(
             fields.url().unwrap(),
             "postgres://al%20ice:p%40ss%20word%2F%23%3F@db.example.test:5432/team%2Fdata?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn repairs_unencoded_percent_characters_in_credentials() {
+        let input = "postgres://report%team:pa%ss@db.example.test:5432/analytics";
+        let fields = ConnectionFields::from_url(input).unwrap();
+
+        assert_eq!(fields.username, "report%team");
+        assert_eq!(fields.password, "pa%ss");
+        assert_eq!(
+            fields.url().unwrap(),
+            "postgres://report%25team:pa%25ss@db.example.test:5432/analytics"
         );
     }
 
