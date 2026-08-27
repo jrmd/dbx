@@ -16,13 +16,36 @@ mod vault;
 
 use app::DbxApp;
 use gpui::{
-    App, AppContext, Bounds, KeyBinding, WindowBounds, WindowDecorations, WindowOptions, point, px,
-    size,
+    App, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations,
+    WindowOptions, point, px, size,
 };
 
 gpui::actions!(dbx_ui, [Quit]);
 
 const APP_NAME: &str = "DBX";
+
+fn dbx_window_options() -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(80.0), px(80.0)),
+            size(px(1440.0), px(900.0)),
+        ))),
+        window_min_size: Some(size(px(960.0), px(640.0))),
+        // GPUI's macOS backend only includes AppKit's resizable style mask when
+        // a titlebar configuration is present. Keep it transparent and move the
+        // native traffic lights outside the content bounds because DBX renders
+        // its own compact close control.
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(-128.0), px(9.0))),
+        }),
+        app_owns_titlebar_drag: true,
+        window_decorations: Some(WindowDecorations::Client),
+        app_id: Some("dev.jrmd.dbx".into()),
+        ..Default::default()
+    }
+}
 
 fn main() {
     gpui_platform::application()
@@ -108,28 +131,35 @@ fn main() {
                 KeyBinding::new("ctrl-q", Quit, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                        point(px(80.0), px(80.0)),
-                        size(px(1440.0), px(900.0)),
-                    ))),
-                    window_min_size: Some(size(px(960.0), px(640.0))),
-                    // DBX owns the titlebar so the window chrome follows the
-                    // same compact active appearance as the rest of the shell.
-                    // The custom controls are rendered by `DbxApp`.
-                    titlebar: None,
-                    app_owns_titlebar_drag: true,
-                    window_decorations: Some(WindowDecorations::Client),
-                    app_id: Some("dev.jrmd.dbx".into()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    window.set_window_title(APP_NAME);
-                    cx.new(|cx| DbxApp::new(window, cx))
-                },
-            )
+            cx.open_window(dbx_window_options(), |window, cx| {
+                window.set_window_title(APP_NAME);
+                cx.new(|cx| DbxApp::new(window, cx))
+            })
             .expect("open DBX window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_window_preserves_native_move_and_resize_contract() {
+        let options = dbx_window_options();
+
+        assert!(options.is_movable);
+        assert!(options.is_resizable);
+        assert!(options.app_owns_titlebar_drag);
+        let titlebar = options
+            .titlebar
+            .expect("macOS requires a titlebar style mask for native edge resizing");
+        assert!(titlebar.appears_transparent);
+        assert!(
+            titlebar
+                .traffic_light_position
+                .is_some_and(|position| position.x < px(0.0)),
+            "DBX keeps its app-owned close control instead of native traffic lights"
+        );
+    }
 }

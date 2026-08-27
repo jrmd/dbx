@@ -1,6 +1,10 @@
 use super::super::*;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 
+fn window_title_drag_width(compact_layout: bool) -> Pixels {
+    if compact_layout { px(96.) } else { px(122.) }
+}
+
 impl DbxApp {
     pub(super) fn render_workspace(
         &mut self,
@@ -128,9 +132,6 @@ impl DbxApp {
     }
 
     pub(super) fn render_topbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let connected = self
-            .active_session()
-            .is_some_and(|session| session.engine.is_some());
         div()
             .h(px(42.))
             .flex_none()
@@ -139,38 +140,51 @@ impl DbxApp {
             .border_b_1()
             .border_color(theme().border)
             .bg(theme().rail)
-            .when(!connected, |view| {
-                view.child(
-                    div()
-                        .w(if self.compact_layout {
-                            px(96.)
-                        } else {
-                            px(122.)
-                        })
-                        .flex_none()
-                        .px(px(12.))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
-                        .child(
-                            div()
-                                .id("window-title-drag")
-                                .flex_1()
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .window_control_area(WindowControlArea::Drag)
-                                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                    window.start_window_move();
-                                })
-                                .on_double_click(|_, window, _| window.zoom_window())
-                                .text_size(px(15.))
-                                .font_weight(FontWeight::BOLD)
-                                .child("DBX"),
-                        ),
-                )
-            })
+            .child(
+                div()
+                    .id("window-title-drag")
+                    .w(window_title_drag_width(self.compact_layout))
+                    .h_full()
+                    .flex_none()
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                        this.window_drag_armed = false;
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.window_drag_armed = false;
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.window_drag_armed = true;
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.window_drag_armed {
+                            this.window_drag_armed = false;
+                            window.start_window_move();
+                        }
+                    }))
+                    .on_double_click(|_, window, _| window.zoom_window())
+                    .child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("DBX"),
+                    ),
+            )
             .child(self.render_connection_tabs(cx))
             .child(
                 div()
@@ -183,9 +197,27 @@ impl DbxApp {
                     .h_full()
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down(MouseButton::Left, |_, window, _| {
-                        window.start_window_move();
-                    })
+                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                        this.window_drag_armed = false;
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.window_drag_armed = false;
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| {
+                            this.window_drag_armed = true;
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, _, window, _| {
+                        if this.window_drag_armed {
+                            this.window_drag_armed = false;
+                            window.start_window_move();
+                        }
+                    }))
                     .on_double_click(|_, window, _| window.zoom_window()),
             )
             .child(
@@ -1051,5 +1083,16 @@ impl DbxApp {
                 },
             ))
             .on_click(listener)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topbar_retains_an_obvious_drag_surface_at_each_layout() {
+        assert_eq!(window_title_drag_width(false), px(122.));
+        assert_eq!(window_title_drag_width(true), px(96.));
     }
 }
