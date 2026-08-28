@@ -377,7 +377,7 @@ pub(super) fn redis_completion_items(
     catalog: Option<&RedisCommandCatalog>,
     active_result: Option<&QueryResult>,
     browser_result: Option<&QueryResult>,
-) -> Option<(Range<usize>, Vec<SqlCompletionItem>, String)> {
+) -> Option<(Range<usize>, Vec<SqlCompletionItem>)> {
     let context = redis_completion_context(text, cursor)?;
     let append_space = text[context.replacement_range.end..]
         .chars()
@@ -402,10 +402,7 @@ pub(super) fn redis_completion_items(
             [active_result, browser_result],
         ),
     };
-    (!items.is_empty()).then(|| {
-        let signature = format!("{text}\u{0}{cursor}\u{0}{context:?}");
-        (context.replacement_range, items, signature)
-    })
+    (!items.is_empty()).then_some((context.replacement_range, items))
 }
 
 fn redis_completion_context(text: &str, cursor: usize) -> Option<RedisCompletionContext> {
@@ -1115,7 +1112,7 @@ mod tests {
     fn catalog_completion(
         text: &str,
         catalog: &RedisCommandCatalog,
-    ) -> (Range<usize>, Vec<SqlCompletionItem>, String) {
+    ) -> (Range<usize>, Vec<SqlCompletionItem>) {
         redis_completion_items(text, text.len(), Some(catalog), None, None)
             .unwrap_or_else(|| panic!("expected completions for {text:?}"))
     }
@@ -1131,7 +1128,7 @@ mod tests {
             ("SUBS", "SUBSTR"),
             ("SLAVE", "SLAVEOF"),
         ] {
-            let (_, items, _) = catalog_completion(text, &catalog);
+            let (_, items) = catalog_completion(text, &catalog);
             assert!(
                 items.iter().any(|item| item.label == expected),
                 "{expected} was not discoverable from {text:?}"
@@ -1143,7 +1140,7 @@ mod tests {
     fn runtime_catalog_is_case_insensitive_and_preserves_the_untyped_suffix() {
         let catalog = fixture_catalog();
         let text = "client i trailing";
-        let (range, items, _) =
+        let (range, items) =
             redis_completion_items(text, "client i".len(), Some(&catalog), None, None)
                 .expect("CLIENT ID completion");
         let item = items
@@ -1169,12 +1166,12 @@ mod tests {
         let catalog = fixture_catalog();
         let key_cache = keyspace_result(&[CellValue::Text("user:42".into())]);
 
-        let (_, key_items, _) =
+        let (_, key_items) =
             redis_completion_items("SET us", 6, Some(&catalog), Some(&key_cache), None)
                 .expect("key completion");
         assert!(key_items.iter().any(|item| item.label == "user:42"));
 
-        let (_, option_items, _) = redis_completion_items(
+        let (_, option_items) = redis_completion_items(
             "SET user:42 value N",
             "SET user:42 value N".len(),
             Some(&catalog),
@@ -1212,11 +1209,11 @@ mod tests {
             vec![argument("integer", None, None, Vec::new()), count, r#match],
         )]);
 
-        let (_, initial_items, _) = catalog_completion("SCAN 0 ", &catalog);
+        let (_, initial_items) = catalog_completion("SCAN 0 ", &catalog);
         assert!(initial_items.iter().any(|item| item.label == "COUNT"));
         assert!(initial_items.iter().any(|item| item.label == "MATCH"));
 
-        let (_, after_value_items, _) = catalog_completion("SCAN 0 COUNT 10 ", &catalog);
+        let (_, after_value_items) = catalog_completion("SCAN 0 COUNT 10 ", &catalog);
         assert!(after_value_items.iter().any(|item| item.label == "MATCH"));
         assert!(!after_value_items.iter().any(|item| item.label == "COUNT"));
 
@@ -1268,7 +1265,7 @@ mod tests {
             ],
         )]);
 
-        let (_, initial, _) = catalog_completion("SET user value ", &catalog);
+        let (_, initial) = catalog_completion("SET user value ", &catalog);
         for expected in ["NX", "IFEQ", "GET", "EX", "PX", "KEEPTTL"] {
             assert!(
                 initial.iter().any(|item| item.label == expected),
@@ -1276,7 +1273,7 @@ mod tests {
             );
         }
 
-        let (_, after_get, _) = catalog_completion("SET user value GET P", &catalog);
+        let (_, after_get) = catalog_completion("SET user value GET P", &catalog);
         assert!(after_get.iter().any(|item| item.label == "PX"));
     }
 
@@ -1331,10 +1328,10 @@ mod tests {
             "later options must wait for LIMIT's required count"
         );
 
-        let (_, after_limit, _) = catalog_completion("SORT source LIMIT 0 10 S", &catalog);
+        let (_, after_limit) = catalog_completion("SORT source LIMIT 0 10 S", &catalog);
         assert!(after_limit.iter().any(|item| item.label == "STORE"));
 
-        let (_, repeated_get, _) = catalog_completion("SORT source GET pattern G", &catalog);
+        let (_, repeated_get) = catalog_completion("SORT source GET pattern G", &catalog);
         assert!(repeated_get.iter().any(|item| item.label == "GET"));
     }
 
@@ -1364,7 +1361,7 @@ mod tests {
             CellValue::Text("user:stream".into()),
         ]);
 
-        let (_, store_items, _) = redis_completion_items(
+        let (_, store_items) = redis_completion_items(
             "SORT source STORE dest",
             "SORT source STORE dest".len(),
             Some(&sort_catalog),
@@ -1378,7 +1375,7 @@ mod tests {
                 .any(|item| item.label == "destination:list")
         );
 
-        let (_, stream_items, _) = redis_completion_items(
+        let (_, stream_items) = redis_completion_items(
             "XREAD STREAMS user:",
             "XREAD STREAMS user:".len(),
             Some(&xread_catalog),
@@ -1429,10 +1426,10 @@ mod tests {
             vec![argument("key", None, Some(0), Vec::new()), trim],
         )]);
 
-        let (_, strategy_items, _) = catalog_completion("XADD stream M", &catalog);
+        let (_, strategy_items) = catalog_completion("XADD stream M", &catalog);
         assert!(strategy_items.iter().any(|item| item.label == "MAXLEN"));
 
-        let (_, limit_items, _) = catalog_completion("XADD stream MAXLEN ~ 100 L", &catalog);
+        let (_, limit_items) = catalog_completion("XADD stream MAXLEN ~ 100 L", &catalog);
         assert!(limit_items.iter().any(|item| item.label == "LIMIT"));
     }
 
@@ -1446,7 +1443,7 @@ mod tests {
             CellValue::Text("user:42".into()),
         ]);
 
-        let (_, items, _) = redis_completion_items(
+        let (_, items) = redis_completion_items(
             "DEL one us",
             "DEL one us".len(),
             Some(&catalog),
@@ -1467,7 +1464,7 @@ mod tests {
         let catalog = catalog(vec![command("GET", Vec::new())]);
         let key_cache = keyspace_result(&[CellValue::Text("user:42".into())]);
 
-        let (_, items, _) = redis_completion_items(
+        let (_, items) = redis_completion_items(
             "GET user:",
             "GET user:".len(),
             Some(&catalog),
@@ -1487,7 +1484,7 @@ mod tests {
         commands.push(command("COMMAND", Vec::new()));
         let catalog = catalog(commands);
 
-        let (_, items, _) = catalog_completion("COMMAND", &catalog);
+        let (_, items) = catalog_completion("COMMAND", &catalog);
         assert!(items.len() <= MAX_REDIS_COMPLETIONS);
         assert_eq!(
             items.first().map(|item| item.label.as_str()),
@@ -1497,7 +1494,7 @@ mod tests {
 
     #[test]
     fn partial_command_offers_get() {
-        let (_, items, _) =
+        let (_, items) =
             redis_completion_items("GE", 2, None, None, None).expect("command completions");
         let get = items
             .iter()
@@ -1509,7 +1506,7 @@ mod tests {
     #[test]
     fn command_completion_preserves_following_arguments_without_duplicate_spacing() {
         let text = "GE existing:key";
-        let (range, items, _) =
+        let (range, items) =
             redis_completion_items(text, 2, None, None, None).expect("command completions");
         let get = items
             .iter()
@@ -1530,11 +1527,11 @@ mod tests {
 
     #[test]
     fn common_server_and_stream_commands_are_discoverable() {
-        let (_, server_items, _) =
+        let (_, server_items) =
             redis_completion_items("PI", 2, None, None, None).expect("server commands");
         assert!(server_items.iter().any(|item| item.label == "PING"));
 
-        let (_, stream_items, _) =
+        let (_, stream_items) =
             redis_completion_items("XR", 2, None, None, None).expect("stream commands");
         assert!(stream_items.iter().any(|item| item.label == "XRANGE"));
     }
@@ -1549,7 +1546,7 @@ mod tests {
             ("SIS", "SISMEMBER"),
             ("ZRAN", "ZRANK"),
         ] {
-            let (_, items, _) = redis_completion_items(prefix, prefix.len(), None, None, None)
+            let (_, items) = redis_completion_items(prefix, prefix.len(), None, None, None)
                 .expect("command items");
             assert!(items.iter().any(|item| item.label == command));
         }
@@ -1557,7 +1554,7 @@ mod tests {
 
     #[test]
     fn completion_only_uses_the_current_line() {
-        let (_, items, _) = redis_completion_items("SET stale value\nGE", 18, None, None, None)
+        let (_, items) = redis_completion_items("SET stale value\nGE", 18, None, None, None)
             .expect("current line command completions");
         assert!(items.iter().any(|item| item.label == "GET"));
         assert!(!items.iter().any(|item| item.label == "SET"));
@@ -1568,7 +1565,7 @@ mod tests {
         let result = keyspace_result(&[CellValue::Text("user:42".into())]);
         let text = "GET user: suffix";
         let cursor = "GET user:".len();
-        let (range, items, _) = redis_completion_items(text, cursor, None, Some(&result), None)
+        let (range, items) = redis_completion_items(text, cursor, None, Some(&result), None)
             .expect("key completions");
         let item = items
             .iter()
@@ -1592,7 +1589,7 @@ mod tests {
         let result = keyspace_result(&[CellValue::Text("user:7".into())]);
         let text = "GET user:42";
         let cursor = "GET user:".len();
-        let (range, items, _) = redis_completion_items(text, cursor, None, Some(&result), None)
+        let (range, items) = redis_completion_items(text, cursor, None, Some(&result), None)
             .expect("key completions");
         let item = items
             .iter()
@@ -1621,7 +1618,7 @@ mod tests {
             CellValue::Text("shared:key".into()),
             CellValue::Text("browser:key".into()),
         ]);
-        let (_, items, _) = redis_completion_items("GET ", 4, None, Some(&active), Some(&browser))
+        let (_, items) = redis_completion_items("GET ", 4, None, Some(&active), Some(&browser))
             .expect("cached key completions");
 
         assert_eq!(
@@ -1636,7 +1633,7 @@ mod tests {
     #[test]
     fn keys_only_appear_in_key_positions_and_are_escaped_for_redis() {
         let result = keyspace_result(&[CellValue::Text("user name".into())]);
-        let (_, items, _) = redis_completion_items("MGET user", 9, None, Some(&result), None)
+        let (_, items) = redis_completion_items("MGET user", 9, None, Some(&result), None)
             .expect("variadic key completion");
         assert_eq!(items[0].insert_text, "\"user name\"");
         assert!(redis_completion_items("SET user value", 14, None, Some(&result), None).is_none());
@@ -1651,7 +1648,7 @@ mod tests {
             CellValue::Text("vertical\u{b}tab".into()),
             CellValue::Bytes(vec![0xff]),
         ]);
-        let (_, items, _) = redis_completion_items("GET ", 4, None, Some(&result), None)
+        let (_, items) = redis_completion_items("GET ", 4, None, Some(&result), None)
             .expect("safe key completion");
 
         assert_eq!(

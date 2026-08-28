@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{borrow::Cow, time::Instant};
 
 use futures_util::{StreamExt, TryStreamExt};
 use sqlx::{
@@ -153,43 +153,40 @@ impl SqlxEngine {
             SqlxPool::Postgres(pool) => {
                 let mut rows = bind_postgres_query(statement).fetch(pool);
                 while let Some(row) = rows.try_next().await? {
+                    if limit.is_some_and(|limit| output.len() >= limit) {
+                        truncated = true;
+                        break;
+                    }
                     if columns.is_empty() {
                         columns = result_columns(row.columns());
                     }
                     output.push(RowData::new(decode_postgres_row(&row)?));
-                    if limit.is_some_and(|limit| output.len() > limit) {
-                        output.pop();
-                        truncated = true;
-                        break;
-                    }
                 }
             }
             SqlxPool::MySql(pool) => {
                 let mut rows = bind_mysql_query(statement).fetch(pool);
                 while let Some(row) = rows.try_next().await? {
+                    if limit.is_some_and(|limit| output.len() >= limit) {
+                        truncated = true;
+                        break;
+                    }
                     if columns.is_empty() {
                         columns = result_columns(row.columns());
                     }
                     output.push(RowData::new(decode_mysql_row(&row)?));
-                    if limit.is_some_and(|limit| output.len() > limit) {
-                        output.pop();
-                        truncated = true;
-                        break;
-                    }
                 }
             }
             SqlxPool::SQLite(pool) => {
                 let mut rows = bind_sqlite_query(statement).fetch(pool);
                 while let Some(row) = rows.try_next().await? {
+                    if limit.is_some_and(|limit| output.len() >= limit) {
+                        truncated = true;
+                        break;
+                    }
                     if columns.is_empty() {
                         columns = result_columns(row.columns());
                     }
                     output.push(RowData::new(decode_sqlite_row(&row)?));
-                    if limit.is_some_and(|limit| output.len() > limit) {
-                        output.pop();
-                        truncated = true;
-                        break;
-                    }
                 }
             }
         }
@@ -909,10 +906,11 @@ fn push_bounded_row(
 
 fn refine_dynamic_column_types(columns: &mut [ColumnInfo], values: &[CellValue]) {
     for (column, value) in columns.iter_mut().zip(values) {
-        if !matches!(
-            column.data_type.trim().to_ascii_uppercase().as_str(),
-            "" | "NULL" | "UNKNOWN"
-        ) {
+        let data_type = column.data_type.trim();
+        if !(data_type.is_empty()
+            || data_type.eq_ignore_ascii_case("NULL")
+            || data_type.eq_ignore_ascii_case("UNKNOWN"))
+        {
             continue;
         }
         let inferred = match value {
@@ -1174,14 +1172,14 @@ fn decode_sqlite_row(row: &SqliteRow) -> Result<Vec<CellValue>> {
 }
 
 fn decode_postgres_cell(row: &PgRow, index: usize, type_name: &str) -> Result<CellValue> {
-    let type_name = type_name.to_ascii_lowercase();
+    let type_name = normalized_type_name(type_name);
     if (type_name == "bool" || type_name == "boolean")
         && let Ok(value) = row.try_get::<Option<bool>, _>(index)
     {
         return Ok(value.map(CellValue::Boolean).unwrap_or(CellValue::Null));
     }
     if is_postgres_integer(&type_name) {
-        let value = match type_name.as_str() {
+        let value = match type_name.as_ref() {
             "smallint" | "int2" => row
                 .try_get::<Option<i16>, _>(index)
                 .ok()
@@ -1268,7 +1266,7 @@ fn decode_postgres_cell(row: &PgRow, index: usize, type_name: &str) -> Result<Ce
 }
 
 fn decode_mysql_cell(row: &MySqlRow, index: usize, type_name: &str) -> Result<CellValue> {
-    let type_name = type_name.to_ascii_lowercase();
+    let type_name = normalized_type_name(type_name);
     if (type_name.contains("bool") || type_name == "tinyint(1)")
         && let Ok(value) = row.try_get::<Option<bool>, _>(index)
     {
@@ -1339,7 +1337,7 @@ fn decode_mysql_cell(row: &MySqlRow, index: usize, type_name: &str) -> Result<Ce
 }
 
 fn decode_sqlite_cell(row: &SqliteRow, index: usize, type_name: &str) -> Result<CellValue> {
-    let type_name = type_name.to_ascii_lowercase();
+    let type_name = normalized_type_name(type_name);
     let unknown_type = type_name == "null";
     // SQLite reports NULL for the dynamic type of some PRAGMA/result
     // columns. Inspect the value before falling back so metadata such as
@@ -1420,6 +1418,17 @@ fn decode_text_or_bytes_mysql(row: &MySqlRow, index: usize, type_name: &str) -> 
     Ok(CellValue::Text(format!(
         "<unsupported SQL type `{type_name}`>"
     )))
+}
+
+/// Avoid allocating a lowercase type name for the common case where the
+/// driver already reports metadata in lowercase. The decoder only needs an
+/// owned value when an uppercase character is present.
+fn normalized_type_name(type_name: &str) -> Cow<'_, str> {
+    if type_name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(type_name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(type_name)
+    }
 }
 
 fn mysql_bytes_fallback(value: Vec<u8>) -> CellValue {

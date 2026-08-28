@@ -208,8 +208,8 @@ impl DbxApp {
         else {
             return div().into_any_element();
         };
-        // Paint failed-query underlines only while the text still matches the
-        // run that produced them; any edit silently clears highlighting.
+        // Paint failed-query underlines only while the query revision still
+        // matches the run that produced them; text edits clear the range.
         if sql_dialect {
             let highlight = self
                 .session(session_id)
@@ -219,18 +219,10 @@ impl DbxApp {
                     let SecondaryTabKind::Query(query) = &tab.kind else {
                         return None;
                     };
-                    Some((
-                        query.error_highlight.clone(),
-                        query.query_text.read(cx).clone(),
-                    ))
+                    query.error_highlight.clone()
                 })
-                .map(|(highlight, text)| match highlight {
-                    Some((snapshot, range)) if snapshot == text => vec![range],
-                    _ => Vec::new(),
-                });
-            if let Some(ranges) = highlight {
-                query_editor.update(cx, |editor, cx| editor.set_diagnostics(ranges, cx));
-            }
+                .map_or_else(Vec::new, |range| vec![range]);
+            query_editor.update(cx, |editor, cx| editor.set_diagnostics(highlight, cx));
         }
         let query_focus = query_editor.read(cx).focus_handle();
         let completion = query_focus
@@ -241,7 +233,7 @@ impl DbxApp {
             self.render_sql_completion(
                 session_id,
                 tab_id,
-                query_editor.read(cx).completion_anchor(),
+                query_editor.read(cx).completion_anchor(cx),
                 menu,
                 cx,
             )

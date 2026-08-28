@@ -238,7 +238,9 @@ fn value_map(value: &Value) -> Option<Vec<(String, &Value)>> {
         ),
         Value::Array(entries) if entries.len() % 2 == 0 => Some(
             entries
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .filter_map(|pair| value_text(&pair[0]).map(|key| (key.to_owned(), &pair[1])))
                 .collect(),
         ),
