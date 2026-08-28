@@ -248,26 +248,23 @@ fn plain_cell_text(value: &CellValue) -> String {
 }
 
 fn delimited_row(values: &[CellValue], delimiter: char) -> String {
-    values
-        .iter()
-        .map(|value| delimited_cell(value, delimiter))
-        .collect::<Vec<_>>()
-        .join(&delimiter.to_string())
+    let mut output = String::new();
+    append_delimited_row(&mut output, values, delimiter);
+    output
 }
 
 fn delimited_result(result: &QueryResult, delimiter: char) -> String {
-    let mut lines = Vec::with_capacity(result.rows.len() + 1);
-    lines.push(delimited_text_row(
+    let mut output = String::new();
+    append_delimited_text_row(
+        &mut output,
         result.columns.iter().map(|column| column.name.as_str()),
         delimiter,
-    ));
-    lines.extend(
-        result
-            .rows
-            .iter()
-            .map(|row| delimited_row(&row.values, delimiter)),
     );
-    lines.join("\n")
+    for row in &result.rows {
+        output.push('\n');
+        append_delimited_row(&mut output, &row.values, delimiter);
+    }
+    output
 }
 
 fn delimited_column<'a>(
@@ -275,27 +272,50 @@ fn delimited_column<'a>(
     values: impl Iterator<Item = &'a CellValue>,
     delimiter: char,
 ) -> String {
-    std::iter::once(quote_delimited_text(header, delimiter, false))
-        .chain(values.map(|value| delimited_cell(value, delimiter)))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut output = String::new();
+    append_quoted_delimited_text(&mut output, header, delimiter, false);
+    for value in values {
+        output.push('\n');
+        append_delimited_cell(&mut output, value, delimiter);
+    }
+    output
 }
 
-fn delimited_cell(value: &CellValue, delimiter: char) -> String {
-    match value {
-        CellValue::Null => NULL_SENTINEL.to_owned(),
-        value => quote_delimited_text(&plain_cell_text(value), delimiter, true),
+fn append_delimited_row(output: &mut String, values: &[CellValue], delimiter: char) {
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(delimiter);
+        }
+        append_delimited_cell(output, value, delimiter);
     }
 }
 
-fn delimited_text_row<'a>(values: impl Iterator<Item = &'a str>, delimiter: char) -> String {
-    values
-        .map(|value| quote_delimited_text(value, delimiter, false))
-        .collect::<Vec<_>>()
-        .join(&delimiter.to_string())
+fn append_delimited_cell(output: &mut String, value: &CellValue, delimiter: char) {
+    match value {
+        CellValue::Null => output.push_str(NULL_SENTINEL),
+        value => append_quoted_delimited_text(output, &plain_cell_text(value), delimiter, true),
+    }
 }
 
-fn quote_delimited_text(value: &str, delimiter: char, protect_null_sentinel: bool) -> String {
+fn append_delimited_text_row<'a>(
+    output: &mut String,
+    values: impl Iterator<Item = &'a str>,
+    delimiter: char,
+) {
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            output.push(delimiter);
+        }
+        append_quoted_delimited_text(output, value, delimiter, false);
+    }
+}
+
+fn append_quoted_delimited_text(
+    output: &mut String,
+    value: &str,
+    delimiter: char,
+    protect_null_sentinel: bool,
+) {
     let needs_quotes = value.is_empty()
         || (protect_null_sentinel && value == NULL_SENTINEL)
         || value.contains(delimiter)
@@ -303,46 +323,79 @@ fn quote_delimited_text(value: &str, delimiter: char, protect_null_sentinel: boo
         || value.contains('\r')
         || value.contains('\n');
     if !needs_quotes {
-        return value.to_owned();
+        output.push_str(value);
+        return;
     }
 
-    format!("\"{}\"", value.replace('"', "\"\""))
+    output.push('"');
+    for character in value.chars() {
+        if character == '"' {
+            output.push('"');
+        }
+        output.push(character);
+    }
+    output.push('"');
 }
 
 fn json_result(result: &QueryResult) -> String {
-    let columns = result
-        .columns
-        .iter()
-        .map(|column| {
-            serde_json::json!({
-                "name": column.name,
-                "data_type": column.data_type,
-            })
-        })
-        .collect::<Vec<_>>();
-    let rows = result
-        .rows
-        .iter()
-        .map(|row| row.values.iter().map(json_cell_value).collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-
-    serde_json::json!({ "columns": columns, "rows": rows }).to_string()
+    // Serialize directly into the final buffer. Building a serde_json::Value
+    // tree first duplicates every text/JSON cell until the final string is
+    // produced, which is a large and avoidable peak for result exports.
+    let mut output = Vec::new();
+    output.extend_from_slice(br#"{"columns":["#);
+    for (index, column) in result.columns.iter().enumerate() {
+        if index > 0 {
+            output.push(b',');
+        }
+        output.extend_from_slice(br#"{"data_type":"#);
+        write_json_value(&mut output, &column.data_type);
+        output.extend_from_slice(br#","name":"#);
+        write_json_value(&mut output, &column.name);
+        output.push(b'}');
+    }
+    output.extend_from_slice(br#"],"rows":["#);
+    for (row_index, row) in result.rows.iter().enumerate() {
+        if row_index > 0 {
+            output.push(b',');
+        }
+        output.push(b'[');
+        for (value_index, value) in row.values.iter().enumerate() {
+            if value_index > 0 {
+                output.push(b',');
+            }
+            write_json_cell_value(&mut output, value);
+        }
+        output.push(b']');
+    }
+    output.extend_from_slice(b"]}");
+    String::from_utf8(output).expect("serde_json always writes UTF-8")
 }
 
-fn json_cell_value(value: &CellValue) -> serde_json::Value {
+fn write_json_value<T: serde::Serialize>(output: &mut Vec<u8>, value: &T) {
+    serde_json::to_writer(output, value).expect("writing JSON to Vec cannot fail");
+}
+
+fn write_json_cell_value(output: &mut Vec<u8>, value: &CellValue) {
     match value {
-        CellValue::Null => serde_json::Value::Null,
-        CellValue::Boolean(value) => serde_json::Value::Bool(*value),
-        CellValue::Integer(value) => serde_json::Value::from(*value),
-        CellValue::Unsigned(value) => serde_json::Value::from(*value),
-        CellValue::Real(value) => serde_json::Number::from_f64(*value)
-            .map(serde_json::Value::Number)
-            // JSON has no NaN or infinity; keeping their text avoids silently turning a real
-            // database value into a NULL in an export.
-            .unwrap_or_else(|| serde_json::Value::String(value.to_string())),
-        CellValue::Text(value) => serde_json::Value::String(value.clone()),
-        CellValue::Bytes(_) => serde_json::Value::String(plain_cell_text(value)),
-        CellValue::Json(value) => value.clone(),
+        CellValue::Null => output.extend_from_slice(b"null"),
+        CellValue::Boolean(value) => write_json_value(output, value),
+        CellValue::Integer(value) => write_json_value(output, value),
+        CellValue::Unsigned(value) => write_json_value(output, value),
+        CellValue::Real(value) => {
+            if let Some(number) = serde_json::Number::from_f64(*value) {
+                write_json_value(output, &number);
+            } else {
+                // JSON has no NaN or infinity; keeping their text avoids
+                // silently turning a real database value into a NULL export.
+                write_json_value(output, &value.to_string());
+            }
+        }
+        CellValue::Text(value) => write_json_value(output, value),
+        CellValue::Bytes(_) => {
+            let text = plain_cell_text(value);
+            write_json_value(output, &text);
+        }
+        CellValue::Json(value) => write_json_value(output, value),
     }
 }
 

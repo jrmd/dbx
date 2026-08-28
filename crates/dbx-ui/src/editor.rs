@@ -2047,9 +2047,6 @@ impl EditorSnapshot {
 pub struct TextEditor {
     /// The surrounding view owns this entity and can observe it for changes.
     value: Entity<String>,
-    /// A frame-local copy used while painting.  Keeping this copy avoids
-    /// borrowing the value entity throughout custom element layout/paint.
-    content: String,
     focus_handle: FocusHandle,
     multiline: bool,
     language: EditorLanguage,
@@ -2104,10 +2101,8 @@ impl TextEditor {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let content = value.read(cx).clone();
         let observed = cx.observe(&value, |this, value, cx| {
             let text = value.read(cx);
-            this.content = text.clone();
             this.selected_range = clamp_range(text, this.selected_range.clone());
             this.marked_range = this
                 .marked_range
@@ -2120,7 +2115,6 @@ impl TextEditor {
 
         Self {
             value,
-            content,
             focus_handle,
             multiline,
             language,
@@ -2212,7 +2206,6 @@ impl TextEditor {
         self.record_history(cx);
         let text = normalize_value(&text.into(), self.multiline);
         let cursor = text.len();
-        self.content = text.clone();
         self.selected_range = cursor..cursor;
         self.selection_reversed = false;
         self.marked_range = None;
@@ -2266,9 +2259,10 @@ impl TextEditor {
     /// falls back to the origin, allowing callers to render without a fixed
     /// query-editor-specific offset.
     #[allow(dead_code)]
-    pub fn completion_anchor(&self) -> Point<Pixels> {
+    pub fn completion_anchor(&self, cx: &App) -> Point<Pixels> {
+        let text = self.value.read(cx);
         completion_anchor(
-            &self.content,
+            text,
             self.cursor_offset_internal(),
             self.last_bounds,
             &self.last_layout,
@@ -2356,7 +2350,6 @@ impl TextEditor {
     }
 
     fn set_text_without_selection(&mut self, text: String, cx: &mut Context<Self>) {
-        self.content = text.clone();
         self.value.update(cx, |value, cx| {
             *value = text;
             cx.notify();
@@ -2375,7 +2368,6 @@ impl TextEditor {
     }
 
     fn restore_snapshot(&mut self, snapshot: EditorSnapshot, cx: &mut Context<Self>) {
-        self.content = snapshot.text.clone();
         self.selected_range = clamp_range(&snapshot.text, snapshot.selection);
         self.selection_reversed = snapshot.selection_reversed;
         self.marked_range = None;
@@ -2619,7 +2611,8 @@ impl TextEditor {
         window.show_character_palette();
     }
 
-    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+    fn index_for_mouse_position(&self, position: Point<Pixels>, cx: &App) -> usize {
+        let text = self.value.read(cx);
         let bounds =
             selection_hit_bounds(self.is_selecting, self.selection_bounds, self.last_bounds);
         let (Some(bounds), false) = (bounds, self.last_layout.is_empty()) else {
@@ -2629,14 +2622,13 @@ impl TextEditor {
             return 0;
         }
         if position.y >= bounds.bottom() {
-            return self.content.len();
+            return text.len();
         }
 
         let line_height = bounds.size.height / self.last_layout.len().max(1) as f32;
         let line = ((position.y - bounds.top()) / line_height) as usize;
         let line = line.min(self.last_layout.len() - 1);
         let local_x = position.x - bounds.left();
-        let text = self.text_unchecked();
         let offset = nth_line_start(text, line);
         let display_index = self.last_layout[line].closest_index_for_x(local_x);
         let source_index = if self.password {
@@ -2647,10 +2639,6 @@ impl TextEditor {
         clamp_boundary(text, offset + source_index)
     }
 
-    fn text_unchecked(&self) -> &str {
-        &self.content
-    }
-
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -2658,7 +2646,7 @@ impl TextEditor {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
-        let index = self.index_for_mouse_position(event.position);
+        let index = self.index_for_mouse_position(event.position, cx);
         // Snapshot after resolving the initial click, before the focus and
         // selection notifications can cause another paint pass.
         self.selection_bounds = self.last_bounds;
@@ -2682,7 +2670,7 @@ impl TextEditor {
         // platform event is the source of truth for whether a drag is active.
         self.is_selecting = mouse_selection_active(self.is_selecting, event.dragging());
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+            self.select_to(self.index_for_mouse_position(event.position, cx), cx);
         } else {
             self.selection_bounds = None;
         }
@@ -2770,9 +2758,9 @@ impl EntityInputHandler for TextEditor {
         })
     }
 
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+    fn marked_text_range(&self, _: &mut Window, cx: &mut Context<Self>) -> Option<Range<usize>> {
         self.marked_range.as_ref().map(|range| {
-            let text = self.text_unchecked();
+            let text = self.value.read(cx);
             utf8_to_utf16(text, range.start)..utf8_to_utf16(text, range.end)
         })
     }
@@ -2887,9 +2875,10 @@ impl EntityInputHandler for TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
+        let text = self.text(cx);
         Some(utf8_to_utf16(
-            &self.text(cx),
-            self.index_for_mouse_position(point),
+            &text,
+            self.index_for_mouse_position(point, cx),
         ))
     }
 }
@@ -2966,9 +2955,9 @@ impl Element for TextEditorText {
         cx: &mut App,
     ) -> (LayoutId, ()) {
         let editor = self.editor.read(cx);
-        let text = editor.text(cx);
-        let display = editor.password.then(|| password_mask(&text));
-        let painted_text = display.as_deref().unwrap_or(&text);
+        let text = editor.value.read(cx);
+        let display = editor.password.then(|| password_mask(text));
+        let painted_text = display.as_deref().unwrap_or(text);
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let measured_width = painted_text
@@ -3011,24 +3000,24 @@ impl Element for TextEditorText {
         cx: &mut App,
     ) -> PrepaintState {
         let editor = self.editor.read(cx);
-        let text = editor.text(cx);
-        let display = editor.password.then(|| password_mask(&text));
-        let painted_text = display.as_deref().unwrap_or(&text);
+        let text = editor.value.read(cx);
+        let display = editor.password.then(|| password_mask(text));
+        let painted_text = display.as_deref().unwrap_or(text);
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let mut lines = Vec::new();
         let mut line_start = 0;
         let syntax_tokens = match editor.language {
             EditorLanguage::PlainText => Vec::new(),
-            EditorLanguage::Sql => lex_sql(&text)
+            EditorLanguage::Sql => lex_sql(text)
                 .into_iter()
                 .map(HighlightToken::from)
                 .collect(),
-            EditorLanguage::Redis => lex_redis(&text)
+            EditorLanguage::Redis => lex_redis(text)
                 .into_iter()
                 .map(HighlightToken::from)
                 .collect(),
-            EditorLanguage::Json => lex_json(&text)
+            EditorLanguage::Json => lex_json(text)
                 .into_iter()
                 .map(HighlightToken::from)
                 .collect(),
@@ -3065,10 +3054,10 @@ impl Element for TextEditorText {
 
         let line_height = window.line_height();
         let cursor = editor.cursor_offset();
-        let (cursor_line, cursor_col) = line_and_column(&text, cursor);
+        let (cursor_line, cursor_col) = line_and_column(text, cursor);
         let cursor_position = point(
             lines[cursor_line].x_for_index(if editor.password {
-                password_display_offset(&text[nth_line_start(&text, cursor_line)..], cursor_col)
+                password_display_offset(&text[nth_line_start(text, cursor_line)..], cursor_col)
             } else {
                 cursor_col
             }),
@@ -3104,8 +3093,8 @@ impl Element for TextEditorText {
 
         let mut selections = Vec::new();
         if !editor.selected_range.is_empty() {
-            let (start_line, start_col) = line_and_column(&text, editor.selected_range.start);
-            let (end_line, end_col) = line_and_column(&text, editor.selected_range.end);
+            let (start_line, start_col) = line_and_column(text, editor.selected_range.start);
+            let (end_line, end_col) = line_and_column(text, editor.selected_range.end);
             for (line, shaped_line) in lines
                 .iter()
                 .enumerate()
@@ -3114,7 +3103,7 @@ impl Element for TextEditorText {
             {
                 let start = if line == start_line {
                     shaped_line.x_for_index(if editor.password {
-                        password_display_offset(&text[nth_line_start(&text, line)..], start_col)
+                        password_display_offset(&text[nth_line_start(text, line)..], start_col)
                     } else {
                         start_col
                     })
@@ -3123,7 +3112,7 @@ impl Element for TextEditorText {
                 };
                 let end = if line == end_line {
                     shaped_line.x_for_index(if editor.password {
-                        password_display_offset(&text[nth_line_start(&text, line)..], end_col)
+                        password_display_offset(&text[nth_line_start(text, line)..], end_col)
                     } else {
                         end_col
                     })
@@ -3203,7 +3192,10 @@ impl Element for TextEditorText {
             {
                 editor.scroll_handle.set_offset(scroll_offset);
             }
-            editor.last_layout = state.lines.clone();
+            // The prepaint state is no longer needed after painting. Move the
+            // shaped lines into the editor so the hit-test/completion cache
+            // does not allocate and clone the full layout every frame.
+            editor.last_layout = std::mem::take(&mut state.lines);
             editor.last_bounds = Some(state.paint_bounds);
         });
     }

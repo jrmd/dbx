@@ -322,7 +322,17 @@ struct SqlCompletionMenu {
     replacement_range: Range<usize>,
     items: Vec<SqlCompletionItem>,
     selected: usize,
-    signature: String,
+    signature: CompletionSignature,
+}
+
+/// A completion state identity without retaining a second copy of the query.
+/// The query entity increments its revision whenever its text changes; the
+/// caret offset distinguishes otherwise identical documents at different
+/// insertion points.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompletionSignature {
+    text_revision: u64,
+    cursor: usize,
 }
 
 impl CompletionItemKind {
@@ -370,6 +380,10 @@ struct BackgroundTaskSet(Vec<tokio::task::AbortHandle>);
 
 impl BackgroundTaskSet {
     fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
+        // Completed tasks no longer need an abort handle. Sweeping here keeps
+        // this owner-scoped cancellation set bounded even when a connection
+        // performs many sequential refreshes or metadata requests.
+        self.0.retain(|handle| !handle.is_finished());
         self.0.push(task.abort_handle());
     }
 
@@ -400,20 +414,15 @@ struct QueryTab {
     results_stale: bool,
     status: String,
     error: Option<String>,
-    /// The exact query slice and database context sent to the engine. Keeping
-    /// this separate from the live editor makes result provenance explicit.
-    executed_query: Option<String>,
-    executed_range: Option<Range<usize>>,
-    execution_scope: Option<editor::QueryExecutionScope>,
     executed_database: Option<String>,
     abort_handle: AbortOnDrop,
-    /// The query text a failed run was executed against plus the byte range
-    /// its error message points at. Highlighting only paints while the editor
-    /// still holds that exact text, so any edit clears it.
-    error_highlight: Option<(String, Range<usize>)>,
+    /// The byte range an error message points at. Query text edits increment
+    /// `query_revision` and clear this range before it can be painted again.
+    error_highlight: Option<Range<usize>>,
     request_generation: u64,
-    completion_signature: Option<String>,
-    completion_dismissed_signature: Option<String>,
+    query_revision: u64,
+    completion_signature: Option<CompletionSignature>,
+    completion_dismissed_signature: Option<CompletionSignature>,
     completion_index: usize,
     _subscriptions: Vec<Subscription>,
 }
@@ -453,7 +462,11 @@ impl QueryTab {
                     .find(|tab| tab.id == tab_id)
                 && let SecondaryTabKind::Query(query) = &mut tab.kind
             {
+                query.query_revision = query.query_revision.wrapping_add(1);
                 query.results_stale = query.result.is_some();
+                query.error_highlight = None;
+                query.completion_signature = None;
+                query.completion_dismissed_signature = None;
             }
             cx.notify();
         });
@@ -475,13 +488,11 @@ impl QueryTab {
             results_stale: false,
             status: "Ready to query".into(),
             error: None,
-            executed_query: None,
-            executed_range: None,
-            execution_scope: None,
             executed_database: None,
             abort_handle: AbortOnDrop::default(),
             error_highlight: None,
             request_generation: 0,
+            query_revision: 0,
             completion_signature: None,
             completion_dismissed_signature: None,
             completion_index: 0,
@@ -2812,6 +2823,7 @@ impl DbxApp {
             let SecondaryTabKind::Query(query_tab) = &tab.kind else {
                 return None;
             };
+            let text_revision = query_tab.query_revision;
             let query_text = query_tab.query_text.read(cx).clone();
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
             if session.kind.is_sql() {
@@ -2830,17 +2842,32 @@ impl DbxApp {
                         active_schema_filter: session.schema_filter.as_deref(),
                     },
                 );
-                let signature = format!("{query_text}\u{0}{cursor}\u{0}{context:?}");
-                (tab_id, context.replacement_range, items, signature)
+                (
+                    tab_id,
+                    context.replacement_range,
+                    items,
+                    CompletionSignature {
+                        text_revision,
+                        cursor,
+                    },
+                )
             } else if session.kind == DatabaseKind::Redis {
-                let (replacement_range, items, signature) = redis_completion_items(
+                let (replacement_range, items) = redis_completion_items(
                     &query_text,
                     cursor,
                     session.redis_command_catalog.as_deref(),
                     query_tab.result.as_deref(),
                     session.result.as_deref(),
                 )?;
-                (tab_id, replacement_range, items, signature)
+                (
+                    tab_id,
+                    replacement_range,
+                    items,
+                    CompletionSignature {
+                        text_revision,
+                        cursor,
+                    },
+                )
             } else {
                 return None;
             }
@@ -2858,11 +2885,11 @@ impl DbxApp {
         let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
             return None;
         };
-        if query_tab.completion_dismissed_signature.as_deref() == Some(signature.as_str()) {
+        if query_tab.completion_dismissed_signature == Some(signature) {
             return None;
         }
-        if query_tab.completion_signature.as_deref() != Some(signature.as_str()) {
-            query_tab.completion_signature = Some(signature.clone());
+        if query_tab.completion_signature != Some(signature) {
+            query_tab.completion_signature = Some(signature);
             query_tab.completion_index = 0;
         }
         query_tab.completion_dismissed_signature = None;
@@ -3250,9 +3277,7 @@ impl DbxApp {
         query_tab.status = "Running query…".into();
         query_tab.request_generation = query_tab.request_generation.saturating_add(1);
         let generation = query_tab.request_generation;
-        query_tab.executed_query = Some(query.clone());
-        query_tab.executed_range = Some(range.clone());
-        query_tab.execution_scope = Some(scope);
+        let query_revision = query_tab.query_revision;
         query_tab.executed_database = database.clone();
         cx.notify();
         // The executed statement moves into the blocking task; the original
@@ -3298,10 +3323,13 @@ impl DbxApp {
                             // Positions reported against the trimmed statement
                             // shift by the trimmed leading whitespace.
                             let lead = range.start + executed_leading_whitespace;
-                            query_tab.error_highlight = editor::sql_error_range(&message, &query)
-                                .map(|range| {
-                                    (full_query.clone(), range.start + lead..range.end + lead)
-                                });
+                            query_tab.error_highlight =
+                                if query_tab.query_revision == query_revision {
+                                    editor::sql_error_range(&message, &query)
+                                        .map(|range| range.start + lead..range.end + lead)
+                                } else {
+                                    None
+                                };
                             query_tab.error = Some(message.clone());
                             query_tab.results_stale = query_tab.result.is_some();
                             query_tab.status = "Operation failed".into();
@@ -3565,7 +3593,7 @@ impl DbxApp {
             query
                 .error_highlight
                 .as_ref()
-                .map(|(_, range)| (query.query_editor.clone(), range.start))
+                .map(|range| (query.query_editor.clone(), range.start))
         });
         if let Some((editor, offset)) = editor {
             let focus = editor.read(cx).focus_handle();

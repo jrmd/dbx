@@ -137,8 +137,7 @@ impl RedisEngine {
             return self.query_scan(value, options, started).await;
         }
 
-        let (columns, rows) = redis_value_rows(command_name, value)?;
-        let (rows, truncated) = limit_rows(rows, options);
+        let (columns, rows, truncated) = redis_value_rows(command_name, value, options)?;
         Ok(query_result(columns, rows, None, truncated, started))
     }
 
@@ -173,7 +172,7 @@ impl RedisEngine {
                 )));
             }
 
-            for (key, metadata) in keys.into_iter().zip(metadata.chunks_exact(2)) {
+            for (key, metadata) in keys.into_iter().zip(metadata.as_chunks::<2>().0.iter()) {
                 rows.push(RowData::new(vec![
                     cell_value(key),
                     cell_value(metadata[0].clone()),
@@ -365,7 +364,11 @@ fn redis_argument(value: &CellValue) -> Result<Vec<u8>> {
     }
 }
 
-fn redis_value_rows(command: &str, value: Value) -> Result<(Vec<ColumnInfo>, Vec<RowData>)> {
+fn redis_value_rows(
+    command: &str,
+    value: Value,
+    options: QueryOptions,
+) -> Result<(Vec<ColumnInfo>, Vec<RowData>, bool)> {
     match value {
         Value::Array(values) => {
             // Only commands whose protocol explicitly defines alternating
@@ -380,49 +383,78 @@ fn redis_value_rows(command: &str, value: Value) -> Result<(Vec<ColumnInfo>, Vec
                     ColumnInfo::result("key", 0, "string"),
                     ColumnInfo::result("value", 1, "value"),
                 ];
-                let rows = values
-                    .chunks_exact(2)
-                    .map(|pair| {
-                        RowData::new(vec![
-                            cell_value(pair[0].clone()),
-                            cell_value(pair[1].clone()),
-                        ])
-                    })
-                    .collect();
-                return Ok((columns, rows));
+                let limit = row_limit(options);
+                let mut rows = Vec::with_capacity(limit.unwrap_or(64).min(1024));
+                let mut values = values.into_iter();
+                let mut truncated = false;
+                while let Some(key) = values.next() {
+                    let Some(value) = values.next() else {
+                        break;
+                    };
+                    if limit.is_some_and(|limit| rows.len() >= limit) {
+                        truncated = true;
+                        break;
+                    }
+                    rows.push(RowData::new(vec![cell_value(key), cell_value(value)]));
+                }
+                return Ok((columns, rows, truncated));
             }
             let columns = vec![ColumnInfo::result("value", 0, "value")];
-            let rows = values
-                .into_iter()
-                .map(|value| RowData::new(vec![cell_value(value)]))
-                .collect();
-            Ok((columns, rows))
+            let (rows, truncated) = bounded_rows(values, options, |value| {
+                RowData::new(vec![cell_value(value)])
+            });
+            Ok((columns, rows, truncated))
         }
         Value::Map(entries) => {
             let columns = vec![
                 ColumnInfo::result("key", 0, "string"),
                 ColumnInfo::result("value", 1, "value"),
             ];
-            let rows = entries
-                .into_iter()
-                .map(|(key, value)| RowData::new(vec![cell_value(key), cell_value(value)]))
-                .collect();
-            Ok((columns, rows))
+            let (rows, truncated) = bounded_rows(entries, options, |(key, value)| {
+                RowData::new(vec![cell_value(key), cell_value(value)])
+            });
+            Ok((columns, rows, truncated))
         }
-        Value::Set(values) => Ok((
-            vec![ColumnInfo::result("value", 0, "value")],
-            values
-                .into_iter()
-                .map(|value| RowData::new(vec![cell_value(value)]))
-                .collect(),
-        )),
-        Value::Attribute { data, .. } => redis_value_rows(command, *data),
-        Value::Push { data, .. } => redis_value_rows(command, Value::Array(data)),
+        Value::Set(values) => {
+            let (rows, truncated) = bounded_rows(values, options, |value| {
+                RowData::new(vec![cell_value(value)])
+            });
+            Ok((
+                vec![ColumnInfo::result("value", 0, "value")],
+                rows,
+                truncated,
+            ))
+        }
+        Value::Attribute { data, .. } => redis_value_rows(command, *data, options),
+        Value::Push { data, .. } => redis_value_rows(command, Value::Array(data), options),
         value => Ok((
             vec![ColumnInfo::result("value", 0, "value")],
             vec![RowData::new(vec![cell_value(value)])],
+            false,
         )),
     }
+}
+
+/// Convert a Redis collection directly into the bounded grid shape. The
+/// response owns all values already, so stopping the iterator after the first
+/// omitted row releases the unrendered tail without allocating `RowData` for
+/// it. This matters for commands such as HGETALL on a large hash.
+fn bounded_rows<I, F>(values: I, options: QueryOptions, mut row: F) -> (Vec<RowData>, bool)
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> RowData,
+{
+    let limit = row_limit(options);
+    let mut rows = Vec::with_capacity(limit.unwrap_or(64).min(1024));
+    let mut truncated = false;
+    for value in values {
+        if limit.is_some_and(|limit| rows.len() >= limit) {
+            truncated = true;
+            break;
+        }
+        rows.push(row(value));
+    }
+    (rows, truncated)
 }
 
 fn command_returns_pairs(command: &str) -> bool {
@@ -471,14 +503,6 @@ fn unwrap_redis_container(value: Value) -> Value {
     }
 }
 
-fn limit_rows(rows: Vec<RowData>, options: QueryOptions) -> (Vec<RowData>, bool) {
-    let Some(limit) = row_limit(options) else {
-        return (rows, false);
-    };
-    let truncated = rows.len() > limit;
-    (rows.into_iter().take(limit).collect(), truncated)
-}
-
 fn limit_values(values: Vec<Value>, options: QueryOptions) -> (Vec<Value>, bool) {
     let Some(limit) = row_limit(options) else {
         return (values, false);
@@ -495,9 +519,9 @@ fn cell_value(value: Value) -> CellValue {
     match value {
         Value::Nil => CellValue::Null,
         Value::Int(value) => CellValue::Integer(value),
-        Value::BulkString(value) => match String::from_utf8(value.clone()) {
+        Value::BulkString(value) => match String::from_utf8(value) {
             Ok(value) => CellValue::Text(value),
-            Err(_) => CellValue::Bytes(value),
+            Err(error) => CellValue::Bytes(error.into_bytes()),
         },
         Value::SimpleString(value) | Value::VerbatimString { text: value, .. } => {
             CellValue::Text(value)
@@ -548,7 +572,7 @@ mod tests {
 
     #[test]
     fn redis_hash_replies_are_tabular() {
-        let (columns, rows) = redis_value_rows(
+        let (columns, rows, truncated) = redis_value_rows(
             "HGETALL",
             Value::Array(vec![
                 Value::BulkString(b"name".to_vec()),
@@ -556,8 +580,10 @@ mod tests {
                 Value::BulkString(b"active".to_vec()),
                 Value::Int(1),
             ]),
+            QueryOptions::default(),
         )
         .unwrap();
+        assert!(!truncated);
         assert_eq!(columns.len(), 2);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values[0], CellValue::Text("name".into()));
@@ -566,14 +592,16 @@ mod tests {
 
     #[test]
     fn even_length_list_replies_are_not_assumed_to_be_pairs() {
-        let (columns, rows) = redis_value_rows(
+        let (columns, rows, truncated) = redis_value_rows(
             "MGET",
             Value::Array(vec![
                 Value::BulkString(b"Ada".to_vec()),
                 Value::BulkString(b"Grace".to_vec()),
             ]),
+            QueryOptions::default(),
         )
         .unwrap();
+        assert!(!truncated);
         assert_eq!(
             columns
                 .iter()
@@ -611,7 +639,7 @@ mod tests {
 
     #[test]
     fn nested_replies_remain_single_raw_values() {
-        let (columns, rows) = redis_value_rows(
+        let (columns, rows, truncated) = redis_value_rows(
             "HSCAN",
             Value::Array(vec![
                 Value::BulkString(b"0".to_vec()),
@@ -620,16 +648,36 @@ mod tests {
                     Value::BulkString(b"value".to_vec()),
                 ]),
             ]),
+            QueryOptions::default(),
         )
         .unwrap();
+        assert!(!truncated);
         assert_eq!(columns.len(), 1);
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
+    fn redis_collection_rows_are_bounded_before_grid_conversion() {
+        let values = (0..100)
+            .map(|value| Value::BulkString(value.to_string().into_bytes()))
+            .collect();
+        let (columns, rows, truncated) = redis_value_rows(
+            "LRANGE",
+            Value::Array(values),
+            QueryOptions { max_rows: Some(2) },
+        )
+        .unwrap();
+
+        assert_eq!(columns.len(), 1);
+        assert_eq!(rows.len(), 2);
+        assert!(truncated);
+        assert_eq!(rows[1].values, vec![CellValue::Text("1".into())]);
+    }
+
+    #[test]
     fn redis_limits_report_omitted_rows() {
         let rows = vec![RowData::default(), RowData::default()];
-        let (rows, truncated) = limit_rows(rows, QueryOptions { max_rows: Some(1) });
+        let (rows, truncated) = bounded_rows(rows, QueryOptions { max_rows: Some(1) }, |row| row);
         assert_eq!(rows.len(), 1);
         assert!(truncated);
 
