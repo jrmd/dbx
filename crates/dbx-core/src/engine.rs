@@ -157,6 +157,19 @@ impl DatabaseEngine {
         self.execute(&SqlStatement::new(sql, Vec::new())).await
     }
 
+    /// Execute an ordered SQL script on one connection and commit only after
+    /// every statement succeeds. PostgreSQL and SQLite include transactional
+    /// DDL; MySQL may implicitly commit DDL according to server semantics.
+    pub async fn execute_transaction(&self, statements: &[String]) -> Result<()> {
+        match self {
+            Self::Sql(engine) => engine.execute_transaction(statements).await,
+            Self::Redis(_) => Err(DbxError::Unsupported {
+                operation: "execute_transaction".into(),
+                kind: self.kind(),
+            }),
+        }
+    }
+
     pub async fn query_table(
         &self,
         table: &TableRef,

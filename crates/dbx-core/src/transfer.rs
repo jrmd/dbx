@@ -15,7 +15,7 @@
 //!   nor TSV has a binary convention.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -314,6 +314,7 @@ pub async fn export_database(
             )
             .as_bytes(),
         );
+        append_database_prelude(kind, &request.tables, &table_order, &mut output)?;
         output.extend_from_slice(b"\n-- Schema\n");
         for &index in &table_order {
             let export_table = &export_tables[index];
@@ -416,6 +417,54 @@ pub async fn export_database(
         gzipped: request.gzipped,
         schema_only: false,
     })
+}
+
+fn append_database_prelude(
+    kind: DatabaseKind,
+    tables: &[TableRef],
+    table_order: &[usize],
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    if kind == DatabaseKind::PostgreSQL {
+        let schemas: BTreeSet<&str> = tables
+            .iter()
+            .filter_map(|table| table.schema.as_deref())
+            .collect();
+        if !schemas.is_empty() {
+            output.extend_from_slice(b"\n-- Schemas\n");
+            for schema in schemas {
+                output.extend_from_slice(
+                    format!(
+                        "CREATE SCHEMA IF NOT EXISTS {};\n",
+                        quote_identifier(kind, schema)?
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+
+    output.extend_from_slice(b"\n-- Replace existing tables\n");
+    let reverse_order: Vec<&TableRef> = table_order
+        .iter()
+        .rev()
+        .map(|index| &tables[*index])
+        .collect();
+    if kind == DatabaseKind::SQLite {
+        for table in reverse_order {
+            output.extend_from_slice(
+                format!("DROP TABLE IF EXISTS {};\n", quote_table(kind, table)?).as_bytes(),
+            );
+        }
+    } else {
+        let quoted = reverse_order
+            .into_iter()
+            .map(|table| quote_table(kind, table))
+            .collect::<Result<Vec<_>>>()?;
+        output
+            .extend_from_slice(format!("DROP TABLE IF EXISTS {};\n", quoted.join(", ")).as_bytes());
+    }
+    Ok(())
 }
 
 /// Import a complete database dump. Delimited files remain table-scoped and
@@ -945,13 +994,9 @@ pub async fn import_file(
     match file_format.format {
         DumpFormat::Sql => {
             let statements = split_sql_statements(&script);
-            let mut executed = 0u64;
-            for statement in &statements {
-                engine.execute_sql(statement).await?;
-                executed += 1;
-            }
+            engine.execute_transaction(&statements).await?;
             Ok(ImportReport {
-                statements_executed: executed,
+                statements_executed: statements.len() as u64,
                 rows_inserted: 0,
                 elapsed_ms: elapsed_ms_since(started),
             })
@@ -1928,6 +1973,14 @@ mod tests {
             .unwrap();
         let parent_insert = dump.find("INSERT INTO \"dbx_transfer_parent\"").unwrap();
         let child_insert = dump.find("INSERT INTO \"dbx_transfer_child\"").unwrap();
+        let child_drop = dump
+            .find("DROP TABLE IF EXISTS \"dbx_transfer_child\"")
+            .unwrap();
+        let parent_drop = dump
+            .find("DROP TABLE IF EXISTS \"dbx_transfer_parent\"")
+            .unwrap();
+        assert!(child_drop < parent_drop);
+        assert!(parent_drop < parent_create);
         assert!(parent_create < child_create);
         assert!(child_create < first_insert);
         assert!(parent_insert < child_insert);
@@ -1943,13 +1996,99 @@ mod tests {
             .execute_sql("PRAGMA foreign_keys = ON")
             .await
             .unwrap();
+        restored
+            .execute_sql(
+                "CREATE TABLE dbx_transfer_parent (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            )
+            .await
+            .unwrap();
+        restored
+            .execute_sql(
+                "CREATE TABLE dbx_transfer_child (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, FOREIGN KEY (parent_id) REFERENCES dbx_transfer_parent (id))",
+            )
+            .await
+            .unwrap();
+        restored
+            .execute_sql("INSERT INTO dbx_transfer_parent (id, name) VALUES (99, 'stale')")
+            .await
+            .unwrap();
+        restored
+            .execute_sql("INSERT INTO dbx_transfer_child (id, parent_id) VALUES (99, 99)")
+            .await
+            .unwrap();
         let report = import_database(&restored, &path).await.unwrap();
-        assert_eq!(report.statements_executed, 4);
+        assert_eq!(report.statements_executed, 6);
         let violations = restored
             .query("PRAGMA foreign_key_check", QueryOptions { max_rows: None })
             .await
             .unwrap();
         assert!(violations.rows.is_empty());
+        let restored_rows = restored
+            .query(
+                "SELECT id FROM dbx_transfer_parent ORDER BY id",
+                QueryOptions { max_rows: None },
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored_rows.rows.len(), 1);
+        assert_eq!(restored_rows.rows[0].values[0], CellValue::Integer(1));
+    }
+
+    #[tokio::test]
+    async fn sql_import_rolls_back_every_statement_when_one_fails() {
+        let engine = DatabaseEngine::connect(crate::ConnectionConfig::new(
+            crate::DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        engine
+            .execute_sql("CREATE TABLE dbx_atomic (id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        engine
+            .execute_sql("INSERT INTO dbx_atomic (id) VALUES (1)")
+            .await
+            .unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("atomic.sql");
+        fs::write(
+            &path,
+            "DELETE FROM dbx_atomic; INSERT INTO dbx_atomic (id) VALUES (2); INSERT INTO missing_table (id) VALUES (3);",
+        )
+        .unwrap();
+
+        assert!(import_database(&engine, &path).await.is_err());
+        let rows = engine
+            .query("SELECT id FROM dbx_atomic", QueryOptions { max_rows: None })
+            .await
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].values[0], CellValue::Integer(1));
+    }
+
+    #[test]
+    fn postgres_database_prelude_creates_unique_schemas_before_replacing_tables() {
+        let tables = vec![
+            TableRef::in_schema("tenant", "events"),
+            TableRef::in_schema("tenant", "accounts"),
+        ];
+        let mut output = Vec::new();
+        append_database_prelude(DatabaseKind::PostgreSQL, &tables, &[1, 0], &mut output).unwrap();
+        let sql = String::from_utf8(output).unwrap();
+
+        assert_eq!(
+            sql.matches("CREATE SCHEMA IF NOT EXISTS \"tenant\"")
+                .count(),
+            1
+        );
+        let create_schema = sql.find("CREATE SCHEMA").unwrap();
+        let drop_tables = sql.find("DROP TABLE").unwrap();
+        assert!(create_schema < drop_tables);
+        assert!(
+            sql.contains("DROP TABLE IF EXISTS \"tenant\".\"events\", \"tenant\".\"accounts\"")
+        );
     }
 
     #[tokio::test]
