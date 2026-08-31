@@ -348,6 +348,42 @@ impl SqlxEngine {
         Ok(exec_result(rows_affected, last_insert_id, started))
     }
 
+    pub async fn execute_transaction(&self, statements: &[String]) -> Result<()> {
+        match self.pool_snapshot().await {
+            SqlxPool::Postgres(pool) => {
+                let mut transaction = pool.begin().await?;
+                for statement in statements {
+                    if let Err(error) = sqlx::query(statement).execute(&mut *transaction).await {
+                        transaction.rollback().await?;
+                        return Err(error.into());
+                    }
+                }
+                transaction.commit().await?;
+            }
+            SqlxPool::MySql(pool) => {
+                let mut transaction = pool.begin().await?;
+                for statement in statements {
+                    if let Err(error) = sqlx::query(statement).execute(&mut *transaction).await {
+                        transaction.rollback().await?;
+                        return Err(error.into());
+                    }
+                }
+                transaction.commit().await?;
+            }
+            SqlxPool::SQLite(pool) => {
+                let mut transaction = pool.begin().await?;
+                for statement in statements {
+                    if let Err(error) = sqlx::query(statement).execute(&mut *transaction).await {
+                        transaction.rollback().await?;
+                        return Err(error.into());
+                    }
+                }
+                transaction.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn metadata_query(&self, sql: &str, params: &[CellValue]) -> Result<QueryResult> {
         self.query_with_statement(
             &SqlStatement::new(sql, params.to_vec()),
