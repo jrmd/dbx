@@ -29,11 +29,7 @@ impl DbxApp {
             .filter(|table| table.kind == EntityKind::Table)
             .collect();
         if tables.is_empty() {
-            if let Some(session) = self.session_mut(session_id) {
-                session.status = "No tables are available to export".into();
-                session.error = None;
-            }
-            cx.notify();
+            self.show_toast(ToastKind::Info, "No tables to export", cx);
             return;
         }
         let selected_tables = tables.iter().map(table_selection_key).collect();
@@ -240,21 +236,24 @@ impl DbxApp {
                         } else {
                             "data"
                         };
-                        session.status = format!(
-                            "Exported {} table(s) · {} row(s) · {} {} file{}",
-                            summary.tables_exported,
-                            summary.rows_exported,
+                        let message = format!(
+                            "Exported {} · {} · {} {}",
+                            counted(summary.tables_exported, "table", "tables"),
+                            counted(summary.rows_exported, "row", "rows"),
                             mode,
-                            summary.files_written,
-                            if summary.files_written == 1 { "" } else { "s" }
+                            if summary.files_written == 1 {
+                                "file"
+                            } else {
+                                "files"
+                            }
                         );
+                        this.show_toast(ToastKind::Success, message, cx);
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Database export failed".into();
+                        cx.notify();
                     }
                 }
-                cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -324,7 +323,7 @@ impl DbxApp {
         };
         if file_format.format != DumpFormat::Sql {
             self.set_error(
-                "Database imports require an SQL dump. CSV and TSV files import into one table from its context menu.".into(),
+                "Choose a .sql dump. Import CSV or TSV from a table’s context menu.".into(),
             );
             cx.notify();
             return;
@@ -341,9 +340,7 @@ impl DbxApp {
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: "Run this database SQL dump?".into(),
-            detail: format!(
-                "Every statement in ‘{file_name}’ will run against {connection_name}. Review the file first if you did not create it."
-            ),
+            detail: format!("Every statement in ‘{file_name}’ will run against {connection_name}."),
             confirm_label: "Run dump",
             tone: ConfirmationTone::Warning,
             action: ConfirmationAction::DatabaseImport { session_id, path },
@@ -403,18 +400,21 @@ impl DbxApp {
                 match result {
                     Ok(report) => {
                         session.error = None;
-                        session.status = format!(
-                            "Imported {} statement(s) from {file_name}",
-                            report.statements_executed
-                        );
                         this.refresh_tables_for(session_id, cx);
+                        this.show_toast(
+                            ToastKind::Success,
+                            format!(
+                                "Imported {} from {file_name}",
+                                counted(report.statements_executed, "statement", "statements")
+                            ),
+                            cx,
+                        );
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Database import failed".into();
+                        cx.notify();
                     }
                 }
-                cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -518,17 +518,18 @@ impl DbxApp {
                 match result {
                     Ok(summary) => {
                         session.error = None;
-                        session.status = format!(
-                            "Exported {} row(s) to {}",
-                            summary.rows_exported, destination
+                        let message = format!(
+                            "Exported {} to {}",
+                            counted(summary.rows_exported, "row", "rows"),
+                            destination
                         );
+                        this.show_toast(ToastKind::Success, message, cx);
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Export failed".into();
+                        cx.notify();
                     }
                 }
-                cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -700,26 +701,26 @@ impl DbxApp {
                         if imported_table_open {
                             this.refresh_table_for(session_id, cx);
                         }
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.status = if report.statements_executed > 0 {
-                                format!(
-                                    "Ran {} statement(s) from {}",
-                                    report.statements_executed, file_name
-                                )
-                            } else {
-                                format!(
-                                    "Imported {} row(s) from {}",
-                                    report.rows_inserted, file_name
-                                )
-                            };
-                        }
+                        let message = if report.statements_executed > 0 {
+                            format!(
+                                "Ran {} from {}",
+                                counted(report.statements_executed, "statement", "statements"),
+                                file_name
+                            )
+                        } else {
+                            format!(
+                                "Imported {} from {}",
+                                counted(report.rows_inserted, "row", "rows"),
+                                file_name
+                            )
+                        };
+                        this.show_toast(ToastKind::Success, message, cx);
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Import failed".into();
+                        cx.notify();
                     }
                 }
-                cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
         })

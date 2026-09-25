@@ -89,6 +89,9 @@ pub enum FieldValueKind {
     Integer,
     Unsigned,
     Real,
+    /// Exact numerics are validated as numbers but sent as text so values
+    /// wider than an `f64` keep every digit.
+    Decimal,
     Bytes,
     Json,
     Text,
@@ -101,6 +104,7 @@ impl FieldValueKind {
             Self::Integer => "integer",
             Self::Unsigned => "unsigned integer",
             Self::Real => "real number",
+            Self::Decimal => "decimal number",
             Self::Bytes => "hex bytes",
             Self::Json => "JSON",
             Self::Text => "text",
@@ -115,42 +119,46 @@ impl fmt::Display for FieldValueKind {
 }
 
 /// Classify a [`ColumnInfo`] for typed field parsing.
+///
+/// Engines spell types differently (`int unsigned`, `tinyint(1)`,
+/// `double precision`, `character varying(20)`), so this matches the base
+/// type name rather than substrings: `interval` and `point` are not integers.
+/// Enums, bit strings, dates, and unknown types are edited as text; the SQL
+/// builder casts text to the column type where the database needs it.
 pub fn field_value_kind(column: &ColumnInfo) -> FieldValueKind {
+    if !column.enum_values.is_empty() {
+        return FieldValueKind::Text;
+    }
     let data_type = column.data_type.trim().to_ascii_lowercase();
+    if data_type.ends_with("[]") {
+        return FieldValueKind::Text;
+    }
+    let mut words = data_type
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty());
+    let base = words.next().unwrap_or_default();
+    let unsigned = base == "unsigned" || words.any(|word| word == "unsigned");
 
-    if data_type.contains("json") {
-        FieldValueKind::Json
-    } else if data_type.contains("blob")
-        || data_type.contains("bytea")
-        || data_type.contains("binary")
-    {
-        FieldValueKind::Bytes
-    } else if data_type.contains("bool")
-        || data_type == "bit"
-        || data_type.starts_with("bit(")
-        || data_type.starts_with("tinyint(1")
-    {
-        FieldValueKind::Boolean
-    } else if data_type.contains("unsigned")
-        || data_type.starts_with("uint")
-        || data_type.starts_with("ubigint")
-    {
-        FieldValueKind::Unsigned
-    } else if data_type.contains("int")
-        || data_type.contains("serial")
-        || data_type.starts_with("sint")
-    {
-        FieldValueKind::Integer
-    } else if data_type.contains("real")
-        || data_type.contains("double")
-        || data_type.contains("float")
-        || data_type.contains("decimal")
-        || data_type.contains("numeric")
-        || data_type == "number"
-    {
-        FieldValueKind::Real
-    } else {
-        FieldValueKind::Text
+    match base {
+        "json" | "jsonb" => FieldValueKind::Json,
+        "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" => {
+            FieldValueKind::Bytes
+        }
+        "bool" | "boolean" => FieldValueKind::Boolean,
+        "tinyint" if data_type.starts_with("tinyint(1)") => FieldValueKind::Boolean,
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "int2" | "int4"
+        | "int8" | "serial" | "smallserial" | "bigserial" | "serial2" | "serial4" | "serial8"
+        | "unsigned" | "year"
+            if unsigned =>
+        {
+            FieldValueKind::Unsigned
+        }
+        "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "int2" | "int4"
+        | "int8" | "serial" | "smallserial" | "bigserial" | "serial2" | "serial4" | "serial8"
+        | "year" => FieldValueKind::Integer,
+        "real" | "double" | "float" | "float4" | "float8" => FieldValueKind::Real,
+        "decimal" | "dec" | "numeric" | "number" | "fixed" => FieldValueKind::Decimal,
+        _ => FieldValueKind::Text,
     }
 }
 
@@ -214,6 +222,28 @@ pub fn parse_field_value(column: &ColumnInfo, text: &str) -> Result<CellValue, F
             )),
             Err(_) => Err(FieldValueError::new(kind, text, "use a decimal number")),
         },
+        FieldValueKind::Decimal => {
+            let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+            let (mantissa, exponent) = unsigned
+                .split_once(['e', 'E'])
+                .map_or((unsigned, None), |(mantissa, exponent)| {
+                    (mantissa, Some(exponent))
+                });
+            let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+            let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+            let valid = !(whole.is_empty() && fraction.is_empty())
+                && digits(whole)
+                && digits(fraction)
+                && exponent.is_none_or(|exponent| {
+                    let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+                    !exponent.is_empty() && digits(exponent)
+                });
+            if valid {
+                Ok(CellValue::Text(trimmed.to_owned()))
+            } else {
+                Err(FieldValueError::new(kind, text, "use a decimal number"))
+            }
+        }
         FieldValueKind::Bytes => parse_hex_bytes(trimmed)
             .map(CellValue::Bytes)
             .map_err(|reason| FieldValueError::new(kind, text, reason)),
@@ -462,9 +492,11 @@ impl FieldRow {
         };
         let boolean_selector = if value_kind == FieldValueKind::Boolean {
             let options = ["true", "false"];
-            let selected_index = options
-                .iter()
-                .position(|option| option.eq_ignore_ascii_case(initial_text.trim()));
+            let selected_index = match parse_field_value(&column, &initial_text) {
+                Ok(CellValue::Boolean(true)) => Some(0),
+                Ok(CellValue::Boolean(false)) => Some(1),
+                _ => None,
+            };
             let items = SearchableVec::new(
                 options
                     .into_iter()
@@ -538,6 +570,32 @@ impl FieldRow {
 
     pub fn set_value(&mut self) {
         self.state = FieldValueState::Value;
+    }
+
+    /// Point the enum/boolean selectors at the current text, or clear them
+    /// when the text is not one of their options.
+    pub fn sync_value_selectors(&self, window: &mut Window, cx: &mut App) {
+        let text = self.value.read(cx).trim().to_owned();
+        if let Some(selector) = &self.enum_selector {
+            let index = self
+                .column
+                .enum_values
+                .iter()
+                .position(|option| *option == text);
+            selector.update(cx, |selector, cx| {
+                selector.set_selected_index(index.map(IndexPath::new), window, cx)
+            });
+        }
+        if let Some(selector) = &self.boolean_selector {
+            let index = match parse_field_value(&self.column, &text) {
+                Ok(CellValue::Boolean(true)) => Some(0),
+                Ok(CellValue::Boolean(false)) => Some(1),
+                _ => None,
+            };
+            selector.update(cx, |selector, cx| {
+                selector.set_selected_index(index.map(IndexPath::new), window, cx)
+            });
+        }
     }
 
     pub fn value_kind(&self) -> FieldValueKind {
@@ -1000,13 +1058,31 @@ pub fn changed_fields(
                     return None;
                 }
                 resolved.value.and_then(|value| match &value {
-                    MutationValue::Parameter(value) => (draft.original.as_ref() != Some(value))
-                        .then_some((resolved.column, MutationValue::Parameter(value.clone()))),
+                    MutationValue::Parameter(value) => (!draft
+                        .original
+                        .as_ref()
+                        .is_some_and(|original| same_value(original, value)))
+                    .then_some((resolved.column, MutationValue::Parameter(value.clone()))),
                     MutationValue::Expression(_) => Some((resolved.column, value)),
                 })
             })
             .collect(),
     )
+}
+
+/// Whether a parsed field value is the stored value. Drivers do not always
+/// decode a column as the kind the editor parses it to (a YEAR arrives
+/// unsigned, a SQLite boolean as an integer), so numbers compare by value.
+fn same_value(original: &CellValue, value: &CellValue) -> bool {
+    fn integer(value: &CellValue) -> Option<i128> {
+        match value {
+            CellValue::Boolean(value) => Some(i128::from(*value)),
+            CellValue::Integer(value) => Some(i128::from(*value)),
+            CellValue::Unsigned(value) => Some(i128::from(*value)),
+            _ => None,
+        }
+    }
+    original == value || integer(original).is_some_and(|original| Some(original) == integer(value))
 }
 
 /// Extract values for an insert, omitting fields explicitly marked Default.
@@ -1140,6 +1216,73 @@ mod tests {
             parse_field_value(&column("name", "TEXT", true), "NULL").unwrap(),
             CellValue::Text("NULL".into())
         );
+    }
+
+    #[test]
+    fn column_types_classify_by_base_name_not_substring() {
+        let kind = |data_type| field_value_kind(&column("field", data_type, true));
+        // MySQL COLUMN_TYPE spellings.
+        assert_eq!(kind("tinyint(1)"), FieldValueKind::Boolean);
+        assert_eq!(kind("tinyint"), FieldValueKind::Integer);
+        assert_eq!(kind("int unsigned"), FieldValueKind::Unsigned);
+        assert_eq!(kind("year"), FieldValueKind::Integer);
+        assert_eq!(kind("decimal(10,2)"), FieldValueKind::Decimal);
+        assert_eq!(kind("varbinary(8)"), FieldValueKind::Bytes);
+        assert_eq!(kind("bit(1)"), FieldValueKind::Text);
+        // PostgreSQL format_type spellings that contain other type names.
+        assert_eq!(kind("interval"), FieldValueKind::Text);
+        assert_eq!(kind("point"), FieldValueKind::Text);
+        assert_eq!(kind("integer[]"), FieldValueKind::Text);
+        assert_eq!(kind("bit(3)"), FieldValueKind::Text);
+        assert_eq!(kind("timestamp without time zone"), FieldValueKind::Text);
+        assert_eq!(kind("double precision"), FieldValueKind::Real);
+        assert_eq!(kind("numeric(30,10)"), FieldValueKind::Decimal);
+
+        let mut mood = column("mood", "enum('int','json')", false);
+        mood.enum_values = vec!["int".into(), "json".into()];
+        assert_eq!(field_value_kind(&mood), FieldValueKind::Text);
+    }
+
+    #[test]
+    fn decimals_keep_every_digit_and_reject_non_numbers() {
+        let price = column("price", "numeric(30,10)", false);
+        assert_eq!(
+            parse_field_value(&price, " 12345678901234567890.0123456789 ").unwrap(),
+            CellValue::Text("12345678901234567890.0123456789".into())
+        );
+        for valid in ["-1", "+.5", "3.", "1e-3", "2E+10"] {
+            assert!(parse_field_value(&price, valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", ".", "1.2.3", "1e", "abc", "0x10"] {
+            assert!(parse_field_value(&price, invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn untouched_rows_with_driver_typed_values_have_no_changes() {
+        // Drivers decode these columns as a different kind from the one the
+        // editor parses to; an unrelated save must not rewrite or reject them.
+        let columns = vec![
+            column("flag", "tinyint(1)", false),
+            column("released", "year", false),
+            column("mask", "bit(8)", false),
+            column("price", "decimal(10,2)", false),
+            column("sqlite_flag", "BOOLEAN", false),
+        ];
+        let drafts = [
+            ("flag", CellValue::Boolean(true), "true"),
+            ("released", CellValue::Unsigned(2024), "2024"),
+            ("mask", CellValue::Unsigned(15), "15"),
+            ("price", CellValue::Text("4.50".into()), "4.50"),
+            ("sqlite_flag", CellValue::Integer(1), "1"),
+        ]
+        .into_iter()
+        .map(|(name, original, text)| {
+            FieldDraft::with_new_id(name, Some(original), text, FieldValueState::Value, None)
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(changed_fields(&drafts, &columns).unwrap(), Vec::new());
     }
 
     #[test]

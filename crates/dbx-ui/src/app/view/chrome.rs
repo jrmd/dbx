@@ -1,33 +1,48 @@
 use super::super::*;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 
-fn window_title_drag_width(compact_layout: bool) -> Pixels {
-    if compact_layout { px(96.) } else { px(122.) }
-}
-
 impl DbxApp {
     pub(super) fn render_workspace(
         &mut self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let sidebar_visible = !self.sidebar_hidden;
+        let workspace = div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .pr(px(GLASS_INSET))
+            .pb(px(GLASS_INSET))
+            .gap(px(GLASS_INSET))
+            .when(sidebar_visible, |view| view.child(self.render_sidebar(cx)))
+            .child(
+                // The content sheet: the one opaque surface, so data never
+                // competes with whatever is behind the window.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .rounded(px(RADIUS_PANEL))
+                    .border_1()
+                    .border_color(theme().hairline)
+                    .bg(theme().canvas)
+                    .shadow(glass_shadow(10.))
+                    .child(self.render_main(window, cx))
+                    .child(self.render_status(cx)),
+            );
+        // Overlays live outside the gapped row so they never take up layout.
         div()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .flex()
             .flex_col()
-            .bg(theme().canvas)
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_main(window, cx)),
-            )
-            .child(self.render_status(cx))
+            .child(workspace)
             .child(self.render_table_context_menu(cx))
             .child(self.render_database_export_dialog(window, cx))
             .child(self.render_confirmation_dialog(cx))
@@ -36,49 +51,40 @@ impl DbxApp {
 
     pub(super) fn render_app_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pane = self.active_session().map(|session| session.pane);
+        let busy = self.active_session().is_some_and(|session| session.busy);
         div()
-            .w(px(46.))
+            .w(px(48.))
             .flex_none()
             .flex()
             .flex_col()
             .items_center()
-            .border_r_1()
-            .border_color(theme().border)
-            .bg(theme().rail)
-            .child(
-                div()
-                    .h(px(42.))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_b_1()
-                    .border_color(theme().border)
-                    .child(img(self.logo.clone()).id("rail-logo").size(px(24.))),
-            )
+            .pb(px(GLASS_INSET))
             .child(
                 div()
                     .flex_1()
-                    .py(px(8.))
+                    .pt(px(2.))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(4.))
+                    .gap(px(6.))
                     .child(self.rail_button(
                         "rail-data",
                         Icon::Table,
+                        "Data",
                         active_pane == Some(Pane::Data),
                         cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
                     ))
                     .child(self.rail_button(
                         "rail-structure",
                         Icon::Structure,
+                        "Structure",
                         active_pane == Some(Pane::Structure),
                         cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Structure, cx)),
                     ))
                     .child(self.rail_button(
                         "rail-query",
                         Icon::Query,
+                        "New query",
                         active_pane == Some(Pane::Query),
                         cx.listener(|this, _, window, cx| {
                             if let Some(session_id) = this.active_session_id() {
@@ -89,10 +95,15 @@ impl DbxApp {
             )
             .child(
                 div()
-                    .mb(px(11.))
-                    .size(px(7.))
+                    .id("rail-connection-health")
+                    .size(px(8.))
                     .rounded_full()
-                    .bg(theme().success),
+                    .bg(if busy {
+                        theme().warning
+                    } else {
+                        theme().success
+                    })
+                    .tooltip(tip(if busy { "Working…" } else { "Connected" })),
             )
     }
 
@@ -123,136 +134,220 @@ impl DbxApp {
                     self.open_structure_tab_for(session_id, table, cx);
                     return;
                 }
-                if let Some(session) = self.session_mut(session_id) {
-                    session.status = "Select a table before opening its structure".into();
-                }
+                self.show_toast(ToastKind::Info, "Select a table to view its structure", cx);
+                return;
             }
         }
         cx.notify();
     }
 
-    pub(super) fn render_topbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Arm the app-owned titlebar drag on any element: double-click zooms,
+    /// right-click opens the compositor's window menu where one exists.
+    fn titlebar_drag<E>(&self, element: E, cx: &mut Context<Self>) -> E
+    where
+        E: InteractiveElement + StatefulInteractiveElement + gpui_component::InteractiveElementExt,
+    {
+        element
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                this.window_drag_armed = false;
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.window_drag_armed = false;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.window_drag_armed = true;
+                }),
+            )
+            .on_mouse_down(MouseButton::Right, |event, window, _| {
+                if window.window_controls().window_menu {
+                    window.show_window_menu(event.position);
+                }
+            })
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.window_drag_armed {
+                    this.window_drag_armed = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_double_click(|_, window, _| window.zoom_window())
+    }
+
+    pub(super) fn render_topbar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_sessions = !self.sessions.is_empty();
+        let connected = self
+            .active_session()
+            .is_some_and(|session| session.engine.is_some());
+        let show_sidebar_toggle = connected && !self.connection_picker_open;
+        let identity = self
+            .titlebar_drag(
+                div()
+                    .id("window-title-drag")
+                    .h_full()
+                    .flex_none()
+                    .pl(px(if cfg!(target_os = "macos") { 80. } else { 14. }))
+                    .pr(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.)),
+                cx,
+            )
+            .when(!has_sessions, |view| {
+                view.child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("DBX"),
+                    )
+            })
+            .when(show_sidebar_toggle, |view| {
+                view.child(
+                    glass_icon_button("toggle-sidebar", Icon::Sidebar, false)
+                        .tooltip(tip(if self.sidebar_hidden {
+                            "Show explorer"
+                        } else {
+                            "Hide explorer"
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                )
+            });
         div()
-            .h(px(42.))
+            .h(px(46.))
             .flex_none()
             .flex()
             .items_center()
-            .border_b_1()
-            .border_color(theme().border)
-            .bg(theme().rail)
-            .child(
-                div()
-                    .id("window-title-drag")
-                    .w(window_title_drag_width(self.compact_layout))
-                    .h_full()
-                    .flex_none()
-                    .px(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
-                        this.window_drag_armed = false;
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, _| {
-                            this.window_drag_armed = false;
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, _| {
-                            this.window_drag_armed = true;
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, _, window, _| {
-                        if this.window_drag_armed {
-                            this.window_drag_armed = false;
-                            window.start_window_move();
-                        }
-                    }))
-                    .on_double_click(|_, window, _| window.zoom_window())
-                    .child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::BOLD)
-                            .child("DBX"),
-                    ),
-            )
+            .child(identity)
             .child(self.render_connection_tabs(cx))
             .child(
-                div()
-                    .id("window-title-drag-spacer")
-                    .w(if self.compact_layout {
-                        px(24.)
-                    } else {
-                        px(48.)
-                    })
-                    .h_full()
-                    .flex_none()
-                    .window_control_area(WindowControlArea::Drag)
-                    .on_mouse_down_out(cx.listener(|this, _, _, _| {
-                        this.window_drag_armed = false;
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, _| {
-                            this.window_drag_armed = false;
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, _| {
-                            this.window_drag_armed = true;
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, _, window, _| {
-                        if this.window_drag_armed {
-                            this.window_drag_armed = false;
-                            window.start_window_move();
-                        }
-                    }))
-                    .on_double_click(|_, window, _| window.zoom_window()),
+                self.titlebar_drag(
+                    div()
+                        .id("window-title-drag-spacer")
+                        .flex_1()
+                        .min_w(px(if self.compact_layout { 24. } else { 48. }))
+                        .h_full(),
+                    cx,
+                ),
             )
             .child(
                 div()
                     .flex_none()
-                    .px(px(8.))
+                    .pr(px(10.))
                     .flex()
                     .items_center()
-                    .gap(px(5.))
-                    .child(
-                        Button::new("toggle-appearance")
-                            .with_size(Size::XSmall)
-                            .compact()
-                            .ghost()
-                            .tooltip(match self.appearance {
-                                Appearance::Light => "Use dark appearance",
-                                Appearance::Dark => "Use light appearance",
-                            })
-                            .child(icon(
-                                match self.appearance {
-                                    Appearance::Light => Icon::Moon,
-                                    Appearance::Dark => Icon::Sun,
-                                },
-                                theme().text_muted,
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_appearance(window, cx)
-                            })),
+                    .gap(px(4.))
+                    .when(self.vault_state == Some(VaultState::Unlocked), |view| {
+                        view.child(
+                            glass_icon_button("lock-vault", Icon::Lock, false)
+                                .tooltip(tip("Lock vault"))
+                                .when(!self.vault_busy && !self.saving_connection, |button| {
+                                    button.on_click(cx.listener(|this, _, window, cx| {
+                                        this.lock_vault(cx);
+                                        this.vault_editors
+                                            .passphrase_editor
+                                            .read(cx)
+                                            .focus_handle()
+                                            .focus(window, cx);
+                                    }))
+                                }),
+                        )
+                    })
+                    .child(self.render_appearance_menu(cx))
+                    .when(!cfg!(target_os = "macos"), |view| {
+                        view.child(self.render_window_controls(window))
+                    }),
+            )
+    }
+
+    fn render_appearance_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity().downgrade();
+        let current = self.appearance;
+        let reduce = self.reduce_transparency;
+        Button::new("appearance-menu")
+            .with_size(Size::Small)
+            .compact()
+            .ghost()
+            .rounded_full()
+            .tooltip("Appearance")
+            .child(icon(Icon::Appearance, theme().text_muted))
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.label("Appearance");
+                for option in Appearance::ALL {
+                    let this = this.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option.label())
+                            .checked(option == current)
+                            .on_click(move |_, window, cx| {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.set_appearance_preference(option, window, cx)
+                                });
+                            }),
+                    );
+                }
+                let this = this.clone();
+                menu.separator().item(
+                    PopupMenuItem::new("Reduce transparency")
+                        .checked(reduce)
+                        .on_click(move |_, window, cx| {
+                            let _ = this
+                                .update(cx, |this, cx| this.toggle_reduce_transparency(window, cx));
+                        }),
+                )
+            })
+    }
+
+    /// Minimize / maximize / close for platforms where DBX draws its own
+    /// titlebar, showing only the controls the compositor supports.
+    fn render_window_controls(&self, window: &Window) -> impl IntoElement {
+        let controls = window.window_controls();
+        let maximized = window.is_maximized();
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .ml(px(4.))
+            .when(controls.minimize, |view| {
+                view.child(
+                    window_control_button("window-minimize", Icon::Minimize, false)
+                        .tooltip(tip("Minimize"))
+                        .on_click(|_, window, _| window.minimize_window()),
+                )
+            })
+            .when(controls.maximize, |view| {
+                view.child(
+                    window_control_button(
+                        "window-maximize",
+                        if maximized {
+                            Icon::Restore
+                        } else {
+                            Icon::Maximize
+                        },
+                        false,
                     )
-                    .child(window_close_button().on_click(|_, _, cx| cx.quit())),
+                    .tooltip(tip(if maximized { "Restore" } else { "Maximize" }))
+                    .on_click(|_, window, _| window.zoom_window()),
+                )
+            })
+            .child(
+                window_control_button("window-close", Icon::Close, true)
+                    .tooltip(tip("Close"))
+                    .on_click(|_, window, _| window.remove_window()),
             )
     }
 
     fn render_connection_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_session_id = self.active_session_id();
+        let active_session_id = self
+            .active_session_id()
+            .filter(|_| !self.connection_picker_open);
         let sessions: Vec<_> = self
             .sessions
             .iter()
@@ -272,16 +367,16 @@ impl DbxApp {
                 )
             })
             .collect();
+        let has_sessions = !sessions.is_empty();
         div()
             .id("connection-tabs-scroll")
-            .flex_1()
+            .flex_shrink(1.)
             .min_w_0()
-            .px(px(6.))
             .h_full()
             .flex()
-            .items_end()
-            .gap(px(3.))
-            .overflow_scroll()
+            .items_center()
+            .gap(px(4.))
+            .overflow_x_scroll()
             .children(sessions.into_iter().map(
                 |(session_id, label, busy, kind, saved, environment)| {
                     let selected = active_session_id == Some(session_id);
@@ -289,11 +384,9 @@ impl DbxApp {
                         .id(SharedString::from(format!("connection-tab-{session_id}")))
                         .flex_none()
                         .cursor_pointer()
-                        .child(div().size(px(5.)).rounded_full().bg(if busy {
-                            theme().warning
-                        } else {
-                            theme().success
-                        }))
+                        .when(busy, |tab| {
+                            tab.child(div().size(px(6.)).rounded_full().bg(theme().warning))
+                        })
                         .when(saved, |tab| tab.child(environment_badge(environment)))
                         .child(
                             div()
@@ -301,13 +394,14 @@ impl DbxApp {
                                     "close-connection-tab-{session_id}"
                                 )))
                                 .size(px(18.))
-                                .rounded(px(4.))
+                                .rounded_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .cursor_pointer()
-                                .hover(|style| style.bg(theme().panel_raised))
-                                .child(icon(Icon::Close, theme().text_muted))
+                                .hover(|style| style.bg(theme().glass_hover))
+                                .tooltip(tip("Close connection"))
+                                .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     this.close_session(session_id, cx)
@@ -320,21 +414,14 @@ impl DbxApp {
                         )
                 },
             ))
-            .child(
-                div()
-                    .id("add-connection-tab")
-                    .flex_none()
-                    .mb(px(5.))
-                    .size(px(26.))
-                    .rounded(px(6.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme().panel_raised))
-                    .child(icon(Icon::Add, theme().accent))
-                    .on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx))),
-            )
+            // The connection list already offers "new" while it is showing.
+            .when(has_sessions && !self.connection_picker_open, |view| {
+                view.child(
+                    glass_icon_button("add-connection-tab", Icon::Add, false)
+                        .tooltip(tip("New connection"))
+                        .on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx))),
+                )
+            })
     }
 
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -359,27 +446,26 @@ impl DbxApp {
         let visible_tables = schema_filtered_tables(kind, &tables, selected_schema.as_deref());
         let explorer_actions = cx.entity().downgrade();
         let table_count = visible_tables.len();
-        div()
+        glass(div(), RADIUS_GLASS, 8.)
             .w(if self.compact_layout {
-                px(180.)
+                px(188.)
             } else {
-                px(224.)
+                px(236.)
             })
             .flex_none()
             .flex()
             .flex_col()
-            .border_r_1()
-            .border_color(theme().border)
-            .bg(theme().panel)
+            .overflow_hidden()
             .child(
                 div()
                     .px(px(10.))
-                    .py(px(7.))
+                    .pt(px(8.))
+                    .pb(px(8.))
                     .flex()
                     .flex_col()
                     .gap(px(7.))
                     .border_b_1()
-                    .border_color(theme().border)
+                    .border_color(theme().hairline)
                     .child(
                         div()
                             .flex()
@@ -393,22 +479,20 @@ impl DbxApp {
                                     .child(icon(Icon::Database, theme().text_muted))
                                     .child(
                                         div()
-                                            .text_size(px(10.))
+                                            .text_size(px(12.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme().text_muted)
+                                            .text_color(theme().text)
                                             .child(if kind == DatabaseKind::Redis {
-                                                "KEYSPACE"
+                                                "Keyspace"
                                             } else {
-                                                "EXPLORER"
+                                                "Explorer"
                                             }),
                                     )
                                     .when(!self.compact_layout, |view| {
-                                        view.child(
-                                            div()
-                                                .text_size(px(9.))
-                                                .text_color(theme().text_muted)
-                                                .child(format!("{table_count}")),
-                                        )
+                                        view.child(badge(
+                                            format!("{table_count}"),
+                                            theme().text_muted,
+                                        ))
                                     }),
                             )
                             .child(
@@ -421,7 +505,7 @@ impl DbxApp {
                                             .compact()
                                             .ghost()
                                             .tooltip("Refresh explorer")
-                                            .child(icon(Icon::Refresh, theme().accent))
+                                            .child(icon(Icon::Refresh, theme().text_muted))
                                             .on_click(cx.listener(move |this, _, _window, cx| {
                                                 this.refresh_tables_for(session_id, cx)
                                             })),
@@ -436,7 +520,7 @@ impl DbxApp {
                                                 .compact()
                                                 .ghost()
                                                 .tooltip("New table")
-                                                .child(icon(Icon::Add, theme().accent))
+                                                .child(icon(Icon::Add, theme().text_muted))
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
                                                         this.create_table_template_for(
@@ -509,9 +593,9 @@ impl DbxApp {
                                 .gap(px(4.))
                                 .child(
                                     div()
-                                        .w(px(44.))
+                                        .w(px(52.))
                                         .flex_none()
-                                        .text_size(px(9.))
+                                        .text_size(px(11.))
                                         .text_color(theme().text_muted)
                                         .child("Database"),
                                 )
@@ -533,24 +617,25 @@ impl DbxApp {
                                             };
                                             div()
                                                 .id(SharedString::from(format!("db-{database}")))
-                                                .px(px(7.))
+                                                .flex_none()
+                                                .px(px(9.))
                                                 .py(px(3.))
-                                                .rounded(px(4.))
+                                                .rounded_full()
                                                 .bg(if selected {
                                                     theme().accent_soft
                                                 } else {
-                                                    theme().panel_raised
+                                                    theme().glass_hover
                                                 })
                                                 .text_color(if selected {
                                                     theme().accent
                                                 } else {
                                                     theme().text_muted
                                                 })
-                                                .text_size(px(9.))
+                                                .text_size(px(11.))
                                                 .cursor_pointer()
                                                 .hover(|style| {
                                                     style
-                                                        .bg(theme().panel_raised)
+                                                        .bg(theme().glass_selected)
                                                         .text_color(theme().text)
                                                 })
                                                 .child(label)
@@ -573,9 +658,9 @@ impl DbxApp {
                                 .gap(px(4.))
                                 .child(
                                     div()
-                                        .w(px(44.))
+                                        .w(px(52.))
                                         .flex_none()
-                                        .text_size(px(9.))
+                                        .text_size(px(11.))
                                         .text_color(theme().text_muted)
                                         .child("Schema"),
                                 )
@@ -595,24 +680,25 @@ impl DbxApp {
                                             let schema_id = schema_filter_id(schema.as_deref());
                                             div()
                                                 .id(SharedString::from(schema_id))
-                                                .px(px(7.))
+                                                .flex_none()
+                                                .px(px(9.))
                                                 .py(px(3.))
-                                                .rounded(px(4.))
+                                                .rounded_full()
                                                 .bg(if selected {
                                                     theme().accent_soft
                                                 } else {
-                                                    theme().panel_raised
+                                                    theme().glass_hover
                                                 })
                                                 .text_color(if selected {
                                                     theme().accent
                                                 } else {
                                                     theme().text_muted
                                                 })
-                                                .text_size(px(9.))
+                                                .text_size(px(11.))
                                                 .cursor_pointer()
                                                 .hover(|style| {
                                                     style
-                                                        .bg(theme().panel_raised)
+                                                        .bg(theme().glass_selected)
                                                         .text_color(theme().text)
                                                 })
                                                 .child(label)
@@ -633,7 +719,7 @@ impl DbxApp {
                     .id("sidebar-scroll")
                     .flex_1()
                     .overflow_y_scroll()
-                    .py(px(5.))
+                    .py(px(6.))
                     .children(visible_tables.into_iter().map(|table| {
                         let selected = selected_table.as_ref().is_some_and(|current| {
                             current.name == table.name && current.schema == table.schema
@@ -642,26 +728,26 @@ impl DbxApp {
                         let menu_table = table.clone();
                         div()
                             .id(SharedString::from(table_sidebar_id(&table)))
-                            .mx(px(5.))
+                            .mx(px(6.))
                             .h(px(28.))
                             .px(px(8.))
-                            .rounded(px(5.))
-                            .bg(if selected {
-                                theme().accent_soft
-                            } else {
-                                theme().panel
+                            .rounded(px(RADIUS_CONTROL))
+                            .when(selected, |row| {
+                                row.bg(theme().accent_soft).font_weight(FontWeight::MEDIUM)
                             })
                             .text_color(if selected {
                                 theme().accent
                             } else {
-                                theme().text_muted
+                                theme().text
                             })
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .flex()
                             .items_center()
                             .gap(px(7.))
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme().panel_raised).text_color(theme().text))
+                            .when(!selected, |row| {
+                                row.hover(|style| style.bg(theme().glass_hover))
+                            })
                             .child(icon(
                                 if table.kind == EntityKind::Table {
                                     Icon::Table
@@ -702,9 +788,12 @@ impl DbxApp {
             .active_session()
             .map(|session| session.pane)
             .unwrap_or(Pane::Data);
+        // min_h_0 lets tall panes (a long row draft) scroll inside the sheet
+        // instead of pushing the inspector actions and footer out of view.
         div()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
             .child(self.render_tabs(cx))
@@ -745,138 +834,65 @@ impl DbxApp {
                 (session.active_secondary_tab, tabs)
             })
             .unwrap_or_default();
+        let data_selected = active_secondary_tab.is_none();
         div()
             .id("document-tabs")
-            .h(px(36.))
-            .px(px(9.))
+            .h(px(40.))
+            .flex_none()
+            .px(px(8.))
             .flex()
             .min_w_0()
-            .items_end()
-            .gap(px(3.))
+            .items_center()
+            .gap(px(4.))
             .overflow_x_scroll()
             .border_b_1()
             .border_color(theme().border)
             .bg(theme().panel)
             .child(
-                div()
-                    .id("document-data")
-                    .h(px(31.))
-                    .px(px(11.))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .rounded_t(px(5.))
-                    .border_1()
-                    .border_color(if active_secondary_tab.is_none() {
-                        theme().border_strong
-                    } else {
-                        theme().panel
-                    })
-                    .bg(if active_secondary_tab.is_none() {
-                        theme().canvas
-                    } else {
-                        theme().panel
-                    })
-                    .text_color(if active_secondary_tab.is_none() {
-                        theme().text
-                    } else {
-                        theme().text_muted
-                    })
-                    .text_size(px(11.))
-                    .cursor_pointer()
-                    .child(icon(
-                        Icon::Table,
-                        if active_secondary_tab.is_none() {
-                            theme().accent
-                        } else {
-                            theme().text_muted
-                        },
-                    ))
+                document_tab("document-data", Icon::Table, data_selected)
                     .child("Data")
+                    .pr(px(12.))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
                     ),
             )
             .children(tabs.into_iter().map(|(tab_id, label, kind)| {
                 let selected = active_secondary_tab == Some(tab_id);
-                div()
-                    .id(SharedString::from(format!("document-{tab_id}")))
-                    .h(px(31.))
-                    .px(px(11.))
-                    .flex()
-                    .items_center()
-                    .gap(px(7.))
-                    .rounded_t(px(5.))
-                    .border_1()
-                    .border_color(if selected {
-                        theme().border_strong
-                    } else {
-                        theme().panel
-                    })
-                    .bg(if selected {
-                        theme().canvas
-                    } else {
-                        theme().panel
-                    })
-                    .text_color(if selected {
-                        theme().text
-                    } else {
-                        theme().text_muted
-                    })
-                    .text_size(px(11.))
-                    .cursor_pointer()
-                    .child(icon(
-                        kind,
-                        if selected {
-                            theme().accent
-                        } else {
-                            theme().text_muted
-                        },
-                    ))
-                    .child(label)
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("close-document-{tab_id}")))
-                            .ml(px(2.))
-                            .size(px(18.))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(theme().text_muted)
-                            .hover(|style| {
-                                style.bg(theme().panel_raised).text_color(theme().danger)
-                            })
-                            .child(icon(Icon::Close, theme().text_muted))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                if let Some(session_id) = session_id {
-                                    this.request_close_secondary_tab_for(
-                                        session_id, tab_id, window, cx,
-                                    );
-                                }
-                            })),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(session_id) = session_id {
-                            this.activate_secondary_tab_for(session_id, tab_id, window, cx);
-                        }
-                    }))
+                document_tab(
+                    SharedString::from(format!("document-{tab_id}")),
+                    kind,
+                    selected,
+                )
+                .child(label)
+                .child(
+                    div()
+                        .id(SharedString::from(format!("close-document-{tab_id}")))
+                        .size(px(18.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|style| style.bg(theme().glass_hover))
+                        .tooltip(tip("Close tab"))
+                        .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(session_id) = session_id {
+                                this.request_close_secondary_tab_for(
+                                    session_id, tab_id, window, cx,
+                                );
+                            }
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(session_id) = session_id {
+                        this.activate_secondary_tab_for(session_id, tab_id, window, cx);
+                    }
+                }))
             }))
             .child(
-                div()
-                    .id("add-query-document")
-                    .h(px(26.))
-                    .w(px(26.))
-                    .mb(px(2.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.))
-                    .text_color(theme().text_muted)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme().accent_soft).text_color(theme().accent))
-                    .child(icon(Icon::Add, theme().text_muted))
+                glass_icon_button("add-query-document", Icon::Add, false)
+                    .tooltip(tip("New query"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(session_id) = session_id {
                             this.add_query_tab_for(session_id, window, cx);
@@ -885,39 +901,42 @@ impl DbxApp {
             )
     }
 
+    /// The footer carries errors, in-progress work, and the result extent.
+    /// Idle narration ("Ready", "Inspecting selected row") is left out.
     fn render_status(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (error, status, result, table_pagination) =
+        let (error, status, result, table_pagination, summary) =
             self.active_session()
                 .map(|session| {
                     if let Some(tab) = session.active_secondary_tab.and_then(|tab_id| {
                         session.secondary_tabs.iter().find(|tab| tab.id == tab_id)
                     }) {
                         match &tab.kind {
-                            SecondaryTabKind::Query(query) => {
-                                return (
-                                    query.error.clone(),
-                                    query.status.clone(),
-                                    query.result.clone(),
-                                    None,
-                                );
+                            // Query tabs show their outcome and errors inline.
+                            SecondaryTabKind::Query(_) => {
+                                return (None, String::new(), None, None, String::new());
                             }
                             SecondaryTabKind::Diagram(diagram) => {
-                                let status = if diagram.busy && diagram.document.is_some() {
-                                    "Refreshing database diagram…".into()
-                                } else if diagram.busy {
-                                    "Building database diagram…".into()
-                                } else if let Some(selected) = &diagram.selected_node {
-                                    format!("Selected {selected} · double-click to open data")
-                                } else if let Some(document) = &diagram.document {
-                                    format!(
-                                        "{} tables · {} relationships",
-                                        document.nodes.len(),
-                                        document.edges.len()
-                                    )
-                                } else {
-                                    "Database diagram".into()
+                                let status = match (diagram.busy, &diagram.document) {
+                                    (true, Some(_)) => "Refreshing database diagram…".into(),
+                                    (true, None) => "Building database diagram…".into(),
+                                    (false, _) => String::new(),
                                 };
-                                return (diagram.error.clone(), status, None, None);
+                                let summary = diagram
+                                    .document
+                                    .as_ref()
+                                    .map(|document| {
+                                        format!(
+                                            "{} · {}",
+                                            counted(document.nodes.len() as u64, "table", "tables"),
+                                            counted(
+                                                document.edges.len() as u64,
+                                                "relationship",
+                                                "relationships"
+                                            )
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                return (diagram.error.clone(), status, None, None, summary);
                             }
                             SecondaryTabKind::Structure(_) => {}
                         }
@@ -935,12 +954,17 @@ impl DbxApp {
                     ));
                     (
                         session.error.clone(),
-                        session.status.clone(),
+                        if session.busy {
+                            session.status.clone()
+                        } else {
+                            String::new()
+                        },
                         session.result.clone(),
                         table_pagination,
+                        String::new(),
                     )
                 })
-                .unwrap_or_else(|| (self.error.clone(), self.status.clone(), None, None));
+                .unwrap_or_else(|| (self.error.clone(), String::new(), None, None, String::new()));
         let result_summary = result
             .as_ref()
             .map(|result| {
@@ -963,7 +987,7 @@ impl DbxApp {
                     format!("{} rows", result.rows.len())
                 }
             })
-            .unwrap_or_default();
+            .unwrap_or(summary);
         let pagination_controls =
             table_pagination.map(|(session_id, page, has_next_page, busy)| {
                 div()
@@ -988,21 +1012,24 @@ impl DbxApp {
                     ))
             });
         div()
-            .h(px(26.))
-            .px(px(10.))
+            .h(px(30.))
+            .flex_none()
+            .px(px(12.))
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(12.))
             .border_t_1()
             .border_color(theme().border)
             .bg(theme().panel)
-            .text_size(px(10.))
+            .text_size(px(11.))
             .text_color(theme().text_muted)
             .child(
                 div()
                     .min_w_0()
                     .flex_1()
                     .truncate()
+                    .when(error.is_some(), |view| view.text_color(theme().danger))
                     .child(error.unwrap_or(status)),
             )
             .child(
@@ -1034,16 +1061,14 @@ impl DbxApp {
     ) -> impl IntoElement {
         Button::new(id)
             .label(label)
-            .with_size(Size::Small)
-            .compact()
+            .with_size(Size::XSmall)
+            .h(px(22.))
+            .px(px(10.))
+            .rounded_full()
             .outline()
             .disabled(!enabled)
-            .border_color(theme().border)
-            .bg(if enabled {
-                theme().panel_raised
-            } else {
-                theme().panel
-            })
+            .border_color(theme().hairline)
+            .bg(theme().glass_hover)
             .text_color(if enabled {
                 theme().text
             } else {
@@ -1057,42 +1082,71 @@ impl DbxApp {
         &self,
         id: &'static str,
         kind: Icon,
+        label: &'static str,
         selected: bool,
         listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
-        div()
-            .id(id)
-            .size(px(32.))
-            .rounded(px(6.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(if selected {
-                theme().accent_soft
-            } else {
-                theme().rail
-            })
-            .cursor_pointer()
-            .hover(|style| style.bg(theme().panel_raised))
-            .child(icon(
-                kind,
-                if selected {
-                    theme().accent
-                } else {
-                    theme().text_muted
-                },
-            ))
+        glass_icon_button(id, kind, selected)
+            .size(px(34.))
+            .tooltip(tip(label))
             .on_click(listener)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A pill-shaped document tab on the content sheet's tab strip.
+fn document_tab(id: impl Into<ElementId>, kind: Icon, selected: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(28.))
+        .pl(px(10.))
+        .pr(px(4.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .rounded_full()
+        .text_size(px(12.))
+        .cursor_pointer()
+        .when(selected, |tab| {
+            tab.bg(theme().glass_selected)
+                .border_1()
+                .border_color(theme().hairline)
+                .shadow(glass_shadow(3.))
+                .text_color(theme().text)
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(!selected, |tab| {
+            tab.text_color(theme().text_muted)
+                .hover(|style| style.bg(theme().glass_hover).text_color(theme().text))
+        })
+        .child(icon(
+            kind,
+            if selected {
+                theme().accent
+            } else {
+                theme().text_muted
+            },
+        ))
+}
 
-    #[test]
-    fn topbar_retains_an_obvious_drag_surface_at_each_layout() {
-        assert_eq!(window_title_drag_width(false), px(122.));
-        assert_eq!(window_title_drag_width(true), px(96.));
-    }
+/// A circular titlebar control. Close gets a destructive hover.
+fn window_control_button(id: &'static str, kind: Icon, destructive: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(24.))
+        .flex_none()
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme().glass_hover)
+        .cursor_pointer()
+        .hover(move |style| {
+            if destructive {
+                style.bg(theme().danger)
+            } else {
+                style.bg(theme().glass_selected)
+            }
+        })
+        .child(icon(kind, theme().text).size(px(12.)))
 }

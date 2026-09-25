@@ -29,15 +29,14 @@ use dbx_core::{
     import_database, import_file,
 };
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable as _, FontWeight,
-    Image, ImageFormat, IntoElement, KeyDownEvent, MouseButton, PathPromptOptions, Pixels, Point,
-    Render, Rgba, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _,
-    Subscription, Window, WindowControlArea, WindowHandle, anchored, deferred, div, img, point,
-    prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, CursorStyle, Decorations, Div, ElementId, Entity,
+    FocusHandle, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent,
+    MouseButton, PathPromptOptions, Pixels, Point, Render, ResizeEdge, Rgba, ScrollHandle,
+    SharedString, Stateful, StatefulInteractiveElement, Subscription, Window, WindowControlArea,
+    WindowHandle, anchored, deferred, div, img, point, prelude::*, px,
 };
 use gpui_component::{
-    Disableable as _, FocusTrapElement as _, InteractiveElementExt as _, Selectable as _,
-    Sizable as _, Size,
+    Disableable as _, FocusTrapElement as _, Selectable as _, Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     resizable::ResizableState,
     select::{SearchableVec, Select, SelectEvent},
@@ -62,8 +61,11 @@ use crate::{
     row_drafts::{FieldId, FieldRow, FieldValueKind, FieldValueState, RowDraftModel},
     settings::{Settings, SettingsStore},
     theme::{
-        Appearance, ButtonKind, Icon, appearance, badge, button, connection_tab, database_logo,
-        icon, panel_header, set_appearance, theme,
+        Appearance, ButtonKind, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS, RADIUS_PANEL,
+        appearance, badge, button, connection_tab, database_logo, glass, glass_icon_button,
+        glass_raised, glass_shadow, icon, panel_header, reduce_transparency, segmented_track,
+        set_appearance, set_reduce_transparency, set_system_appearance, shortcut,
+        sync_component_theme, theme, tip, window_background,
     },
     vault::VaultState,
 };
@@ -103,6 +105,12 @@ gpui::actions!(
         DiagramRefresh,
         VaultFocusNext,
         VaultFocusPrevious,
+        NewConnection,
+        NewQuery,
+        CloseTab,
+        NextConnection,
+        PreviousConnection,
+        ToggleSidebar,
         SubmitVault
     ]
 );
@@ -180,28 +188,35 @@ fn table_browse_page(page: u64) -> Page {
     }
 }
 
+/// "1 row", "3 rows": proper plurals instead of "row(s)".
+pub(crate) fn counted(count: impl TryInto<u64>, singular: &str, plural: &str) -> String {
+    let count = count.try_into().unwrap_or(u64::MAX);
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
 fn trim_table_browse_result(result: &mut QueryResult) -> bool {
     let has_next_page = result.rows.len() > TABLE_BROWSE_PAGE_SIZE as usize;
     result.rows.truncate(TABLE_BROWSE_PAGE_SIZE as usize);
     has_next_page
 }
 
-fn window_close_button() -> Stateful<Div> {
-    div()
-        .id("window-close")
-        .size(px(28.))
-        .rounded(px(5.))
-        .border_1()
-        .border_color(theme().border_strong)
-        .bg(theme().panel)
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .hover(|style| style.bg(theme().danger).border_color(theme().danger))
-        .child(icon(Icon::Close, theme().text).size(px(12.)))
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToastKind {
+    Info,
+    Success,
+    Error,
 }
+
+/// Transient, self-dismissing feedback for outcomes that have no other
+/// visible trace (a passing connection test, a save). Persistent state and
+/// form errors stay inline instead.
+pub(crate) struct Toast {
+    id: u64,
+    kind: ToastKind,
+    message: SharedString,
+}
+
+const MAX_TOASTS: usize = 3;
 
 struct ConnectionDraft {
     kind: DatabaseKind,
@@ -486,7 +501,7 @@ impl QueryTab {
             result_column_widths: HashMap::new(),
             busy: false,
             results_stale: false,
-            status: "Ready to query".into(),
+            status: String::new(),
             error: None,
             executed_database: None,
             abort_handle: AbortOnDrop::default(),
@@ -996,14 +1011,20 @@ pub struct DbxApp {
     confirmation_dialog: Option<ConfirmationDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     appearance: Appearance,
+    reduce_transparency: bool,
     settings_store: Option<SettingsStore>,
     compact_layout: bool,
     narrow_workspace: bool,
+    sidebar_hidden: bool,
+    /// Owns keyboard focus whenever no control does, so app shortcuts keep
+    /// working after the focused element (e.g. a closed tab's editor) is gone.
+    focus_handle: FocusHandle,
+    toasts: Vec<Toast>,
+    next_toast_id: u64,
     window_drag_armed: bool,
     test_generation: u64,
     testing_connection: bool,
     _subscriptions: Vec<Subscription>,
-    status: String,
     error: Option<String>,
 }
 
@@ -1020,6 +1041,11 @@ impl DbxApp {
             cx.observe(&draft.username, |_, _, cx| cx.notify()),
             cx.observe(&draft.password, |_, _, cx| cx.notify()),
             cx.observe(&draft.database, |_, _, cx| cx.notify()),
+            // Follow live OS light/dark changes when the preference is System.
+            cx.observe_window_appearance(window, |this, window, cx| {
+                this.apply_material(window, cx);
+                cx.notify();
+            }),
         ];
 
         let (profile_store, saved_connections, profile_error) = match ProfileStore::new() {
@@ -1080,14 +1106,18 @@ impl DbxApp {
             confirmation_dialog: None,
             mutation_error_dialog: None,
             appearance: appearance(),
+            reduce_transparency: reduce_transparency(),
             settings_store: SettingsStore::new().ok(),
             compact_layout: false,
             narrow_workspace: false,
+            sidebar_hidden: false,
+            focus_handle: cx.focus_handle(),
+            toasts: Vec::new(),
+            next_toast_id: 0,
             window_drag_armed: false,
             test_generation: 0,
             testing_connection: false,
             _subscriptions: subscriptions,
-            status: "Choose an engine and connect".into(),
             error: profile_error,
         }
     }
@@ -1151,7 +1181,7 @@ impl DbxApp {
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: "Clear query history?".into(),
-            detail: "This removes the saved query history for the current connection. Open query tabs are not affected.".into(),
+            detail: "Saved history for this connection will be removed. Open tabs stay.".into(),
             confirm_label: "Clear history",
             tone: ConfirmationTone::Warning,
             action: ConfirmationAction::ClearQueryHistory { session_id },
@@ -1175,65 +1205,81 @@ impl DbxApp {
             let cleared = runtime
                 .spawn_blocking(move || store.clear(&connection))
                 .await;
-            this.update(cx, |this, cx| {
-                match cleared {
-                    Ok(Ok(count)) => {
-                        this.recent_query_history
-                            .retain(|entry| entry.connection != retained_connection);
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.error = None;
-                            session.status = format!(
-                                "Cleared {count} history entr{}",
-                                if count == 1 { "y" } else { "ies" }
-                            );
-                        }
-                    }
-                    Ok(Err(error)) => {
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.error = Some(format!("Could not clear query history: {error}"));
-                            session.status = "Query history was not cleared".into();
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.error =
-                                Some(format!("Query history task stopped unexpectedly: {error}"));
-                            session.status = "Query history was not cleared".into();
-                        }
-                    }
+            this.update(cx, |this, cx| match cleared {
+                Ok(Ok(count)) => {
+                    this.recent_query_history
+                        .retain(|entry| entry.connection != retained_connection);
+                    this.show_toast(
+                        ToastKind::Success,
+                        format!(
+                            "Cleared {}",
+                            counted(count, "history entry", "history entries")
+                        ),
+                        cx,
+                    );
                 }
-                cx.notify();
+                Ok(Err(error)) => this.show_toast(
+                    ToastKind::Error,
+                    format!("Could not clear query history: {error}"),
+                    cx,
+                ),
+                Err(error) => this.show_toast(
+                    ToastKind::Error,
+                    format!("Query history task stopped unexpectedly: {error}"),
+                    cx,
+                ),
             })?;
             Ok::<(), anyhow::Error>(())
         })
         .detach();
     }
 
-    fn toggle_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let next = match self.appearance {
-            Appearance::Light => Appearance::Dark,
-            Appearance::Dark => Appearance::Light,
-        };
+    pub(crate) fn set_appearance_preference(
+        &mut self,
+        next: Appearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.appearance = next;
         set_appearance(next);
-        gpui_component::Theme::change(
-            match next {
-                Appearance::Light => gpui_component::ThemeMode::Light,
-                Appearance::Dark => gpui_component::ThemeMode::Dark,
-            },
-            Some(window),
-            cx,
-        );
-        if let Some(store) = &self.settings_store {
-            if let Err(error) = store.save(Settings::new(next)) {
-                self.error = Some(format!("Could not save appearance preference: {error}"));
-            } else {
-                self.status = format!("Using {} appearance", next.label().to_ascii_lowercase());
-            }
-        } else {
-            self.error = Some("Appearance preference storage is unavailable".into());
-        }
+        self.apply_material(window, cx);
+        self.persist_settings(cx);
         cx.notify();
+    }
+
+    pub(crate) fn toggle_reduce_transparency(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reduce_transparency = !self.reduce_transparency;
+        set_reduce_transparency(self.reduce_transparency);
+        self.apply_material(window, cx);
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    /// Re-resolve the palette against the OS appearance and push it into the
+    /// window backdrop and gpui-component.
+    pub(crate) fn apply_material(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        set_system_appearance(window.appearance());
+        window.set_background_appearance(window_background());
+        sync_component_theme(Some(window), cx);
+    }
+
+    fn persist_settings(&mut self, cx: &mut Context<Self>) {
+        let settings =
+            Settings::new(self.appearance).with_reduce_transparency(self.reduce_transparency);
+        let failure = match &self.settings_store {
+            Some(store) => store
+                .save(settings)
+                .err()
+                .map(|error| format!("Couldn’t save appearance preference: {error}")),
+            None => Some("Appearance preference storage is unavailable".into()),
+        };
+        if let Some(message) = failure {
+            self.show_toast(ToastKind::Error, message, cx);
+        }
     }
 
     fn dismiss_overlay_on_escape(
@@ -1251,7 +1297,9 @@ impl DbxApp {
             self.cancel_confirmation(window, cx);
             true
         } else {
-            self.database_export_dialog.take().is_some() || self.table_context_menu.take().is_some()
+            self.database_export_dialog.take().is_some()
+                || self.table_context_menu.take().is_some()
+                || self.dismiss_connection_picker()
         };
         if dismissed {
             cx.stop_propagation();
@@ -1319,7 +1367,6 @@ impl DbxApp {
             self.connection_picker_open = false;
             self.compact_connection_form_open = self.saved_connections.is_empty();
             self.error = None;
-            self.status = "Disconnected".into();
         }
         cx.notify();
     }
@@ -1507,7 +1554,6 @@ impl DbxApp {
         });
         query_tab.error = None;
         query_tab.error_highlight = None;
-        query_tab.status = "History query loaded".into();
         focus.focus(window, cx);
         cx.notify();
     }
@@ -1605,7 +1651,6 @@ impl DbxApp {
             if let Some(session) = self.session_mut(session_id) {
                 session.error =
                     Some("Database diagrams are available for relational connections".into());
-                session.status = "Diagram unavailable".into();
             }
             cx.notify();
             return;
@@ -1964,38 +2009,40 @@ impl DbxApp {
                         .spawn_blocking(move || std::fs::write(path, bytes))
                         .await;
                     this.update(cx, |this, cx| {
-                        if let Some(session) = this.session_mut(session_id) {
-                            match result {
-                                Ok(Ok(())) => {
-                                    session.status = format!("Exported diagram to {destination}");
-                                    session.error = None;
-                                }
-                                Ok(Err(error)) => {
-                                    session.status = "Diagram export failed".into();
-                                    session.error =
-                                        Some(format!("Could not export diagram: {error}"));
-                                }
-                                Err(error) => {
-                                    session.status = "Diagram export failed".into();
-                                    session.error =
-                                        Some(format!("Diagram export task stopped: {error}"));
-                                }
-                            }
-                        }
-                        cx.notify();
+                        let (kind, message) = match result {
+                            Ok(Ok(())) => (
+                                ToastKind::Success,
+                                format!("Exported diagram to {destination}"),
+                            ),
+                            Ok(Err(error)) => (
+                                ToastKind::Error,
+                                format!("Could not export diagram: {error}"),
+                            ),
+                            Err(error) => (
+                                ToastKind::Error,
+                                format!("Diagram export task stopped: {error}"),
+                            ),
+                        };
+                        this.show_toast(kind, message, cx);
                     })?;
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => {
                     this.update(cx, |this, cx| {
-                        this.set_error(format!("Could not open the save dialog: {error}"));
-                        cx.notify();
+                        this.show_toast(
+                            ToastKind::Error,
+                            format!("Could not open the save dialog: {error}"),
+                            cx,
+                        );
                     })?;
                 }
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.set_error(format!("Save dialog closed unexpectedly: {error}"));
-                        cx.notify();
+                        this.show_toast(
+                            ToastKind::Error,
+                            format!("Save dialog closed unexpectedly: {error}"),
+                            cx,
+                        );
                     })?;
                 }
             }
@@ -2083,7 +2130,7 @@ impl DbxApp {
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: "Close query?".into(),
-            detail: "Closing discards this tab. You can reopen its text from Query options during this connection; eligible executed queries also remain in local history.".into(),
+            detail: "You can reopen it from Query options until you disconnect.".into(),
             confirm_label: "Close query",
             tone: ConfirmationTone::Warning,
             action: ConfirmationAction::CloseQuery { session_id, tab_id },
@@ -2177,7 +2224,6 @@ impl DbxApp {
         query
             .query_editor
             .update(cx, |editor, cx| editor.set_text(text, cx));
-        query.status = "Reopened closed query".into();
         cx.notify();
     }
 
@@ -2213,9 +2259,6 @@ impl DbxApp {
             session.row_draft_subscriptions.clear();
             session.foreign_keys.clear();
             session.selected_column = 0;
-            session.status = "Select a table".into();
-        } else {
-            session.status = "Schema filter updated".into();
         }
         session.error = None;
         cx.notify();
@@ -2337,6 +2380,7 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
+                let mut referenced_row_missing = false;
                 match result {
                     Ok((structure, result, has_next_page)) => {
                         let has_rows = !result.rows.is_empty();
@@ -2350,13 +2394,7 @@ impl DbxApp {
                         session.table_has_next_page = has_next_page;
                         session.set_result(Some(result), cx);
                         session.result_table = Some(result_table.clone());
-                        session.status = if row_navigation && has_rows {
-                            "Opened referenced row".into()
-                        } else if row_navigation {
-                            "Referenced row not found".into()
-                        } else {
-                            "Ready".into()
-                        };
+                        referenced_row_missing = row_navigation && !has_rows;
                         session.error = None;
                         session.pane = Pane::Data;
                         if row_navigation && has_rows {
@@ -2367,8 +2405,10 @@ impl DbxApp {
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Operation failed".into();
                     }
+                }
+                if referenced_row_missing {
+                    this.show_toast(ToastKind::Info, "Referenced row not found", cx);
                 }
                 cx.notify();
             })?;
@@ -2388,14 +2428,14 @@ impl DbxApp {
             .session(session_id)
             .and_then(|session| foreign_key_target_table(&session.tables, &foreign_key))
         else {
-            if let Some(session) = self.session_mut(session_id) {
-                session.status = format!(
+            self.show_toast(
+                ToastKind::Info,
+                format!(
                     "Referenced table {} is not available in this database",
                     foreign_key.referenced_table
-                );
-                session.error = None;
-            }
-            cx.notify();
+                ),
+                cx,
+            );
             return;
         };
 
@@ -2678,7 +2718,6 @@ impl DbxApp {
             Err(error) => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.error = Some(error);
-                    session.status = "Filter needs attention".into();
                 }
                 cx.notify();
                 return;
@@ -2752,12 +2791,10 @@ impl DbxApp {
                         session.result_table = Some(result_table.clone());
                         session.selected_row = None;
                         session.row_draft = None;
-                        session.status = "Ready".into();
                         session.error = None;
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Operation failed".into();
                     }
                 }
                 cx.notify();
@@ -3169,13 +3206,13 @@ impl DbxApp {
         let (title, detail, confirm_label, tone) = match editor::sql_execution_kind(query) {
             editor::SqlExecutionKind::Destructive => (
                 "Run destructive query?",
-                "This statement can permanently change or delete data. Review it before continuing.",
+                "This statement can permanently change or delete data.",
                 "Run query",
                 ConfirmationTone::Danger,
             ),
             _ if editor::sql_statement_count(query) > 1 => (
                 "Run multiple statements?",
-                "Statements run in order and are not automatically transactional. Earlier changes may remain if a later statement fails.",
+                "Statements run in order without a transaction. If one fails, earlier changes stay.",
                 "Run statements",
                 ConfirmationTone::Warning,
             ),
@@ -3332,14 +3369,12 @@ impl DbxApp {
                                 };
                             query_tab.error = Some(message.clone());
                             query_tab.results_stale = query_tab.result.is_some();
-                            query_tab.status = "Operation failed".into();
                             (QueryHistoryOutcome::failure(message), false)
                         }
                         Err(error) => {
                             let message = format!("Query task stopped unexpectedly: {error}");
                             query_tab.error = Some(message.clone());
                             query_tab.results_stale = query_tab.result.is_some();
-                            query_tab.status = "Operation failed".into();
                             (QueryHistoryOutcome::failure(message), false)
                         }
                     }
@@ -3468,17 +3503,15 @@ impl DbxApp {
                 QueryResultSelection::None => None,
             }
         }) else {
-            if let Some(session) = self.session_mut(session_id) {
-                session.status = "Select a result cell, row, or column to copy".into();
-            }
-            cx.notify();
+            self.show_toast(
+                ToastKind::Info,
+                "Select a result cell, row, or column to copy",
+                cx,
+            );
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        if let Some(session) = self.session_mut(session_id) {
-            session.status = format!("Copied {label}");
-        }
-        cx.notify();
+        self.show_toast(ToastKind::Success, format!("Copied {label}"), cx);
     }
 
     pub(super) fn copy_query_result_for(
@@ -3491,10 +3524,14 @@ impl DbxApp {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        if let Some(session) = self.session_mut(session_id) {
-            session.status = format!("Copied {} result", format.extension().to_ascii_uppercase());
-        }
-        cx.notify();
+        self.show_toast(
+            ToastKind::Success,
+            format!(
+                "Copied result as {}",
+                format.extension().to_ascii_uppercase()
+            ),
+            cx,
+        );
     }
 
     pub(super) fn export_query_result_for(
@@ -3520,38 +3557,40 @@ impl DbxApp {
                         .spawn_blocking(move || std::fs::write(path, text))
                         .await;
                     this.update(cx, |this, cx| {
-                        if let Some(session) = this.session_mut(session_id) {
-                            match result {
-                                Ok(Ok(())) => {
-                                    session.error = None;
-                                    session.status = format!("Exported result to {destination}");
-                                }
-                                Ok(Err(error)) => {
-                                    session.error =
-                                        Some(format!("Could not export result: {error}"));
-                                    session.status = "Result export failed".into();
-                                }
-                                Err(error) => {
-                                    session.error =
-                                        Some(format!("Result export task stopped: {error}"));
-                                    session.status = "Result export failed".into();
-                                }
-                            }
-                        }
-                        cx.notify();
+                        let (kind, message) = match result {
+                            Ok(Ok(())) => (
+                                ToastKind::Success,
+                                format!("Exported result to {destination}"),
+                            ),
+                            Ok(Err(error)) => (
+                                ToastKind::Error,
+                                format!("Could not export result: {error}"),
+                            ),
+                            Err(error) => (
+                                ToastKind::Error,
+                                format!("Result export task stopped: {error}"),
+                            ),
+                        };
+                        this.show_toast(kind, message, cx);
                     })?;
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => {
                     this.update(cx, |this, cx| {
-                        this.set_error(format!("Could not open the save dialog: {error}"));
-                        cx.notify();
+                        this.show_toast(
+                            ToastKind::Error,
+                            format!("Could not open the save dialog: {error}"),
+                            cx,
+                        );
                     })?;
                 }
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.set_error(format!("Save dialog closed unexpectedly: {error}"));
-                        cx.notify();
+                        this.show_toast(
+                            ToastKind::Error,
+                            format!("Save dialog closed unexpectedly: {error}"),
+                            cx,
+                        );
                     })?;
                 }
             }
@@ -3571,10 +3610,7 @@ impl DbxApp {
         });
         if let Some(error) = error {
             cx.write_to_clipboard(ClipboardItem::new_string(error));
-            if let Some(session) = self.session_mut(session_id) {
-                session.status = "Copied query error".into();
-            }
-            cx.notify();
+            self.show_toast(ToastKind::Success, "Copied query error", cx);
         }
     }
 
@@ -3846,6 +3882,132 @@ impl DbxApp {
         self.refresh_table(cx);
     }
 
+    fn new_connection_action(&mut self, _: &NewConnection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_state == Some(VaultState::Unlocked) {
+            self.begin_new_connection(cx);
+        }
+    }
+
+    fn new_query_action(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connection_picker_open {
+            return;
+        }
+        if let Some(session_id) = self.active_session_id() {
+            self.add_query_tab_for(session_id, window, cx);
+        }
+    }
+
+    /// ⌘W closes the active document tab; on the persistent Data document it
+    /// closes the connection itself, mirroring browser/editor tab semantics.
+    fn close_tab_action(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connection_picker_open {
+            return;
+        }
+        let Some(session) = self.active_session() else {
+            return;
+        };
+        let session_id = session.id;
+        match session.active_secondary_tab {
+            Some(tab_id) => self.request_close_secondary_tab_for(session_id, tab_id, window, cx),
+            None => self.close_session(session_id, cx),
+        }
+    }
+
+    fn cycle_connection(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.sessions.len();
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .active_session_id()
+            .and_then(|id| self.sessions.iter().position(|session| session.id == id))
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        let session_id = self.sessions[next].id;
+        self.activate_session(session_id, cx);
+    }
+
+    fn next_connection_action(
+        &mut self,
+        _: &NextConnection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_connection(true, cx);
+    }
+
+    fn previous_connection_action(
+        &mut self,
+        _: &PreviousConnection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_connection(false, cx);
+    }
+
+    fn toggle_sidebar_action(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_sidebar(cx);
+    }
+
+    pub(crate) fn show_toast(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_toast_id;
+        self.next_toast_id += 1;
+        self.toasts.push(Toast {
+            id,
+            kind,
+            message: message.into(),
+        });
+        if self.toasts.len() > MAX_TOASTS {
+            self.toasts.remove(0);
+        }
+        let lifetime = match kind {
+            ToastKind::Error => std::time::Duration::from_secs(6),
+            ToastKind::Info | ToastKind::Success => std::time::Duration::from_millis(3200),
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(lifetime).await;
+            this.update(cx, |this, cx| this.dismiss_toast(id, cx))
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        let before = self.toasts.len();
+        self.toasts.retain(|toast| toast.id != id);
+        if self.toasts.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// Escape backs out of the connection picker to the connection that was
+    /// already open, like dismissing a sheet.
+    fn dismiss_connection_picker(&mut self) -> bool {
+        let live_session = self
+            .active_session()
+            .is_some_and(|session| session.engine.is_some());
+        if self.connection_picker_open && live_session {
+            self.connection_picker_open = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        cx.notify();
+    }
+
     /// Switch the session's active database on the existing engine. The
     /// engine keeps its connection; only the selected database changes, so
     /// tables and data are reloaded for the new context.
@@ -3938,7 +4100,6 @@ impl DbxApp {
                         session.foreign_keys.clear();
                         session.row_draft = None;
                         session.row_draft_subscriptions.clear();
-                        session.status = format!("Switched to {database}");
                         session.error = None;
                         diagram_needs_reload = diagram_open;
                     }
@@ -3950,7 +4111,6 @@ impl DbxApp {
                             }
                         }
                         session.error = Some(error.to_string());
-                        session.status = "Database switch failed".into();
                     }
                     Err(error) => {
                         for tab in &mut session.secondary_tabs {
@@ -3962,7 +4122,6 @@ impl DbxApp {
                         session.error = Some(format!(
                             "Database switch task stopped unexpectedly: {error}"
                         ));
-                        session.status = "Database switch failed".into();
                     }
                 }
                 cx.notify();
@@ -4005,7 +4164,6 @@ impl DbxApp {
         session.clear_grid_selection(cx);
         session.row_draft = Some(row_draft);
         session.error = None;
-        session.status = "Preparing a new row".into();
         cx.notify();
     }
 
@@ -4047,13 +4205,13 @@ impl DbxApp {
                 subscriptions.push(cx.subscribe_in(
                     &selector,
                     window,
-                    move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                    move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, window, cx| {
                         let SelectEvent::Confirm(value) = event;
                         let state = value
                             .as_ref()
                             .and_then(|value| FieldValueState::from_label(value.as_ref()));
                         if let Some(state) = state {
-                            this.set_row_field_state_for(session_id, field_id, state, cx);
+                            this.set_row_field_state_for(session_id, field_id, state, window, cx);
                         }
                     },
                 ));
@@ -4217,10 +4375,11 @@ impl DbxApp {
                     table.clear_selection(cx);
                 }
             });
-            if let Some(session) = self.session_mut(session_id) {
-                session.status = "Save or cancel the current row before selecting another".into();
-            }
-            cx.notify();
+            self.show_toast(
+                ToastKind::Info,
+                "Save or cancel the current row before selecting another",
+                cx,
+            );
             return;
         }
         let Some(session) = self.session_mut(session_id) else {
@@ -4238,7 +4397,6 @@ impl DbxApp {
         session.row_draft = None;
         session.row_draft_subscriptions.clear();
         session.error = None;
-        session.status = "Inspecting selected row".into();
         cx.notify();
     }
 
@@ -4275,7 +4433,6 @@ impl DbxApp {
                         "Column {} is missing from the loaded table result",
                         column.name
                     ));
-                    session.status = "Row cannot be edited".into();
                 }
                 cx.notify();
                 return;
@@ -4293,7 +4450,6 @@ impl DbxApp {
         session.inspector_open = true;
         session.row_draft = Some(draft);
         session.error = None;
-        session.status = "Editing selected row".into();
         cx.notify();
     }
 
@@ -4317,6 +4473,7 @@ impl DbxApp {
         session_id: SessionId,
         field_id: FieldId,
         state: FieldValueState,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.session_mut(session_id) else {
@@ -4337,6 +4494,10 @@ impl DbxApp {
             return;
         }
         field.set_state(state);
+        // SQL mode edits the same text; show what Value mode will now save.
+        if state == FieldValueState::Value {
+            field.sync_value_selectors(window, cx);
+        }
         session.error = None;
         cx.notify();
     }
@@ -4352,11 +4513,6 @@ impl DbxApp {
             }
             session.draft_mode = DraftMode::Update;
             session.error = None;
-            session.status = if was_insert {
-                "New row cancelled".into()
-            } else {
-                "Row edit cancelled".into()
-            };
             cx.notify();
         }
     }
@@ -4381,7 +4537,7 @@ impl DbxApp {
             self.show_mutation_error_for(
                 session_id,
                 draft_mode,
-                "Use the Redis command console to mutate keys in this MVP.".into(),
+                "Edit Redis keys from the command console.".into(),
                 return_focus,
                 window,
                 cx,
@@ -4438,9 +4594,8 @@ impl DbxApp {
             Ok(None) => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.error = None;
-                    session.status = "No row fields changed".into();
                 }
-                cx.notify();
+                self.show_toast(ToastKind::Info, "No changes to save", cx);
                 return;
             }
             Err((error, field_id)) => {
@@ -4492,11 +4647,9 @@ impl DbxApp {
                     return;
                 }
                 match outcome {
-                    Ok(result) => {
+                    Ok(_) => {
                         if let Some(session) = this.session_mut(session_id) {
                             session.busy = false;
-                            session.status =
-                                format!("Saved · {} row(s) changed", result.rows_affected);
                             session.error = None;
                         }
                         this.refresh_table_for(session_id, cx);
@@ -4540,7 +4693,6 @@ impl DbxApp {
             Err(error) => {
                 if let Some(session) = self.session_mut(session_id) {
                     session.error = Some(error);
-                    session.status = "Operation failed".into();
                 }
                 cx.notify();
                 return;
@@ -4551,7 +4703,7 @@ impl DbxApp {
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: format!("Delete row {}?", selected_row + 1),
             detail: format!(
-                "This permanently deletes the selected row from {}. This action cannot be undone.",
+                "The row will be permanently deleted from {}.",
                 table_ref_label(&table)
             ),
             confirm_label: "Delete row",
@@ -4583,9 +4735,7 @@ impl DbxApp {
         }
         if !session.kind.is_sql() {
             if let Some(session) = self.session_mut(session_id) {
-                session.error =
-                    Some("Use the Redis command console to mutate keys in this MVP.".into());
-                session.status = "Operation failed".into();
+                session.error = Some("Edit Redis keys from the command console.".into());
             }
             cx.notify();
             return;
@@ -4617,11 +4767,9 @@ impl DbxApp {
                     return;
                 }
                 match outcome {
-                    Ok(result) => {
+                    Ok(_) => {
                         if let Some(session) = this.session_mut(session_id) {
                             session.busy = false;
-                            session.status =
-                                format!("Deleted · {} row(s) changed", result.rows_affected);
                             session.error = None;
                         }
                         this.refresh_table_for(session_id, cx);
@@ -4630,7 +4778,6 @@ impl DbxApp {
                         if let Some(session) = this.session_mut(session_id) {
                             session.busy = false;
                             session.error = Some(error.to_string());
-                            session.status = "Operation failed".into();
                         }
                         cx.notify();
                     }
@@ -4724,14 +4871,13 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (title, status) = match draft_mode {
-            DraftMode::Insert => ("Couldn’t insert row", "Row insert failed"),
-            DraftMode::Update => ("Couldn’t update row", "Row update failed"),
+        let title = match draft_mode {
+            DraftMode::Insert => "Couldn’t insert row",
+            DraftMode::Update => "Couldn’t update row",
         };
         if let Some(session) = self.session_mut(session_id) {
             session.busy = false;
             session.error = Some(detail.clone());
-            session.status = status.into();
         }
         let focus = cx.focus_handle();
         self.mutation_error_dialog = Some(MutationErrorDialog {
@@ -4755,7 +4901,6 @@ impl DbxApp {
         };
         if let Some(session) = self.session_mut(dialog.session_id) {
             session.error = None;
-            session.status = "Row changes are still open".into();
         }
         if let Some(return_focus) = dialog.return_focus {
             return_focus.focus(window, cx);
@@ -4869,11 +5014,11 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
-                match result {
+                let toast = match result {
                     Ok((outcome, tables)) => {
                         session.tables = tables;
                         session.error = None;
-                        match action {
+                        Some(match action {
                             TableAction::Truncate => {
                                 if let Some(result) = session.result.as_mut() {
                                     let result = Arc::make_mut(result);
@@ -4893,10 +5038,11 @@ impl DbxApp {
                                 session.result_table = Some(target_table.clone());
                                 session.selected_row = None;
                                 session.row_draft = None;
-                                session.status = format!(
-                                    "Truncated {} · {} row(s) changed",
-                                    table.name, outcome.rows_affected
-                                );
+                                format!(
+                                    "Truncated {} · {}",
+                                    table.name,
+                                    counted(outcome.rows_affected, "row", "rows")
+                                )
                             }
                             TableAction::Drop => {
                                 if session.selected_table.as_ref() == Some(&target_table) {
@@ -4910,16 +5056,19 @@ impl DbxApp {
                                     session.selected_row = None;
                                     session.row_draft = None;
                                 }
-                                session.status = format!("Deleted table {}", table.name);
+                                format!("Deleted table {}", table.name)
                             }
-                        }
+                        })
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Table action failed".into();
+                        None
                     }
+                };
+                match toast {
+                    Some(message) => this.show_toast(ToastKind::Success, message, cx),
+                    None => cx.notify(),
                 }
-                cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -4941,7 +5090,7 @@ impl DbxApp {
             .filter(|column| column.primary_key)
             .collect();
         if primary_keys.is_empty() {
-            return Err("Editing and deletion require a primary key for safe row identity.".into());
+            return Err("Rows without a primary key are read-only.".into());
         }
         primary_keys
             .into_iter()
@@ -5013,7 +5162,6 @@ impl DbxApp {
 
     fn set_error(&mut self, message: String) {
         self.error = Some(message);
-        self.status = "Operation failed".into();
     }
 }
 

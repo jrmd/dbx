@@ -156,9 +156,11 @@ impl DbxApp {
                                                 ButtonKind::Primary,
                                             )
                                             .cursor_pointer()
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.refresh_table_for(session_id, cx)
-                                            })),
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.refresh_table_for(session_id, cx)
+                                                }),
+                                            ),
                                         )
                                     })
                                     .when(can_mutate, |view| {
@@ -189,18 +191,6 @@ impl DbxApp {
                             redis_filter_focus,
                             false,
                         )))
-                    })
-                    .when(kind.is_sql() && !has_filter_rows, |view| {
-                        view.child(
-                            div()
-                                .px(px(8.))
-                                .py(px(6.))
-                                .text_size(px(11.))
-                                .text_color(theme().text_muted)
-                                .child(format!(
-                                    "Showing up to {TABLE_BROWSE_PAGE_SIZE} rows. Add a filter to narrow this table."
-                                )),
-                        )
                     })
                     .when(kind.is_sql() && has_filter_rows, |view| {
                         view.child(
@@ -479,28 +469,21 @@ impl DbxApp {
                             .flex()
                             .items_center()
                             .gap(px(5.))
-                            .child(badge(
-                                match draft_mode {
-                                    DraftMode::Insert => "NEW",
-                                    DraftMode::Update if has_draft => "EDITING",
-                                    DraftMode::Update if can_edit && has_selected_row => "SELECTED",
-                                    DraftMode::Update if read_only_result && has_selected_row => {
-                                        "READ ONLY"
-                                    }
-                                    DraftMode::Update => "DETAILS",
-                                },
-                                if draft_mode == DraftMode::Update && !has_draft {
-                                    theme().text_muted
-                                } else {
-                                    theme().accent
-                                },
-                            ))
+                            // The title already says new/edit/details; only
+                            // read-only adds information.
+                            .when(
+                                draft_mode == DraftMode::Update
+                                    && !has_draft
+                                    && read_only_result
+                                    && has_selected_row,
+                                |view| view.child(badge("Read-only", theme().text_muted)),
+                            )
                             .child(
                                 Button::new("close-inspector")
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
-                                    .tooltip("Close row inspector")
+                                    .tooltip("Close")
                                     .child(icon(Icon::Close, theme().text_muted))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.close_inspector_for(session_id, cx)
@@ -528,7 +511,7 @@ impl DbxApp {
                                     .py(px(12.))
                                     .text_size(px(12.))
                                     .text_color(theme().text_muted)
-                                    .child("Select a row to inspect all of its fields."),
+                                    .child("No row selected"),
                             )
                         },
                     )
@@ -600,7 +583,13 @@ impl DbxApp {
                                     name,
                                     format!(
                                         "{} · {}{}",
-                                        if is_enum {
+                                        // MySQL spells enums with their labels,
+                                        // which the selector already lists.
+                                        if is_enum
+                                            && data_type.to_ascii_lowercase().starts_with("enum(")
+                                        {
+                                            "enum".to_owned()
+                                        } else if is_enum {
                                             format!("enum · {data_type}")
                                         } else {
                                             data_type
@@ -614,14 +603,7 @@ impl DbxApp {
                                     view.child(value_control)
                                 })
                                 .when(state == FieldValueState::Sql, |view| {
-                                    view.child(sql_control).child(
-                                        div()
-                                            .text_size(px(9.))
-                                            .text_color(theme().text_muted)
-                                            .child(
-                                                "Runs as one database expression, for example NOW().",
-                                            ),
-                                    )
+                                    view.child(sql_control)
                                 })
                                 .when(
                                     matches!(
@@ -640,9 +622,9 @@ impl DbxApp {
                                                 .text_size(px(11.))
                                                 .text_color(theme().text_muted)
                                                 .child(if state == FieldValueState::Null {
-                                                    "Stores SQL NULL"
+                                                    "NULL"
                                                 } else {
-                                                    "Database supplies the value"
+                                                    "Default"
                                                 }),
                                         )
                                     },
@@ -695,23 +677,11 @@ impl DbxApp {
                     .border_color(theme().border)
                     .flex()
                     .flex_col()
+                    // Only show the action bar when there is something to act on.
+                    .when(!(has_draft || (has_selected_row && can_edit)), |view| {
+                        view.hidden()
+                    })
                     .gap(px(9.))
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(theme().text_muted)
-                            .child(if has_draft && draft_mode == DraftMode::Insert {
-                                "Default omits the column; SQL runs an expression."
-                            } else if has_draft {
-                                "Only changed values are written; SQL runs an expression."
-                            } else if read_only_result && has_selected_row {
-                                "Query results are read-only."
-                            } else if has_selected_row {
-                                "Review this row before choosing Edit."
-                            } else {
-                                "Select a row to inspect its values."
-                            }),
-                    )
                     .when(has_draft, |view| {
                         view.child(
                             div()
@@ -755,7 +725,7 @@ impl DbxApp {
                                 .child(
                                     Button::new("delete-row")
                                         .label("Delete row")
-                                        .with_size(Size::Small)
+                                        .with_size(Size::XSmall)
                                         .compact()
                                         .ghost()
                                         .text_color(theme().danger)
@@ -902,7 +872,7 @@ impl DbxApp {
                             .rounded(px(6.))
                             .text_size(px(11.))
                             .text_color(theme().text_muted)
-                            .child("No foreign-key constraints on this table."),
+                            .child("No foreign keys"),
                     )
                 },
             )

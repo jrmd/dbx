@@ -134,7 +134,7 @@ impl DbxApp {
         };
         let destination_label = if format == DumpFormat::Sql {
             format!(
-                "One {} file{} · schema and data unless Schema only is selected",
+                "One {} file{}",
                 format.extension().to_ascii_uppercase(),
                 if gzipped { " (gzip)" } else { "" }
             )
@@ -161,10 +161,11 @@ impl DbxApp {
                     .id("database-export-dialog")
                     .w(px(560.))
                     .max_h(px(680.))
-                    .rounded(px(10.))
+                    .rounded(px(RADIUS_GLASS))
                     .border_1()
-                    .border_color(theme().border_strong)
-                    .bg(theme().panel)
+                    .border_color(theme().hairline)
+                    .bg(theme().glass_raised)
+                    .shadow(glass_shadow(28.))
                     .overflow_hidden()
                     .flex()
                     .flex_col()
@@ -267,7 +268,13 @@ impl DbxApp {
                                     .child("OUTPUT FORMAT"),
                             )
                             .child(div().flex().gap(px(5.)).children(format_choices))
-                            .child(div().flex().gap(px(16.)).child(schema_toggle).child(gzip_toggle)),
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(16.))
+                                    .child(schema_toggle)
+                                    .child(gzip_toggle),
+                            ),
                     )
                     .child(
                         div()
@@ -311,10 +318,10 @@ impl DbxApp {
                                     "Choose folder…",
                                     ButtonKind::Quiet,
                                 )
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.choose_database_export_directory(cx)
-                                    })),
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| this.choose_database_export_directory(cx),
+                                )),
                             ),
                     )
                     .child(
@@ -327,17 +334,7 @@ impl DbxApp {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .max_w(px(340.))
-                                    .text_size(px(9.))
-                                    .text_color(theme().text_muted)
-                                    .child(if format == DumpFormat::Sql {
-                                        "SQL includes table columns, primary keys, and selected foreign keys."
-                                    } else {
-                                        "Delimited exports create one independently usable file per selected table."
-                                    }),
-                            )
+                            .child(div())
                             .child(
                                 div()
                                     .flex()
@@ -348,25 +345,33 @@ impl DbxApp {
                                             "Cancel",
                                             ButtonKind::Quiet,
                                         )
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(|this, _, _, cx| {
+                                        .cursor_pointer()
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
                                                 this.cancel_database_export(cx)
-                                            })),
+                                            }),
+                                        ),
                                     )
                                     .child(
                                         button(
                                             "run-database-export",
-                                            format!("Export {selected_count} table{}", if selected_count == 1 { "" } else { "s" }),
+                                            format!(
+                                                "Export {selected_count} table{}",
+                                                if selected_count == 1 { "" } else { "s" }
+                                            ),
                                             ButtonKind::Primary,
                                         )
-                                            .disabled(!can_export)
-                                            .when(can_export, |button| {
+                                        .disabled(!can_export)
+                                        .when(
+                                            can_export,
+                                            |button| {
                                                 button.cursor_pointer().on_click(cx.listener(
                                                     |this, _, _, cx| {
                                                         this.execute_database_export(cx)
                                                     },
                                                 ))
-                                            }),
+                                            },
+                                        ),
                                     ),
                             ),
                     )
@@ -385,9 +390,9 @@ impl DbxApp {
         let confirm_label = dialog.confirm_label;
         let tone = dialog.tone;
         let focus = dialog.focus.clone();
-        let (tone_label, tone_color, confirm_kind) = match tone {
-            ConfirmationTone::Warning => ("Review action", theme().warning, ButtonKind::Primary),
-            ConfirmationTone::Danger => ("Destructive", theme().danger, ButtonKind::Danger),
+        let confirm_kind = match tone {
+            ConfirmationTone::Warning => ButtonKind::Primary,
+            ConfirmationTone::Danger => ButtonKind::Danger,
         };
 
         let overlay = div()
@@ -404,10 +409,11 @@ impl DbxApp {
                 div()
                     .id("confirmation-dialog")
                     .w(px(420.))
-                    .rounded(px(10.))
+                    .rounded(px(RADIUS_GLASS))
                     .border_1()
-                    .border_color(theme().border_strong)
-                    .bg(theme().panel)
+                    .border_color(theme().hairline)
+                    .bg(theme().glass_raised)
+                    .shadow(glass_shadow(28.))
                     .overflow_hidden()
                     .child(
                         div()
@@ -420,19 +426,13 @@ impl DbxApp {
                             .justify_between()
                             .gap(px(12.))
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(7.))
-                                    .child(
-                                        div()
-                                            .text_size(px(15.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme().text)
-                                            .child(title),
-                                    )
-                                    .child(badge(tone_label, tone_color)),
+                                div().min_w_0().flex().items_center().gap(px(7.)).child(
+                                    div()
+                                        .text_size(px(15.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme().text)
+                                        .child(title),
+                                ),
                             )
                             .child(
                                 Button::new("close-confirmation")
@@ -510,10 +510,11 @@ impl DbxApp {
                     .id("mutation-error-dialog")
                     .w(px(460.))
                     .max_h(px(520.))
-                    .rounded(px(10.))
+                    .rounded(px(RADIUS_GLASS))
                     .border_1()
-                    .border_color(theme().border_strong)
-                    .bg(theme().panel)
+                    .border_color(theme().hairline)
+                    .bg(theme().glass_raised)
+                    .shadow(glass_shadow(28.))
                     .overflow_hidden()
                     .flex()
                     .flex_col()
@@ -534,8 +535,7 @@ impl DbxApp {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text)
                                     .child(title),
-                            )
-                            .child(badge("Save failed", theme().danger)),
+                            ),
                     )
                     .child(
                         div()
@@ -548,15 +548,6 @@ impl DbxApp {
                             .flex()
                             .flex_col()
                             .gap(px(12.))
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(theme().text_muted)
-                                    .line_height(gpui::relative(1.5))
-                                    .child(
-                                        "This row change could not be applied. Your draft is still open.",
-                                    ),
-                            )
                             .child(
                                 div()
                                     .p(px(12.))
@@ -581,19 +572,17 @@ impl DbxApp {
                             .items_center()
                             .justify_between()
                             .gap(px(12.))
+                            .child(div())
                             .child(
-                                div()
-                                    .min_w_0()
-                                    .text_size(px(9.))
-                                    .text_color(theme().text_muted)
-                                    .child("Correct the value or expression, then try again."),
-                            )
-                            .child(
-                                button("dismiss-mutation-error", "Back to row", ButtonKind::Primary)
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.dismiss_mutation_error(window, cx)
-                                    })),
+                                button(
+                                    "dismiss-mutation-error",
+                                    "Back to row",
+                                    ButtonKind::Primary,
+                                )
+                                .cursor_pointer()
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.dismiss_mutation_error(window, cx),
+                                )),
                             ),
                     )
                     .focus_trap("mutation-error-focus-trap", &focus),
@@ -631,10 +620,11 @@ impl DbxApp {
                         .id("table-context-menu")
                         .w(px(220.))
                         .p(px(6.))
-                        .rounded(px(8.))
+                        .rounded(px(RADIUS_PANEL))
                         .border_1()
-                        .border_color(theme().border_strong)
-                        .bg(theme().panel_raised)
+                        .border_color(theme().hairline)
+                        .bg(theme().glass_raised)
+                        .shadow(glass_shadow(18.))
                         .text_size(px(12.))
                         .on_mouse_down_out(
                             cx.listener(|this, _, _, cx| this.close_table_context_menu(cx)),

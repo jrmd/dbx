@@ -20,6 +20,117 @@ async fn mysql_crud_integration() -> Result<()> {
     run_sql_scenario(DatabaseKind::MySQL, "DBX_TEST_MYSQL_URL").await
 }
 
+/// Values the row editor sends as text (dates, uuids, enums, arrays, bit
+/// strings) and NULLs must land in typed columns, and every column must
+/// decode back to the text the editor would show.
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn postgresql_typed_mutation_round_trip() -> Result<()> {
+    typed_mutation_round_trip(
+        DatabaseKind::PostgreSQL,
+        "DBX_TEST_POSTGRES_URL",
+        &[
+            "DROP TABLE IF EXISTS dbx_integration_types",
+            "DROP TYPE IF EXISTS dbx_integration_level",
+            "CREATE TYPE dbx_integration_level AS ENUM ('low', 'high')",
+            "CREATE TABLE dbx_integration_types (id integer PRIMARY KEY, price numeric(10,2), day date, seen timestamp, token uuid, level dbx_integration_level, address inet, tags integer[], flags bit(3), wait interval, cost money)",
+        ],
+        &[
+            ("price", "4.50"),
+            ("day", "2025-02-03"),
+            ("seen", "2025-02-03 04:05:06"),
+            ("token", "00000000-0000-0000-0000-000000000002"),
+            ("level", "high"),
+            ("address", "10.0.0.2"),
+            ("tags", "{3,4}"),
+            ("flags", "011"),
+            ("wait", "2 days 01:00:00"),
+            ("cost", "5.25"),
+        ],
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn mysql_typed_mutation_round_trip() -> Result<()> {
+    typed_mutation_round_trip(
+        DatabaseKind::MySQL,
+        "DBX_TEST_MYSQL_URL",
+        &[
+            "DROP TABLE IF EXISTS dbx_integration_types",
+            "CREATE TABLE dbx_integration_types (id int PRIMARY KEY, price decimal(10,2) NULL, day date NULL, seen timestamp NULL, level enum('low','high') NULL, mask bit(8) NULL)",
+        ],
+        &[
+            ("price", "4.50"),
+            ("day", "2025-02-03"),
+            ("seen", "2025-02-03 04:05:06"),
+            ("level", "high"),
+            ("mask", "15"),
+        ],
+    )
+    .await
+}
+
+async fn typed_mutation_round_trip(
+    kind: DatabaseKind,
+    variable: &str,
+    setup: &[&str],
+    values: &[(&str, &str)],
+) -> Result<()> {
+    let Some(url) = integration_url(variable) else {
+        return Ok(());
+    };
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(kind, url)).await?;
+    for statement in setup {
+        engine.execute_sql(statement).await?;
+    }
+    let table = table_ref_named(kind, "dbx_integration_types");
+    let text = |value: &str| CellValue::Text(value.to_owned());
+    let (mut columns, mut row) = (vec!["id".to_owned()], vec![CellValue::Integer(1)]);
+    for (column, value) in values {
+        columns.push((*column).to_owned());
+        row.push(text(value));
+    }
+    engine
+        .insert(&InsertRequest::new(table.clone(), columns, row))
+        .await?;
+    let read_back = |result: &dbx_core::QueryResult, column: &str| {
+        let index = result
+            .columns
+            .iter()
+            .position(|metadata| metadata.name == column)
+            .unwrap();
+        result.rows[0].values[index].to_string()
+    };
+    let result = engine
+        .query_table(&table, &[], &[], &[], None, QueryOptions::default())
+        .await?;
+    for (column, value) in values {
+        assert_eq!(read_back(&result, column), *value, "{column}");
+    }
+
+    let nulls = values
+        .iter()
+        .map(|(column, _)| ((*column).to_owned(), CellValue::Null))
+        .collect();
+    engine
+        .update(&UpdateRequest::for_primary_key(
+            table.clone(),
+            nulls,
+            vec![("id".into(), CellValue::Integer(1))],
+        ))
+        .await?;
+    let result = engine
+        .query_table(&table, &[], &[], &[], None, QueryOptions::default())
+        .await?;
+    for (column, _) in values {
+        assert_eq!(read_back(&result, column), "NULL", "{column}");
+    }
+    engine.drop_table(&table).await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires the disposable integration databases"]
 async fn sqlite_file_crud_integration() -> Result<()> {
@@ -326,6 +437,8 @@ async fn assert_postgres_enum_decoding(engine: &DatabaseEngine) -> Result<()> {
             .iter()
             .find(|column| column.name == "mood")
             .expect("enum column should be present in table metadata");
+        // format_type qualifies the name only when it is outside search_path,
+        // so the spelling is always usable in a mutation cast.
         assert_eq!(mood.data_type, "dbx_integration_mood");
         assert_eq!(mood.enum_values, ["happy", "sad", "neutral"]);
         engine

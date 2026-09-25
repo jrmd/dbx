@@ -4,7 +4,10 @@ use futures_util::{StreamExt, TryStreamExt};
 use sqlx::{
     Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
     mysql::{MySqlArguments, MySqlPoolOptions, MySqlRow},
-    postgres::{PgArguments, PgPool, PgPoolOptions, PgRow},
+    postgres::{
+        PgArguments, PgPool, PgPoolOptions, PgRow,
+        types::{PgInterval, PgMoney},
+    },
     sqlite::{SqliteArguments, SqlitePoolOptions, SqliteRow},
 };
 use sqlx::{Either, Executor};
@@ -186,7 +189,9 @@ impl SqlxEngine {
                     if columns.is_empty() {
                         columns = result_columns(row.columns());
                     }
-                    output.push(RowData::new(decode_sqlite_row(&row)?));
+                    let values = decode_sqlite_row(&row)?;
+                    refine_dynamic_column_types(&mut columns, &values);
+                    output.push(RowData::new(values));
                 }
             }
         }
@@ -453,23 +458,26 @@ impl SqlxEngine {
                 // PRAGMA accepts a quoted string for the table name. Escaping
                 // here prevents a table name from changing the pragma query.
                 let escaped = table.name.replace('\'', "''");
-                self.metadata_query(
-                    &format!("PRAGMA table_info('{escaped}')"),
-                    &[],
-                )
-                .await?
+                self.metadata_query(&format!("PRAGMA table_info('{escaped}')"), &[])
+                    .await?
             }
             DatabaseKind::PostgreSQL => {
                 let schema = table.schema.clone().unwrap_or_else(|| "public".to_owned());
                 self.metadata_query(
-                    "SELECT c.column_name, CASE WHEN c.data_type = 'USER-DEFINED' THEN c.udt_schema || '.' || c.udt_name ELSE c.data_type END AS data_type, c.is_nullable, c.ordinal_position, CASE WHEN EXISTS (SELECT 1 FROM information_schema.key_column_usage kcu JOIN information_schema.table_constraints tc ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name WHERE kcu.table_schema = c.table_schema AND kcu.table_name = c.table_name AND kcu.column_name = c.column_name AND tc.constraint_type = 'PRIMARY KEY') THEN TRUE ELSE FALSE END AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = enum_type.oid), '') AS enum_values FROM information_schema.columns c LEFT JOIN pg_namespace enum_namespace ON enum_namespace.nspname = c.udt_schema LEFT JOIN pg_type enum_type ON enum_type.typname = c.udt_name AND enum_type.typnamespace = enum_namespace.oid WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position",
+                    // format_type spells the column type exactly as SQL
+                    // accepts it (length, precision, arrays, and qualified
+                    // user-defined types), so mutations can cast text
+                    // parameters to it.
+                    "SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
                     &[CellValue::Text(schema), CellValue::Text(table.name.clone())],
                 )
                 .await?
             }
             DatabaseKind::MySQL => {
                 self.metadata_query(
-                    "SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(DATA_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    // COLUMN_TYPE keeps `tinyint(1)`, `unsigned`, and enum
+                    // labels, which DATA_TYPE drops.
+                    "SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
                     &[CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -1234,8 +1242,24 @@ fn decode_postgres_cell(row: &PgRow, index: usize, type_name: &str) -> Result<Ce
     if is_postgres_decimal(&type_name)
         && let Ok(value) = row.try_get::<Option<sqlx::types::BigDecimal>, _>(index)
     {
+        // SQLx scales numerics to whole base-10000 digit groups (4.50 reads
+        // as 4.5000). The binary header's display scale is what PostgreSQL
+        // itself prints.
+        let display_scale = row
+            .try_get_raw(index)
+            .ok()
+            .filter(|value| value.format() == sqlx::postgres::PgValueFormat::Binary)
+            .and_then(|value| value.as_bytes().ok())
+            .and_then(|bytes| bytes.get(6..8))
+            .map(|scale| i64::from(u16::from_be_bytes([scale[0], scale[1]])));
         return Ok(value
-            .map(|value| CellValue::Text(value.to_string()))
+            .map(|value| {
+                let value = match display_scale {
+                    Some(scale) => value.with_scale(scale),
+                    None => value,
+                };
+                CellValue::Text(value.to_string())
+            })
             .unwrap_or(CellValue::Null));
     }
     if (type_name == "real" || type_name == "float4")
@@ -1298,7 +1322,219 @@ fn decode_postgres_cell(row: &PgRow, index: usize, type_name: &str) -> Result<Ce
             .map(|value| CellValue::Text(value.to_rfc3339()))
             .unwrap_or(CellValue::Null));
     }
+    if matches!(type_name.as_ref(), "bit" | "varbit" | "bit varying") {
+        return decode_postgres_bit_string(row, index, &type_name);
+    }
+    if type_name == "interval"
+        && let Ok(value) = row.try_get::<Option<PgInterval>, _>(index)
+    {
+        return Ok(value
+            .map(|value| CellValue::Text(format_postgres_interval(&value)))
+            .unwrap_or(CellValue::Null));
+    }
+    if type_name == "money"
+        && let Ok(value) = row.try_get::<Option<PgMoney>, _>(index)
+    {
+        // Money's fractional digits follow lc_monetary; two is the default
+        // and matches the value PostgreSQL accepts back as input.
+        return Ok(value
+            .map(|value| {
+                let sign = if value.0 < 0 { "-" } else { "" };
+                let cents = value.0.unsigned_abs();
+                CellValue::Text(format!("{sign}{}.{:02}", cents / 100, cents % 100))
+            })
+            .unwrap_or(CellValue::Null));
+    }
+    if matches!(type_name.as_ref(), "inet" | "cidr") {
+        return decode_postgres_network(row, index, &type_name);
+    }
+    if let Some(value) = decode_postgres_array(row, index) {
+        return Ok(value);
+    }
     decode_text_or_bytes_pg(row, index, &type_name)
+}
+
+/// Render an interval in PostgreSQL's default output style, which is also
+/// valid input: `1 year 2 mons 3 days 04:05:06`.
+fn format_postgres_interval(interval: &PgInterval) -> String {
+    let mut parts = Vec::new();
+    let mut unit = |amount: i64, name: &str| {
+        if amount != 0 {
+            let plural = if amount.abs() == 1 { "" } else { "s" };
+            parts.push(format!("{amount} {name}{plural}"));
+        }
+    };
+    unit(i64::from(interval.months / 12), "year");
+    unit(i64::from(interval.months % 12), "mon");
+    unit(i64::from(interval.days), "day");
+    if interval.microseconds != 0 || parts.is_empty() {
+        let sign = if interval.microseconds < 0 { "-" } else { "" };
+        let micros = interval.microseconds.unsigned_abs();
+        let seconds = micros / 1_000_000;
+        let mut time = format!(
+            "{sign}{:02}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+        let fraction = micros % 1_000_000;
+        if fraction != 0 {
+            time.push_str(format!(".{fraction:06}").trim_end_matches('0'));
+        }
+        parts.push(time);
+    }
+    parts.join(" ")
+}
+
+/// Decode `inet`/`cidr`: family, prefix bits, is-cidr flag, address length,
+/// then the address bytes.
+fn decode_postgres_network(row: &PgRow, index: usize, type_name: &str) -> Result<CellValue> {
+    let unsupported = || CellValue::Text(format!("<unsupported SQL type `{type_name}`>"));
+    let Ok(value) = row.try_get_raw(index) else {
+        return Ok(unsupported());
+    };
+    if value.is_null() {
+        return Ok(CellValue::Null);
+    }
+    if value.format() == sqlx::postgres::PgValueFormat::Text {
+        return Ok(value
+            .as_str()
+            .map(|text| CellValue::Text(text.to_owned()))
+            .unwrap_or_else(|_| unsupported()));
+    }
+    let Ok(&[_, bits, is_cidr, _, ref address @ ..]) = value.as_bytes() else {
+        return Ok(unsupported());
+    };
+    let (address, max_bits) = match address {
+        &[a, b, c, d] => (std::net::Ipv4Addr::new(a, b, c, d).to_string(), 32),
+        address => match <[u8; 16]>::try_from(address) {
+            Ok(octets) => (std::net::Ipv6Addr::from(octets).to_string(), 128),
+            Err(_) => return Ok(unsupported()),
+        },
+    };
+    Ok(CellValue::Text(if is_cidr != 0 || bits != max_bits {
+        format!("{address}/{bits}")
+    } else {
+        address
+    }))
+}
+
+/// Decode one-dimensional arrays of common element types into PostgreSQL's
+/// array literal form, e.g. `{1,2}` or `{"a b",NULL}`, which it accepts back.
+fn decode_postgres_array(row: &PgRow, index: usize) -> Option<CellValue> {
+    use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+
+    // SQLx names array types `ELEMENT[]`. Its `kind()` is avoided because it
+    // panics for custom types it has not resolved.
+    if !row.columns()[index].type_info().name().ends_with("[]") {
+        return None;
+    }
+    fn elements<T: ToString>(values: Vec<Option<T>>, quote: bool) -> Vec<Option<(String, bool)>> {
+        values
+            .into_iter()
+            .map(|value| value.map(|value| (value.to_string(), quote)))
+            .collect()
+    }
+    macro_rules! try_array {
+        ($($element:ty => $quote:expr),* $(,)?) => {
+            $(
+                if let Ok(values) = row.try_get::<Option<Vec<Option<$element>>>, _>(index) {
+                    return Some(values.map_or(CellValue::Null, |values| {
+                        CellValue::Text(format_postgres_array(elements(values, $quote)))
+                    }));
+                }
+            )*
+        };
+    }
+    try_array!(
+        bool => false,
+        i16 => false,
+        i32 => false,
+        i64 => false,
+        f32 => false,
+        f64 => false,
+        sqlx::types::BigDecimal => false,
+        String => true,
+        sqlx::types::Uuid => false,
+        NaiveDate => false,
+        NaiveTime => true,
+        NaiveDateTime => true,
+        DateTime<Utc> => true,
+    );
+    None
+}
+
+fn format_postgres_array(elements: Vec<Option<(String, bool)>>) -> String {
+    let mut output = String::from("{");
+    for (position, element) in elements.into_iter().enumerate() {
+        if position > 0 {
+            output.push(',');
+        }
+        match element {
+            None => output.push_str("NULL"),
+            Some((text, quote)) => {
+                let quote = quote
+                    && (text.is_empty()
+                        || text.eq_ignore_ascii_case("null")
+                        || text.chars().any(|character| {
+                            character.is_whitespace() || "{},\"\\".contains(character)
+                        }));
+                if quote {
+                    output.push('"');
+                    for character in text.chars() {
+                        if matches!(character, '"' | '\\') {
+                            output.push('\\');
+                        }
+                        output.push(character);
+                    }
+                    output.push('"');
+                } else {
+                    output.push_str(&text);
+                }
+            }
+        }
+    }
+    output.push('}');
+    output
+}
+
+/// PostgreSQL sends bit strings as a big-endian bit count followed by the
+/// packed bits. Render them the way SQL spells them, e.g. `101`.
+fn decode_postgres_bit_string(row: &PgRow, index: usize, type_name: &str) -> Result<CellValue> {
+    let unsupported = || CellValue::Text(format!("<unsupported SQL type `{type_name}`>"));
+    let Ok(value) = row.try_get_raw(index) else {
+        return Ok(unsupported());
+    };
+    if value.is_null() {
+        return Ok(CellValue::Null);
+    }
+    if value.format() == sqlx::postgres::PgValueFormat::Text {
+        return Ok(value
+            .as_str()
+            .map(|text| CellValue::Text(text.to_owned()))
+            .unwrap_or_else(|_| unsupported()));
+    }
+    let Ok(bytes) = value.as_bytes() else {
+        return Ok(unsupported());
+    };
+    let Some((length, bits)) = bytes.split_first_chunk::<4>() else {
+        return Ok(unsupported());
+    };
+    let length = u32::from_be_bytes(*length) as usize;
+    if bits.len() * 8 < length {
+        return Ok(unsupported());
+    }
+    Ok(CellValue::Text(
+        (0..length)
+            .map(|bit| {
+                if bits[bit / 8] & (0x80 >> (bit % 8)) == 0 {
+                    '0'
+                } else {
+                    '1'
+                }
+            })
+            .collect(),
+    ))
 }
 
 fn decode_mysql_cell(row: &MySqlRow, index: usize, type_name: &str) -> Result<CellValue> {
@@ -1336,7 +1572,14 @@ fn decode_mysql_cell(row: &MySqlRow, index: usize, type_name: &str) -> Result<Ce
     {
         return Ok(value.map(CellValue::Real).unwrap_or(CellValue::Null));
     }
-    if (type_name.contains("blob") || type_name.contains("binary") || type_name == "bit")
+    // BIT(n) is a number in MySQL (`b'101'` = 5), and the row editor writes
+    // it back as one, so show it as an integer rather than raw bytes.
+    if type_name == "bit"
+        && let Ok(value) = row.try_get::<Option<u64>, _>(index)
+    {
+        return Ok(value.map(CellValue::Unsigned).unwrap_or(CellValue::Null));
+    }
+    if (type_name.contains("blob") || type_name.contains("binary"))
         && let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index)
     {
         return Ok(value.map(CellValue::Bytes).unwrap_or(CellValue::Null));
@@ -1362,6 +1605,16 @@ fn decode_mysql_cell(row: &MySqlRow, index: usize, type_name: &str) -> Result<Ce
             .map(|value| CellValue::Text(value.to_string()))
             .unwrap_or(CellValue::Null));
     }
+    if type_name == "timestamp"
+        && let Ok(value) =
+            row.try_get::<Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>>, _>(index)
+    {
+        // SQLx pins the MySQL session time zone to UTC, so this is the same
+        // wall-clock text the session reads and writes.
+        return Ok(value
+            .map(|value| CellValue::Text(value.naive_utc().to_string()))
+            .unwrap_or(CellValue::Null));
+    }
     if type_name == "time"
         && let Ok(value) = row.try_get::<Option<sqlx::types::chrono::NaiveTime>, _>(index)
     {
@@ -1372,44 +1625,28 @@ fn decode_mysql_cell(row: &MySqlRow, index: usize, type_name: &str) -> Result<Ce
     decode_text_or_bytes_mysql(row, index, &type_name)
 }
 
-fn decode_sqlite_cell(row: &SqliteRow, index: usize, type_name: &str) -> Result<CellValue> {
-    let type_name = normalized_type_name(type_name);
-    let unknown_type = type_name == "null";
-    // SQLite reports NULL for the dynamic type of some PRAGMA/result
-    // columns. Inspect the value before falling back so metadata such as
-    // `cid` and `pk` remains numeric rather than becoming an error cell.
-    if unknown_type && let Ok(value) = row.try_get::<Option<i64>, _>(index) {
-        return Ok(value.map(CellValue::Integer).unwrap_or(CellValue::Null));
+fn decode_sqlite_cell(row: &SqliteRow, index: usize, declared_type: &str) -> Result<CellValue> {
+    let value = row.try_get_raw(index)?;
+    if value.is_null() {
+        return Ok(CellValue::Null);
     }
-    if type_name.contains("bool")
-        && let Ok(value) = row.try_get::<Option<bool>, _>(index)
+    // Preserve declared boolean semantics, but use each value's storage class
+    // otherwise: a NUMERIC column may contain integers, reals, text, and NULL.
+    // SQLx can report NULL for its static metadata even when a cell is a real.
+    if declared_type.eq_ignore_ascii_case("boolean")
+        && let Ok(value) = row.try_get::<bool, _>(index)
     {
-        return Ok(value.map(CellValue::Boolean).unwrap_or(CellValue::Null));
+        return Ok(CellValue::Boolean(value));
     }
-    if type_name.contains("int")
-        && let Ok(value) = row.try_get::<Option<i64>, _>(index)
-    {
-        return Ok(value.map(CellValue::Integer).unwrap_or(CellValue::Null));
+    match value.type_info().name() {
+        "INTEGER" => Ok(CellValue::Integer(row.try_get(index)?)),
+        "REAL" => Ok(CellValue::Real(row.try_get(index)?)),
+        "TEXT" => Ok(CellValue::Text(row.try_get(index)?)),
+        "BLOB" => Ok(CellValue::Bytes(row.try_get(index)?)),
+        type_name => Ok(CellValue::Text(format!(
+            "<unsupported SQL type `{type_name}`>"
+        ))),
     }
-    if (type_name.contains("real") || type_name.contains("float") || type_name == "numeric")
-        && let Ok(value) = row.try_get::<Option<f64>, _>(index)
-    {
-        return Ok(value.map(CellValue::Real).unwrap_or(CellValue::Null));
-    }
-    if type_name.contains("blob")
-        && let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index)
-    {
-        return Ok(value.map(CellValue::Bytes).unwrap_or(CellValue::Null));
-    }
-    if let Ok(value) = row.try_get::<Option<String>, _>(index) {
-        return Ok(value.map(CellValue::Text).unwrap_or(CellValue::Null));
-    }
-    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
-        return Ok(value.map(CellValue::Bytes).unwrap_or(CellValue::Null));
-    }
-    Ok(CellValue::Text(format!(
-        "<unsupported SQL type `{type_name}`>"
-    )))
 }
 
 fn decode_text_or_bytes_pg(row: &PgRow, index: usize, type_name: &str) -> Result<CellValue> {
@@ -1419,15 +1656,20 @@ fn decode_text_or_bytes_pg(row: &PgRow, index: usize, type_name: &str) -> Result
     if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(index) {
         return Ok(value.map(CellValue::Bytes).unwrap_or(CellValue::Null));
     }
-    // Custom types such as PostgreSQL enums are transmitted as text but do
-    // not match any built-in Rust decoder, so the typed `try_get` calls
-    // above reject them. Read the raw wire value so enum labels stay usable
-    // instead of surfacing an unsupported-type cell.
+    // Enum labels are sent as plain text but match no built-in decoder, so
+    // read the raw wire value. Other binary encodings (tsvector, geometric
+    // types, ...) can be valid UTF-8 without being text, so a raw value is
+    // only trusted when it was sent as text or has no control characters.
     match row.try_get_raw(index) {
         Ok(value) if value.is_null() => Ok(CellValue::Null),
-        Ok(value) => match value.as_str() {
-            Ok(text) => Ok(CellValue::Text(text.to_owned())),
-            Err(_) => match value.as_bytes() {
+        Ok(value) => match value.as_str().ok().filter(|text| {
+            value.format() == sqlx::postgres::PgValueFormat::Text
+                || !text
+                    .chars()
+                    .any(|character| character.is_control() && !character.is_whitespace())
+        }) {
+            Some(text) => Ok(CellValue::Text(text.to_owned())),
+            None => match value.as_bytes() {
                 Ok(bytes) => Ok(CellValue::Bytes(bytes.to_vec())),
                 Err(_) => Ok(CellValue::Text(format!(
                     "<unsupported SQL type `{type_name}`>"

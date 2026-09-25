@@ -5,7 +5,7 @@ use crate::{
     ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError, ExecResult, Filter,
     InsertRequest, Order, Page, QueryResult, RelationalSchema, Result, SqlStatement, TableInfo,
     TableRef, TableStructure, UpdateRequest, build_create_table, build_delete, build_drop_table,
-    build_insert, build_select, build_truncate_table, build_update_with_columns,
+    build_insert_with_columns, build_select, build_truncate_table, build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
 
@@ -199,7 +199,8 @@ impl DatabaseEngine {
 
     pub async fn insert(&self, request: &InsertRequest) -> Result<ExecResult> {
         ensure_sql(self.kind(), "insert")?;
-        let statement = build_insert(self.kind(), request)?;
+        let columns = self.describe_table(&request.table).await?;
+        let statement = build_insert_with_columns(self.kind(), request, &columns)?;
         self.execute(&statement).await
     }
 

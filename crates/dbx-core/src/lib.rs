@@ -26,8 +26,8 @@ pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog}
 pub use redis_engine::RedisEngine;
 pub use sql::{
     SqlStatement, build_create_table, build_delete, build_drop_table, build_insert,
-    build_multi_row_insert, build_select, build_truncate_table, build_update,
-    build_update_with_columns, quote_identifier, validate_sql_expression,
+    build_insert_with_columns, build_multi_row_insert, build_select, build_truncate_table,
+    build_update, build_update_with_columns, quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::{
@@ -218,6 +218,82 @@ mod tests {
         assert!(build_insert(DatabaseKind::PostgreSQL, &request).is_err());
     }
 
+    fn typed_column(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            enum_values: Vec::new(),
+            nullable: true,
+            ordinal: 1,
+            primary_key: false,
+        }
+    }
+
+    #[test]
+    fn postgres_mutations_cast_text_and_null_parameters_to_the_column_type() {
+        let columns = vec![
+            typed_column("seen_at", "timestamp without time zone"),
+            typed_column("flags", "bit(3)"),
+            typed_column("tags", "text[]"),
+            typed_column("count", "integer"),
+            typed_column("odd", "x; DROP TABLE t"),
+        ];
+        let request = UpdateRequest::for_primary_key(
+            TableRef::new("events"),
+            vec![
+                ("seen_at".into(), CellValue::Null),
+                ("flags".into(), CellValue::Text("101".into())),
+                ("tags".into(), CellValue::Text("{a,b}".into())),
+                ("count".into(), CellValue::Integer(3)),
+                ("odd".into(), CellValue::Text("x".into())),
+            ],
+            vec![("id".into(), CellValue::Integer(7))],
+        );
+        assert_eq!(
+            build_update_with_columns(DatabaseKind::PostgreSQL, &request, &columns)
+                .unwrap()
+                .sql,
+            "UPDATE \"events\" SET \"seen_at\" = CAST($1 AS timestamp without time zone), \"flags\" = CAST($2 AS bit(3)), \"tags\" = CAST($3 AS text[]), \"count\" = $4, \"odd\" = $5 WHERE \"id\" = $6"
+        );
+
+        let insert = InsertRequest::new(
+            TableRef::new("events"),
+            vec!["seen_at".into(), "count".into()],
+            vec![
+                CellValue::Text("2025-01-02 03:04:05".into()),
+                CellValue::Integer(1),
+            ],
+        );
+        assert_eq!(
+            build_insert_with_columns(DatabaseKind::PostgreSQL, &insert, &columns)
+                .unwrap()
+                .sql,
+            "INSERT INTO \"events\" (\"seen_at\", \"count\") VALUES (CAST($1 AS timestamp without time zone), $2)"
+        );
+    }
+
+    #[test]
+    fn mysql_bit_text_is_written_as_a_number() {
+        let columns = vec![
+            typed_column("mask", "bit(8)"),
+            typed_column("name", "varchar(20)"),
+        ];
+        let request = UpdateRequest::for_primary_key(
+            TableRef::new("flags"),
+            vec![
+                ("mask".into(), CellValue::Text("15".into())),
+                ("name".into(), CellValue::Text("x".into())),
+            ],
+            vec![("id".into(), CellValue::Integer(1))],
+        );
+        assert_eq!(
+            build_update_with_columns(DatabaseKind::MySQL, &request, &columns)
+                .unwrap()
+                .sql,
+            "UPDATE `flags` SET `mask` = CAST(? AS UNSIGNED), `name` = ? WHERE `id` = ?"
+        );
+    }
+
     #[test]
     fn postgres_enum_updates_cast_text_parameters_to_the_enum_type() {
         let request = UpdateRequest::for_primary_key(
@@ -239,7 +315,7 @@ mod tests {
 
         assert_eq!(
             statement.sql,
-            "UPDATE \"public\".\"orders\" SET \"status\" = CAST($1 AS \"public\".\"order_status\") WHERE \"id\" = $2"
+            "UPDATE \"public\".\"orders\" SET \"status\" = CAST($1 AS public.order_status) WHERE \"id\" = $2"
         );
         assert_eq!(
             statement.params,
@@ -823,6 +899,51 @@ mod tests {
             .unwrap();
         assert!(cte_insert.rows.is_empty());
         assert_eq!(cte_insert.rows_affected, Some(1));
+    }
+
+    #[tokio::test]
+    async fn sqlite_browse_preserves_mixed_numeric_storage_classes() {
+        let engine = DatabaseEngine::connect(ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        engine
+            .execute_sql("CREATE TABLE budgets (id INTEGER PRIMARY KEY, amount NUMERIC)")
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO budgets VALUES (1, 125.5), (2, 251), (3, NULL), (4, 'pending')",
+            )
+            .await
+            .unwrap();
+        let result = engine
+            .query_table(
+                &TableRef::new("budgets"),
+                &[],
+                &[],
+                &[],
+                None,
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row.values[1].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                CellValue::Real(125.5),
+                CellValue::Integer(251),
+                CellValue::Null,
+                CellValue::Text("pending".into())
+            ],
+        );
+        assert_ne!(result.columns[1].data_type, "NULL");
     }
 
     #[tokio::test]

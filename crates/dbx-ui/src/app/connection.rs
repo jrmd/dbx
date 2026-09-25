@@ -101,7 +101,7 @@ impl DbxApp {
 
     pub(super) fn submit_vault_passphrase(&mut self, creating: bool, cx: &mut Context<Self>) {
         let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
-            self.set_error("Credential vault is unavailable".into());
+            self.set_error("The vault is unavailable".into());
             cx.notify();
             return;
         };
@@ -129,12 +129,6 @@ impl DbxApp {
         let generation = self.vault_generation;
         let runtime = self.runtime.clone();
         self.error = None;
-        self.status = if creating {
-            "Creating credential vault…"
-        } else {
-            "Unlocking credential vault…"
-        }
-        .into();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = runtime
@@ -154,12 +148,6 @@ impl DbxApp {
                 match result {
                     Ok(()) => {
                         this.vault_state = Some(VaultState::Unlocked);
-                        this.status = if creating {
-                            "Credential vault created and unlocked"
-                        } else {
-                            "Credential vault unlocked"
-                        }
-                        .into();
                         this.error = None;
                         let selected_with_secret = this.draft.selected_profile.filter(|id| {
                             this.saved_connections
@@ -168,16 +156,13 @@ impl DbxApp {
                                 .is_some_and(SavedConnection::has_secret)
                         });
                         if let Some(profile_id) = selected_with_secret {
-                            this.status =
-                                "Credential vault unlocked · loading saved password…".into();
                             this.hydrate_saved_credential(profile_id, cx);
                         }
                     }
                     Err(_) => this.set_error(if creating {
-                        "Could not create the credential vault.".into()
+                        "Couldn’t create the vault".into()
                     } else {
-                        "Could not unlock the credential vault. Check the passphrase or vault data."
-                            .into()
+                        "Wrong passphrase".into()
                     }),
                 }
                 this.clear_vault_inputs(cx);
@@ -196,7 +181,7 @@ impl DbxApp {
             return;
         };
         if vault.lock().is_err() {
-            self.set_error("Could not lock the credential vault".into());
+            self.set_error("Couldn’t lock the vault".into());
             cx.notify();
             return;
         }
@@ -213,7 +198,6 @@ impl DbxApp {
             });
         }
         self.clear_vault_inputs(cx);
-        self.status = "Credential vault locked".into();
         self.error = None;
         cx.notify();
     }
@@ -337,11 +321,6 @@ impl DbxApp {
         });
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
         self.error = None;
-        self.status = if has_saved_password {
-            "Loading saved password…".into()
-        } else {
-            "Saved connection selected".into()
-        };
         if has_saved_password {
             self.hydrate_saved_credential(profile_id, cx);
         }
@@ -385,12 +364,11 @@ impl DbxApp {
 
         if self.credential_hydrating {
             let Some(window_handle) = window.window_handle().downcast::<DbxApp>() else {
-                self.set_error("Could not open the saved connection in this window".into());
+                self.set_error("Couldn’t open the saved connection".into());
                 cx.notify();
                 return;
             };
             self.credential_connect_window = Some(window_handle);
-            self.status = format!("Opening ‘{}’ after its password loads…", profile.name);
             self.error = None;
             cx.notify();
             return;
@@ -409,7 +387,9 @@ impl DbxApp {
         let requested_fields = self.connection_fields(cx);
         let runtime = self.runtime.clone();
         cx.spawn(async move |this, cx| {
-            let result = runtime.spawn_blocking(move || store.load(profile_id)).await?;
+            let result = runtime
+                .spawn_blocking(move || store.load(profile_id))
+                .await?;
             let connect_window = this.update(cx, |this, cx| {
                 if this.credential_hydration_generation != hydration_generation {
                     return None;
@@ -422,7 +402,11 @@ impl DbxApp {
                     &requested_fields,
                 ) {
                     this.credential_connect_window = None;
-                    this.status = "Connection details changed · saved password not restored".into();
+                    this.show_toast(
+                        ToastKind::Info,
+                        "Connection details changed, so the saved password wasn’t restored",
+                        cx,
+                    );
                     this.error = None;
                     cx.notify();
                     return None;
@@ -436,7 +420,6 @@ impl DbxApp {
                             *value = std::mem::take(&mut fields.password);
                             cx.notify();
                         });
-                        this.status = "Saved connection selected · password restored".into();
                         this.error = None;
                         let connect_window = this.credential_connect_window.take();
                         cx.notify();
@@ -444,7 +427,9 @@ impl DbxApp {
                     }
                     Err(_) => {
                         this.credential_connect_window = None;
-                        this.set_error("Saved connection password is unavailable in the credential vault. Import old passwords or enter it once and Save.".into());
+                        this.set_error(
+                            "No saved password for this connection. Enter it and save.".into(),
+                        );
                         cx.notify();
                         None
                     }
@@ -454,7 +439,8 @@ impl DbxApp {
                 window_handle.update(cx, |this, window, cx| this.connect(window, cx))?;
             }
             Ok::<(), anyhow::Error>(())
-        }).detach();
+        })
+        .detach();
     }
 
     pub(super) fn save_connection(&mut self, cx: &mut Context<Self>) {
@@ -489,7 +475,6 @@ impl DbxApp {
         let runtime = self.runtime.clone();
         self.saving_connection = true;
         self.error = None;
-        self.status = "Saving connection…".into();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let (save_result, list_result) = runtime
@@ -513,7 +498,11 @@ impl DbxApp {
                 match save_result {
                     Ok(profile) if unchanged => {
                         this.draft.selected_profile = Some(profile.id);
-                        this.status = format!("Saved connection ‘{}’", profile.name);
+                        this.show_toast(
+                            ToastKind::Success,
+                            format!("Saved “{}”", profile.name),
+                            cx,
+                        );
                         this.error = None;
                     }
                     Ok(_) => {}
@@ -551,7 +540,6 @@ impl DbxApp {
                                 cx,
                             );
                             this.error = None;
-                            this.status = format!("Selected {}", path.display());
                             cx.notify();
                         })?;
                     }
@@ -616,7 +604,6 @@ impl DbxApp {
         self.active_session_id = Some(session_id);
         self.connection_picker_open = false;
         self.error = None;
-        self.status = format!("Connecting to {kind}…");
         let runtime = self.runtime.clone();
         cx.notify();
 
@@ -716,13 +703,11 @@ impl DbxApp {
                             session.set_result(None, cx);
                             session.result_table = None;
                         }
-                        session.status = format!("Connected to {kind}");
                         session.error = None;
                         session.pane = Pane::Data;
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
-                        session.status = "Connection failed".into();
                     }
                 }
                 cx.notify();
@@ -742,7 +727,7 @@ impl DbxApp {
             cx.notify();
             return;
         }
-        let (kind, _, config) = match self.resolve_draft(cx) {
+        let (_, _, config) = match self.resolve_draft(cx) {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.set_error(error);
@@ -762,7 +747,6 @@ impl DbxApp {
         };
         self.testing_connection = true;
         self.error = None;
-        self.status = format!("Testing {kind} connection…");
         let runtime = self.runtime.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -779,7 +763,11 @@ impl DbxApp {
                 }
                 if this.draft_test_fingerprint(cx).ok().as_ref() != Some(&fingerprint) {
                     this.testing_connection = false;
-                    this.status = "Connection details changed · test again".into();
+                    this.show_toast(
+                        ToastKind::Info,
+                        "Connection details changed. Test again.",
+                        cx,
+                    );
                     this.error = None;
                     cx.notify();
                     return;
@@ -787,12 +775,17 @@ impl DbxApp {
                 this.testing_connection = false;
                 match result {
                     Ok(table_count) => {
-                        this.status =
-                            format!("Connection succeeded · {table_count} table(s) found");
+                        this.show_toast(
+                            ToastKind::Success,
+                            format!(
+                                "Connection succeeded · {table_count} {}",
+                                if table_count == 1 { "table" } else { "tables" }
+                            ),
+                            cx,
+                        );
                         this.error = None;
                     }
                     Err(error) => {
-                        this.status = "Connection test failed".into();
                         this.error = Some(error.to_string());
                     }
                 }
@@ -830,7 +823,6 @@ impl DbxApp {
             value.zeroize();
             cx.notify();
         });
-        self.status = "Choose a saved connection or create a new one".into();
         self.error = None;
         cx.notify();
     }
