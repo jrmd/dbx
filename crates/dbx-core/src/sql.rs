@@ -96,6 +96,16 @@ pub fn build_select(
 }
 
 pub fn build_insert(kind: DatabaseKind, request: &InsertRequest) -> Result<SqlStatement> {
+    build_insert_with_columns(kind, request, &[])
+}
+
+/// Build an insert using table metadata to type parameters the driver
+/// cannot bind directly; see [`build_update_with_columns`].
+pub fn build_insert_with_columns(
+    kind: DatabaseKind,
+    request: &InsertRequest,
+    columns: &[ColumnInfo],
+) -> Result<SqlStatement> {
     if request.columns.len() != request.values.len() {
         return Err(DbxError::Parse(
             "insert columns and values must have the same length".into(),
@@ -130,11 +140,17 @@ pub fn build_insert(kind: DatabaseKind, request: &InsertRequest) -> Result<SqlSt
     }
     statement.push_str(") VALUES (");
     let mut params = Vec::with_capacity(request.values.len());
-    for (index, value) in request.values.iter().enumerate() {
+    for (index, (column, value)) in request.columns.iter().zip(&request.values).enumerate() {
         if index > 0 {
             statement.push_str(", ");
         }
-        append_mutation_value(kind, &mut statement, &mut params, value)?;
+        append_column_value(
+            kind,
+            &mut statement,
+            &mut params,
+            value,
+            column_metadata(columns, column),
+        )?;
     }
     statement.push(')');
     Ok(SqlStatement::new(statement, params))
@@ -195,8 +211,10 @@ pub fn build_update(kind: DatabaseKind, request: &UpdateRequest) -> Result<SqlSt
     build_update_with_columns(kind, request, &[])
 }
 
-/// Build an update while retaining the database type information needed by
-/// drivers whose enum parameters cannot be inferred from a text bind.
+/// Build an update using table metadata to type parameters the driver
+/// cannot bind directly: PostgreSQL will not assign a `text` parameter to a
+/// date, uuid, enum, or other non-string column, and MySQL reads a string
+/// written to BIT as its character bytes.
 pub fn build_update_with_columns(
     kind: DatabaseKind,
     request: &UpdateRequest,
@@ -228,47 +246,76 @@ pub fn build_update_with_columns(
         if index > 0 {
             statement.push_str(", ");
         }
-        let value_sql = if kind == DatabaseKind::PostgreSQL
-            && matches!(value, MutationValue::Parameter(_))
-            && columns
-                .iter()
-                .find(|metadata| metadata.name == *column)
-                .is_some_and(|metadata| !metadata.enum_values.is_empty())
-        {
-            let enum_type = columns
-                .iter()
-                .find(|metadata| metadata.name == *column)
-                .map(|metadata| metadata.data_type.as_str())
-                .ok_or_else(|| DbxError::Parse("enum column metadata disappeared".into()))?;
-            let placeholder = placeholder(kind, params.len() + 1);
-            format!(
-                "CAST({placeholder} AS {})",
-                quote_identifier(kind, enum_type)?
-            )
-        } else {
-            let mut value_sql = String::new();
-            append_mutation_value(kind, &mut value_sql, &mut params, value)?;
-            value_sql
-        };
-        write!(
-            statement,
-            "{} = {}",
-            quote_identifier(kind, column)?,
-            value_sql
-        )
-        .map_err(|error| DbxError::Parse(error.to_string()))?;
-        if let MutationValue::Parameter(value) = value
-            && kind == DatabaseKind::PostgreSQL
-            && columns
-                .iter()
-                .find(|metadata| metadata.name == *column)
-                .is_some_and(|metadata| !metadata.enum_values.is_empty())
-        {
-            params.push(value.clone());
-        }
+        write!(statement, "{} = ", quote_identifier(kind, column)?)
+            .map_err(|error| DbxError::Parse(error.to_string()))?;
+        append_column_value(
+            kind,
+            &mut statement,
+            &mut params,
+            value,
+            column_metadata(columns, column),
+        )?;
     }
     append_filters(kind, &mut statement, &mut params, &request.filters)?;
     Ok(SqlStatement::new(statement, params))
+}
+
+fn column_metadata<'a>(columns: &'a [ColumnInfo], column: &str) -> Option<&'a ColumnInfo> {
+    columns.iter().find(|metadata| metadata.name == column)
+}
+
+/// Append one assignment/insert value, casting text and NULL parameters to
+/// the column type where the dialect needs it.
+fn append_column_value(
+    kind: DatabaseKind,
+    statement: &mut String,
+    params: &mut Vec<CellValue>,
+    value: &MutationValue,
+    column: Option<&ColumnInfo>,
+) -> Result<()> {
+    let cast = match (kind, value, column) {
+        (
+            DatabaseKind::PostgreSQL,
+            MutationValue::Parameter(CellValue::Text(_) | CellValue::Null),
+            Some(column),
+        ) => cast_type_name(&column.data_type),
+        (DatabaseKind::MySQL, MutationValue::Parameter(CellValue::Text(_)), Some(column))
+            if column
+                .data_type
+                .trim()
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bit")) =>
+        {
+            Some("UNSIGNED")
+        }
+        _ => None,
+    };
+    let Some(cast) = cast else {
+        return append_mutation_value(kind, statement, params, value);
+    };
+    statement.push_str("CAST(");
+    append_mutation_value(kind, statement, params, value)?;
+    write!(statement, " AS {cast})").map_err(|error| DbxError::Parse(error.to_string()))
+}
+
+/// Accept a catalog type name for use in `CAST(... AS type)`. PostgreSQL's
+/// `format_type` output is already valid SQL (quoting odd identifiers), so
+/// this only rejects anything that could end the expression. Unusual names
+/// fall back to an uncast parameter rather than failing the mutation.
+fn cast_type_name(data_type: &str) -> Option<&str> {
+    let data_type = data_type.trim();
+    let safe = !data_type.is_empty()
+        && data_type.matches('"').count().is_multiple_of(2)
+        && !data_type.contains("--")
+        && !data_type.contains("/*")
+        && data_type.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '_' | '(' | ')' | ',' | ' ' | '.' | '[' | ']' | '"'
+                )
+        });
+    safe.then_some(data_type)
 }
 
 fn append_mutation_value(

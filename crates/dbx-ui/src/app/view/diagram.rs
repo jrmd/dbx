@@ -94,7 +94,7 @@ impl DbxApp {
                 .items_center()
                 .justify_center()
                 .text_color(theme().text_muted)
-                .child("Open a database diagram from Explorer actions")
+                .child("No diagram open")
                 .into_any_element();
         };
 
@@ -123,7 +123,7 @@ impl DbxApp {
                     document.edges.len()
                 )
             })
-            .unwrap_or_else(|| "Discovering tables and relationships".into());
+            .unwrap_or_else(|| "Loading tables…".into());
         let schema_filter_active = selected_schemas.is_some();
         let schema_filter_control = (kind == DatabaseKind::PostgreSQL
             && !available_schemas.is_empty())
@@ -166,7 +166,7 @@ impl DbxApp {
                         .compact()
                         .outline()
                         .selected(schema_filter_active)
-                        .tooltip("Choose the PostgreSQL schemas shown in this diagram")
+                        .tooltip("Schemas")
                         .label(format!("Schemas · {summary}")),
                 )
                 .child(
@@ -222,16 +222,6 @@ impl DbxApp {
                         .flex_col()
                         .gap(px(3.))
                         .children(schema_rows),
-                )
-                .child(
-                    div()
-                        .px(px(10.))
-                        .py(px(7.))
-                        .border_t_1()
-                        .border_color(theme().border)
-                        .text_size(px(9.))
-                        .text_color(theme().text_muted)
-                        .child("Applies to this diagram and its exports."),
                 )
         });
         let toolbar = div()
@@ -379,7 +369,7 @@ impl DbxApp {
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
-                                    .tooltip("Fit the whole diagram (F)")
+                                    .tooltip("Fit (F) · reset zoom (0)")
                                     .label("Fit")
                                     .disabled((zoom - fit_zoom).abs() < 0.01 && viewport_at_origin)
                                     .on_click(move |_, _, cx| {
@@ -394,7 +384,7 @@ impl DbxApp {
                                     .compact()
                                     .outline()
                                     .label("Export")
-                                    .tooltip("Export the whole diagram")
+                                    .tooltip("Export")
                                     .dropdown_menu(move |menu, _, _| {
                                         let svg_document = svg_document.clone();
                                         let svg_colors = svg_colors.clone();
@@ -461,7 +451,7 @@ impl DbxApp {
                             .with_size(Size::XSmall)
                             .compact()
                             .ghost()
-                            .tooltip("Refresh diagram (R)")
+                            .tooltip("Refresh (R)")
                             .child(icon(Icon::Refresh, theme().text_muted))
                             .disabled(busy)
                             .on_click(move |_, _, cx| {
@@ -472,9 +462,6 @@ impl DbxApp {
                     ),
             );
 
-        let show_shortcut_hint = document
-            .as_ref()
-            .is_some_and(|document| !document.nodes.is_empty());
         let body_content = match document {
             Some(document) if document.nodes.is_empty() => div()
                 .flex_1()
@@ -494,17 +481,7 @@ impl DbxApp {
                             } else {
                                 "No relational tables found"
                             },
-                        ))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(theme().text_muted)
-                                .child(if schema_filter_active {
-                                    "Choose another schema or select All schemas."
-                                } else {
-                                    "Create or import tables, then refresh the diagram."
-                                }),
-                        ),
+                        )),
                 )
                 .into_any_element(),
             Some(document) => {
@@ -806,9 +783,9 @@ impl DbxApp {
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme().text)
                                     .child(if error.is_some() {
-                                        "Could not build the diagram"
+                                        "Couldn’t build the diagram"
                                     } else {
-                                        "Discovering your schema…"
+                                        "Loading diagram…"
                                     }),
                             )
                             .when_some(error.clone(), |view, error| {
@@ -821,7 +798,7 @@ impl DbxApp {
                                 )
                                 .child(
                                     Button::new("diagram-retry")
-                                        .with_size(Size::Small)
+                                        .with_size(Size::XSmall)
                                         .compact()
                                         .outline()
                                         .label("Try again")
@@ -892,26 +869,7 @@ impl DbxApp {
             .on_action(cx.listener(move |this, _: &DiagramRefresh, _, cx| {
                 this.refresh_diagram_for(session_id, cx);
             }))
-            .child(body_content)
-            .when(show_shortcut_hint, |view| {
-                view.child(
-                    div()
-                        .absolute()
-                        .right(px(12.))
-                        .bottom(px(10.))
-                        .px(px(7.))
-                        .py(px(3.))
-                        .rounded(px(4.))
-                        .bg(theme().panel.alpha(0.92))
-                        .border_1()
-                        .border_color(theme().border)
-                        .text_size(px(9.))
-                        .text_color(theme().text_muted)
-                        .child(
-                            "Drag to pan · arrows move · Shift arrows jump · +/− zoom · F fit · 0 reset",
-                        ),
-                )
-            });
+            .child(body_content);
 
         div()
             .flex_1()

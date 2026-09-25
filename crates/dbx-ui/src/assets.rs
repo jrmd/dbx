@@ -16,6 +16,12 @@ pub const ICON_ADD: &str = "icons/add.svg";
 pub const ICON_CLOSE: &str = "icons/close.svg";
 pub const ICON_MORE: &str = "icons/more.svg";
 pub const ICON_ARROW_RIGHT: &str = "icons/arrow-right.svg";
+pub const ICON_MINIMIZE: &str = "icons/minimize.svg";
+pub const ICON_MAXIMIZE: &str = "icons/maximize.svg";
+pub const ICON_RESTORE: &str = "icons/restore.svg";
+pub const ICON_SIDEBAR: &str = "icons/sidebar.svg";
+pub const ICON_APPEARANCE: &str = "icons/appearance.svg";
+pub const ICON_LOCK: &str = "icons/lock.svg";
 pub const LOGO_POSTGRESQL: &str = "icons/postgresql.svg";
 pub const LOGO_MYSQL: &str = "icons/mysql.svg";
 pub const LOGO_SQLITE: &str = "icons/sqlite.svg";
@@ -44,12 +50,20 @@ impl AssetSource for Assets {
             ICON_CLOSE => include_bytes!("../assets/icons/close.svg").as_slice(),
             ICON_MORE => include_bytes!("../assets/icons/more.svg").as_slice(),
             ICON_ARROW_RIGHT => include_bytes!("../assets/icons/arrow-right.svg").as_slice(),
+            ICON_MINIMIZE => include_bytes!("../assets/icons/minimize.svg").as_slice(),
+            ICON_MAXIMIZE => include_bytes!("../assets/icons/maximize.svg").as_slice(),
+            ICON_RESTORE => include_bytes!("../assets/icons/restore.svg").as_slice(),
+            ICON_SIDEBAR => include_bytes!("../assets/icons/sidebar.svg").as_slice(),
+            ICON_APPEARANCE => include_bytes!("../assets/icons/appearance.svg").as_slice(),
+            ICON_LOCK => include_bytes!("../assets/icons/lock.svg").as_slice(),
             LOGO_POSTGRESQL => include_bytes!("../assets/icons/postgresql.svg").as_slice(),
             LOGO_MYSQL => include_bytes!("../assets/icons/mysql.svg").as_slice(),
             LOGO_SQLITE => include_bytes!("../assets/icons/sqlite.svg").as_slice(),
             LOGO_REDIS => include_bytes!("../assets/icons/redis.svg").as_slice(),
             LOGO => LOGO_BYTES,
-            _ => return Ok(None),
+            // gpui-component draws its own glyphs (menu checkmarks, select
+            // carets, dialog closes) from its bundled icon set.
+            _ => return gpui_component_assets::Assets.load(path),
         };
 
         Ok(Some(Cow::Borrowed(asset)))
@@ -74,6 +88,12 @@ impl AssetSource for Assets {
                 "close.svg",
                 "more.svg",
                 "arrow-right.svg",
+                "minimize.svg",
+                "maximize.svg",
+                "restore.svg",
+                "sidebar.svg",
+                "appearance.svg",
+                "lock.svg",
                 "postgresql.svg",
                 "mysql.svg",
                 "sqlite.svg",

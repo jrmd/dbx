@@ -17,6 +17,7 @@ use gpui_component::{
 };
 
 use crate::editor::TextEditor;
+use crate::row_drafts::{FieldValueKind, field_value_kind};
 
 /// A stable identifier for a filter row.
 ///
@@ -135,43 +136,16 @@ pub fn operator_value_required(operator: FilterOperator) -> bool {
     operator_requires_value(operator)
 }
 
-/// Classify a database column for filter value parsing.
-///
-/// Drivers report type names with different casing and with optional size or
-/// precision suffixes.  Classification is therefore deliberately
-/// case-insensitive and conservative: types that are not known scalar types
-/// are treated as text instead of making a valid column impossible to filter.
+/// Classify a database column for filter value parsing, using the same type
+/// rules as the row editor. Byte columns are filtered by their text form.
 pub fn filter_value_kind(column: &ColumnInfo) -> FilterValueKind {
-    let data_type = column.data_type.trim().to_ascii_lowercase();
-
-    if data_type.contains("json") {
-        FilterValueKind::Json
-    } else if data_type.contains("bool")
-        || data_type == "bit"
-        || data_type.starts_with("bit(")
-        || data_type.starts_with("tinyint(1")
-    {
-        FilterValueKind::Boolean
-    } else if data_type.contains("unsigned")
-        || data_type.starts_with("uint")
-        || data_type.starts_with("ubigint")
-    {
-        FilterValueKind::Unsigned
-    } else if data_type.contains("int")
-        || data_type.contains("serial")
-        || data_type.starts_with("sint")
-    {
-        FilterValueKind::Integer
-    } else if data_type.contains("real")
-        || data_type.contains("double")
-        || data_type.contains("float")
-        || data_type.contains("decimal")
-        || data_type.contains("numeric")
-        || data_type == "number"
-    {
-        FilterValueKind::Real
-    } else {
-        FilterValueKind::Text
+    match field_value_kind(column) {
+        FieldValueKind::Boolean => FilterValueKind::Boolean,
+        FieldValueKind::Integer => FilterValueKind::Integer,
+        FieldValueKind::Unsigned => FilterValueKind::Unsigned,
+        FieldValueKind::Real | FieldValueKind::Decimal => FilterValueKind::Real,
+        FieldValueKind::Json => FilterValueKind::Json,
+        FieldValueKind::Bytes | FieldValueKind::Text => FilterValueKind::Text,
     }
 }
 

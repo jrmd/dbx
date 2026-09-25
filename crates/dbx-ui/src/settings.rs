@@ -22,11 +22,14 @@ pub struct Settings {
     pub version: u32,
     #[serde(default)]
     pub appearance: Appearance,
+    /// Replace glass materials with opaque surfaces.
+    #[serde(default)]
+    pub reduce_transparency: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self::new(Appearance::Dark)
+        Self::new(Appearance::System)
     }
 }
 
@@ -35,7 +38,13 @@ impl Settings {
         Self {
             version: SETTINGS_FILE_VERSION,
             appearance,
+            reduce_transparency: false,
         }
+    }
+
+    pub fn with_reduce_transparency(mut self, reduce: bool) -> Self {
+        self.reduce_transparency = reduce;
+        self
     }
 }
 
@@ -172,10 +181,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_settings_default_to_dark() {
+    fn missing_settings_follow_the_system_with_glass() {
         let (_directory, store) = test_store();
         assert_eq!(store.load().expect("load defaults"), Settings::default());
-        assert_eq!(Settings::default().appearance, Appearance::Dark);
+        assert_eq!(Settings::default().appearance, Appearance::System);
+        assert!(!Settings::default().reduce_transparency);
+    }
+
+    #[test]
+    fn earlier_documents_keep_their_explicit_appearance() {
+        let (_directory, store) = test_store();
+        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#)
+            .expect("write earlier settings");
+        let settings = store.load().expect("load earlier settings");
+        assert_eq!(settings.appearance, Appearance::Dark);
+        assert!(!settings.reduce_transparency);
     }
 
     #[test]

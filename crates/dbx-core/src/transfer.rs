@@ -829,25 +829,37 @@ async fn write_export_file(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
         .map_err(|error| DbxError::Io(error.to_string()))
 }
 
+/// Accept a catalog type spelling (`numeric(10,2)`, `int unsigned`,
+/// `enum('a','b')`, `"Mixed Case"`) for a generated `CREATE TABLE`. Quoted
+/// labels and identifiers may contain spaces and punctuation, but nothing
+/// outside them may end the statement or open a comment.
 fn safe_schema_type(data_type: &str) -> Result<String> {
     let data_type = data_type.trim();
+    let invalid = || DbxError::Parse(format!("invalid metadata column type `{data_type}`"));
     if data_type.is_empty()
         || data_type.contains(';')
         || data_type.contains('\\')
         || data_type.contains('\0')
-        || data_type.contains("--")
-        || data_type.contains("/*")
-        || data_type.contains("*/")
         || data_type.contains('\n')
         || data_type.contains('\r')
-        || !data_type.chars().all(|character| {
-            character.is_ascii_alphanumeric()
-                || matches!(character, '_' | '(' | ')' | ',' | ' ' | '.' | '[' | ']')
-        })
     {
-        return Err(DbxError::Parse(format!(
-            "invalid metadata column type `{data_type}`"
-        )));
+        return Err(invalid());
+    }
+    let mut quote = None;
+    for character in data_type.chars() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None if matches!(character, '\'' | '"') => quote = Some(character),
+            None if character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '(' | ')' | ',' | ' ' | '.' | '[' | ']') => {}
+            None => return Err(invalid()),
+        }
+    }
+    // A doubled quote (`''`) closes and reopens, so balance is all that
+    // needs checking at the end.
+    if quote.is_some() {
+        return Err(invalid());
     }
     Ok(data_type.to_owned())
 }
@@ -1639,6 +1651,29 @@ fn elapsed_ms_since(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_types_allow_quoted_labels_but_nothing_that_escapes_them() {
+        for valid in [
+            "numeric(10,2)",
+            "int unsigned",
+            "integer[]",
+            "enum('a b','it''s','x--y')",
+            "\"Mixed Case\"",
+        ] {
+            assert_eq!(safe_schema_type(valid).unwrap(), valid);
+        }
+        for invalid in [
+            "enum('open",
+            "int -- comment",
+            "int /* c */",
+            "int; DROP TABLE t",
+            "enum('a');",
+            "text\nNOT NULL",
+        ] {
+            assert!(safe_schema_type(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn detect_file_format_handles_plain_and_gzipped_extensions() {

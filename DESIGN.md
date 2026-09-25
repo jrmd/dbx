@@ -49,8 +49,9 @@ typography:
     fontWeight: 500
 rounded:
   editor: "5px"
-  control: "6px"
-  panel: "10px"
+  control: "7px"
+  panel: "12px"
+  glass: "16px"
   full: "9999px"
 spacing:
   space-1: "4px"
@@ -90,7 +91,7 @@ components:
     textColor: "{colors.text}"
     rounded: "{rounded.editor}"
     padding: "0 11px"
-    height: "31px"
+    height: "35px"
   input:
     backgroundColor: "{colors.canvas}"
     textColor: "{colors.text}"
@@ -111,10 +112,10 @@ The interface is intentionally native and dense. Surfaces are layered only enoug
 
 **Key Characteristics:**
 
-- Persistent context: a 46px app rail, 42px top bar, 26px status bar, and visible explorer/inspector panes; the supplied DBX logo asset anchors the connected rail or the disconnected top-bar identity.
-- Deliberate density: 10–12px operational text, 30–36px controls, and four-pixel spacing increments.
+- Persistent context: a 48px app rail, 46px unified titlebar, 30px status bar, and visible explorer/inspector panes; the DBX logo anchors the disconnected titlebar and the vault gate.
+- Deliberate density: 11–12px operational text, 26–30px controls, and four-pixel spacing increments.
 - Blue is an interaction locator, not a decorative fill; it marks active navigation and primary commit actions.
-- Borders and tonal planes, rather than shadows, separate work areas.
+- Chrome is glass, content is paper: navigation floats on a translucent material over the desktop, while data always sits on one opaque content sheet.
 
 ## Colors
 
@@ -125,7 +126,8 @@ The default palette is a low-glare charcoal console: cool white text sits on lay
 - **Dark:** Black Canvas, Instrument Panel, Raised Utility Surface, and Navigation Rail remain the default low-glare working environment.
 - **Light:** Cool Paper (`light-canvas`) holds the workspace, white (`light-panel`) carries panes, Pale Utility (`light-panel-raised`) distinguishes controls, and Blue-Slate dividers preserve the pane hierarchy.
 - **Parity:** blue still means action/location, green still means health, amber still means caution, and red still means destructive. Grid alternation, focus visibility, editor syntax, overlays, and disabled states must be checked in both appearances.
-- **Control:** the compact sun/moon action in the top bar switches appearance immediately and persists the choice. It replaces the duplicated top-bar refresh action rather than adding another competing control.
+- **System:** the default. DBX follows the operating system's light/dark setting live.
+- **Control:** the titlebar Appearance menu offers System, Light, and Dark plus **Reduce transparency**; every choice applies immediately and persists.
 
 ### Primary
 
@@ -179,22 +181,28 @@ At widths below 1180px, DBX enters its narrow-workspace behavior and removes the
 
 ## Elevation & Depth
 
-DBX is flat by default: it defines depth through the ordered canvas, panel, raised-panel, and rail tones plus one-pixel borders. There are no drop-shadow tokens. Menus, popovers, selected tabs, and controls earn distinction through `panel-raised` or `border-strong`, never floating-card effects.
+DBX uses a Liquid Glass material hierarchy with exactly three layers:
 
-**The Earned Separation Rule.** Add a new tonal plane only when it clarifies a pane, selection, or transient utility; default content stays on the canvas with a single border boundary.
+1. **Backdrop** (`window`): a translucent tint over a blurred desktop (`NSVisualEffectView` on macOS, compositor blur on Wayland). The titlebar, rail, and connection tabs sit directly on it. The tint is denser off macOS, where compositors may not blur.
+2. **Floating glass** (`glass`, `RADIUS_GLASS`, inset 8px): the explorer and saved-connection sidebars. Glass carries a hairline border, a soft ambient shadow, and a one-pixel **specular rim** (an inset top highlight) that makes the layer read as a physical sheet.
+3. **Content sheet** (`canvas`, `RADIUS_PANEL`): the single opaque surface holding tabs, grids, editors, forms, and the status bar. Data never competes with the desktop.
+
+Transient layers (menus, popovers, dialogs, the vault gate) use the denser `glass_raised` material with a deeper shadow. **Reduce transparency** swaps every material for an opaque equivalent and switches the window to an opaque backdrop; contrast tests assert text legibility on those fallbacks.
+
+**The Earned Separation Rule.** Inside the content sheet, depth stays tonal and border-led. Glass belongs to chrome and transient layers, never to rows, cells, or form fields.
 
 ## Shapes
 
-Forms are compact and lightly softened. Standard controls use a 6px radius, panel containers use 10px, text editors use 5px, and compact icon affordances may use 4–5px corners. Status dots and badges are fully rounded. Borders are one pixel and never replaced with thick outlines; selected state comes from blue tint and text/icon color, not excessive rounding.
+Selectable and actionable controls are capsules: buttons, connection tabs, document tabs, segmented options, chips, and titlebar icon controls. List rows use a 10px radius, the content sheet 12px, floating glass 16px, and raised dialogs 20px. Status dots and badges are fully rounded. Borders are one pixel. Selection comes from a lifted glass pill or a blue tint, not heavier outlines.
 
 ## Components
 
 ### Buttons
 
-The button family is compact, square-shouldered, and action-ranked.
+The button family is compact, capsule-shaped, and action-ranked.
 
-- **Shape:** gently softened control corners (6px), 30px height, 12px horizontal padding, one-pixel border.
-- **Primary:** Command Blue fill with Operational White text for commits such as Connect, Run, and New connection.
+- **Shape:** full capsule, 28px height, 14px horizontal padding, one-pixel hairline border, 12px medium label. Always build buttons through `theme::button` (or `Size::XSmall`); gpui-component otherwise sizes labels at 16px.
+- **Primary:** Command Blue fill with Operational White text and a specular top rim, for commits such as Connect, Run, and Unlock.
 - **Quiet:** Raised Utility Surface with a Hairline Divider and white text for secondary operations such as Save, Test Connection, or Choose file. Test Connection validates the currently entered configuration only: it must not save a profile, open a workspace, or change database state.
 - **Danger:** Raised Utility Surface with a red border and red label; reserve it for irreversible actions.
 - **Hover / Focus:** quiet icon controls lift only to `panel-raised`; quiet form buttons may change their border to Command Blue. Keyboard focus must use the brighter Focus Blue rather than relying on hover.
@@ -220,12 +228,12 @@ The button family is compact, square-shouldered, and action-ranked.
 - **Top bar:** 42px rail-toned strip; show the supplied DBX logo with the DBX title while disconnected, and retain connection tabs to preserve multi-connection context once a workspace is active.
 - **Appearance action:** a single compact sun/moon action sits with window-level controls, is available before and after connection, and names the appearance it will switch to in its tooltip.
 - **Connection tabs:** 32px high, 6px top corners, icon + health dot + engine badge + muted metadata. Active tabs use the standard panel and stronger border, with a full-width 2px Command Blue bottom indicator; inactive tabs use the rail.
-- **Document tabs:** each connection owns a 36px, horizontally scrollable row containing the persistent Data document plus independently closable Query, table-bound Structure, and database Diagram documents. Active documents use the canvas, strong border, and Command Blue icon; the compact add action opens another query without replacing existing work.
+- **Document tabs:** each connection owns a 36px, horizontally scrollable row containing the persistent Data document plus independently closable Query, table-bound Structure, and database Diagram documents. Active documents use the canvas, a single blue bottom separator, and Command Blue icon; the compact add action opens another query without replacing existing work.
 - **Explorer:** the header keeps Refresh and New Table visible for quick routine work. Diagram, Export, and Import live in one compact overflow menu rather than competing for header width. Database and schema filter rows remain labelled, horizontally scrollable chip rows; they never wrap into the table list. Active entries use Blue Selection Well with Command Blue icon/text; unselected entries stay muted until hover. When a PostgreSQL schema filter is active, table labels omit that redundant schema prefix; the All view remains qualified.
 
 ### Cards / Containers
 
-- **Connection setup:** a 10px-radius Instrument Panel with a single Hairline Divider. Its engine list and configuration pane are separated by a vertical border rather than nested cards. Details and Connection String receive equal visual weight; Details uses labeled Host, Port, User, Password, and Database fields, while SQLite presents a database-file field with a native Choose file action.
+- **Connection setup:** a flat configuration pane beside the saved-connection list, separated by a single vertical border. Form labels use an 11px minimum. Details and Connection String receive equal visual weight; Details uses labeled Host, Port, User, Password, and Database fields, while SQLite presents a database-file field with a native Choose file action.
 - **Menus:** Raised Utility Surface, strong border, 8px corners, 6px internal padding, and compact 8px × 7px menu rows.
 - **Grid and inspector:** adjacent border-separated panes, not independently elevated cards.
 - **Structure metadata:** columns and foreign keys form separate dense sections. Foreign-key rows show constraint name, local columns, qualified target columns, and update/delete actions without introducing nested cards.
@@ -272,10 +280,16 @@ The button family is compact, square-shouldered, and action-ranked.
 
 ### Don't:
 
-- **Don't** introduce shadows, glass effects, oversized cards, or decorative gradients; depth is tonal and border-led.
+- **Don't** put glass inside the content sheet, stack translucent layers over data, or add decorative gradients. Glass is for chrome and transient layers only.
 - **Don't** use blue as ambient decoration or apply semantic success/warning/danger colors without a state meaning.
 - **Don't** wrap multi-connection tabs into ambiguous rows; retain horizontal scrolling and concise metadata.
 - **Don't** turn the Explorer header into a row of text actions or make the diagram a competing global navigation destination.
 - **Don't** repeat an active PostgreSQL schema prefix in explorer table labels; retain qualification only in the All view.
 - **Don't** replace the authored geometric icon vocabulary with emoji, mixed icon sets, or browser-shaped controls.
 - **Don't** save a connection password in profile JSON or use Test Connection to persist, open, or change a database.
+
+### Native desktop chrome
+
+The 46px unified titlebar spans the window and is transparent over the backdrop. The whole empty stretch is a drag area: double-click zooms and right-click opens the compositor window menu. macOS keeps native traffic lights (inset 16px) with reserved leading space. Elsewhere DBX draws circular minimize, maximize/restore, and close controls, showing only those the compositor supports. Client-decorated windows get invisible edge and corner resize handles. Connection tabs are capsules; the selected one lifts into a glass pill. When connected, a sidebar toggle sits beside the window identity.
+
+Standard shortcuts use ⌘ on macOS and Ctrl elsewhere: New Connection (N), New Query (T), Close Tab (W; on Data it closes the connection), Toggle Explorer (B), Refresh (R, F5), and next/previous connection (Ctrl-Tab / Ctrl-Shift-Tab, ⌘⇧] / ⌘⇧[). Escape backs out of the connection picker to the open connection. macOS gets a full menu bar (DBX, File, Edit, View, Query, Window) wired to the same actions. If focus is lost (for example, a focused tab closes), the root view reclaims it so shortcuts keep working.

@@ -1580,6 +1580,7 @@ dependencies = [
  "getrandom 0.4.3",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_platform",
  "keyring",
  "percent-encoding",

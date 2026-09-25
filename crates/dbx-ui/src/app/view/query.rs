@@ -19,9 +19,9 @@ impl DbxApp {
                 .child(if busy {
                     "Running query…"
                 } else if failed {
-                    "The query did not complete. Review the error above and try again."
+                    "Query failed"
                 } else {
-                    "Run a query to see rows"
+                    "No results"
                 })
                 .into_any_element();
         }
@@ -33,7 +33,7 @@ impl DbxApp {
                 .items_center()
                 .justify_center()
                 .text_color(theme().text_muted)
-                .child("The statement completed without a row result.")
+                .child("Statement completed · no rows returned")
                 .into_any_element();
         }
 
@@ -302,18 +302,17 @@ impl DbxApp {
         if let Some(completion_element) = completion_element {
             editor_panel = editor_panel.child(completion_element);
         }
+        // A finished or idle result needs no label; the row counts say it.
         let result_label = if error.is_some() {
-            "Failed"
+            Some("Failed")
         } else if busy {
-            "Running"
+            Some("Running")
         } else if results_stale {
-            "Stale result"
+            Some("Stale result")
         } else if truncated {
-            "Results limited"
-        } else if has_result {
-            "Complete"
+            Some("Results limited")
         } else {
-            "Ready"
+            None
         };
         let result_color = if error.is_some() {
             theme().danger
@@ -323,11 +322,6 @@ impl DbxApp {
             theme().success
         } else {
             theme().text_muted
-        };
-        let editor_label = if sql_dialect {
-            "SQL editor"
-        } else {
-            "Command editor"
         };
         let app = cx.entity().downgrade();
         let history = self
@@ -357,19 +351,8 @@ impl DbxApp {
                     .border_b_1()
                     .border_color(theme().border)
                     .bg(theme().panel)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(7.))
-                            .child(icon(Icon::Query, theme().accent))
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(editor_label),
-                            ),
-                    )
+                    // The tab already names the query; keep the actions right-aligned.
+                    .child(div())
                     .child(
                         div()
                             .flex()
@@ -378,9 +361,10 @@ impl DbxApp {
                             .when(!busy, |actions| {
                                 actions.child(
                                     button("run-query", "Run", ButtonKind::Primary)
-                                        .tooltip(
-                                            "Run selection or current statement (Cmd/Ctrl+Enter)",
-                                        )
+                                        .tooltip(format!(
+                                            "Run statement ({})",
+                                            shortcut("↵", "Enter")
+                                        ))
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.request_run_query_for(
@@ -392,7 +376,7 @@ impl DbxApp {
                             .when(busy, |actions| {
                                 actions.child(
                                     button("cancel-query", "Cancel", ButtonKind::Quiet)
-                                        .tooltip("Cancel the active query (Escape)")
+                                        .tooltip("Cancel (Esc)")
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.cancel_query_for(session_id, cx);
@@ -658,14 +642,16 @@ impl DbxApp {
                                                     .rounded_full()
                                                     .bg(result_color),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .text_size(px(11.))
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(theme().text)
-                                                    .child(result_label),
-                                            )
+                                            .when_some(result_label, |strip, label| {
+                                                strip.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .text_size(px(11.))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(theme().text)
+                                                        .child(label),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .min_w_0()

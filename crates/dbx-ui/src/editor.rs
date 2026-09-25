@@ -3087,7 +3087,9 @@ impl Element for TextEditorText {
                     ),
                     size(px(2.), line_height),
                 ),
-                gpui::blue(),
+                // Pure blue vanishes on the dark canvas; the focus ring
+                // colour is tuned for contrast in both appearances.
+                crate::theme::theme().focus_ring,
             )
         });
 

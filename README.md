@@ -149,3 +149,7 @@ Robust read-only sessions, SSH tunnels, and a formal audit log remain security w
 5. Harden cancellation, transactions, query history, SSH tunnels, accessibility, and cross-platform packaging through real-world testing; extend transfers with progress, streaming, and native bulk-loader hand-off for very large files.
 
 Contributions should keep the UI responsive, preserve parameterization, and include a connector-level test for any engine-specific behaviour.
+
+### Isolated native UI testing
+
+Run `scripts/run-ui-test.sh` on Linux for a persistent test vault, four QA connection profiles, and a seeded SQLite database, all isolated under `target/ui-test/`. See [desktop QA](docs/desktop-qa.md) for Docker startup, test credentials, and native checks.
