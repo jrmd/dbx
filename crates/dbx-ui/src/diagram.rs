@@ -29,8 +29,15 @@ pub struct DiagramPalette<'a> {
     pub text: &'a str,
     pub muted_text: &'a str,
     pub accent: &'a str,
+    /// Primary-key glyphs; foreign keys use `accent`.
+    pub key: &'a str,
     pub relation: &'a str,
 }
+
+/// Corner radius for orthogonal relationship routes.
+pub const EDGE_CORNER_RADIUS: f32 = 7.0;
+/// Separation between relationships that share a routing corridor.
+const LANE_SPACING: f32 = 7.0;
 
 /// A positioned table card in a diagram.
 #[derive(Clone, Debug)]
@@ -49,6 +56,8 @@ pub struct DiagramNode {
 #[derive(Clone, Debug)]
 pub struct DiagramColumn {
     pub name: String,
+    /// Compact display spelling of the column type (`timestamptz`,
+    /// `varchar(160)`), which keeps cards narrow without truncation.
     pub data_type: String,
     pub nullable: bool,
     pub primary_key: bool,
@@ -68,6 +77,25 @@ pub struct DiagramEdge {
     /// geometry in the document avoids reparsing SVG in the render loop.
     pub points: Vec<(f32, f32)>,
     pub self_referential: bool,
+    /// Every referencing column is nullable: a zero-or-many relationship.
+    pub optional: bool,
+}
+
+/// Crow's-foot cardinality marks for one relationship, in document space.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EdgeMarkers {
+    pub lines: Vec<[(f32, f32); 2]>,
+    /// Centre and radius of the "zero" ring on optional relationships.
+    pub ring: Option<((f32, f32), f32)>,
+}
+
+/// One drawing step of a rounded orthogonal route.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RouteStep {
+    Move((f32, f32)),
+    Line((f32, f32)),
+    /// Quadratic curve to the first point, controlled by the second.
+    Curve((f32, f32), (f32, f32)),
 }
 
 /// A complete layout ready for rendering or export.
@@ -174,11 +202,6 @@ impl DiagramDocument {
             })
             .collect::<Vec<_>>();
         nodes.sort_by(|left, right| left.id.cmp(&right.id));
-        let node_by_id = nodes
-            .iter()
-            .map(|node| (node.id.clone(), node))
-            .collect::<HashMap<_, _>>();
-
         let mut edges = Vec::new();
         for entry in &tables {
             let source = table_id(&entry.table);
@@ -187,54 +210,133 @@ impl DiagramDocument {
                 if !table_ids.contains(&target) {
                     continue;
                 }
-                let source_node = node_by_id[&source];
-                let target_node = node_by_id[&target];
-                let self_referential = source == target;
-                let path = edge_path(source_node, target_node, foreign_key, self_referential);
-                let points = edge_path_points(&path);
+                let optional = !foreign_key.columns.is_empty()
+                    && foreign_key.columns.iter().all(|name| {
+                        entry
+                            .structure
+                            .columns
+                            .iter()
+                            .find(|column| column.name == *name)
+                            .is_some_and(|column| column.nullable)
+                    });
                 edges.push(DiagramEdge {
                     id: format!("{source}:{index}"),
+                    self_referential: source == target,
                     source: source.clone(),
                     target,
                     source_columns: foreign_key.columns.clone(),
                     target_columns: foreign_key.referenced_columns.clone(),
-                    path,
-                    points,
-                    self_referential,
+                    path: String::new(),
+                    points: Vec::new(),
+                    optional,
                 });
             }
         }
         edges.sort_by(|left, right| left.id.cmp(&right.id));
 
-        let width = nodes
-            .iter()
-            .map(|node| node.x + node.width + PADDING)
-            .fold(PADDING * 2.0, f32::max);
-        let height = nodes
-            .iter()
-            .map(|node| node.y + node.height + PADDING)
-            .fold(PADDING * 2.0, f32::max);
-        Self {
+        let mut document = Self {
             database: schema.database.clone(),
             nodes,
             edges,
-            width,
-            height,
+            width: 0.0,
+            height: 0.0,
+        };
+        document.route();
+        document
+    }
+
+    /// Move one card to a new document position and reroute every
+    /// relationship. Positions are clamped so a card cannot leave the scene.
+    pub fn move_node(&mut self, id: &str, x: f32, y: f32) -> bool {
+        let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) else {
+            return false;
+        };
+        let (x, y) = (x.max(PADDING / 2.0).round(), y.max(PADDING / 2.0).round());
+        if node.x == x && node.y == y {
+            return false;
         }
+        node.x = x;
+        node.y = y;
+        self.route();
+        true
+    }
+
+    /// Restore user-arranged card positions after a rebuild. Unknown IDs are
+    /// ignored so a schema filter can hide arranged tables.
+    pub fn place_nodes(&mut self, positions: &HashMap<String, (f32, f32)>) {
+        if positions.is_empty() {
+            return;
+        }
+        for node in &mut self.nodes {
+            if let Some(&(x, y)) = positions.get(&node.id) {
+                node.x = x.max(PADDING / 2.0);
+                node.y = y.max(PADDING / 2.0);
+            }
+        }
+        self.route();
+    }
+
+    /// The top-left corner of a card, if it exists.
+    pub fn node_position(&self, id: &str) -> Option<(f32, f32)> {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| (node.x, node.y))
+    }
+
+    /// Recompute relationship geometry and scene bounds from card positions.
+    fn route(&mut self) {
+        let node_by_id = self
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node))
+            .collect::<HashMap<_, _>>();
+        for edge in &mut self.edges {
+            let (Some(source), Some(target)) = (
+                node_by_id.get(edge.source.as_str()),
+                node_by_id.get(edge.target.as_str()),
+            ) else {
+                continue;
+            };
+            let path = edge_route(
+                source,
+                target,
+                edge.source_columns.first().map(String::as_str),
+                edge.target_columns.first().map(String::as_str),
+                edge.self_referential,
+            );
+            edge.points = edge_path_points(&path);
+        }
+        separate_lanes(&mut self.edges);
+        for edge in &mut self.edges {
+            edge.path = rounded_svg_path(&edge.points, EDGE_CORNER_RADIUS);
+        }
+
+        self.width = self
+            .nodes
+            .iter()
+            .map(|node| node.x + node.width + PADDING)
+            .fold(PADDING * 2.0, f32::max);
+        self.height = self
+            .nodes
+            .iter()
+            .map(|node| node.y + node.height + PADDING)
+            .fold(PADDING * 2.0, f32::max);
     }
 
     /// Serializes the canonical vector representation. This is intentionally
     /// the export representation of the same geometry used by the native view.
     pub fn svg(&self, palette: DiagramPalette<'_>, selected: Option<&str>) -> String {
+        const FONT: &str = r#"font-family="system-ui, -apple-system, 'Segoe UI', sans-serif""#;
         let mut svg = format!(
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.0}" height="{:.0}" viewBox="0 0 {:.0} {:.0}" role="img" aria-label="Entity relationship diagram for {}"><defs><marker id="relation-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" viewBox="0 0 8 8" orient="auto"><path d="M 0 0 L 8 4 L 0 8 z" fill="{}"/></marker></defs><rect width="100%" height="100%" fill="{}"/>"#,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{:.0}" height="{:.0}" viewBox="0 0 {:.0} {:.0}" role="img" aria-label="Entity relationship diagram for {}"><defs><pattern id="dbx-grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="{}" fill-opacity="0.45"/></pattern></defs><rect width="100%" height="100%" fill="{}"/><rect width="100%" height="100%" fill="url(#dbx-grid)"/>"#,
             self.width,
             self.height,
             self.width,
             self.height,
             escape(&self.database),
-            palette.relation,
-            palette.canvas
+            palette.border,
+            palette.canvas,
         );
         for edge in &self.edges {
             let column_pairs = edge
@@ -244,7 +346,33 @@ impl DiagramDocument {
                 .map(|(source, target)| format!("{} → {}", escape(source), escape(target)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            svg.push_str(&format!(r#"<path d="{}" fill="none" stroke="{}" stroke-width="1.5" stroke-linejoin="round" marker-end="url(#relation-arrow)" data-self-referential="{}"><title>{} → {} ({})</title></path>"#, edge.path, palette.relation, edge.self_referential, escape(&edge.source), escape(&edge.target), column_pairs));
+            let markers = edge_markers(&edge.points, edge.optional);
+            let mut marks = String::new();
+            for [from, to] in &markers.lines {
+                marks.push_str(&format!(
+                    "M {:.1} {:.1} L {:.1} {:.1} ",
+                    from.0, from.1, to.0, to.1
+                ));
+            }
+            svg.push_str(&format!(
+                r#"<g data-relationship="{}" data-self-referential="{}"><title>{} → {} ({})</title><path d="{}" fill="none" stroke="{}" stroke-width="1.5" stroke-linejoin="round"/><path d="{}" fill="none" stroke="{}" stroke-width="1.5" stroke-linecap="round"/>"#,
+                escape(&edge.id),
+                edge.self_referential,
+                escape(&edge.source),
+                escape(&edge.target),
+                column_pairs,
+                edge.path,
+                palette.relation,
+                marks.trim_end(),
+                palette.relation,
+            ));
+            if let Some(((x, y), radius)) = markers.ring {
+                svg.push_str(&format!(
+                    r#"<circle cx="{x:.1}" cy="{y:.1}" r="{radius:.1}" fill="{}" stroke="{}" stroke-width="1.5"/>"#,
+                    palette.canvas, palette.relation
+                ));
+            }
+            svg.push_str("</g>");
         }
         for node in &self.nodes {
             let is_selected = selected == Some(node.id.as_str());
@@ -254,28 +382,77 @@ impl DiagramDocument {
                 palette.border
             };
             let stroke_width = if is_selected { 2.0 } else { 1.0 };
-            svg.push_str(&format!(r#"<g data-table="{}"><title>{}</title><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="8" fill="{}" stroke="{}" stroke-width="{}"/><path d="M {:.1} {:.1} h {:.1} v {:.1} h -{:.1} z" fill="{}"/><text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="14" font-weight="600">{}</text><text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="10">{}</text>"#,
-                escape(&node.id), escape(&display_table(&node.table)), node.x, node.y, node.width, node.height, palette.surface, stroke, stroke_width,
-                node.x, node.y, node.width, HEADER_HEIGHT, node.width, palette.surface_muted,
-                node.x + 12.0, node.y + 18.0, palette.text, escape(&node.table.name),
-                node.x + 12.0, node.y + 32.0, palette.muted_text, escape(node.table.schema.as_deref().unwrap_or("default"))
+            svg.push_str(&format!(
+                r#"<g data-table="{}"><title>{}</title><rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="10" fill="{}" stroke="{}" stroke-width="{}"/><path d="M {:.1} {:.1} a 10 10 0 0 1 10 -10 h {:.1} a 10 10 0 0 1 10 10 v {:.1} h -{:.1} z" fill="{}"/><line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}"/><text x="{:.1}" y="{:.1}" fill="{}" {FONT} font-size="14" font-weight="600">{}</text><text x="{:.1}" y="{:.1}" fill="{}" {FONT} font-size="10">{}</text>"#,
+                escape(&node.id),
+                escape(&display_table(&node.table)),
+                node.x,
+                node.y,
+                node.width,
+                node.height,
+                palette.surface,
+                stroke,
+                stroke_width,
+                node.x,
+                node.y + 10.0,
+                node.width - 20.0,
+                HEADER_HEIGHT - 10.0,
+                node.width,
+                palette.surface_muted,
+                node.x,
+                node.y + HEADER_HEIGHT,
+                node.x + node.width,
+                node.y + HEADER_HEIGHT,
+                palette.border,
+                node.x + 12.0,
+                node.y + 19.0,
+                palette.text,
+                escape(&node.table.name),
+                node.x + 12.0,
+                node.y + 33.0,
+                palette.muted_text,
+                escape(node.table.schema.as_deref().unwrap_or("default")),
             ));
             for (index, column) in node.columns.iter().enumerate() {
                 let y = node.y + HEADER_HEIGHT + 17.0 + (index as f32 * ROW_HEIGHT);
-                let key = if column.primary_key {
-                    "PK"
+                let (key, key_color) = if column.primary_key {
+                    ("PK", palette.key)
                 } else if column.foreign_key {
-                    "FK"
+                    ("FK", palette.accent)
                 } else {
-                    ""
+                    ("", palette.muted_text)
                 };
-                svg.push_str(&format!(r#"<text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="10" font-weight="600">{}</text><text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="12">{}</text><text x="{:.1}" y="{:.1}" text-anchor="end" fill="{}" font-family="system-ui, sans-serif" font-size="11">{}{}</text>"#,
-                    node.x + 12.0, y, palette.accent, key, node.x + 38.0, y, palette.text, escape(&column.name), node.x + node.width - 12.0, y, palette.muted_text, escape(&column.data_type), if column.nullable { "" } else { " · not null" }
+                svg.push_str(&format!(
+                    r#"<text x="{:.1}" y="{:.1}" fill="{}" {FONT} font-size="9" font-weight="700">{}</text><text x="{:.1}" y="{:.1}" fill="{}" {FONT} font-size="12"{}>{}</text><text x="{:.1}" y="{:.1}" text-anchor="end" fill="{}" {FONT} font-size="11">{}{}</text>"#,
+                    node.x + 12.0,
+                    y,
+                    key_color,
+                    key,
+                    node.x + 38.0,
+                    y,
+                    palette.text,
+                    if column.primary_key {
+                        r#" font-weight="600""#
+                    } else {
+                        ""
+                    },
+                    escape(&column.name),
+                    node.x + node.width - 12.0,
+                    y,
+                    palette.muted_text,
+                    escape(&column.data_type),
+                    if column.nullable { "?" } else { "" }
                 ));
             }
             if node.omitted_columns > 0 {
                 let y = node.y + HEADER_HEIGHT + 17.0 + (node.columns.len() as f32 * ROW_HEIGHT);
-                svg.push_str(&format!(r#"<text x="{:.1}" y="{:.1}" fill="{}" font-family="system-ui, sans-serif" font-size="11">+{} more columns</text>"#, node.x + 12.0, y, palette.muted_text, node.omitted_columns));
+                svg.push_str(&format!(
+                    r#"<text x="{:.1}" y="{:.1}" fill="{}" {FONT} font-size="11">+{} more columns</text>"#,
+                    node.x + 12.0,
+                    y,
+                    palette.muted_text,
+                    node.omitted_columns
+                ));
             }
             svg.push_str("</g>");
         }
@@ -348,7 +525,7 @@ fn visible_columns(
             }
             Some(DiagramColumn {
                 name: column.name.clone(),
-                data_type: column.data_type.clone(),
+                data_type: short_type(&column.data_type),
                 nullable: column.nullable,
                 primary_key: column.primary_key,
                 foreign_key: foreign.contains(&column.name),
@@ -506,13 +683,32 @@ fn node_height(columns: &(Vec<DiagramColumn>, usize)) -> f32 {
     HEADER_HEIGHT + ((visible.len() + usize::from(*omitted > 0)) as f32 * ROW_HEIGHT) + 10.0
 }
 
+#[cfg(test)]
 fn edge_path(
     source: &DiagramNode,
     target: &DiagramNode,
     foreign_key: &ForeignKeyInfo,
     self_referential: bool,
 ) -> String {
-    let from_y = row_y(source, foreign_key.columns.first().map(String::as_str));
+    edge_route(
+        source,
+        target,
+        foreign_key.columns.first().map(String::as_str),
+        foreign_key.referenced_columns.first().map(String::as_str),
+        self_referential,
+    )
+}
+
+/// An orthogonal route from the referencing column's row on `source` to the
+/// referenced column's row on `target`, as an `M/H/V` path.
+fn edge_route(
+    source: &DiagramNode,
+    target: &DiagramNode,
+    source_column: Option<&str>,
+    target_column: Option<&str>,
+    self_referential: bool,
+) -> String {
+    let from_y = row_y(source, source_column);
     if self_referential {
         let right = source.x + source.width + 34.0;
         // Return to the top edge rather than stopping above the card. The
@@ -529,10 +725,7 @@ fn edge_path(
             source.y,
         );
     }
-    let to_y = row_y(
-        target,
-        foreign_key.referenced_columns.first().map(String::as_str),
-    );
+    let to_y = row_y(target, target_column);
     let source_bottom = source.y + source.height;
     let target_bottom = target.y + target.height;
     let source_right = source.x + source.width;
@@ -585,15 +778,19 @@ fn edge_path(
             source_right, from_y, rail, to_y, target_right
         );
     }
+    // The vertical run sits in the gap beside the target. Relationships that
+    // skip a layout column then never run hidden behind an intermediate card,
+    // and every relationship into one table shares a corridor that
+    // `separate_lanes` can fan out.
     if source_right <= target_left {
-        let middle = (source_right + target_left) / 2.0;
+        let middle = target_left - (target_left - source_right).min(HORIZONTAL_GAP) / 2.0;
         format!(
             "M {:.1} {:.1} H {:.1} V {:.1} H {:.1}",
             source_right, from_y, middle, to_y, target_left
         )
     } else {
         debug_assert!(target_right <= source.x);
-        let middle = (target_right + source.x) / 2.0;
+        let middle = target_right + (source.x - target_right).min(HORIZONTAL_GAP) / 2.0;
         format!(
             "M {:.1} {:.1} H {:.1} V {:.1} H {:.1}",
             source.x,
@@ -603,6 +800,196 @@ fn edge_path(
             target.x + target.width
         )
     }
+}
+
+/// Fan out relationships whose vertical runs share a corridor so parallel
+/// lines never draw on top of one another.
+fn separate_lanes(edges: &mut [DiagramEdge]) {
+    let mut corridors = BTreeMap::<i64, Vec<usize>>::new();
+    for (index, edge) in edges.iter().enumerate() {
+        let points = &edge.points;
+        if edge.self_referential
+            || points.len() != 4
+            || points[1].0 != points[2].0
+            || points[0].1 != points[1].1
+        {
+            continue;
+        }
+        corridors
+            .entry((points[1].0 * 10.0).round() as i64)
+            .or_default()
+            .push(index);
+    }
+    for members in corridors.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        // Space available on either side of the corridor, bounded by the
+        // narrowest gap between facing card borders in this group.
+        let half_width = members
+            .iter()
+            .map(|&index| {
+                let points = &edges[index].points;
+                let corridor = points[1].0;
+                (corridor - points[0].0)
+                    .abs()
+                    .min((points[3].0 - corridor).abs())
+            })
+            .fold(f32::INFINITY, f32::min)
+            - 10.0;
+        if half_width <= 0.0 {
+            continue;
+        }
+        let mut ordered = members;
+        ordered.sort_by(|&left, &right| {
+            let (left, right) = (&edges[left].points, &edges[right].points);
+            left[3]
+                .1
+                .total_cmp(&right[3].1)
+                .then(left[0].1.total_cmp(&right[0].1))
+        });
+        let count = ordered.len() as f32;
+        let spacing = LANE_SPACING.min(half_width * 2.0 / (count - 1.0));
+        for (lane, index) in ordered.into_iter().enumerate() {
+            let offset = (lane as f32 - (count - 1.0) / 2.0) * spacing;
+            let points = &mut edges[index].points;
+            points[1].0 += offset;
+            points[2].0 += offset;
+        }
+    }
+}
+
+/// Draw an orthogonal polyline with rounded corners. Radii shrink on short
+/// segments so a curve never overshoots its neighbours.
+pub fn rounded_route(points: &[(f32, f32)], radius: f32) -> Vec<RouteStep> {
+    let Some(&first) = points.first() else {
+        return Vec::new();
+    };
+    let mut steps = vec![RouteStep::Move(first)];
+    for index in 1..points.len() {
+        let corner = points[index];
+        let Some(&next) = points.get(index + 1) else {
+            steps.push(RouteStep::Line(corner));
+            break;
+        };
+        let previous = points[index - 1];
+        let incoming = distance(previous, corner);
+        let outgoing = distance(corner, next);
+        let radius = radius.min(incoming / 2.0).min(outgoing / 2.0);
+        if radius <= 0.5 {
+            steps.push(RouteStep::Line(corner));
+            continue;
+        }
+        steps.push(RouteStep::Line(toward(corner, previous, radius)));
+        steps.push(RouteStep::Curve(toward(corner, next, radius), corner));
+    }
+    steps
+}
+
+fn rounded_svg_path(points: &[(f32, f32)], radius: f32) -> String {
+    rounded_route(points, radius)
+        .into_iter()
+        .map(|step| match step {
+            RouteStep::Move((x, y)) => format!("M {x:.1} {y:.1}"),
+            RouteStep::Line((x, y)) => format!("L {x:.1} {y:.1}"),
+            RouteStep::Curve((x, y), (cx, cy)) => format!("Q {cx:.1} {cy:.1} {x:.1} {y:.1}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn distance(from: (f32, f32), to: (f32, f32)) -> f32 {
+    (to.0 - from.0).hypot(to.1 - from.1)
+}
+
+/// The point `length` along the segment from `from` toward `to`.
+fn toward(from: (f32, f32), to: (f32, f32), length: f32) -> (f32, f32) {
+    let total = distance(from, to);
+    if total <= f32::EPSILON {
+        return from;
+    }
+    let ratio = length / total;
+    (
+        from.0 + (to.0 - from.0) * ratio,
+        from.1 + (to.1 - from.1) * ratio,
+    )
+}
+
+/// Crow's-foot notation: a fork on the referencing (many) end, a double bar
+/// on the referenced (exactly one) end, and a bar or ring beside the fork for
+/// mandatory or optional participation.
+pub fn edge_markers(points: &[(f32, f32)], optional: bool) -> EdgeMarkers {
+    let mut markers = EdgeMarkers::default();
+    let unit = |from: (f32, f32), to: (f32, f32)| {
+        let length = distance(from, to);
+        (length > f32::EPSILON).then(|| ((to.0 - from.0) / length, (to.1 - from.1) / length))
+    };
+    let along = |origin: (f32, f32), direction: (f32, f32), length: f32| {
+        (
+            origin.0 + direction.0 * length,
+            origin.1 + direction.1 * length,
+        )
+    };
+    let across = |origin: (f32, f32), direction: (f32, f32), half: f32| {
+        let normal = (-direction.1, direction.0);
+        [
+            (origin.0 + normal.0 * half, origin.1 + normal.1 * half),
+            (origin.0 - normal.0 * half, origin.1 - normal.1 * half),
+        ]
+    };
+
+    if let (Some(&start), Some(&next)) = (points.first(), points.get(1))
+        && let Some(direction) = unit(start, next)
+    {
+        let apex = along(start, direction, 11.0);
+        let [left, right] = across(start, direction, 6.0);
+        markers.lines.push([apex, left]);
+        markers.lines.push([apex, right]);
+        markers.lines.push([apex, start]);
+        if optional {
+            markers.ring = Some((along(start, direction, 16.0), 3.5));
+        } else {
+            let bar = along(start, direction, 15.0);
+            markers.lines.push(across(bar, direction, 6.0));
+        }
+    }
+    if points.len() >= 2 {
+        let tip = points[points.len() - 1];
+        let previous = points[points.len() - 2];
+        if let Some(direction) = unit(tip, previous) {
+            for offset in [6.0, 10.0] {
+                markers
+                    .lines
+                    .push(across(along(tip, direction, offset), direction, 6.0));
+            }
+        }
+    }
+    markers
+}
+
+/// Compact, conventional spellings for verbose catalog type names.
+pub fn short_type(data_type: &str) -> String {
+    let trimmed = data_type.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    const REPLACEMENTS: [(&str, &str); 9] = [
+        ("timestamp with time zone", "timestamptz"),
+        ("timestamp without time zone", "timestamp"),
+        ("time with time zone", "timetz"),
+        ("time without time zone", "time"),
+        ("character varying", "varchar"),
+        ("double precision", "float8"),
+        ("bit varying", "varbit"),
+        ("character", "char"),
+        ("integer", "int"),
+    ];
+    for (verbose, short) in REPLACEMENTS {
+        if let Some(rest) = lower.strip_prefix(verbose)
+            && (rest.is_empty() || rest.starts_with(['(', '[', ' ']))
+        {
+            return format!("{short}{}", &trimmed[verbose.len()..]);
+        }
+    }
+    trimmed.to_owned()
 }
 
 fn edge_path_points(path: &str) -> Vec<(f32, f32)> {
@@ -819,6 +1206,7 @@ mod tests {
             text: "#f1f5f9",
             muted_text: "#94a3b8",
             accent: "#2563eb",
+            key: "#f59e0b",
             relation: "#60a5fa",
         }
     }
@@ -1187,17 +1575,90 @@ mod tests {
     }
 
     #[test]
-    fn arrowhead_tip_is_anchored_at_the_connector_endpoint() {
+    fn crows_foot_marks_the_many_end_and_bars_the_one_end() {
+        let points = [(100.0, 50.0), (60.0, 50.0), (60.0, 10.0), (0.0, 10.0)];
+        let mandatory = edge_markers(&points, false);
+        // Fork (three lines) plus a participation bar, then two "one" bars.
+        assert_eq!(mandatory.lines.len(), 6);
+        assert!(mandatory.ring.is_none());
+        assert!(
+            mandatory
+                .lines
+                .iter()
+                .take(3)
+                .all(|[apex, _]| *apex == (89.0, 50.0))
+        );
+        assert!(
+            mandatory.lines[4..]
+                .iter()
+                .all(|[from, to]| from.0 == to.0 && from.0 < 11.0)
+        );
+        let optional = edge_markers(&points, true);
+        assert_eq!(optional.lines.len(), 5);
+        assert_eq!(optional.ring, Some(((84.0, 50.0), 3.5)));
+    }
+
+    #[test]
+    fn shared_corridors_fan_out_into_separate_lanes() {
+        let parent = table("parent", vec![column("id", 0, true)], vec![]);
+        let children = ["a", "b", "c"].map(|name| {
+            table(
+                name,
+                vec![column("id", 0, true), column("parent_id", 1, false)],
+                vec![foreign(&["parent_id"], "parent", &["id"])],
+            )
+        });
+        let mut tables = vec![parent];
+        tables.extend(children);
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
-            tables: vec![table("users", vec![column("id", 0, true)], vec![])],
+            tables,
         });
+        let corridors = document
+            .edges
+            .iter()
+            .map(|edge| edge.points[1].0)
+            .collect::<Vec<_>>();
+        let mut distinct = corridors.clone();
+        distinct.sort_by(f32::total_cmp);
+        distinct.dedup();
+        assert_eq!(corridors.len(), 3);
+        assert_eq!(distinct.len(), 3, "{corridors:?}");
+        assert!(document.edges.iter().all(|edge| edge.path.contains('Q')));
+    }
 
-        assert!(
-            document
-                .svg(palette(), None)
-                .contains("markerWidth=\"8\" markerHeight=\"8\" refX=\"8\" refY=\"4\"")
+    #[test]
+    fn moving_a_card_reroutes_its_relationships() {
+        let mut document = DiagramDocument::from_schema(&RelationalSchema {
+            database: "db".into(),
+            tables: vec![
+                table("parent", vec![column("id", 0, true)], vec![]),
+                table(
+                    "child",
+                    vec![column("id", 0, true), column("parent_id", 1, false)],
+                    vec![foreign(&["parent_id"], "parent", &["id"])],
+                ),
+            ],
+        });
+        let before = document.edges[0].points.clone();
+        assert!(document.move_node("public.parent", 900.0, 700.0));
+        assert_eq!(
+            document.node_position("public.parent"),
+            Some((900.0, 700.0))
         );
+        assert_ne!(document.edges[0].points, before);
+        assert!(document.width >= 900.0 && document.height >= 700.0);
+        assert!(!document.move_node("public.missing", 0.0, 0.0));
+    }
+
+    #[test]
+    fn verbose_catalog_types_are_shortened_for_cards() {
+        assert_eq!(short_type("timestamp with time zone"), "timestamptz");
+        assert_eq!(short_type("character varying(160)"), "varchar(160)");
+        assert_eq!(short_type("character(2)[]"), "char(2)[]");
+        assert_eq!(short_type("integer[]"), "int[]");
+        assert_eq!(short_type("interval"), "interval");
+        assert_eq!(short_type("characters"), "characters");
     }
 
     #[test]

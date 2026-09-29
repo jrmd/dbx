@@ -85,6 +85,10 @@ impl DbxApp {
             .flex_col()
             .child(
                 div()
+                    .key_context("DbxFilters")
+                    .on_action(cx.listener(move |this, _: &ApplyFilters, _, cx| {
+                        this.refresh_table_for(session_id, cx)
+                    }))
                     .px(px(8.))
                     .py(px(6.))
                     .flex()
@@ -127,22 +131,24 @@ impl DbxApp {
                                     .items_center()
                                     .gap(px(6.))
                                     .when(kind.is_sql() && !has_filter_rows, |view| {
-                                        view.child(self.small_button(
-                                            "add-filter",
-                                            "Add filter",
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.add_filter_for(session_id, window, cx)
-                                            }),
-                                        ))
+                                        view.child(
+                                            button("add-filter", "Add filter", ButtonKind::Quiet)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.add_filter_for(session_id, window, cx)
+                                                    },
+                                                )),
+                                        )
                                     })
                                     .when(kind.is_sql() && has_filter_rows, |view| {
-                                        view.child(self.small_button(
-                                            "clear-filters",
-                                            "Clear",
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.clear_filters_for(session_id, cx)
-                                            }),
-                                        ))
+                                        view.child(
+                                            button("clear-filters", "Clear", ButtonKind::Quiet)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.clear_filters_for(session_id, cx)
+                                                })),
+                                        )
                                     })
                                     .when(!kind.is_sql() || has_filter_rows, |view| {
                                         view.child(
@@ -223,6 +229,8 @@ impl DbxApp {
                                                 div().flex_1().min_w_0().max_w(px(240.)).child(
                                                     Select::new(&column_selector)
                                                         .with_size(Size::Small)
+                                                        .h(px(FILTER_CONTROL_HEIGHT))
+                                                        .rounded(px(5.))
                                                         .w_full()
                                                         .menu_max_h(px(220.))
                                                         .placeholder("Column")
@@ -236,6 +244,8 @@ impl DbxApp {
                                                 div().flex_1().min_w_0().max_w(px(220.)).child(
                                                     Select::new(&operator_selector)
                                                         .with_size(Size::Small)
+                                                        .h(px(FILTER_CONTROL_HEIGHT))
+                                                        .rounded(px(5.))
                                                         .w_full()
                                                         .menu_max_h(px(220.))
                                                         .text_size(px(11.))
@@ -261,11 +271,11 @@ impl DbxApp {
                                                     .when(
                                                         !operator_requires_value(operator),
                                                         |view| {
-                                                            view.h(px(36.))
+                                                            view.h(px(FILTER_CONTROL_HEIGHT))
                                                                 .px(px(9.))
                                                                 .flex()
                                                                 .items_center()
-                                                                .rounded(px(6.))
+                                                                .rounded(px(5.))
                                                                 .bg(theme().panel_raised)
                                                                 .text_color(theme().text_muted)
                                                                 .child("No value")
@@ -277,10 +287,11 @@ impl DbxApp {
                                                     "remove-filter-{row_id}"
                                                 )))
                                                 .flex_none()
-                                                .w(px(28.))
+                                                .size(px(FILTER_CONTROL_HEIGHT))
                                                 .with_size(Size::XSmall)
                                                 .compact()
                                                 .ghost()
+                                                .rounded(px(5.))
                                                 .tooltip("Remove filter")
                                                 .child(icon(Icon::Close, theme().text_muted))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -806,55 +817,113 @@ impl DbxApp {
             })
             .child(
                 div()
-                    .h(px(34.))
-                    .mt(px(10.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(theme().border_strong)
-                    .bg(theme().panel_raised)
-                    .text_size(px(9.))
-                    .text_color(theme().text_muted)
-                    .child("COLUMN")
-                    .child("TYPE / CONSTRAINTS"),
-            )
-            .children(table_columns.iter().map(|column| {
-                div()
-                    .h(px(34.))
-                    .px(px(10.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
+                    .mt(px(12.))
+                    .rounded(px(RADIUS_PANEL))
+                    .border_1()
                     .border_color(theme().border)
+                    .overflow_hidden()
                     .child(
-                        div()
-                            .text_size(px(11.))
+                        structure_row()
+                            .h(px(30.))
+                            .bg(theme().panel_raised)
+                            .border_b_1()
+                            .border_color(theme().border_strong)
+                            .text_size(px(10.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(column.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
                             .text_color(theme().text_muted)
-                            .child(format!(
-                                "{}{}{}",
-                                column.data_type,
-                                if column.nullable {
-                                    " · nullable"
-                                } else {
-                                    " · required"
-                                },
-                                if column.primary_key {
-                                    " · primary key"
-                                } else {
-                                    ""
-                                }
-                            )),
+                            .child(structure_cell(STRUCTURE_ORDINAL_WIDTH).child("#"))
+                            .child(structure_cell(STRUCTURE_KEY_WIDTH).child("Key"))
+                            .child(div().flex_1().min_w_0().child("Column"))
+                            .child(div().flex_1().min_w_0().child("Type"))
+                            .child(structure_cell(STRUCTURE_NULL_WIDTH).child("Nullable"))
+                            .child(div().flex_1().min_w_0().child("References")),
                     )
-            }))
+                    .children(table_columns.iter().enumerate().map(|(index, column)| {
+                        let reference = foreign_keys.iter().find_map(|foreign_key| {
+                            let position = foreign_key
+                                .columns
+                                .iter()
+                                .position(|name| *name == column.name)?;
+                            let target_column = foreign_key.referenced_columns.get(position)?;
+                            Some(format!(
+                                "{}.{target_column}",
+                                foreign_key
+                                    .referenced_schema
+                                    .as_ref()
+                                    .map(|schema| format!(
+                                        "{schema}.{}",
+                                        foreign_key.referenced_table
+                                    ))
+                                    .unwrap_or_else(|| foreign_key.referenced_table.clone())
+                            ))
+                        });
+                        let foreign = reference.is_some();
+                        structure_row()
+                            .id(SharedString::from(format!("structure-column-{index}")))
+                            .h(px(32.))
+                            .text_size(px(12.))
+                            .when(index > 0, |row| {
+                                row.border_t_1().border_color(theme().border)
+                            })
+                            .when(index % 2 == 1, |row| row.bg(theme().grid_alternate))
+                            .hover(|style| style.bg(theme().glass_hover))
+                            .child(
+                                structure_cell(STRUCTURE_ORDINAL_WIDTH)
+                                    .text_size(px(10.))
+                                    .text_color(theme().text_muted)
+                                    .child(format!("{}", index + 1)),
+                            )
+                            .child(
+                                structure_cell(STRUCTURE_KEY_WIDTH)
+                                    .flex()
+                                    .gap(px(3.))
+                                    .when(column.primary_key, |cell| {
+                                        cell.child(key_badge("PK", theme().warning))
+                                    })
+                                    .when(foreign, |cell| {
+                                        cell.child(key_badge("FK", theme().focus_ring))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme().text)
+                                    .when(column.primary_key, |cell| {
+                                        cell.font_weight(FontWeight::SEMIBOLD)
+                                    })
+                                    .child(column.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme().sql_type)
+                                    .child(column.data_type.clone()),
+                            )
+                            .child(
+                                structure_cell(STRUCTURE_NULL_WIDTH)
+                                    .text_color(if column.nullable {
+                                        theme().text_muted
+                                    } else {
+                                        theme().text
+                                    })
+                                    .child(if column.nullable { "NULL" } else { "NOT NULL" }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme().text_muted)
+                                    .when_some(reference, |cell, reference| {
+                                        cell.child(format!("→ {reference}"))
+                                    }),
+                            )
+                    })),
+            )
             .child(div().mt(px(18.)).child(panel_header(
                 "Foreign keys",
                 format!("{} constraints", foreign_keys.len()),
@@ -978,6 +1047,34 @@ impl DbxApp {
                     )
             }))
     }
+}
+
+/// Every control in a filter row matches the single-line editor height.
+const FILTER_CONTROL_HEIGHT: f32 = 32.0;
+
+const STRUCTURE_ORDINAL_WIDTH: f32 = 32.0;
+const STRUCTURE_KEY_WIDTH: f32 = 56.0;
+const STRUCTURE_NULL_WIDTH: f32 = 84.0;
+
+fn structure_row() -> Div {
+    div().px(px(12.)).flex().items_center().gap(px(12.))
+}
+
+fn structure_cell(width: f32) -> Div {
+    div().w(px(width)).flex_none().flex().items_center()
+}
+
+/// A compact PK/FK marker shared by the structure grid and diagram cards.
+fn key_badge(label: &'static str, color: Rgba) -> Div {
+    div()
+        .px(px(5.))
+        .py(px(1.))
+        .rounded(px(4.))
+        .bg(color.alpha(0.14))
+        .text_size(px(9.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(color)
+        .child(label)
 }
 
 #[cfg(test)]

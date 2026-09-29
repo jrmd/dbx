@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError, ExecResult, Filter,
     InsertRequest, Order, Page, QueryResult, RelationalSchema, Result, SqlStatement, TableInfo,
-    TableRef, TableStructure, UpdateRequest, build_create_table, build_delete, build_drop_table,
-    build_insert_with_columns, build_select, build_truncate_table, build_update_with_columns,
+    TableRef, TableStructure, UpdateRequest, build_create_table, build_delete_with_columns,
+    build_drop_table, build_insert_with_columns, build_select_with_columns, build_truncate_table,
+    build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
 
@@ -180,15 +181,40 @@ impl DatabaseEngine {
         options: QueryOptions,
     ) -> Result<QueryResult> {
         ensure_sql(self.kind(), "query_table")?;
-        let statement = build_select(self.kind(), table, columns, filters, order, page)?;
+        let metadata = self.filter_metadata(table, filters).await?;
+        let statement = build_select_with_columns(
+            self.kind(),
+            table,
+            columns,
+            filters,
+            order,
+            page,
+            metadata.as_deref().unwrap_or_default(),
+        )?;
         let mut result = self.query_statement(&statement, options).await?;
         // SQLx cannot expose result-set metadata for an empty `SELECT` through
         // `AnyRow`. Fall back to the table schema so an empty table still has
         // usable headers in the grid.
         if result.columns.is_empty() {
-            result.columns = self.describe_table(table).await?;
+            result.columns = match metadata {
+                Some(metadata) => metadata,
+                None => self.describe_table(table).await?,
+            };
         }
         Ok(result)
+    }
+
+    /// PostgreSQL needs column types to cast text filter parameters (for
+    /// example, to `uuid`); other dialects coerce them implicitly.
+    async fn filter_metadata(
+        &self,
+        table: &TableRef,
+        filters: &[Filter],
+    ) -> Result<Option<Vec<ColumnInfo>>> {
+        if self.kind() != DatabaseKind::PostgreSQL || filters.is_empty() {
+            return Ok(None);
+        }
+        self.describe_table(table).await.map(Some)
     }
 
     pub async fn create_table(&self, request: &CreateTableRequest) -> Result<ExecResult> {
@@ -214,7 +240,13 @@ impl DatabaseEngine {
 
     pub async fn delete(&self, table: &TableRef, filters: &[Filter]) -> Result<ExecResult> {
         ensure_sql(self.kind(), "delete")?;
-        let statement = build_delete(self.kind(), table, filters)?;
+        let metadata = self.filter_metadata(table, filters).await?;
+        let statement = build_delete_with_columns(
+            self.kind(),
+            table,
+            filters,
+            metadata.as_deref().unwrap_or_default(),
+        )?;
         self.execute(&statement).await
     }
 

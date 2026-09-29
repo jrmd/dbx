@@ -2,7 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use dbx_core::{CellValue, ColumnInfo, ForeignKeyInfo, QueryResult, TableInfo};
 use gpui::{
-    App, Context, Div, IntoElement, Pixels, SharedString, Stateful, Window, div, prelude::*, px,
+    App, Context, Div, FontWeight, IntoElement, Pixels, SharedString, Stateful, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     Sizable as _,
@@ -10,6 +11,7 @@ use gpui_component::{
     table::{Column as DataColumn, TableDelegate, TableEvent, TableState},
 };
 
+use crate::row_drafts::{FieldValueKind, field_value_kind};
 use crate::theme::{Icon, icon, theme};
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
@@ -22,6 +24,8 @@ const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
 pub(super) struct ResultTableDelegate {
     result: Option<Arc<QueryResult>>,
     columns: Vec<DataColumn>,
+    /// Per data column: numeric values are right-aligned so digits line up.
+    numeric: Vec<bool>,
     foreign_keys: Vec<ForeignKeyInfo>,
 }
 
@@ -30,6 +34,7 @@ impl Default for ResultTableDelegate {
         Self {
             result: None,
             columns: vec![Self::row_number_column()],
+            numeric: Vec::new(),
             foreign_keys: Vec::new(),
         }
     }
@@ -182,6 +187,24 @@ impl ResultTableDelegate {
             }));
         }
 
+        self.numeric = result
+            .as_deref()
+            .map(|result| {
+                result
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        matches!(
+                            field_value_kind(column),
+                            FieldValueKind::Integer
+                                | FieldValueKind::Unsigned
+                                | FieldValueKind::Real
+                                | FieldValueKind::Decimal
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.result = result;
         self.columns = columns;
         self.foreign_keys = foreign_keys
@@ -432,15 +455,54 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        div()
+        let column = col_ix
+            .checked_sub(1)
+            .and_then(|index| self.result.as_ref()?.columns.get(index));
+        let numeric = col_ix
+            .checked_sub(1)
+            .and_then(|index| self.numeric.get(index).copied())
+            .unwrap_or(false);
+        let cell = div()
             .size_full()
             .flex()
             .items_center()
+            .gap(px(5.))
             .px(px(8.))
-            .text_size(px(10.))
-            .text_color(theme().text_muted)
-            .truncate()
-            .child(self.columns[col_ix].name.clone())
+            .overflow_hidden()
+            .when(numeric, |cell| cell.justify_end());
+        let Some(column) = column else {
+            return cell
+                .text_size(px(10.))
+                .text_color(theme().text_muted)
+                .child(self.columns[col_ix].name.clone());
+        };
+        cell.when(column.primary_key, |cell| {
+            cell.child(
+                div()
+                    .flex_none()
+                    .text_size(px(8.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme().warning)
+                    .child("PK"),
+            )
+        })
+        .child(
+            div()
+                .flex_shrink(1.)
+                .min_w_0()
+                .truncate()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme().text)
+                .child(column.name.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(px(9.))
+                .text_color(theme().text_muted)
+                .child(column.data_type.to_ascii_lowercase()),
+        )
     }
 
     fn render_tr(
@@ -466,6 +528,7 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let mut null = false;
         let (text, text_color) = if col_ix == 0 {
             ((row_ix + 1).to_string(), theme().text_muted)
         } else {
@@ -473,16 +536,22 @@ impl TableDelegate for ResultTableDelegate {
                 .as_ref()
                 .and_then(|result| result.rows.get(row_ix))
                 .and_then(|row| row.values.get(col_ix - 1))
-                .map(|value| {
-                    if matches!(value, CellValue::Null) {
-                        ("NULL".to_owned(), theme().text_muted)
-                    } else {
-                        (value.to_string(), theme().text)
+                .map(|value| match value {
+                    CellValue::Null => {
+                        null = true;
+                        ("NULL".to_owned(), theme().text_muted.alpha(0.7))
                     }
+                    CellValue::Boolean(true) => ("true".to_owned(), theme().success),
+                    CellValue::Boolean(false) => ("false".to_owned(), theme().text_muted),
+                    value => (value.to_string(), theme().text),
                 })
                 .unwrap_or_else(|| ("—".to_owned(), theme().text_muted))
         };
         let foreign_key = self.foreign_key_for_cell(row_ix, col_ix);
+        let numeric = col_ix
+            .checked_sub(1)
+            .and_then(|index| self.numeric.get(index).copied())
+            .unwrap_or(false);
 
         let mut cell = div()
             .size_full()
@@ -492,10 +561,19 @@ impl TableDelegate for ResultTableDelegate {
             .whitespace_nowrap()
             .truncate()
             .text_size(px(11.))
-            .text_color(text_color);
+            .text_color(text_color)
+            .when(null, |cell| cell.italic())
+            .when(numeric && foreign_key.is_none(), |cell| cell.justify_end());
         if foreign_key.is_some() {
             cell = cell
-                .child(div().flex_1().min_w_0().truncate().child(text))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .when(numeric, |value| value.justify_end())
+                        .child(div().min_w_0().truncate().child(text)),
+                )
                 .child(
                     Button::new(SharedString::from(format!(
                         "foreign-key-link-{row_ix}-{col_ix}"

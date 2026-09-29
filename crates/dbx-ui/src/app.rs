@@ -111,7 +111,8 @@ gpui::actions!(
         NextConnection,
         PreviousConnection,
         ToggleSidebar,
-        SubmitVault
+        SubmitVault,
+        ApplyFilters
     ]
 );
 
@@ -630,6 +631,11 @@ struct DiagramTab {
     scroll_handle: ScrollHandle,
     focus: FocusHandle,
     drag_anchor: Option<DiagramDragAnchor>,
+    /// A card being rearranged by pointer drag.
+    node_drag: Option<DiagramNodeDrag>,
+    /// Card positions the user arranged by hand, keyed by node ID. They
+    /// survive refreshes and schema-filter rebuilds until the layout is reset.
+    arranged_positions: HashMap<String, (f32, f32)>,
     request_generation: u64,
     abort_handle: AbortOnDrop,
 }
@@ -638,6 +644,16 @@ struct DiagramTab {
 struct DiagramDragAnchor {
     pointer: Point<Pixels>,
     scroll_offset: Point<Pixels>,
+    /// Whether the press travelled far enough to count as a pan rather than
+    /// a click on empty canvas (which clears the selection).
+    moved: bool,
+}
+
+#[derive(Clone)]
+struct DiagramNodeDrag {
+    node_id: String,
+    pointer: Point<Pixels>,
+    origin: (f32, f32),
 }
 
 impl DiagramTab {
@@ -660,6 +676,8 @@ impl DiagramTab {
             scroll_handle: ScrollHandle::new(),
             focus: cx.focus_handle(),
             drag_anchor: None,
+            node_drag: None,
+            arranged_positions: HashMap::new(),
             request_generation: 0,
             abort_handle: AbortOnDrop::default(),
         }
@@ -1751,10 +1769,12 @@ impl DbxApp {
                             &mut diagram.selected_schemas,
                             &diagram.available_schemas,
                         );
-                        diagram.document = Some(Arc::new(diagram_document_for_selection(
+                        let mut document = diagram_document_for_selection(
                             &source_schema,
                             diagram.selected_schemas.as_ref(),
-                        )));
+                        );
+                        document.place_nodes(&diagram.arranged_positions);
+                        diagram.document = Some(Arc::new(document));
                         diagram.source_schema = Some(source_schema);
                         diagram.stale = false;
                         diagram.error = None;
@@ -1843,6 +1863,7 @@ impl DbxApp {
         diagram.drag_anchor = Some(DiagramDragAnchor {
             pointer,
             scroll_offset: diagram.scroll_handle.offset(),
+            moved: false,
         });
         cx.notify();
     }
@@ -1856,9 +1877,14 @@ impl DbxApp {
         let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
             return;
         };
-        let Some(anchor) = diagram.drag_anchor else {
+        let Some(anchor) = diagram.drag_anchor.as_mut() else {
             return;
         };
+        let travel = (pointer.x - anchor.pointer.x)
+            .abs()
+            .max((pointer.y - anchor.pointer.y).abs());
+        anchor.moved |= travel > px(3.);
+        let anchor = *anchor;
         let offset = point(
             anchor.scroll_offset.x + (pointer.x - anchor.pointer.x),
             anchor.scroll_offset.y + (pointer.y - anchor.pointer.y),
@@ -1894,10 +1920,202 @@ impl DbxApp {
     }
 
     pub(super) fn end_diagram_pan_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        if let Some(diagram) = self.active_diagram_tab_mut(session_id) {
+        if let Some(diagram) = self.active_diagram_tab_mut(session_id)
+            && (diagram.drag_anchor.is_some() || diagram.node_drag.is_some())
+        {
+            if diagram.drag_anchor.is_some_and(|anchor| !anchor.moved) {
+                diagram.selected_node = None;
+            }
             diagram.drag_anchor = None;
+            diagram.node_drag = None;
             cx.notify();
         }
+    }
+
+    pub(super) fn begin_diagram_node_drag_for(
+        &mut self,
+        session_id: SessionId,
+        node_id: String,
+        pointer: Point<Pixels>,
+    ) {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return;
+        };
+        let Some(origin) = diagram
+            .document
+            .as_ref()
+            .and_then(|document| document.node_position(&node_id))
+        else {
+            return;
+        };
+        diagram.drag_anchor = None;
+        diagram.node_drag = Some(DiagramNodeDrag {
+            node_id,
+            pointer,
+            origin,
+        });
+    }
+
+    /// Move the dragged card with the pointer. Returns whether a drag is in
+    /// progress so the caller can skip canvas panning.
+    pub(super) fn drag_diagram_node_to_for(
+        &mut self,
+        session_id: SessionId,
+        pointer: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return false;
+        };
+        let Some(drag) = diagram.node_drag.clone() else {
+            return false;
+        };
+        let zoom = diagram.zoom.max(0.01);
+        let x = drag.origin.0 + f32::from(pointer.x - drag.pointer.x) / zoom;
+        let y = drag.origin.1 + f32::from(pointer.y - drag.pointer.y) / zoom;
+        if let Some(document) = diagram.document.as_mut()
+            && Arc::make_mut(document).move_node(&drag.node_id, x, y)
+            && let Some(position) = document.node_position(&drag.node_id)
+        {
+            diagram
+                .arranged_positions
+                .insert(drag.node_id.clone(), position);
+            cx.notify();
+        }
+        true
+    }
+
+    /// Discard hand-arranged card positions and return to the automatic
+    /// layout.
+    pub(super) fn reset_diagram_layout_for(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return;
+        };
+        diagram.arranged_positions.clear();
+        rebuild_diagram_document(diagram);
+        cx.notify();
+    }
+
+    /// Zoom while keeping the document point under `anchor` (window
+    /// coordinates) fixed, as pinch and Ctrl+wheel zoom do in native canvases.
+    pub(super) fn zoom_diagram_at_for(
+        &mut self,
+        session_id: SessionId,
+        zoom: f32,
+        anchor: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return;
+        };
+        let Some(document) = diagram.document.as_ref() else {
+            return;
+        };
+        let next_zoom = zoom.clamp(0.35, 2.0);
+        if (next_zoom - diagram.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let viewport = diagram.scroll_handle.bounds();
+        let offset = diagram.scroll_handle.offset();
+        let local = point(
+            f32::from(anchor.x - viewport.origin.x),
+            f32::from(anchor.y - viewport.origin.y),
+        );
+        let document_point = (
+            (local.x - f32::from(offset.x) - DIAGRAM_SCENE_PADDING) / diagram.zoom,
+            (local.y - f32::from(offset.y) - DIAGRAM_SCENE_PADDING) / diagram.zoom,
+        );
+        let scene = (
+            document.width * next_zoom + DIAGRAM_SCENE_PADDING * 2.0,
+            document.height * next_zoom + DIAGRAM_SCENE_PADDING * 2.0,
+        );
+        let max_offset = point(
+            px((scene.0 - f32::from(viewport.size.width)).max(0.0)),
+            px((scene.1 - f32::from(viewport.size.height)).max(0.0)),
+        );
+        let next_offset = point(
+            px(local.x - (document_point.0 * next_zoom + DIAGRAM_SCENE_PADDING)),
+            px(local.y - (document_point.1 * next_zoom + DIAGRAM_SCENE_PADDING)),
+        );
+        diagram
+            .scroll_handle
+            .set_offset(clamp_diagram_scroll_offset(next_offset, max_offset));
+        diagram.zoom = next_zoom;
+        cx.notify();
+    }
+
+    pub(super) fn active_diagram_zoom(&self, session_id: SessionId) -> Option<f32> {
+        let session = self.session(session_id)?;
+        let tab_id = session.active_secondary_tab?;
+        session
+            .secondary_tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| match &tab.kind {
+                SecondaryTabKind::Diagram(diagram) => Some(diagram.zoom),
+                _ => None,
+            })
+    }
+
+    /// Window-space bounds of the minimap's drawing area. The minimap is
+    /// pinned to the viewport's bottom-right corner, so its geometry follows
+    /// from the tracked scroll bounds and the document's aspect ratio.
+    pub(super) fn diagram_minimap_bounds(
+        &self,
+        session_id: SessionId,
+    ) -> Option<gpui::Bounds<Pixels>> {
+        let session = self.session(session_id)?;
+        let tab_id = session.active_secondary_tab?;
+        let SecondaryTabKind::Diagram(diagram) = &session
+            .secondary_tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)?
+            .kind
+        else {
+            return None;
+        };
+        let document = diagram.document.as_ref()?;
+        let (width, height) = diagram_minimap_size(document);
+        let viewport = diagram.scroll_handle.bounds();
+        let inset = px(DIAGRAM_MINIMAP_MARGIN + DIAGRAM_MINIMAP_PADDING);
+        Some(gpui::Bounds::new(
+            point(
+                viewport.origin.x + viewport.size.width - inset - px(width),
+                viewport.origin.y + viewport.size.height - inset - px(height),
+            ),
+            gpui::size(px(width), px(height)),
+        ))
+    }
+
+    /// Scroll so a document point sits in the centre of the viewport; used by
+    /// the minimap.
+    pub(super) fn center_diagram_on_for(
+        &mut self,
+        session_id: SessionId,
+        document_point: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return;
+        };
+        let viewport = diagram.scroll_handle.bounds().size;
+        let target = point(
+            px(f32::from(viewport.width) / 2.0
+                - (document_point.0 * diagram.zoom + DIAGRAM_SCENE_PADDING)),
+            px(f32::from(viewport.height) / 2.0
+                - (document_point.1 * diagram.zoom + DIAGRAM_SCENE_PADDING)),
+        );
+        diagram
+            .scroll_handle
+            .set_offset(clamp_diagram_scroll_offset(
+                target,
+                diagram.scroll_handle.max_offset(),
+            ));
+        cx.notify();
     }
 
     pub(super) fn set_all_diagram_schemas_for(
@@ -5342,10 +5560,10 @@ fn rebuild_diagram_document(diagram: &mut DiagramTab) {
     let Some(source_schema) = diagram.source_schema.as_ref() else {
         return;
     };
-    let document = Arc::new(diagram_document_for_selection(
-        source_schema,
-        diagram.selected_schemas.as_ref(),
-    ));
+    let mut document =
+        diagram_document_for_selection(source_schema, diagram.selected_schemas.as_ref());
+    document.place_nodes(&diagram.arranged_positions);
+    let document = Arc::new(document);
     if diagram
         .selected_node
         .as_deref()
@@ -5356,6 +5574,7 @@ fn rebuild_diagram_document(diagram: &mut DiagramTab) {
     diagram.document = Some(document);
     diagram.scroll_handle.set_offset(point(px(0.), px(0.)));
     diagram.drag_anchor = None;
+    diagram.node_drag = None;
 }
 
 fn diagram_document_for_selection(
@@ -5468,6 +5687,19 @@ fn table_click_action(event: &gpui::ClickEvent) -> TableClickAction {
 
 fn redis_command_word(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+const DIAGRAM_MINIMAP_MAX_WIDTH: f32 = 188.0;
+const DIAGRAM_MINIMAP_MAX_HEIGHT: f32 = 124.0;
+const DIAGRAM_MINIMAP_MARGIN: f32 = 14.0;
+const DIAGRAM_MINIMAP_PADDING: f32 = 6.0;
+
+/// The minimap drawing size: the document scaled to fit a fixed box.
+fn diagram_minimap_size(document: &DiagramDocument) -> (f32, f32) {
+    let width = document.width.max(1.0);
+    let height = document.height.max(1.0);
+    let scale = (DIAGRAM_MINIMAP_MAX_WIDTH / width).min(DIAGRAM_MINIMAP_MAX_HEIGHT / height);
+    (width * scale, height * scale)
 }
 
 fn clamp_diagram_scroll_offset(offset: Point<Pixels>, max_offset: Point<Pixels>) -> Point<Pixels> {

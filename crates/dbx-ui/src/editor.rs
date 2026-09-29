@@ -2571,6 +2571,10 @@ impl TextEditor {
     fn newline(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         if self.multiline {
             self.replace(self.selected_range.clone(), "\n", cx);
+        } else {
+            // A single-line field has no newline; let an enclosing form bind
+            // Enter to its submit action.
+            cx.propagate();
         }
     }
 

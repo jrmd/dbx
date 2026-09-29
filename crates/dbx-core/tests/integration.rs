@@ -109,6 +109,26 @@ async fn typed_mutation_round_trip(
     for (column, value) in values {
         assert_eq!(read_back(&result, column), *value, "{column}");
     }
+    // Filters send the same editor text. PostgreSQL must type it for the
+    // compared column (`uuid = text` does not exist) and match non-character
+    // columns against their text rendering for LIKE operators.
+    if kind == DatabaseKind::PostgreSQL {
+        for (column, value) in values {
+            for operator in [FilterOperator::Equals, FilterOperator::Contains] {
+                let filtered = engine
+                    .query_table(
+                        &table,
+                        &[],
+                        &[Filter::new(*column, operator, Some(text(value)))],
+                        &[],
+                        None,
+                        QueryOptions::default(),
+                    )
+                    .await?;
+                assert_eq!(filtered.rows.len(), 1, "{column} {operator:?}");
+            }
+        }
+    }
 
     let nulls = values
         .iter()

@@ -904,67 +904,88 @@ impl DbxApp {
     /// The footer carries errors, in-progress work, and the result extent.
     /// Idle narration ("Ready", "Inspecting selected row") is left out.
     fn render_status(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (error, status, result, table_pagination, summary) =
-            self.active_session()
-                .map(|session| {
-                    if let Some(tab) = session.active_secondary_tab.and_then(|tab_id| {
-                        session.secondary_tabs.iter().find(|tab| tab.id == tab_id)
-                    }) {
-                        match &tab.kind {
-                            // Query tabs show their outcome and errors inline.
-                            SecondaryTabKind::Query(_) => {
-                                return (None, String::new(), None, None, String::new());
-                            }
-                            SecondaryTabKind::Diagram(diagram) => {
-                                let status = match (diagram.busy, &diagram.document) {
-                                    (true, Some(_)) => "Refreshing database diagram…".into(),
-                                    (true, None) => "Building database diagram…".into(),
-                                    (false, _) => String::new(),
-                                };
-                                let summary = diagram
-                                    .document
-                                    .as_ref()
-                                    .map(|document| {
-                                        format!(
-                                            "{} · {}",
-                                            counted(document.nodes.len() as u64, "table", "tables"),
-                                            counted(
-                                                document.edges.len() as u64,
-                                                "relationship",
-                                                "relationships"
-                                            )
+        let (error, status, result, table_pagination, summary) = self
+            .active_session()
+            .map(|session| {
+                if let Some(tab) = session
+                    .active_secondary_tab
+                    .and_then(|tab_id| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
+                {
+                    match &tab.kind {
+                        // Query tabs show their outcome and errors inline.
+                        SecondaryTabKind::Query(_) => {
+                            return (None, String::new(), None, None, String::new());
+                        }
+                        SecondaryTabKind::Diagram(diagram) => {
+                            let status = match (diagram.busy, &diagram.document) {
+                                (true, Some(_)) => "Refreshing database diagram…".into(),
+                                (true, None) => "Building database diagram…".into(),
+                                (false, _) => String::new(),
+                            };
+                            let summary = diagram
+                                .document
+                                .as_ref()
+                                .map(|document| {
+                                    format!(
+                                        "{} · {}",
+                                        counted(document.nodes.len() as u64, "table", "tables"),
+                                        counted(
+                                            document.edges.len() as u64,
+                                            "relationship",
+                                            "relationships"
                                         )
-                                    })
-                                    .unwrap_or_default();
-                                return (diagram.error.clone(), status, None, None, summary);
-                            }
-                            SecondaryTabKind::Structure(_) => {}
+                                    )
+                                })
+                                .unwrap_or_default();
+                            return (diagram.error.clone(), status, None, None, summary);
+                        }
+                        SecondaryTabKind::Structure(structure) => {
+                            let summary = if structure.busy {
+                                String::new()
+                            } else {
+                                format!(
+                                    "{} · {}",
+                                    counted(structure.columns.len() as u64, "column", "columns"),
+                                    counted(
+                                        structure.foreign_keys.len() as u64,
+                                        "foreign key",
+                                        "foreign keys"
+                                    )
+                                )
+                            };
+                            let status = if structure.busy {
+                                "Loading structure…".to_owned()
+                            } else {
+                                String::new()
+                            };
+                            return (structure.error.clone(), status, None, None, summary);
                         }
                     }
-                    let table_pagination = (session.kind.is_sql()
-                        && session.selected_table.is_some()
-                        && session.pane == Pane::Data
-                        && session.active_secondary_tab.is_none()
-                        && session.result.is_some())
-                    .then_some((
-                        session.id,
-                        session.table_page,
-                        session.table_has_next_page,
-                        session.busy,
-                    ));
-                    (
-                        session.error.clone(),
-                        if session.busy {
-                            session.status.clone()
-                        } else {
-                            String::new()
-                        },
-                        session.result.clone(),
-                        table_pagination,
-                        String::new(),
-                    )
-                })
-                .unwrap_or_else(|| (self.error.clone(), String::new(), None, None, String::new()));
+                }
+                let table_pagination = (session.kind.is_sql()
+                    && session.selected_table.is_some()
+                    && session.pane == Pane::Data
+                    && session.active_secondary_tab.is_none()
+                    && session.result.is_some())
+                .then_some((
+                    session.id,
+                    session.table_page,
+                    session.table_has_next_page,
+                    session.busy,
+                ));
+                (
+                    session.error.clone(),
+                    if session.busy {
+                        session.status.clone()
+                    } else {
+                        String::new()
+                    },
+                    session.result.clone(),
+                    table_pagination,
+                    String::new(),
+                )
+            })
+            .unwrap_or_else(|| (self.error.clone(), String::new(), None, None, String::new()));
         let result_summary = result
             .as_ref()
             .map(|result| {
@@ -1041,15 +1062,6 @@ impl DbxApp {
                     .child(result_summary)
                     .when_some(pagination_controls, |view, controls| view.child(controls)),
             )
-    }
-
-    pub(super) fn small_button(
-        &self,
-        id: &'static str,
-        label: impl Into<SharedString>,
-        listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        self.small_button_state(id, label, true, listener)
     }
 
     pub(super) fn small_button_state(
