@@ -70,6 +70,21 @@ pub fn build_select(
     order: &[Order],
     page: Option<Page>,
 ) -> Result<SqlStatement> {
+    build_select_with_columns(kind, table, columns, filters, order, page, &[])
+}
+
+/// Build a select using table metadata so filter parameters are typed for
+/// the compared column (PostgreSQL does not coerce `text` to `uuid`,
+/// timestamps, enums, and similar types).
+pub fn build_select_with_columns(
+    kind: DatabaseKind,
+    table: &TableRef,
+    columns: &[String],
+    filters: &[Filter],
+    order: &[Order],
+    page: Option<Page>,
+    metadata: &[ColumnInfo],
+) -> Result<SqlStatement> {
     let table = quote_table(kind, table)?;
     let projection = if columns.is_empty() {
         "*".to_owned()
@@ -89,7 +104,7 @@ pub fn build_select(
     statement.push_str(" FROM ");
     statement.push_str(&table);
     let mut params = Vec::new();
-    append_filters(kind, &mut statement, &mut params, filters)?;
+    append_filters(kind, &mut statement, &mut params, filters, metadata)?;
     append_order(kind, &mut statement, order)?;
     append_page(kind, &mut statement, &mut params, page)?;
     Ok(SqlStatement::new(statement, params))
@@ -256,7 +271,7 @@ pub fn build_update_with_columns(
             column_metadata(columns, column),
         )?;
     }
-    append_filters(kind, &mut statement, &mut params, &request.filters)?;
+    append_filters(kind, &mut statement, &mut params, &request.filters, columns)?;
     Ok(SqlStatement::new(statement, params))
 }
 
@@ -368,6 +383,17 @@ pub fn build_delete(
     table: &TableRef,
     filters: &[Filter],
 ) -> Result<SqlStatement> {
+    build_delete_with_columns(kind, table, filters, &[])
+}
+
+/// Build a delete using table metadata to type filter parameters; see
+/// [`build_select_with_columns`].
+pub fn build_delete_with_columns(
+    kind: DatabaseKind,
+    table: &TableRef,
+    filters: &[Filter],
+    columns: &[ColumnInfo],
+) -> Result<SqlStatement> {
     if filters.is_empty() {
         return Err(DbxError::Parse(
             "delete requires at least one filter; use raw SQL for an intentional full-table delete"
@@ -376,7 +402,7 @@ pub fn build_delete(
     }
     let mut statement = format!("DELETE FROM {}", quote_table(kind, table)?);
     let mut params = Vec::new();
-    append_filters(kind, &mut statement, &mut params, filters)?;
+    append_filters(kind, &mut statement, &mut params, filters, columns)?;
     Ok(SqlStatement::new(statement, params))
 }
 
@@ -503,6 +529,7 @@ fn append_filters(
     statement: &mut String,
     params: &mut Vec<CellValue>,
     filters: &[Filter],
+    columns: &[ColumnInfo],
 ) -> Result<()> {
     if filters.is_empty() {
         return Ok(());
@@ -512,37 +539,58 @@ fn append_filters(
         if index > 0 {
             statement.push_str(" AND ");
         }
-        statement.push_str(&quote_identifier(kind, &filter.column)?);
+        let column = column_metadata(columns, &filter.column);
+        let identifier = quote_identifier(kind, &filter.column)?;
+        let comparison = match filter.operator {
+            FilterOperator::Equals => Some(" = "),
+            FilterOperator::NotEquals => Some(" <> "),
+            FilterOperator::GreaterThan => Some(" > "),
+            FilterOperator::GreaterThanOrEqual => Some(" >= "),
+            FilterOperator::LessThan => Some(" < "),
+            FilterOperator::LessThanOrEqual => Some(" <= "),
+            _ => None,
+        };
+        if let Some(operator) = comparison {
+            statement.push_str(&identifier);
+            push_value_predicate(kind, statement, params, filter, operator, column)?;
+            continue;
+        }
         match filter.operator {
-            FilterOperator::Equals => push_value_predicate(kind, statement, params, filter, " = ")?,
-            FilterOperator::NotEquals => {
-                push_value_predicate(kind, statement, params, filter, " <> ")?
-            }
-            FilterOperator::GreaterThan => {
-                push_value_predicate(kind, statement, params, filter, " > ")?
-            }
-            FilterOperator::GreaterThanOrEqual => {
-                push_value_predicate(kind, statement, params, filter, " >= ")?
-            }
-            FilterOperator::LessThan => {
-                push_value_predicate(kind, statement, params, filter, " < ")?
-            }
-            FilterOperator::LessThanOrEqual => {
-                push_value_predicate(kind, statement, params, filter, " <= ")?
-            }
-            FilterOperator::Contains => {
-                push_like_predicate(kind, statement, params, filter, "%", "%")?
-            }
-            FilterOperator::StartsWith => {
-                push_like_predicate(kind, statement, params, filter, "", "%")?
-            }
-            FilterOperator::EndsWith => {
-                push_like_predicate(kind, statement, params, filter, "%", "")?
-            }
+            FilterOperator::Contains => push_like_predicate(
+                kind,
+                statement,
+                params,
+                filter,
+                &identifier,
+                column,
+                "%",
+                "%",
+            )?,
+            FilterOperator::StartsWith => push_like_predicate(
+                kind,
+                statement,
+                params,
+                filter,
+                &identifier,
+                column,
+                "",
+                "%",
+            )?,
+            FilterOperator::EndsWith => push_like_predicate(
+                kind,
+                statement,
+                params,
+                filter,
+                &identifier,
+                column,
+                "%",
+                "",
+            )?,
             FilterOperator::IsNull => {
                 if filter.value.is_some() {
                     return Err(DbxError::Parse("IS NULL does not accept a value".into()));
                 }
+                statement.push_str(&identifier);
                 statement.push_str(" IS NULL");
             }
             FilterOperator::IsNotNull => {
@@ -551,11 +599,49 @@ fn append_filters(
                         "IS NOT NULL does not accept a value".into(),
                     ));
                 }
+                statement.push_str(&identifier);
                 statement.push_str(" IS NOT NULL");
             }
+            _ => unreachable!("comparison operators are handled above"),
         }
     }
     Ok(())
+}
+
+/// Whether a PostgreSQL catalog type is a character type that compares
+/// directly with a `text` parameter. Casting to `varchar(n)`/`char(n)`
+/// would silently truncate the user's value, so these stay uncast.
+fn is_postgres_text_type(data_type: &str) -> bool {
+    let data_type = data_type.trim().to_ascii_lowercase();
+    let base = data_type.split('(').next().unwrap_or_default().trim();
+    matches!(
+        base,
+        "text"
+            | "character varying"
+            | "varchar"
+            | "character"
+            | "char"
+            | "bpchar"
+            | "name"
+            | "citext"
+    )
+}
+
+/// The type a text filter parameter must be cast to before it is compared
+/// with `column`, or `None` when the dialect coerces it implicitly.
+fn filter_parameter_cast<'a>(
+    kind: DatabaseKind,
+    value: &CellValue,
+    column: Option<&'a ColumnInfo>,
+) -> Option<&'a str> {
+    match (kind, value, column) {
+        (DatabaseKind::PostgreSQL, CellValue::Text(_), Some(column))
+            if !is_postgres_text_type(&column.data_type) =>
+        {
+            cast_type_name(&column.data_type)
+        }
+        _ => None,
+    }
 }
 
 fn push_value_predicate(
@@ -564,6 +650,7 @@ fn push_value_predicate(
     params: &mut Vec<CellValue>,
     filter: &Filter,
     operator: &str,
+    column: Option<&ColumnInfo>,
 ) -> Result<()> {
     let Some(value) = filter.value.as_ref() else {
         return Err(DbxError::Parse("filter operator requires a value".into()));
@@ -581,16 +668,24 @@ fn push_value_predicate(
         return Ok(());
     }
     statement.push_str(operator);
-    statement.push_str(&placeholder(kind, params.len() + 1));
+    let placeholder = placeholder(kind, params.len() + 1);
+    match filter_parameter_cast(kind, value, column) {
+        Some(cast) => write!(statement, "CAST({placeholder} AS {cast})")
+            .map_err(|error| DbxError::Parse(error.to_string()))?,
+        None => statement.push_str(&placeholder),
+    }
     params.push(value.clone());
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_like_predicate(
     kind: DatabaseKind,
     statement: &mut String,
     params: &mut Vec<CellValue>,
     filter: &Filter,
+    identifier: &str,
+    column: Option<&ColumnInfo>,
     prefix: &str,
     suffix: &str,
 ) -> Result<()> {
@@ -600,6 +695,17 @@ fn push_like_predicate(
     let CellValue::Text(value) = value else {
         return Err(DbxError::Parse("LIKE filter requires text value".into()));
     };
+    // PostgreSQL has no LIKE operator for uuid, numeric, timestamp, enum, and
+    // other non-character types; match against their text rendering instead.
+    // Without metadata the cast is still safe because text-to-text is a no-op.
+    let cast_to_text = kind == DatabaseKind::PostgreSQL
+        && column.is_none_or(|column| !is_postgres_text_type(&column.data_type));
+    if cast_to_text {
+        write!(statement, "CAST({identifier} AS text)")
+            .map_err(|error| DbxError::Parse(error.to_string()))?;
+    } else {
+        statement.push_str(identifier);
+    }
     statement.push_str(" LIKE ");
     statement.push_str(&placeholder(kind, params.len() + 1));
     statement.push_str(" ESCAPE '!'");

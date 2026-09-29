@@ -115,7 +115,7 @@ pub static DARK_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
         0x0b0d12f2
     }),
     glass: rgba(0xffffff0b),
-    glass_raised: rgba(0x1a1e27f7),
+    glass_raised: rgba(0x1f2430fa),
     glass_hover: rgba(0xffffff12),
     glass_selected: rgba(0xffffff1f),
     rim: rgba(0xffffff29),
@@ -319,6 +319,37 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     component.colors.selection = palette.selection.into();
     component.colors.list_active = palette.accent_soft.into();
     component.colors.list_active_border = palette.accent.into();
+    component.colors.button_primary = palette.accent.into();
+    component.colors.button_primary_foreground = palette.accent_foreground.into();
+    component.colors.button_primary_hover = component.colors.primary_hover;
+    component.colors.button_primary_active = component.colors.primary_active;
+
+    // Components read the resolved token table rather than `colors`, and
+    // `Theme::change` resolved it from the stock palette. Re-resolve every
+    // token DBX overrides so hover and active states match the rest state
+    // (otherwise a primary button turns the stock near-white on hover).
+    let colors = component.colors;
+    let tokens = &mut component.tokens;
+    tokens.popover = colors.popover.into();
+    tokens.popover_foreground = colors.popover_foreground.into();
+    tokens.border = colors.border.into();
+    tokens.accent = colors.accent.into();
+    tokens.accent_foreground = colors.accent_foreground.into();
+    tokens.primary = colors.primary.into();
+    tokens.primary_foreground = colors.primary_foreground.into();
+    tokens.primary_hover = colors.primary_hover.into();
+    tokens.primary_active = colors.primary_active.into();
+    tokens.secondary_hover = colors.secondary_hover.into();
+    tokens.muted_foreground = colors.muted_foreground.into();
+    tokens.ring = colors.ring.into();
+    tokens.caret = colors.caret.into();
+    tokens.selection = colors.selection.into();
+    tokens.list_active = colors.list_active.into();
+    tokens.list_active_border = colors.list_active_border.into();
+    tokens.button_primary = colors.button_primary.into();
+    tokens.button_primary_foreground = colors.button_primary_foreground.into();
+    tokens.button_primary_hover = colors.button_primary_hover.into();
+    tokens.button_primary_active = colors.button_primary_active.into();
 }
 
 /// A keyboard shortcut label in the platform's own notation, e.g.

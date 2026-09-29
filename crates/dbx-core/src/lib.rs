@@ -25,9 +25,10 @@ pub use model::{
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
 pub use sql::{
-    SqlStatement, build_create_table, build_delete, build_drop_table, build_insert,
-    build_insert_with_columns, build_multi_row_insert, build_select, build_truncate_table,
-    build_update, build_update_with_columns, quote_identifier, validate_sql_expression,
+    SqlStatement, build_create_table, build_delete, build_delete_with_columns, build_drop_table,
+    build_insert, build_insert_with_columns, build_multi_row_insert, build_select,
+    build_select_with_columns, build_truncate_table, build_update, build_update_with_columns,
+    quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::{
@@ -442,6 +443,84 @@ mod tests {
             error
                 .to_string()
                 .contains("primary-key equality predicates")
+        );
+    }
+
+    #[test]
+    fn postgres_filters_cast_text_parameters_to_non_text_column_types() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".into(),
+                data_type: "uuid".into(),
+                enum_values: Vec::new(),
+                nullable: false,
+                ordinal: 1,
+                primary_key: true,
+            },
+            ColumnInfo {
+                name: "name".into(),
+                data_type: "character varying(8)".into(),
+                enum_values: Vec::new(),
+                nullable: true,
+                ordinal: 2,
+                primary_key: false,
+            },
+            ColumnInfo {
+                name: "seen_at".into(),
+                data_type: "timestamp with time zone".into(),
+                enum_values: Vec::new(),
+                nullable: true,
+                ordinal: 3,
+                primary_key: false,
+            },
+        ];
+        let text = |value: &str| Some(CellValue::Text(value.into()));
+        let statement = build_select_with_columns(
+            DatabaseKind::PostgreSQL,
+            &TableRef::new("users"),
+            &[],
+            &[
+                Filter::new("id", FilterOperator::Equals, text("7f1d")),
+                Filter::new("name", FilterOperator::NotEquals, text("longer than eight")),
+                Filter::new("seen_at", FilterOperator::GreaterThan, text("2026-01-01")),
+                Filter::new("id", FilterOperator::StartsWith, text("7f")),
+                Filter::new("name", FilterOperator::Contains, text("a")),
+            ],
+            &[],
+            None,
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            statement.sql,
+            "SELECT * FROM \"users\" WHERE \"id\" = CAST($1 AS uuid) AND \"name\" <> $2 AND \"seen_at\" > CAST($3 AS timestamp with time zone) AND CAST(\"id\" AS text) LIKE $4 ESCAPE '!' AND \"name\" LIKE $5 ESCAPE '!'"
+        );
+
+        let delete = build_delete_with_columns(
+            DatabaseKind::PostgreSQL,
+            &TableRef::new("users"),
+            &[Filter::new("id", FilterOperator::Equals, text("7f1d"))],
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            delete.sql,
+            "DELETE FROM \"users\" WHERE \"id\" = CAST($1 AS uuid)"
+        );
+
+        let update = build_update_with_columns(
+            DatabaseKind::PostgreSQL,
+            &UpdateRequest {
+                table: TableRef::new("users"),
+                assignments: vec![("name".into(), CellValue::Text("new".into()).into())],
+                filters: vec![Filter::new("id", FilterOperator::Equals, text("7f1d"))],
+            },
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            update.sql,
+            "UPDATE \"users\" SET \"name\" = CAST($1 AS character varying(8)) WHERE \"id\" = CAST($2 AS uuid)"
         );
     }
 
