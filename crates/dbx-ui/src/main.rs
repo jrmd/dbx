@@ -1,6 +1,7 @@
 mod app;
 mod assets;
 mod connection_fields;
+mod device_unlock;
 mod diagram;
 mod editor;
 #[allow(dead_code)]

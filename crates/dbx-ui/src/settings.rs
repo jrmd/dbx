@@ -25,6 +25,14 @@ pub struct Settings {
     /// Replace glass materials with opaque surfaces.
     #[serde(default)]
     pub reduce_transparency: bool,
+    /// Keep the vault key in the system keychain so launches skip the
+    /// passphrase.
+    #[serde(default = "remember_device_default")]
+    pub remember_device: bool,
+}
+
+fn remember_device_default() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -39,11 +47,17 @@ impl Settings {
             version: SETTINGS_FILE_VERSION,
             appearance,
             reduce_transparency: false,
+            remember_device: true,
         }
     }
 
     pub fn with_reduce_transparency(mut self, reduce: bool) -> Self {
         self.reduce_transparency = reduce;
+        self
+    }
+
+    pub fn with_remember_device(mut self, remember: bool) -> Self {
+        self.remember_device = remember;
         self
     }
 }

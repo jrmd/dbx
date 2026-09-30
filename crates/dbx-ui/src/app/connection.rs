@@ -1,4 +1,5 @@
 use super::*;
+use crate::device_unlock::DeviceUnlock;
 
 fn hydration_matches_current_draft(
     selected_profile: Option<Uuid>,
@@ -99,6 +100,75 @@ impl DbxApp {
         });
     }
 
+    /// The keychain entry for this vault. Tests never touch the real
+    /// system keychain.
+    fn device_unlock(&self) -> Option<DeviceUnlock> {
+        if cfg!(test) {
+            return None;
+        }
+        let vault = self.profile_store.as_ref().and_then(ProfileStore::vault)?;
+        Some(DeviceUnlock::for_vault(vault.path()))
+    }
+
+    /// Unlock with the key this device remembered, if any. The passphrase
+    /// gate stays up (showing "Unlocking…") until the keychain answers, and
+    /// remains the fallback when it has nothing or refuses.
+    pub(super) fn try_device_unlock(&mut self, cx: &mut Context<Self>) {
+        if self.vault_state != Some(VaultState::Locked) || !self.remember_device {
+            return;
+        }
+        let (Some(vault), Some(device)) = (
+            self.profile_store.as_ref().and_then(ProfileStore::vault),
+            self.device_unlock(),
+        ) else {
+            return;
+        };
+        self.vault_busy = true;
+        self.vault_generation += 1;
+        let generation = self.vault_generation;
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            let unlocked = runtime
+                .spawn_blocking(move || {
+                    let Ok(Some(key)) = device.load() else {
+                        return false;
+                    };
+                    match vault.unlock_with_key(key) {
+                        Ok(()) => true,
+                        // The vault was recreated since this device was
+                        // trusted; the stale key can never work again.
+                        Err(VaultError::Authentication) => {
+                            let _ = device.forget();
+                            false
+                        }
+                        Err(_) => false,
+                    }
+                })
+                .await
+                .unwrap_or(false);
+            this.update(cx, |this, cx| {
+                if this.vault_generation != generation {
+                    return;
+                }
+                this.vault_busy = false;
+                if unlocked {
+                    this.vault_state = Some(VaultState::Unlocked);
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Takes effect at the next passphrase unlock, which stores or forgets
+    /// the key; the choice itself is saved now so the gate remembers it.
+    pub(super) fn toggle_remember_device(&mut self, cx: &mut Context<Self>) {
+        self.remember_device = !self.remember_device;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
     pub(super) fn submit_vault_passphrase(&mut self, creating: bool, cx: &mut Context<Self>) {
         let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
             self.set_error("The vault is unavailable".into());
@@ -128,16 +198,30 @@ impl DbxApp {
         self.vault_generation += 1;
         let generation = self.vault_generation;
         let runtime = self.runtime.clone();
+        let device = self.device_unlock();
+        let remember_device = self.remember_device;
         self.error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = runtime
+            let (result, device_error) = runtime
                 .spawn_blocking(move || {
-                    if creating {
+                    let result = if creating {
                         vault.create(passphrase)
                     } else {
                         vault.unlock(passphrase)
-                    }
+                    };
+                    // Trusting (or untrusting) the device never blocks the
+                    // unlock itself; a keychain failure is only reported.
+                    let device_error = match (&result, device) {
+                        (Ok(()), Some(device)) if remember_device => vault
+                            .key()
+                            .map_err(|error| error.to_string())
+                            .and_then(|key| device.store(&key))
+                            .err(),
+                        (Ok(()), Some(device)) => device.forget().err(),
+                        _ => None,
+                    };
+                    (result, device_error)
                 })
                 .await?;
             this.update(cx, |this, cx| {
@@ -157,6 +241,9 @@ impl DbxApp {
                         });
                         if let Some(profile_id) = selected_with_secret {
                             this.hydrate_saved_credential(profile_id, cx);
+                        }
+                        if let Some(error) = device_error {
+                            this.show_toast(ToastKind::Error, error, cx);
                         }
                     }
                     Err(_) => this.set_error(if creating {
@@ -616,57 +703,22 @@ impl DbxApp {
             let initial_table = schema_filtered_tables(kind, &tables, schema_filter.as_deref())
                 .into_iter()
                 .next();
-            let initial = if let Some(table) = initial_table {
-                let table_ref = table_ref(&table);
-                let structure = engine.table_structure(&table_ref).await?;
-                let mut result = if kind.is_sql() {
-                    Some(
-                        engine
-                            .query_table(
-                                &table_ref,
-                                &[],
-                                &[],
-                                &[],
-                                Some(table_browse_page(0)),
-                                QueryOptions::default(),
-                            )
-                            .await?,
-                    )
-                } else {
-                    Some(
-                        engine
-                            .query("SCAN 0 COUNT 100", QueryOptions::default())
-                            .await?,
-                    )
-                };
-                let has_next_page = if kind.is_sql() {
-                    result
-                        .as_mut()
-                        .map(trim_table_browse_result)
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                Some((table_ref, structure, result, has_next_page))
-            } else {
-                None
-            };
             Ok::<_, dbx_core::DbxError>((
                 engine,
                 tables,
                 databases,
                 current_database,
                 schema_filter,
-                initial,
+                initial_table,
             ))
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
         }
 
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task.await?;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 let connected = result.is_ok();
                 let Some(session) = this.session_mut(session_id) else {
                     return;
@@ -675,6 +727,7 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
+                let mut initial_table = None;
                 match result {
                     Ok((engine, tables, databases, current_database, schema_filter, initial)) => {
                         session.engine = Some(engine);
@@ -682,33 +735,19 @@ impl DbxApp {
                         session.databases = databases;
                         session.current_database = current_database;
                         session.schema_filter = schema_filter;
-                        if let Some((table, structure, result, has_next_page)) = initial {
-                            session.selected_table = Some(table.clone());
-                            session.table_columns = structure.columns;
-                            session.foreign_keys = structure.foreign_keys;
-                            session.completion_columns.insert(
-                                completion_table_key(&table),
-                                session.table_columns.clone(),
-                            );
-                            session.table_page = 0;
-                            session.table_has_next_page = has_next_page;
-                            session.set_result(result, cx);
-                            session.result_table = Some(table);
-                        } else {
-                            session.selected_table = None;
-                            session.table_columns.clear();
-                            session.completion_columns.clear();
-                            session.table_page = 0;
-                            session.table_has_next_page = false;
-                            session.set_result(None, cx);
-                            session.result_table = None;
-                        }
+                        session.completion_columns.clear();
                         session.error = None;
                         session.pane = Pane::Data;
+                        initial_table = initial;
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
                     }
+                }
+                // Open the first table the same way a navigator click would,
+                // so it arrives in its own data tab.
+                if let Some(table) = initial_table {
+                    this.select_table_for(session_id, table, window, cx);
                 }
                 cx.notify();
                 this.prefetch_completion_columns_for(session_id, cx);

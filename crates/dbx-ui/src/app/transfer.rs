@@ -696,10 +696,8 @@ impl DbxApp {
                         session.error = None;
                         // Reload the grid when the imported table is open so
                         // new rows appear without a manual refresh.
-                        let imported_table_open =
-                            session.selected_table.as_ref() == Some(&imported_table);
-                        if imported_table_open {
-                            this.refresh_table_for(session_id, cx);
+                        if let Some(tab_id) = session.data_tab_for_table(&imported_table) {
+                            this.refresh_table_for(session_id, tab_id, cx);
                         }
                         let message = if report.statements_executed > 0 {
                             format!(
