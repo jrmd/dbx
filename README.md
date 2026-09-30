@@ -104,7 +104,7 @@ For terminal logs, use `DBX_FOREGROUND=1 make run`. `make macos-build` and `make
 
 ## Your own Mac signing key
 
-**You do not need the maintainer's signing key or a paid Apple Developer account to build and run DBX on your Mac.** This repository does not provide a maintainer Developer ID certificate or a notarized Mac release.
+**You do not need the maintainer's signing key or a paid Apple Developer account to build and run DBX on your Mac.** For maintainer-signed release candidates, see the [macOS release workflow](docs/macos-release.md). A public notarized release is available only after that workflow and release validation succeed.
 
 On the first `make build` or `make run`, [the Mac build helper](scripts/build-macos-app.sh) creates a self-signed **DBX Local Development** code-signing certificate and its private key in your login keychain. Later builds reuse that identity to sign the bundle with identifier `dev.jrmd.dbx`. macOS may ask you to unlock the keychain or allow `codesign` to use the key.
 
@@ -145,7 +145,7 @@ A self-signed local build is **not notarized** and does not provide Developer ID
 
 For distribution under your own identity, obtain a **Developer ID Application** certificate through your Apple Developer Program account, install it together with its private key, sign the app with the hardened runtime and a secure timestamp, then submit it for notarization and staple the accepted ticket. See [Apple's Developer ID certificate instructions](https://developer.apple.com/help/account/certificates/create-developer-id-certificates) and [notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The build helper accepts an existing certificate through `DBX_SIGNING_NAME`, but does not submit or staple notarization tickets. Confirm the Developer ID identity exists with `security find-identity` before selecting it: a missing name makes the helper attempt to create a local self-signed identity, which is unsuitable for distribution. Use Apple's workflow to apply distribution signatures and validate the final artifact. Do not share or commit your private key or certificate export.
+Use `DBX_SIGNING_MODE=developer-id` with `DBX_SIGNING_NAME` for distribution builds: this requires an existing Developer ID Application identity, refuses a self-signed fallback, and adds secure timestamps. The [release workflow](docs/macos-release.md) builds on GitHub's Mac runners, notarizes and staples the bundle, verifies Gatekeeper acceptance, and uploads a candidate ZIP and checksum. Do not share or commit your private key or certificate export.
 
 ## First connection
 
