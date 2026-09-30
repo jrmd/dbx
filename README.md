@@ -77,6 +77,7 @@ For local macOS development, use the Makefile workflow instead of `cargo run`:
 ```bash
 make build
 make run
+make install   # replaces /Applications/DBX.app (override with INSTALL_DIR=...)
 ```
 
 The first run creates a self-signed `DBX Local Development` code-signing
