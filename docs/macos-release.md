@@ -1,6 +1,6 @@
 # macOS release candidates
 
-DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The manual candidate workflow produces **Apple Silicon (arm64)** candidates. The tag-triggered release workflow produces separate Apple Silicon and Intel bundles alongside Linux x86_64.
+DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The manual candidate workflow produces **Apple Silicon (arm64)** candidates. The tag-triggered release workflow produces the same Apple Silicon bundle alongside Linux x86_64. Intel Macs are not supported.
 
 ## Signing setup
 
@@ -60,14 +60,14 @@ one version tag. Set the workspace version in `Cargo.toml`, update `Cargo.lock`,
 commit the release changes, and push a matching `vVERSION` tag. A manual workflow
 rerun must also select that tag. All five Apple secrets above must be available.
 The workflow rejects mismatched tags and prerelease versions, runs tests and
-Clippy, builds Linux x86_64 plus both Mac architectures, and requires successful
+Clippy, builds Linux x86_64 plus Apple Silicon, and requires successful
 notarization for both Mac bundles. It verifies archive checksums, uploads all
 assets to a draft release, then publishes it as latest. A failed build publishes
 nothing. If upload fails after draft creation, inspect/remove that draft before
 retrying; existing published releases are never overwritten by this workflow.
 
 Each release supplies `DBX-VERSION-linux-x86_64.AppImage`,
-`DBX-VERSION-linux-x86_64.tar.gz`, `DBX-VERSION-macos-arm64.zip`, and `DBX-VERSION-macos-x86_64.zip`, each with its own
+`DBX-VERSION-linux-x86_64.tar.gz`, and `DBX-VERSION-macos-arm64.zip`, each with its own
 `.sha256` file. The updater accepts only exact platform/version filenames from
 `jrmd/dbx`, stable versions newer than the running version, and checksum-matching
 downloads. Unsigned candidate filenames cannot be selected.

@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15, macos-15-intel]
+        os: [ubuntu-22.04, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
@@ -119,6 +119,9 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          # Artifacts keep their linux/ and macos/ folders; publish a flat list.
+          find release -mindepth 2 -type f -exec mv -t release {} +
+          find release -mindepth 1 -type d -empty -delete
           (cd release && sha256sum -c ./*.sha256)
           # Keep partially uploaded assets out of /releases/latest.
           gh release create "$RELEASE_TAG" release/* --verify-tag --generate-notes --draft

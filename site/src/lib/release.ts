@@ -14,7 +14,6 @@ export type Release = {
   url: string;
   publishedAt: string;
   macos?: Download;
-  macosIntel?: Download;
   linux?: Download;
 };
 
@@ -66,7 +65,6 @@ export async function getLatestRelease(): Promise<Release | null> {
       url: release.html_url,
       publishedAt: release.published_at,
       macos: pick(release.assets, /macos-arm64\.zip$/),
-      macosIntel: pick(release.assets, /macos-x86_64\.zip$/),
       linux:
         pick(release.assets, /linux-x86_64\.AppImage$/) ??
         pick(release.assets, /linux.*\.tar\.gz$/),

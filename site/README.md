@@ -9,7 +9,7 @@ pnpm dev
 
 ## Downloads
 
-`src/lib/release.ts` reads the latest **published** GitHub release of `jrmd/dbx` and revalidates hourly. It links the `*macos-arm64.zip` and `*macos-x86_64.zip` bundles (plus checksums) and the Linux AppImage, falling back to the Linux tarball. Drafts and prereleases are ignored by GitHub's `latest` endpoint, so until a release is published the download buttons point at the releases page.
+`src/lib/release.ts` reads the latest **published** GitHub release of `jrmd/dbx` and revalidates hourly. It links the `*macos-arm64.zip` bundle (plus its checksum) and the Linux AppImage, falling back to the Linux tarball. Drafts and prereleases are ignored by GitHub's `latest` endpoint, so until a release is published the download buttons point at the releases page.
 
 Set `GITHUB_TOKEN` in the Vercel project to avoid the unauthenticated API rate limit (a fine-grained token with no extra permissions is enough).
 

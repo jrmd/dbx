@@ -13,10 +13,6 @@ APPDIR="${DBX_APPDIR:-$ROOT_DIR/target/linux/DBX.AppDir}"
 APPIMAGE_PATH="${DBX_APPIMAGE:-$ROOT_DIR/target/linux/DBX-$VERSION-linux-$ARCH.AppImage}"
 APPIMAGETOOL="${APPIMAGETOOL:-$ROOT_DIR/target/linux/tools/appimagetool-$ARCH.AppImage}"
 readonly APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
-# Keyboard libraries GPUI links directly. libxcb itself stays with the host
-# because it must match the running X server; Wayland, Vulkan, and fonts are
-# loaded from the host at runtime.
-readonly BUNDLED_LIBS=(libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1)
 
 readonly BINARY_PATH="$ROOT_DIR/target/release/dbx"
 readonly DESKTOP_FILE="$ROOT_DIR/packaging/linux/dbx.desktop"
@@ -64,12 +60,6 @@ build_package() {
 	log "archive: $ARCHIVE_PATH"
 }
 
-library_path() {
-	local cache
-	cache="$(ldconfig -p)"
-	awk -v name="$1" -v arch="${ARCH/_/-}" '$1 == name && $0 ~ arch && !found { print $NF; found = 1 }' <<<"$cache"
-}
-
 fetch_appimagetool() {
 	[[ -x "$APPIMAGETOOL" ]] && return
 	require_command curl
@@ -83,23 +73,17 @@ fetch_appimagetool() {
 build_appimage() {
 	log "assembling AppDir"
 	rm -rf "$APPDIR"
-	mkdir -p "$APPDIR/usr/lib"
+	mkdir -p "$APPDIR"
 	cp -a "$APP_DIR/usr" "$APPDIR/"
 	cp "$DESKTOP_FILE" "$APPDIR/dbx.desktop"
 	cp "$LOGO_SVG" "$APPDIR/dbx.svg"
 	cp "$LOGO_PNG" "$APPDIR/.DirIcon"
 
-	local lib path
-	for lib in "${BUNDLED_LIBS[@]}"; do
-		path="$(library_path "$lib")"
-		[[ -n "$path" ]] || die "library to bundle not found: $lib"
-		cp -L "$path" "$APPDIR/usr/lib/$lib"
-	done
-
+	# No libraries are bundled. xkbcommon must match the host's X11 compose
+	# tables, and libxcb, Wayland, Vulkan, and fonts come from the desktop.
 	cat > "$APPDIR/AppRun" <<'APPRUN'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
-export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$HERE/usr/bin/dbx" "$@"
 APPRUN
 	chmod +x "$APPDIR/AppRun"
