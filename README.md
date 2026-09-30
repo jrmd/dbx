@@ -1,158 +1,183 @@
-# DBX
+<p align="center">
+  <img src="logo.svg" width="88" alt="DBX logo">
+</p>
 
-DBX is a native, fast database workbench built with Rust and [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui). It is intended to make everyday database work feel as direct as a desktop editor: inspect a schema, filter a table, edit a row, or run SQL without giving up the responsiveness and isolation of a native application.
+<h1 align="center">DBX</h1>
+<p align="center">A native database workbench. Built with Rust and GPUI.</p>
+<p align="center">PostgreSQL · MySQL · SQLite · Redis</p>
 
-The initial engine set is:
+Browse your data, follow relationships, edit rows, and run queries in a responsive desktop app. DBX uses [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for its window, input, and GPU rendering.
 
-- PostgreSQL
-- MySQL
-- SQLite
-- Redis
+![DBX in dark mode: tabbed tables, a schema explorer, foreign-key links, and a row inspector](docs/screenshots/workbench.png)
 
-DBX is an early, runnable MVP. It already has a native connection picker, simultaneous connection tabs, schema/keyspace navigator, result grid, structured multi-rule filters, an all-field row inspector, guarded insert/update/delete operations, table truncate/drop menus, create-table SQL templates, and a raw SQL/Redis command console. It should not yet be treated as a production database administration tool.
+**DBX is in active development.** It is runnable today, but should not yet be treated as a production database administration tool. Start with a disposable database and a least-privilege account.
 
-## Implemented in this milestone
+## Inside the workbench
 
-- Native GPUI application shell with IME-aware text editing and SQL syntax highlighting.
-- Named connection profiles persisted as atomic, versioned password-free JSON metadata; normal saved credentials are encrypted in the app-owned DBX Vault with Argon2id + XChaCha20-Poly1305.
-- Isolated simultaneous connection sessions with switchable, closable tabs and generation-safe asynchronous updates.
-- Native SQLite file selection through the operating system file portal.
-- PostgreSQL, MySQL, and SQLite connections through SQLx, plus Redis through redis-rs.
-- Table/view discovery, PostgreSQL schema chips (including `public`, Drizzle-owned schemas, and an all-schemas view), column and primary-key introspection, bounded row pages, and result grids.
-- Multiple structured GUI filters with column/comparator/value controls, typed values, dialect-aware identifier quoting, and PostgreSQL bind markers.
-- Click-to-edit rows with every table field available in one scrollable, typed draft.
-- Right-click table actions for refresh, truncate, and drop, with engine-aware SQL and explicit destructive confirmations.
-- Full-row insertion with explicit Value/NULL/Default states, multi-field primary-key-guarded updates, and primary-key-guarded deletion.
-- Raw SQL execution for relational databases and a raw Redis command surface; Redis browsing starts with incremental `SCAN`.
-- Table and database import/export: table context menus support SQL dumps, CSV, and TSV files, while the database-level export flow lets users select tables, choose SQL/CSV/TSV, set an output name and folder, optionally gzip, and export schemas only. Database SQL imports replay dump statements against the active connection after explicit confirmation; delimited imports remain table-targeted so their header mapping stays explicit. Unquoted empty delimited fields import as NULL while quoted empties stay empty strings.
-- Docker-backed PostgreSQL, MySQL, and Redis contract coverage plus file-backed SQLite coverage for discovery, create, inspect, insert, GUI-style filtering, update, delete, SQL/commands, and Redis TTL/type scanning.
+- **Four database engines:** PostgreSQL, MySQL, and SQLite through SQLx; Redis through redis-rs, with incremental `SCAN` browsing and a command console.
+- **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
+- **Data you can work with:** virtualized grids over bounded row pages, structured filters, foreign-key navigation, and an all-field row inspector.
+- **Explicit edits:** typed insert/update drafts, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
+- **A query editor:** syntax highlighting, SQL completion, result grids, and per-connection query history.
+- **Import and export:** SQL, CSV, and TSV transfers; database exports with table selection, gzip, and schema-only SQL options.
+- **Saved connections:** named profiles, environment labels, connection testing, and encrypted credentials in the DBX Vault.
+- **Native appearance:** light, dark, and system themes, with an option to reduce transparency.
 
-Current UX limitations are deliberate and visible: the table designer begins from an engine-aware SQL template, Redis values use the command console for mutation, and the first grid renders a bounded page rather than a fully virtualized multi-million-row dataset.
+### Write SQL, see the results
 
-## What DBX is for
+![DBX SQL editor running a join over demo projects and teams, with eight result rows](docs/screenshots/query.png)
 
-The first release is centred on a short, reliable workflow:
+Screenshots show the real Linux application with fictional SQLite demo data and reduced transparency enabled. macOS uses its native window controls.
 
-1. Add a connection and browse its databases, schemas, tables, or Redis keyspaces.
-2. Open a table in a virtualized data grid and inspect rows without loading an entire table into memory.
-3. Filter and sort rows through a GUI filter bar; inspect or edit the generated query before applying it.
-4. Add, edit, and delete rows with a reviewable change set and an explicit apply action.
-5. Create tables using a schema form, with a SQL preview for the exact DDL.
-6. Run ad-hoc SQL in a console, view results and errors, and keep a small per-connection query history.
+## Build from source
 
-Redis is intentionally modelled as a key/value data source rather than pretending it has relational tables. Its browser will expose key patterns, types, TTLs, and values, while the SQL console is not available for Redis unless a future Redis SQL-compatible integration is added.
+### Prerequisites
 
-## Current scope
-
-| Area | MVP direction | Deliberately deferred |
-| --- | --- | --- |
-| Connections | PostgreSQL, MySQL, SQLite, Redis; per-connection settings | Cloud-provider login flows, SSH tunnel management, team sync |
-| Browsing | Tables/keyspaces, columns, types, indexes, paged rows | Full ER diagrams, data lineage, server monitoring |
-| Editing | Insert, update, delete, create-table form, SQL preview, table/database import-export (SQL/CSV/TSV, gzip, schema-only SQL) | Migrations, schema diff/deploy, server-side bulk loaders, partial-column CSV mapping |
-| Queries | SQL editor for relational engines, cancellation, result grid | SQL autocomplete parity with a full IDE, query plan visualizer |
-| Filtering | Structured predicates compiled to parameterized SQL; Redis key/type filters | Saved team-wide searches and cross-database joins |
-
-The architecture keeps these deferred features possible without making them dependencies of the first usable build. See [docs/architecture.md](docs/architecture.md) for the boundaries and engine-specific rules.
-
-## Getting started
-
-The commands below are the intended development entry points. Adjust the binary/package names if the workspace layout changes while the MVP is being assembled.
+- **Rust 1.97 or newer**, with Cargo. The minimum version is declared in [Cargo.toml](Cargo.toml).
+- **Git**, a native C/C++ build toolchain, and **CMake** for native dependencies.
+- **macOS:** Xcode and its command-line tools, including the Metal tooling required by GPUI. Open Xcode once to complete setup, then check `xcode-select -p`. See [GPUI/Zed's macOS build guide](https://zed.dev/docs/development/macos) for current platform requirements.
+- **Linux:** a Wayland or X11 desktop, a working Vulkan driver, `pkg-config`, and development libraries for XCB, xkbcommon, and fontconfig. Distribution package names vary; [Zed's Linux dependency guide](https://zed.dev/docs/development/linux) is a useful reference for GPUI's platform dependencies. A desktop file portal is needed for native file dialogs.
+- **Optional:** Docker Compose for the disposable PostgreSQL/MySQL/Redis integration suite; Python 3 for the Linux UI fixtures.
 
 ```bash
-# Rust stable is recommended.
+git clone https://github.com/jrmd/dbx.git
+cd dbx
+
 rustup toolchain install stable
-rustup default stable
-
-# From the repository root:
-cargo run --release --package dbx-ui
-
-# Fast local checks:
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+rustup override set stable
 ```
 
-For local macOS development, use the Makefile workflow instead of `cargo run`:
+The first build fetches the GPUI and gpui-component Git dependencies and compiles the native stack, so allow extra time and disk space.
+
+### Linux
 
 ```bash
-make build
-make run
-make install   # replaces /Applications/DBX.app (override with INSTALL_DIR=...)
-```
+# Build and launch the app.
+cargo run --locked --release --package dbx-ui
 
-The first run creates a self-signed `DBX Local Development` code-signing
-identity in the Mac login keychain, then reuses it to sign a stable
-`target/macos/DBX.app` bundle with identifier `dev.jrmd.dbx`. This is only for
-local development; it does not require an Apple Developer account and does not
-produce a distributable or notarized app. This signing identity is unrelated to
-DBX credential storage: normal saved credentials remain in the app-owned DBX
-Vault. The stable identity does matter for device unlock, though: the Keychain
-item holding the vault key trusts builds signed with it, so rebuilding does not
-trigger a new Keychain prompt.
-
-Use `DBX_FOREGROUND=1 make run` when you want the app's stdout/stderr in the
-terminal. `make cargo-build` and `make cargo-run` remain available for the raw
-Cargo workflow.
-
-The canonical brand asset is [logo.svg](logo.svg). DBX embeds that SVG in the
-native UI, so the active rail or disconnected top-bar mark stays sharp at any display scale without duplicating the brand in a connected workspace.
-
-For packaged local builds:
-
-```bash
-# macOS: target/macos/DBX.app, with Contents/Resources/DBX.icns
-make macos-build
-
-# Linux: target/linux/DBX plus target/linux/dbx-linux.tar.gz
+# Or stage a distributable directory and archive.
 make linux-build
+
+# Build and launch through the packaging helper.
+make linux-run
 ```
 
-The Linux staging tree includes `usr/share/applications/dbx.desktop` and the
-scalable `usr/share/icons/hicolor/scalable/apps/dbx.svg` icon. The macOS
-bundle includes the SVG source and generates the Finder `.icns` resource from
-the same artwork.
+`make linux-build` produces:
 
-Run the disposable connector suite with Docker:
+- `target/linux/DBX/usr/bin/dbx`
+- Desktop metadata and the SVG icon under `target/linux/DBX/usr/share/`
+- `target/linux/dbx-linux.tar.gz`
+
+The archive contains a Linux staging tree, not a self-contained AppImage. The destination machine still needs compatible system libraries and graphics drivers. The raw Cargo binary is `target/release/dbx`.
+
+### macOS
+
+After installing Xcode and launching it once, prepare the toolchain:
 
 ```bash
-./scripts/test-integration.sh
+xcode-select --install
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+brew install cmake
 ```
 
-The script starts PostgreSQL 16, MySQL 8.4, and Redis 7 on loopback-only test ports, creates a temporary SQLite database, waits for health checks, runs the ignored connector tests serially, and always tears everything down. It uses only fixed test credentials and ephemeral `tmpfs`/temporary-file storage. Existing `DBX_TEST_POSTGRES_URL`, `DBX_TEST_MYSQL_URL`, `DBX_TEST_REDIS_URL`, and `DBX_TEST_SQLITE_URL` values override its defaults.
+The command-line tools installer may report they are already installed. If GPUI reports that `metal` is missing, follow the [Metal toolchain troubleshooting steps](https://zed.dev/docs/development/macos#troubleshooting) before rebuilding.
 
-Never commit a real connection string, password, certificate private key, or local database file. `.env.example` may document safe placeholders; `.env` and local database artifacts are ignored by default.
+```bash
+# Build DBX.app and sign it with your own local identity.
+make build
 
-## Product principles
+# Build, sign, and open it.
+make run
 
-- **Native first:** GPUI owns the window, input, layout, and rendering. There is no Electron, Tauri, embedded browser, or webview requirement.
-- **Fast by default:** connection work and queries run away from the GPUI event loop; row fetching is streamed and bounded, with full grid virtualization planned next.
-- **Explicit writes:** GUI edits are drafts until the user reviews and applies them. Destructive operations need a clear confirmation and report the generated SQL.
-- **Engine-aware, not lowest-common-denominator:** a shared interface covers common work, while PostgreSQL, MySQL, SQLite, and Redis keep their important differences.
-- **Safe failure:** timeouts, cancellation, typed errors, and redacted diagnostics are part of the interface, not afterthoughts.
+# Build and replace /Applications/DBX.app.
+make install
+```
 
-## Security expectations
+The bundle is `target/macos/DBX.app`, including its Finder icon. `make install` quits DBX and replaces the installed copy. To install somewhere else:
 
-DBX handles credentials and potentially destructive commands, so an MVP must be honest about what it does and does not protect:
+```bash
+mkdir -p "$HOME/Applications"
+make install INSTALL_DIR="$HOME/Applications"
+```
 
-- Named profile metadata lives in the platform configuration directory rather than a process-only cache and never includes passwords. Normal saved credentials are encrypted in the app-owned DBX Vault with Argon2id + XChaCha20-Poly1305. The passphrase is never stored or recoverable. With **Unlock automatically on this device** (on by default), the vault's derived key — never the passphrase — is kept in the login Keychain on macOS or the Secret Service keyring on Linux, so later launches unlock without a prompt; turning it off forgets the key at the next unlock. Selecting a saved connection eagerly hydrates its credential. Keychain/Secret Service is read only after an explicit **Import old system passwords** action, and imports are non-destructive: an existing vault credential is never overwritten.
-- TLS certificate verification is enabled by default. An insecure or certificate-bypass option, if ever added, must be conspicuous and scoped to one connection.
-- Query text, parameters, result values, and credentials must not be written to logs or crash reports by default. Diagnostics should redact connection URLs and secrets.
-- GUI filters and edits use bound parameters wherever the target engine supports them. Identifiers are quoted by the connector, never interpolated from unchecked text.
-- A connection should default to read-only browsing where the engine permits it, and write actions should show the target connection/database and affected-row estimate.
-- DBX is a client, not a privilege boundary. Use a least-privilege database account and a disposable database for experiments.
+For terminal logs, use `DBX_FOREGROUND=1 make run`. `make macos-build` and `make macos-run` are aliases for `make build` and `make run`. Prefer this bundle workflow on Mac so rebuilds retain a consistent signing identity. `make cargo-build` and `make cargo-run` are also available for the raw Cargo workflow.
 
-Robust read-only sessions, SSH tunnels, and a formal audit log remain security work items—not claims made by this scaffold.
+## Your own Mac signing key
 
-## Roadmap
+**You do not need the maintainer's signing key or a paid Apple Developer account to build and run DBX on your Mac.** This repository does not provide a maintainer Developer ID certificate or a notarized Mac release.
 
-1. Add test-connection UX, explicit TLS controls, and editable engine-specific connection fields.
-2. Replace the bounded first grid with multi-million-row virtualization, resizable columns, multi-column edits, and keyset pagination.
-3. Add a structured table designer with generated DDL review, indexes, constraints, and engine-aware types.
-4. Expand Redis into typed string/hash/list/set/sorted-set/stream inspectors with TTL editing.
-5. Harden cancellation, transactions, query history, SSH tunnels, accessibility, and cross-platform packaging through real-world testing; extend transfers with progress, streaming, and native bulk-loader hand-off for very large files.
+On the first `make build` or `make run`, [the Mac build helper](scripts/build-macos-app.sh) creates a self-signed **DBX Local Development** code-signing certificate and its private key in your login keychain. Later builds reuse that identity to sign the bundle with identifier `dev.jrmd.dbx`. macOS may ask you to unlock the keychain or allow `codesign` to use the key.
 
-Contributions should keep the UI responsive, preserve parameterization, and include a connector-level test for any engine-specific behaviour.
+Keep the same identity for subsequent builds. It helps preserve access to the Keychain item used by **Unlock automatically on this device**; replacing the certificate or using ad-hoc signatures may cause new access prompts. The signing key is separate from your vault passphrase and database credentials.
 
-### Isolated native UI testing
+### If automatic certificate creation fails
 
-Run `scripts/run-ui-test.sh` on Linux for a persistent test vault, four QA connection profiles, and a seeded SQLite database, all isolated under `target/ui-test/`. See [desktop QA](docs/desktop-qa.md) for Docker startup, test credentials, and native checks.
+Create the local identity once in **Keychain Access**:
+
+1. Choose **Keychain Access → Certificate Assistant → Create a Certificate**.
+2. Set **Name** to `DBX Local Development`.
+3. Set **Identity Type** to **Self Signed Root**.
+4. Set **Certificate Type** to **Code Signing**.
+5. Save it in the **login** keychain, including its private key.
+6. Run `make run` again.
+
+Check the available identities and the finished bundle:
+
+```bash
+security find-identity -v -p codesigning "$HOME/Library/Keychains/login.keychain-db"
+codesign --verify --deep --strict --verbose=2 target/macos/DBX.app
+```
+
+To use another local certificate name or keychain, pass the same settings on every build/run/install:
+
+```bash
+DBX_SIGNING_NAME="My DBX Development" make run
+
+DBX_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
+DBX_SIGNING_NAME="My DBX Development" make build
+```
+
+As a temporary fallback, `DBX_SIGNING_NAME=- make run` uses ad-hoc signing without creating a certificate. This gives up the stable certificate identity and may require renewed Keychain approval after rebuilds.
+
+### Distributing a Mac build to other people
+
+A self-signed local build is **not notarized** and does not provide Developer ID trust on someone else's Mac. Passing `codesign --verify` checks the signature's integrity; it does not mean Gatekeeper will accept a downloaded app.
+
+For distribution under your own identity, obtain a **Developer ID Application** certificate through your Apple Developer Program account, install it together with its private key, sign the app with the hardened runtime and a secure timestamp, then submit it for notarization and staple the accepted ticket. See [Apple's Developer ID certificate instructions](https://developer.apple.com/help/account/certificates/create-developer-id-certificates) and [notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
+
+The build helper accepts an existing certificate through `DBX_SIGNING_NAME`, but does not submit or staple notarization tickets. Confirm the Developer ID identity exists with `security find-identity` before selecting it: a missing name makes the helper attempt to create a local self-signed identity, which is unsuitable for distribution. Use Apple's workflow to apply distribution signatures and validate the final artifact. Do not share or commit your private key or certificate export.
+
+## First connection
+
+1. Create a DBX Vault with a passphrase. Keep it somewhere safe: DBX cannot recover it.
+2. Choose PostgreSQL, MySQL, SQLite, or Redis. Add a connection name, environment, and connection details; for SQLite, choose a database file.
+3. Test the connection, save it if desired, and connect.
+4. Open a table, inspect a row, or create a query tab. Review the target connection before applying writes.
+
+Saved profile metadata is password-free JSON in the platform configuration directory. Credentials are encrypted in the app-owned vault with Argon2id and XChaCha20-Poly1305. Optional device unlock stores the derived vault key in macOS Keychain or Linux Secret Service; it never stores your passphrase. Importing old system passwords is an explicit action.
+
+## Development and checks
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace
+
+# Disposable connector tests (requires Docker Compose).
+./scripts/test-integration.sh
+
+# Isolated native UI session (Linux; requires Python 3).
+./scripts/run-ui-test.sh
+```
+
+The integration script starts PostgreSQL 16, MySQL 8.4, and Redis 7 on loopback-only ports, uses temporary SQLite storage, runs connector tests serially, and tears down its containers. `DBX_TEST_POSTGRES_URL`, `DBX_TEST_MYSQL_URL`, `DBX_TEST_REDIS_URL`, and `DBX_TEST_SQLITE_URL` override its defaults; point them only at disposable databases because the tests perform writes.
+
+The native UI launcher keeps its test vault, profiles, and database under `target/ui-test/`, separate from normal user configuration. See [desktop QA](docs/desktop-qa.md) for fixture credentials and platform checks, and [architecture](docs/architecture.md) for the core/UI boundaries.
+
+## Scope and safety
+
+DBX is a client, not a database privilege boundary. GUI filters and row changes use bound parameters and quoted identifiers. Raw SQL and Redis commands execute with your connection's privileges. Use least-privilege accounts and review destructive actions.
+
+Browsing is paged and bounded; grid virtualization does not imply loading an entire database. Table creation starts from an engine-aware SQL template. Redis mutations use the command console. SSH tunnels, migration/schema-diff workflows, server monitoring, and formal audit logs remain outside the current scope.
+
+Never commit real connection strings, passwords, private keys, or local database files. Contributions should preserve native responsiveness and parameterized operations, with connector-level coverage for engine-specific changes.
