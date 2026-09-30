@@ -1159,12 +1159,23 @@ impl DbxApp {
     /// Recent entries for the current connection, newest first. This only
     /// reads the in-memory cache and is therefore safe to call while rendering.
     pub(super) fn recent_query_history_for(&self, session_id: SessionId) -> Vec<QueryHistoryEntry> {
+        self.recent_query_history_limited(session_id, usize::MAX)
+    }
+
+    /// The newest `limit` entries for the session's connection. Render paths use
+    /// this so a long history is not cloned every frame.
+    pub(super) fn recent_query_history_limited(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> Vec<QueryHistoryEntry> {
         let Some(connection) = self.session(session_id).and_then(query_history_connection) else {
             return Vec::new();
         };
         self.recent_query_history
             .iter()
             .filter(|entry| entry.connection == connection)
+            .take(limit)
             .cloned()
             .collect()
     }

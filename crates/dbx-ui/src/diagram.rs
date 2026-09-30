@@ -411,7 +411,7 @@ impl DiagramDocument {
                 node.x + 12.0,
                 node.y + 33.0,
                 palette.muted_text,
-                escape(node.table.schema.as_deref().unwrap_or("default")),
+                escape(node.table.schema.as_deref().unwrap_or_default()),
             ));
             for (index, column) in node.columns.iter().enumerate() {
                 let y = node.y + HEADER_HEIGHT + 17.0 + (index as f32 * ROW_HEIGHT);
@@ -967,7 +967,9 @@ pub fn edge_markers(points: &[(f32, f32)], optional: bool) -> EdgeMarkers {
     markers
 }
 
-/// Compact, conventional spellings for verbose catalog type names.
+/// Compact, lowercase spellings for verbose catalog type names. Only the type
+/// name is lowercased; enum labels and other parenthesised arguments keep their
+/// case. Display only: SQL generation uses the catalog spelling.
 pub fn short_type(data_type: &str) -> String {
     let trimmed = data_type.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -989,7 +991,19 @@ pub fn short_type(data_type: &str) -> String {
             return format!("{short}{}", &trimmed[verbose.len()..]);
         }
     }
-    trimmed.to_owned()
+    display_type(trimmed)
+}
+
+/// Lowercases the type name up to its first argument list.
+pub fn display_type(data_type: &str) -> String {
+    match data_type.find('(') {
+        Some(open) => format!(
+            "{}{}",
+            data_type[..open].to_ascii_lowercase(),
+            &data_type[open..]
+        ),
+        None => data_type.to_ascii_lowercase(),
+    }
 }
 
 fn edge_path_points(path: &str) -> Vec<(f32, f32)> {
@@ -1659,6 +1673,8 @@ mod tests {
         assert_eq!(short_type("integer[]"), "int[]");
         assert_eq!(short_type("interval"), "interval");
         assert_eq!(short_type("characters"), "characters");
+        assert_eq!(short_type("TEXT"), "text");
+        assert_eq!(short_type("ENUM('Draft','Live')"), "enum('Draft','Live')");
     }
 
     #[test]

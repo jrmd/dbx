@@ -303,11 +303,7 @@ impl DbxApp {
             theme().text_muted
         };
         let app = cx.entity().downgrade();
-        let history = self
-            .recent_query_history_for(session_id)
-            .into_iter()
-            .take(10)
-            .collect::<Vec<_>>();
+        let history = self.recent_query_history_limited(session_id, 10);
 
         div()
             .flex_1()

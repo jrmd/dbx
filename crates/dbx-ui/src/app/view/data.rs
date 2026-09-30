@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::diagram::display_type;
 
 fn row_field_heading(
     field_id: FieldId,
@@ -593,7 +594,7 @@ impl DbxApp {
                                         } else if is_enum {
                                             format!("enum · {data_type}")
                                         } else {
-                                            data_type
+                                            display_type(&data_type)
                                         },
                                         if nullable { "nullable" } else { "required" },
                                         if primary_key { " · primary key" } else { "" }
@@ -653,7 +654,7 @@ impl DbxApp {
                                                 div()
                                                     .text_size(px(9.))
                                                     .text_color(theme().text_muted)
-                                                    .child(data_type),
+                                                    .child(display_type(&data_type)),
                                             ),
                                     )
                                     .child(
@@ -887,7 +888,7 @@ impl DbxApp {
                                     .min_w_0()
                                     .truncate()
                                     .text_color(theme().sql_type)
-                                    .child(column.data_type.clone()),
+                                    .child(display_type(&column.data_type)),
                             )
                             .child(
                                 structure_cell(STRUCTURE_NULL_WIDTH)

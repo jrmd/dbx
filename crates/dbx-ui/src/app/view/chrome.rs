@@ -426,22 +426,33 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((kind, tables, databases, current_database, selected_schema, selected_table)) =
-            self.session(session_id).map(|session| {
-                (
+        // Filter inside the borrow so the table list is copied once, not twice.
+        let Some((
+            kind,
+            schema_options,
+            visible_tables,
+            databases,
+            current_database,
+            selected_schema,
+            selected_table,
+        )) = self.session(session_id).map(|session| {
+            (
+                session.kind,
+                schema_filter_options(session.kind, &session.tables),
+                schema_filtered_tables(
                     session.kind,
-                    session.tables.clone(),
-                    session.databases.clone(),
-                    session.current_database.clone(),
-                    session.schema_filter.clone(),
-                    session.selected_table.clone(),
-                )
-            })
+                    &session.tables,
+                    session.schema_filter.as_deref(),
+                ),
+                session.databases.clone(),
+                session.current_database.clone(),
+                session.schema_filter.clone(),
+                session.selected_table.clone(),
+            )
+        })
         else {
             return div().into_any_element();
         };
-        let schema_options = schema_filter_options(kind, &tables);
-        let visible_tables = schema_filtered_tables(kind, &tables, selected_schema.as_deref());
         let explorer_actions = cx.entity().downgrade();
         let table_count = visible_tables.len();
         glass(div(), RADIUS_GLASS, 8.)
