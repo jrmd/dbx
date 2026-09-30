@@ -534,6 +534,79 @@ async fn assert_foreign_key_structure(engine: &DatabaseEngine, kind: DatabaseKin
         assert!(foreign_key.referenced_schema.is_some());
     }
 
+    // The bulk snapshot must agree with the per-table queries it replaces.
+    let snapshot = engine.relational_schema().await?;
+    for entry in &snapshot.tables {
+        let table = TableRef {
+            schema: entry.table.schema.clone(),
+            name: entry.table.name.clone(),
+        };
+        assert_eq!(
+            entry.structure,
+            engine.table_structure(&table).await?,
+            "bulk structure differs for {}",
+            entry.table.name
+        );
+    }
+    let bulk_child = snapshot
+        .tables
+        .iter()
+        .find(|entry| entry.table.name == FOREIGN_KEY_CHILD_TABLE)
+        .expect("child table in relational schema");
+    assert_eq!(bulk_child.structure.foreign_keys, structure.foreign_keys);
+    assert_eq!(bulk_child.structure.columns.len(), 2);
+
+    if kind == DatabaseKind::PostgreSQL {
+        // A foreign key into another schema keeps that schema's name.
+        engine
+            .execute_sql("DROP SCHEMA IF EXISTS dbx_integration_other CASCADE")
+            .await?;
+        engine
+            .execute_sql("CREATE SCHEMA dbx_integration_other")
+            .await?;
+        engine
+            .execute_sql("CREATE TABLE dbx_integration_other.owners (id INTEGER PRIMARY KEY)")
+            .await?;
+        engine
+            .execute_sql(&format!(
+                "CREATE TABLE {} (owner_id INTEGER REFERENCES dbx_integration_other.owners (id))",
+                qualified_table_named(kind, "dbx_integration_fk_cross"),
+            ))
+            .await?;
+        let cross = engine
+            .table_structure(&table_ref_named(kind, "dbx_integration_fk_cross"))
+            .await?;
+        assert_eq!(cross.foreign_keys.len(), 1);
+        let cross_key = &cross.foreign_keys[0];
+        assert_eq!(
+            cross_key.referenced_schema.as_deref(),
+            Some("dbx_integration_other")
+        );
+        assert_eq!(cross_key.referenced_table, "owners");
+        assert_eq!(cross_key.referenced_columns, ["id"]);
+        assert_eq!(cross_key.on_delete, Some(ReferentialAction::NoAction));
+        let snapshot = engine.relational_schema().await?;
+        let bulk_cross = snapshot
+            .tables
+            .iter()
+            .find(|entry| entry.table.name == "dbx_integration_fk_cross")
+            .expect("cross-schema table in relational schema");
+        assert_eq!(bulk_cross.structure, cross);
+        assert!(snapshot.tables.iter().any(|entry| {
+            entry.table.schema.as_deref() == Some("dbx_integration_other")
+                && entry.table.name == "owners"
+        }));
+        engine
+            .execute_sql(&format!(
+                "DROP TABLE {}",
+                qualified_table_named(kind, "dbx_integration_fk_cross")
+            ))
+            .await?;
+        engine
+            .execute_sql("DROP SCHEMA dbx_integration_other CASCADE")
+            .await?;
+    }
+
     engine.drop_table(&child).await?;
     engine.drop_table(&parent).await?;
     Ok(())

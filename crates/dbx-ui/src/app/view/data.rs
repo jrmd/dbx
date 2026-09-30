@@ -103,27 +103,17 @@ impl DbxApp {
                             .items_center()
                             .justify_between()
                             .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(7.))
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme().text)
-                                            .child(if kind.is_sql() {
-                                                "Filters"
-                                            } else {
-                                                "Key pattern"
-                                            }),
-                                    )
-                                    .when(kind.is_sql() && has_filter_rows, |view| {
-                                        view.child(badge(
-                                            format!("{} active", filter_rows.len()),
-                                            theme().text_muted,
-                                        ))
-                                    }),
+                                div().flex().items_center().gap(px(7.)).child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme().text)
+                                        .child(if kind.is_sql() {
+                                            "Filters"
+                                        } else {
+                                            "Key pattern"
+                                        }),
+                                ),
                             )
                             .child(
                                 div()
@@ -800,11 +790,7 @@ impl DbxApp {
                 if busy {
                     "Loading metadata…".into()
                 } else {
-                    format!(
-                        "{} columns · {} foreign keys",
-                        table_columns.len(),
-                        foreign_keys.len()
-                    )
+                    String::new()
                 },
             ))
             .when(error.is_some(), |view| {
@@ -924,10 +910,7 @@ impl DbxApp {
                             )
                     })),
             )
-            .child(div().mt(px(18.)).child(panel_header(
-                "Foreign keys",
-                format!("{} constraints", foreign_keys.len()),
-            )))
+            .child(div().mt(px(18.)).child(panel_header("Foreign keys", "")))
             .when(
                 foreign_keys.is_empty() && !busy && error.is_none(),
                 |view| {

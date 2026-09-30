@@ -180,8 +180,26 @@ impl DatabaseEngine {
         page: Option<Page>,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        self.query_table_with_columns(table, columns, filters, order, page, options, None)
+            .await
+    }
+
+    /// Like [`Self::query_table`], but reuses column metadata the caller
+    /// already holds instead of describing the table again. `known_columns`
+    /// must describe `table`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn query_table_with_columns(
+        &self,
+        table: &TableRef,
+        columns: &[String],
+        filters: &[Filter],
+        order: &[Order],
+        page: Option<Page>,
+        options: QueryOptions,
+        known_columns: Option<&[ColumnInfo]>,
+    ) -> Result<QueryResult> {
         ensure_sql(self.kind(), "query_table")?;
-        let metadata = self.filter_metadata(table, filters).await?;
+        let metadata = self.filter_metadata(table, filters, known_columns).await?;
         let statement = build_select_with_columns(
             self.kind(),
             table,
@@ -191,14 +209,22 @@ impl DatabaseEngine {
             page,
             metadata.as_deref().unwrap_or_default(),
         )?;
-        let mut result = self.query_statement(&statement, options).await?;
-        // SQLx cannot expose result-set metadata for an empty `SELECT` through
-        // `AnyRow`. Fall back to the table schema so an empty table still has
-        // usable headers in the grid.
+        let mut result = match self {
+            Self::Sql(engine) => {
+                engine
+                    .query_statement_headerless(&statement, options)
+                    .await?
+            }
+            Self::Redis(_) => self.query_statement(&statement, options).await?,
+        };
+        // An empty `SELECT` exposes no result-set metadata. Fall back to the
+        // table schema (already known to many callers) so an empty table still
+        // has usable headers in the grid, without sqlx's costly describe.
         if result.columns.is_empty() {
-            result.columns = match metadata {
-                Some(metadata) => metadata,
-                None => self.describe_table(table).await?,
+            result.columns = match (metadata, known_columns) {
+                (Some(metadata), _) => metadata,
+                (None, Some(known)) if !known.is_empty() => known.to_vec(),
+                (None, _) => self.describe_table(table).await?,
             };
         }
         Ok(result)
@@ -210,11 +236,15 @@ impl DatabaseEngine {
         &self,
         table: &TableRef,
         filters: &[Filter],
+        known_columns: Option<&[ColumnInfo]>,
     ) -> Result<Option<Vec<ColumnInfo>>> {
         if self.kind() != DatabaseKind::PostgreSQL || filters.is_empty() {
             return Ok(None);
         }
-        self.describe_table(table).await.map(Some)
+        match known_columns {
+            Some(columns) if !columns.is_empty() => Ok(Some(columns.to_vec())),
+            _ => self.describe_table(table).await.map(Some),
+        }
     }
 
     pub async fn create_table(&self, request: &CreateTableRequest) -> Result<ExecResult> {
@@ -239,8 +269,19 @@ impl DatabaseEngine {
     }
 
     pub async fn delete(&self, table: &TableRef, filters: &[Filter]) -> Result<ExecResult> {
+        self.delete_with_columns(table, filters, None).await
+    }
+
+    /// Like [`Self::delete`], but reuses column metadata the caller already
+    /// holds. `known_columns` must describe `table`.
+    pub async fn delete_with_columns(
+        &self,
+        table: &TableRef,
+        filters: &[Filter],
+        known_columns: Option<&[ColumnInfo]>,
+    ) -> Result<ExecResult> {
         ensure_sql(self.kind(), "delete")?;
-        let metadata = self.filter_metadata(table, filters).await?;
+        let metadata = self.filter_metadata(table, filters, known_columns).await?;
         let statement = build_delete_with_columns(
             self.kind(),
             table,

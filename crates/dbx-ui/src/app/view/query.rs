@@ -6,24 +6,10 @@ impl DbxApp {
         result_grid: Entity<TableState<ResultTableDelegate>>,
         has_result: bool,
         has_rowset: bool,
-        busy: bool,
-        failed: bool,
     ) -> AnyElement {
         if !has_result {
-            return div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme().text_muted)
-                .child(if busy {
-                    "Running query…"
-                } else if failed {
-                    "Query failed"
-                } else {
-                    "No results"
-                })
-                .into_any_element();
+            // The status strip and error banner already say what happened.
+            return div().flex_1().into_any_element();
         }
 
         if !has_rowset {
@@ -65,6 +51,12 @@ impl DbxApp {
             let item = item.clone();
             let replacement_range = menu.replacement_range.clone();
             let item_kind = item.kind;
+            // The kind column already says keyword/type/function/column.
+            let detail = match item.detail.as_str() {
+                "SQL keyword" | "SQL type" | "function" | "table" => "",
+                detail => detail.strip_prefix("column · ").unwrap_or(detail),
+            }
+            .to_string();
             div()
                 .id(SharedString::from(format!(
                     "sql-completion-{session_id}-{tab_id}-{index}"
@@ -87,7 +79,7 @@ impl DbxApp {
                         .w(px(52.))
                         .flex_none()
                         .text_size(px(9.))
-                        .text_color(item_kind.color())
+                        .text_color(theme().text_muted)
                         .child(item_kind.label()),
                 )
                 .child(
@@ -104,7 +96,7 @@ impl DbxApp {
                         .truncate()
                         .text_size(px(10.))
                         .text_color(theme().text_muted)
-                        .child(item.detail.clone()),
+                        .child(detail),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.accept_completion_for(
@@ -140,17 +132,6 @@ impl DbxApp {
                                 .max_h(px(252.))
                                 .overflow_y_scroll()
                                 .children(rows),
-                        )
-                        .child(
-                            div()
-                                .mt(px(4.))
-                                .pt(px(5.))
-                                .px(px(8.))
-                                .border_t_1()
-                                .border_color(theme().border)
-                                .text_size(px(9.))
-                                .text_color(theme().text_muted)
-                                .child("↑↓ navigate · Tab/Enter insert · Esc dismiss"),
                         ),
                 ),
         )
@@ -318,8 +299,6 @@ impl DbxApp {
             theme().danger
         } else if busy || results_stale || truncated {
             theme().warning
-        } else if has_result {
-            theme().success
         } else {
             theme().text_muted
         };
@@ -635,13 +614,15 @@ impl DbxApp {
                                             .min_w_0()
                                             .items_center()
                                             .gap(px(7.))
-                                            .child(
-                                                div()
-                                                    .size(px(6.))
-                                                    .flex_none()
-                                                    .rounded_full()
-                                                    .bg(result_color),
-                                            )
+                                            .when(result_label.is_some(), |strip| {
+                                                strip.child(
+                                                    div()
+                                                        .size(px(6.))
+                                                        .flex_none()
+                                                        .rounded_full()
+                                                        .bg(result_color),
+                                                )
+                                            })
                                             .when_some(result_label, |strip, label| {
                                                 strip.child(
                                                     div()
@@ -658,7 +639,11 @@ impl DbxApp {
                                                     .truncate()
                                                     .text_size(px(10.))
                                                     .text_color(theme().text_muted)
-                                                    .child(status),
+                                                    .child(if error.is_some() || busy {
+                                                        SharedString::default()
+                                                    } else {
+                                                        status.into()
+                                                    }),
                                             ),
                                     )
                                     .when_some(executed_database, |strip, database| {
@@ -733,8 +718,6 @@ impl DbxApp {
                                 result_grid,
                                 has_result,
                                 has_rowset,
-                                busy,
-                                error.is_some(),
                             )),
                     ),
                 ),

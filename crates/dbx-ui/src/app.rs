@@ -72,8 +72,7 @@ use crate::{
 use redis_completion::redis_completion_items;
 use result_table::{ResultTableDelegate, foreign_key_target_table};
 use sql_completion::{
-    CompletionItemKind, SqlCompletionItem, SqlCompletionRequest, completion_table_key,
-    sql_completion_items,
+    SqlCompletionItem, SqlCompletionRequest, completion_table_key, sql_completion_items,
 };
 
 const DIAGRAM_SCENE_PADDING: f32 = 24.0;
@@ -349,20 +348,6 @@ struct SqlCompletionMenu {
 struct CompletionSignature {
     text_revision: u64,
     cursor: usize,
-}
-
-impl CompletionItemKind {
-    fn color(self) -> Rgba {
-        match self {
-            Self::Keyword => theme().sql_keyword,
-            Self::Type => theme().sql_type,
-            Self::Table => theme().accent,
-            Self::Column => theme().success,
-            Self::Function => theme().sql_number,
-            Self::Command => theme().sql_keyword,
-            Self::Key => theme().success,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -823,7 +808,7 @@ impl ConnectionSession {
             table_has_next_page: false,
             selected_row: None,
             selected_column: 0,
-            inspector_open: true,
+            inspector_open: false,
             draft_mode: DraftMode::Update,
             row_draft: None,
             row_draft_subscriptions: Vec::new(),
@@ -2559,28 +2544,31 @@ impl DbxApp {
             self.watch_filter_row_for(session_id, row_id, window, cx);
         }
         let task = runtime.spawn(async move {
-            let structure = engine.table_structure(&table_ref).await?;
-            let (result, has_next_page) = if kind.is_sql() {
-                let mut result = engine
-                    .query_table(
-                        &table_ref,
-                        &[],
-                        &filters,
-                        &[],
-                        Some(table_browse_page(0)),
-                        QueryOptions::default(),
-                    )
-                    .await?;
-                let has_next_page = trim_table_browse_result(&mut result);
-                (result, has_next_page)
-            } else {
-                (
-                    engine
+            // Structure and the first page are independent, so overlap them
+            // instead of paying two sequential round trips.
+            let first_page = async {
+                if kind.is_sql() {
+                    let mut result = engine
+                        .query_table(
+                            &table_ref,
+                            &[],
+                            &filters,
+                            &[],
+                            Some(table_browse_page(0)),
+                            QueryOptions::default(),
+                        )
+                        .await?;
+                    let has_next_page = trim_table_browse_result(&mut result);
+                    Ok::<_, dbx_core::DbxError>((result, has_next_page))
+                } else {
+                    let result = engine
                         .query("SCAN 0 COUNT 100", QueryOptions::default())
-                        .await?,
-                    false,
-                )
+                        .await?;
+                    Ok((result, false))
+                }
             };
+            let (structure, (result, has_next_page)) =
+                tokio::try_join!(engine.table_structure(&table_ref), first_page)?;
             Ok::<_, dbx_core::DbxError>((structure, result, has_next_page))
         });
         if let Some(session) = self.session_mut(session_id) {
@@ -2913,14 +2901,17 @@ impl DbxApp {
     }
 
     fn load_table_page_for(&mut self, session_id: SessionId, page: u64, cx: &mut Context<Self>) {
-        let Some((engine, table, kind, busy)) = self.session(session_id).map(|session| {
-            (
-                session.engine.clone(),
-                session.selected_table.clone(),
-                session.kind,
-                session.busy,
-            )
-        }) else {
+        let Some((engine, table, kind, busy, known_columns)) =
+            self.session(session_id).map(|session| {
+                (
+                    session.engine.clone(),
+                    session.selected_table.clone(),
+                    session.kind,
+                    session.busy,
+                    session.table_columns.clone(),
+                )
+            })
+        else {
             return;
         };
         let (Some(engine), Some(table)) = (engine, table) else {
@@ -2958,14 +2949,17 @@ impl DbxApp {
         let result_table = table.clone();
         let task = runtime.spawn(async move {
             if kind.is_sql() {
+                // The open table's columns are already cached; passing them
+                // saves the PostgreSQL filter-cast lookup on every page.
                 let mut result = engine
-                    .query_table(
+                    .query_table_with_columns(
                         &table,
                         &[],
                         &filters,
                         &[],
                         Some(table_browse_page(page)),
                         QueryOptions::default(),
+                        Some(&known_columns),
                     )
                     .await?;
                 let has_next_page = trim_table_browse_result(&mut result);
@@ -3634,6 +3628,22 @@ impl DbxApp {
     }
 
     fn cancel_query_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        // Escape belongs to an open completion menu first; the keybinding
+        // reaches here before the menu's own key handler can dismiss it.
+        if let Some(menu) = self.query_completion_for(session_id, cx) {
+            if let Some(session) = self.session_mut(session_id)
+                && let Some(tab_id) = session.active_secondary_tab
+                && let Some(tab) = session
+                    .secondary_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
+            {
+                query_tab.completion_dismissed_signature = Some(menu.signature);
+            }
+            cx.notify();
+            return;
+        }
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
@@ -3971,19 +3981,16 @@ impl DbxApp {
         .detach();
     }
 
-    /// Warm a bounded schema cache in the background so query completion can
+    /// Warm the schema cache in the background so query completion can
     /// resolve columns for tables the user has not opened yet. Failures are
     /// intentionally ignored here: table names remain useful completions and
     /// opening a table still retries its authoritative structure request.
     fn prefetch_completion_columns_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        const MAX_COMPLETION_METADATA_TABLES: usize = 128;
-
-        let Some((engine, kind, database, tables)) = self.session(session_id).map(|session| {
+        let Some((engine, kind, database)) = self.session(session_id).map(|session| {
             (
                 session.engine.clone(),
                 session.kind,
                 session.current_database.clone(),
-                session.tables.clone(),
             )
         }) else {
             return;
@@ -3995,22 +4002,28 @@ impl DbxApp {
             return;
         }
 
-        let request_engine = engine.clone();
-        let expected_engine = engine;
+        let expected_engine = engine.clone();
         let runtime = self.runtime.clone();
+        // One bulk catalog snapshot replaces a describe call per table.
         let task = runtime.spawn(async move {
-            let mut metadata = HashMap::new();
-            for table in tables
-                .into_iter()
-                .filter(|table| matches!(table.kind, EntityKind::Table | EntityKind::View))
-                .take(MAX_COMPLETION_METADATA_TABLES)
-            {
-                let table_ref = table_ref(&table);
-                if let Ok(columns) = request_engine.describe_table(&table_ref).await {
-                    metadata.insert(completion_table_key(&table_ref), columns);
-                }
-            }
-            metadata
+            let schema = engine.relational_schema().await;
+            schema
+                .map(|schema| {
+                    schema
+                        .tables
+                        .into_iter()
+                        .filter(|entry| {
+                            matches!(entry.table.kind, EntityKind::Table | EntityKind::View)
+                        })
+                        .map(|entry| {
+                            (
+                                completion_table_key(&table_ref(&entry.table)),
+                                entry.structure.columns,
+                            )
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default()
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
@@ -4970,7 +4983,16 @@ impl DbxApp {
         session.status = "Deleting row…".into();
         session.request_generation += 1;
         let generation = session.request_generation;
-        let task = runtime.spawn(async move { engine.delete(&table, &filters).await });
+        let known_columns = if session.selected_table.as_ref() == Some(&table) {
+            session.table_columns.clone()
+        } else {
+            Vec::new()
+        };
+        let task = runtime.spawn(async move {
+            engine
+                .delete_with_columns(&table, &filters, Some(&known_columns))
+                .await
+        });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
         }

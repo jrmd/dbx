@@ -1,14 +1,14 @@
-use std::{borrow::Cow, time::Instant};
+use std::{borrow::Cow, collections::HashMap, time::Instant};
 
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use sqlx::{
     Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
-    mysql::{MySqlArguments, MySqlPoolOptions, MySqlRow},
+    mysql::{MySqlArguments, MySqlRow},
     postgres::{
-        PgArguments, PgPool, PgPoolOptions, PgRow,
+        PgArguments, PgPool, PgRow,
         types::{PgInterval, PgMoney},
     },
-    sqlite::{SqliteArguments, SqlitePoolOptions, SqliteRow},
+    sqlite::{SqliteArguments, SqliteRow},
 };
 use sqlx::{Either, Executor};
 use tokio::sync::RwLock;
@@ -21,6 +21,31 @@ use crate::{
     split_sql_statements,
 };
 use async_trait::async_trait;
+
+/// How long an unused pooled connection lives before it is closed. Stale
+/// connections are recycled here instead of being pinged on every acquire.
+const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+/// Maps `pg_constraint` action codes to the rule names `information_schema`
+/// used, as the last two columns of a foreign-key row.
+const PG_FK_RULE_SQL: &str = "CASE con.confupdtype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END, CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END";
+
+/// `(schema, name)` identity used to join bulk catalog rows to tables.
+type TableKey = (Option<String>, String);
+
+/// Shared pool settings. SQLx pings a connection on every acquire by default,
+/// which costs a full round trip per query on a remote server.
+fn pool_options<DB: sqlx::Database>(
+    max_connections: u32,
+    acquire_timeout: std::time::Duration,
+    idle_timeout: Option<std::time::Duration>,
+) -> sqlx::pool::PoolOptions<DB> {
+    sqlx::pool::PoolOptions::<DB>::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
+        .test_before_acquire(false)
+        .idle_timeout(idle_timeout)
+}
 
 /// SQLx-backed engine for PostgreSQL, MySQL, and SQLite.
 pub struct SqlxEngine {
@@ -88,36 +113,33 @@ impl SqlxEngine {
             } else {
                 config.max_connections
             };
+        // Recycling idle connections replaces the per-acquire liveness ping,
+        // and an in-memory SQLite database must never lose its only
+        // connection to the idle reaper.
+        let idle_timeout = (!(config.kind == DatabaseKind::SQLite
+            && is_sqlite_memory_url(&config.url)))
+        .then_some(IDLE_CONNECTION_TIMEOUT);
+        let connect_error = |error: sqlx::Error| {
+            DbxError::Connection(crate::error::connection_message(&config.url, error))
+        };
         let pool = match config.kind {
             DatabaseKind::PostgreSQL => SqlxPool::Postgres(
-                PgPoolOptions::new()
-                    .max_connections(max_connections)
-                    .acquire_timeout(timeout)
+                pool_options::<Postgres>(max_connections, timeout, idle_timeout)
                     .connect(&config.url)
                     .await
-                    .map_err(|error| {
-                        DbxError::Connection(crate::error::connection_message(&config.url, error))
-                    })?,
+                    .map_err(connect_error)?,
             ),
             DatabaseKind::MySQL => SqlxPool::MySql(
-                MySqlPoolOptions::new()
-                    .max_connections(max_connections)
-                    .acquire_timeout(timeout)
+                pool_options::<MySql>(max_connections, timeout, idle_timeout)
                     .connect(&config.url)
                     .await
-                    .map_err(|error| {
-                        DbxError::Connection(crate::error::connection_message(&config.url, error))
-                    })?,
+                    .map_err(connect_error)?,
             ),
             DatabaseKind::SQLite => SqlxPool::SQLite(
-                SqlitePoolOptions::new()
-                    .max_connections(max_connections)
-                    .acquire_timeout(timeout)
+                pool_options::<Sqlite>(max_connections, timeout, idle_timeout)
                     .connect(&config.url)
                     .await
-                    .map_err(|error| {
-                        DbxError::Connection(crate::error::connection_message(&config.url, error))
-                    })?,
+                    .map_err(connect_error)?,
             ),
             DatabaseKind::Redis => unreachable!(),
         };
@@ -147,9 +169,30 @@ impl SqlxEngine {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        self.query_statement_impl(statement, options, true).await
+    }
+
+    /// Runs a statement without the describe fallback for empty results, so
+    /// an empty result carries no headers. Callers that already know the
+    /// columns (metadata lookups, table browsing) avoid describe's extra
+    /// catalog round trips this way.
+    pub(crate) async fn query_statement_headerless(
+        &self,
+        statement: &SqlStatement,
+        options: QueryOptions,
+    ) -> Result<QueryResult> {
+        self.query_statement_impl(statement, options, false).await
+    }
+
+    async fn query_statement_impl(
+        &self,
+        statement: &SqlStatement,
+        options: QueryOptions,
+        describe_empty: bool,
+    ) -> Result<QueryResult> {
         let started = Instant::now();
         let limit = row_limit(options);
-        let mut columns = self.describe_columns(&statement.sql).await;
+        let mut columns = Vec::new();
         let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
         let mut truncated = false;
         match &self.pool_snapshot().await {
@@ -195,6 +238,11 @@ impl SqlxEngine {
                 }
             }
         }
+        // Describing costs an extra round trip, so it only runs when an empty
+        // result left the grid without headers.
+        if describe_empty && columns.is_empty() && output.is_empty() {
+            columns = self.describe_columns(&statement.sql).await;
+        }
         Ok(query_result(columns, output, None, truncated, started))
     }
 
@@ -205,7 +253,7 @@ impl SqlxEngine {
     async fn query_raw(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
         let started = Instant::now();
         let limit = row_limit(options);
-        let mut columns = self.describe_columns(sql).await;
+        let mut columns = Vec::new();
         let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
         let mut rows_affected = None;
         let mut truncated = false;
@@ -300,6 +348,18 @@ impl SqlxEngine {
             }
         }
 
+        // Only a row-producing statement can be described meaningfully, and
+        // PostgreSQL/MySQL cannot prepare a multi-statement script. SQLite
+        // describes the first statement locally, so scripts stay eligible.
+        if columns.is_empty()
+            && output.is_empty()
+            && (statements.len() == 1 || self.kind == DatabaseKind::SQLite)
+            && statements
+                .first()
+                .is_some_and(|statement| statement_likely_returns_rows(statement))
+        {
+            columns = self.describe_columns(sql).await;
+        }
         Ok(query_result(
             columns,
             output,
@@ -390,7 +450,9 @@ impl SqlxEngine {
     }
 
     async fn metadata_query(&self, sql: &str, params: &[CellValue]) -> Result<QueryResult> {
-        self.query_with_statement(
+        // Catalog queries have fixed shapes, so an empty result never needs
+        // its headers described (a costly extra round trip on PostgreSQL).
+        self.query_statement_headerless(
             &SqlStatement::new(sql, params.to_vec()),
             QueryOptions { max_rows: None },
         )
@@ -408,7 +470,12 @@ impl SqlxEngine {
             }
             DatabaseKind::PostgreSQL => {
                 self.metadata_query(
-                    "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
+                    // pg_class is much cheaper than information_schema.tables, which
+                    // filters every relation through privilege checks. Relations the
+                    // user cannot read are listed too; querying them reports the error.
+                    // Materialized views are not in information_schema, but browsing
+                    // them like views is what users expect.
+                    "SELECT n.nspname AS table_schema, c.relname AS table_name, CASE WHEN c.relkind IN ('v', 'm') THEN 'VIEW' ELSE 'BASE TABLE' END AS table_type FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' ORDER BY n.nspname, c.relname",
                     &[],
                 )
                 .await?
@@ -484,44 +551,51 @@ impl SqlxEngine {
             }
             DatabaseKind::Redis => unreachable!(),
         };
-        let mut columns = Vec::with_capacity(result.rows.len());
-        for (index, row) in result.rows.iter().enumerate() {
-            let (name, data_type, nullable, ordinal, primary_key) = match self.kind {
-                DatabaseKind::SQLite => {
-                    let primary_key = boolish_value(row, 5)?;
-                    (
-                        text_value(row, 1)?,
-                        text_value(row, 2)?,
-                        !boolish_value(row, 3)? && !primary_key,
-                        integer_value(row, 0)?.max(0) as usize,
-                        primary_key,
-                    )
-                }
-                DatabaseKind::PostgreSQL | DatabaseKind::MySQL => (
-                    text_value(row, 0)?,
-                    text_value(row, 1)?,
-                    text_value(row, 2)?.eq_ignore_ascii_case("yes")
-                        || text_value(row, 2)?.eq_ignore_ascii_case("true"),
-                    integer_value(row, 3)?.max(1) as usize,
-                    boolish_value(row, 4)?,
-                ),
-                DatabaseKind::Redis => unreachable!(),
-            };
-            let enum_values = match self.kind {
-                DatabaseKind::PostgreSQL => enum_values_from_postgres_metadata(row, 5)?,
-                DatabaseKind::MySQL => parse_mysql_enum_definition(&text_value(row, 5)?),
-                DatabaseKind::SQLite | DatabaseKind::Redis => Vec::new(),
-            };
-            columns.push(ColumnInfo {
-                name,
-                data_type,
-                enum_values,
-                nullable,
-                ordinal: if ordinal == 0 { index + 1 } else { ordinal },
-                primary_key,
-            });
-        }
-        Ok(columns)
+        result
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| self.column_from_row(row, 0, index))
+            .collect()
+    }
+
+    /// Parse one column-metadata row whose column fields start at `offset`
+    /// (bulk queries prefix the owning table's schema and name).
+    fn column_from_row(&self, row: &RowData, offset: usize, index: usize) -> Result<ColumnInfo> {
+        let (name, data_type, nullable, ordinal, primary_key) = match self.kind {
+            DatabaseKind::SQLite => {
+                let primary_key = boolish_value(row, offset + 5)?;
+                (
+                    text_value(row, offset + 1)?,
+                    text_value(row, offset + 2)?,
+                    !boolish_value(row, offset + 3)? && !primary_key,
+                    integer_value(row, offset)?.max(0) as usize,
+                    primary_key,
+                )
+            }
+            DatabaseKind::PostgreSQL | DatabaseKind::MySQL => (
+                text_value(row, offset)?,
+                text_value(row, offset + 1)?,
+                text_value(row, offset + 2)?.eq_ignore_ascii_case("yes")
+                    || text_value(row, offset + 2)?.eq_ignore_ascii_case("true"),
+                integer_value(row, offset + 3)?.max(1) as usize,
+                boolish_value(row, offset + 4)?,
+            ),
+            DatabaseKind::Redis => unreachable!(),
+        };
+        let enum_values = match self.kind {
+            DatabaseKind::PostgreSQL => enum_values_from_postgres_metadata(row, offset + 5)?,
+            DatabaseKind::MySQL => parse_mysql_enum_definition(&text_value(row, offset + 5)?),
+            DatabaseKind::SQLite | DatabaseKind::Redis => Vec::new(),
+        };
+        Ok(ColumnInfo {
+            name,
+            data_type,
+            enum_values,
+            nullable,
+            ordinal: if ordinal == 0 { index + 1 } else { ordinal },
+            primary_key,
+        })
     }
 
     async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKeyInfo>> {
@@ -534,7 +608,10 @@ impl SqlxEngine {
             DatabaseKind::PostgreSQL => {
                 let schema = table.schema.clone().unwrap_or_else(|| "public".to_owned());
                 self.metadata_query(
-                    "SELECT tc.constraint_name, kcu.column_name, ccu.table_schema, ccu.table_name, ccu.column_name, rc.update_rule, rc.delete_rule FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON kcu.constraint_catalog = tc.constraint_catalog AND kcu.constraint_schema = tc.constraint_schema AND kcu.constraint_name = tc.constraint_name JOIN information_schema.referential_constraints rc ON rc.constraint_catalog = tc.constraint_catalog AND rc.constraint_schema = tc.constraint_schema AND rc.constraint_name = tc.constraint_name JOIN information_schema.key_column_usage ccu ON ccu.constraint_catalog = rc.unique_constraint_catalog AND ccu.constraint_schema = rc.unique_constraint_schema AND ccu.constraint_name = rc.unique_constraint_name AND ccu.ordinal_position = kcu.position_in_unique_constraint WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1 AND tc.table_name = $2 ORDER BY tc.constraint_name, kcu.ordinal_position",
+                    // pg_constraint avoids the four-way information_schema join,
+                    // which is very slow on large catalogs. Column pairs are
+                    // matched positionally through unnest(...) WITH ORDINALITY.
+                    &format!("SELECT con.conname, a.attname, fn.nspname, fc.relname, fa.attname, {PG_FK_RULE_SQL} FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_class fc ON fc.oid = con.confrelid JOIN pg_namespace fn ON fn.oid = fc.relnamespace CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord) JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum JOIN pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = k.fattnum WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 ORDER BY con.conname, k.ord"),
                     &[CellValue::Text(schema), CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -560,22 +637,86 @@ impl SqlxEngine {
         })
     }
 
+    /// Every column of every table in the active database, in one query.
+    async fn bulk_columns(&self) -> Result<HashMap<TableKey, Vec<ColumnInfo>>> {
+        // Each query prefixes the owning table's (schema, name) and then
+        // repeats the per-table column layout, so `column_from_row` is shared.
+        let sql = match self.kind {
+            DatabaseKind::SQLite => {
+                "SELECT NULL, m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, p.cid"
+            }
+            DatabaseKind::PostgreSQL => {
+                "SELECT n.nspname, c.relname, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY n.nspname, c.relname, a.attnum"
+            }
+            DatabaseKind::MySQL => {
+                "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
+            }
+            DatabaseKind::Redis => unreachable!(),
+        };
+        let result = self.metadata_query(sql, &[]).await?;
+        let mut tables: HashMap<TableKey, Vec<ColumnInfo>> = HashMap::new();
+        for row in &result.rows {
+            let key = (optional_text_value(row, 0)?, text_value(row, 1)?);
+            let columns = tables.entry(key).or_default();
+            let column = self.column_from_row(row, 2, columns.len())?;
+            columns.push(column);
+        }
+        Ok(tables)
+    }
+
+    /// Every foreign key in the active database, in one query.
+    async fn bulk_foreign_keys(&self) -> Result<HashMap<TableKey, Vec<ForeignKeyInfo>>> {
+        let sql = match self.kind {
+            DatabaseKind::SQLite => {
+                "SELECT NULL, m.name, f.id, f.seq, f.\"table\", f.\"from\", f.\"to\", f.on_update, f.on_delete FROM sqlite_master m, pragma_foreign_key_list(m.name) f WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, f.id, f.seq"
+                    .to_owned()
+            }
+            DatabaseKind::PostgreSQL => format!(
+                "SELECT n.nspname, c.relname, con.conname, a.attname, fn.nspname, fc.relname, fa.attname, {PG_FK_RULE_SQL} FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_class fc ON fc.oid = con.confrelid JOIN pg_namespace fn ON fn.oid = fc.relnamespace CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(attnum, fattnum, ord) JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum JOIN pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = k.fattnum WHERE con.contype = 'f' AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' ORDER BY n.nspname, c.relname, con.conname, k.ord"
+            ),
+            DatabaseKind::MySQL => {
+                "SELECT CAST(kcu.TABLE_SCHEMA AS CHAR), CAST(kcu.TABLE_NAME AS CHAR), CAST(kcu.CONSTRAINT_NAME AS CHAR), CAST(kcu.COLUMN_NAME AS CHAR), CAST(kcu.REFERENCED_TABLE_SCHEMA AS CHAR), CAST(kcu.REFERENCED_TABLE_NAME AS CHAR), CAST(kcu.REFERENCED_COLUMN_NAME AS CHAR), CAST(rc.UPDATE_RULE AS CHAR), CAST(rc.DELETE_RULE AS CHAR) FROM information_schema.key_column_usage kcu LEFT JOIN information_schema.referential_constraints rc ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND rc.TABLE_NAME = kcu.TABLE_NAME WHERE kcu.TABLE_SCHEMA = DATABASE() AND kcu.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION"
+                    .to_owned()
+            }
+            DatabaseKind::Redis => unreachable!(),
+        };
+        let result = self.metadata_query(&sql, &[]).await?;
+        // Rows arrive grouped by table, so split them into per-table runs
+        // and reuse the single-table parser on each run.
+        let mut groups: Vec<(TableKey, Vec<RowData>)> = Vec::new();
+        for mut row in result.rows {
+            let key = (optional_text_value(&row, 0)?, text_value(&row, 1)?);
+            row.values.drain(..2);
+            match groups.last_mut() {
+                Some((last, rows)) if *last == key => rows.push(row),
+                _ => groups.push((key, vec![row])),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(key, rows)| Ok((key, foreign_keys_from_rows(self.kind, rows)?)))
+            .collect()
+    }
+
     async fn relational_schema_sql(&self) -> Result<RelationalSchema> {
-        let (database, tables) =
-            tokio::try_join!(self.current_sql_database(), self.list_sql_tables(),)?;
-        let mut tables = futures_util::stream::iter(tables)
-            .map(|table| async move {
-                let structure = self
-                    .table_structure_sql(&TableRef {
-                        schema: table.schema.clone(),
-                        name: table.name.clone(),
-                    })
-                    .await?;
-                Ok::<_, DbxError>(RelationalTable { table, structure })
+        // Four catalog queries in parallel replace two per table.
+        let (database, tables, mut columns, mut foreign_keys) = tokio::try_join!(
+            self.current_sql_database(),
+            self.list_sql_tables(),
+            self.bulk_columns(),
+            self.bulk_foreign_keys(),
+        )?;
+        let mut tables: Vec<RelationalTable> = tables
+            .into_iter()
+            .map(|table| {
+                let key = (table.schema.clone(), table.name.clone());
+                let structure = TableStructure {
+                    columns: columns.remove(&key).unwrap_or_default(),
+                    foreign_keys: foreign_keys.remove(&key).unwrap_or_default(),
+                };
+                RelationalTable { table, structure }
             })
-            .buffer_unordered(8)
-            .try_collect::<Vec<_>>()
-            .await?;
+            .collect();
         tables.sort_by(|left, right| {
             left.table
                 .schema
@@ -666,12 +807,16 @@ impl SqlxEngine {
                 // keep using the same engine object.
                 let url = with_database_path(&self.config.url, name)?;
                 let timeout = std::time::Duration::from_millis(self.config.connect_timeout_ms);
-                let pool = PgPoolOptions::new()
-                    .max_connections(self.config.max_connections)
-                    .acquire_timeout(timeout)
-                    .connect(&url)
-                    .await
-                    .map_err(|error| DbxError::Connection(error.to_string()))?;
+                let pool = pool_options::<Postgres>(
+                    self.config.max_connections,
+                    timeout,
+                    Some(IDLE_CONNECTION_TIMEOUT),
+                )
+                .connect(&url)
+                .await
+                .map_err(|error| {
+                    DbxError::Connection(crate::error::connection_message(&url, error))
+                })?;
                 *self.pool.write().await = SqlxPool::Postgres(pool);
                 Ok(())
             }
