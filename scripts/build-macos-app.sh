@@ -7,6 +7,7 @@ ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="${DBX_APP_DIR:-$ROOT_DIR/target/macos/DBX.app}"
 BUNDLE_ID="${DBX_BUNDLE_ID:-dev.jrmd.dbx}"
 SIGNING_NAME="${DBX_SIGNING_NAME:-DBX Local Development}"
+SIGNING_MODE="${DBX_SIGNING_MODE:-local}"
 KEYCHAIN="${DBX_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 CARGO_BIN="${CARGO:-cargo}"
 
@@ -132,6 +133,12 @@ create_local_identity() {
 }
 
 ensure_signing_identity() {
+	if [[ "$SIGNING_MODE" == "developer-id" ]]; then
+		[[ "$SIGNING_NAME" == "Developer ID Application: "* ]] || die "distribution requires a Developer ID Application identity"
+		identity_is_available || die "Developer ID identity is missing; refusing to create a self-signed replacement"
+		return
+	fi
+	[[ "$SIGNING_MODE" == "local" ]] || die "unknown signing mode: $SIGNING_MODE"
 	if [[ "$SIGNING_NAME" == "-" ]]; then
 		log "using ad-hoc signing; Keychain permissions may not survive rebuilds"
 		return
@@ -201,13 +208,18 @@ build_icon() {
 
 build_bundle() {
 	log "building release binary"
-	(cd "$ROOT_DIR" && "$CARGO_BIN" build --release --package dbx-ui)
+	(cd "$ROOT_DIR" && "$CARGO_BIN" build --locked --release --package dbx-ui)
 	[[ -x "$BINARY_PATH" ]] || die "release binary was not produced: $BINARY_PATH"
 
 	mkdir -p "$APP_DIR/Contents/MacOS"
 	mkdir -p "$APP_DIR/Contents/Resources"
 	cp "$BINARY_PATH" "$APP_DIR/Contents/MacOS/dbx"
 	cp "$INFO_PLIST" "$APP_DIR/Contents/Info.plist"
+	/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$APP_DIR/Contents/Info.plist"
+	if [[ -n "${DBX_VERSION:-}" ]]; then
+		/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $DBX_VERSION" "$APP_DIR/Contents/Info.plist"
+		/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $DBX_VERSION" "$APP_DIR/Contents/Info.plist"
+	fi
 	cp "$LOGO_SVG" "$APP_DIR/Contents/Resources/DBX.svg"
 	build_icon
 	[[ -s "$APP_DIR/Contents/Resources/DBX.icns" ]] || die "macOS icon was not produced"
@@ -215,14 +227,18 @@ build_bundle() {
 
 sign_bundle() {
 	local identity="$SIGNING_NAME"
+	local sign_options=(--force --options runtime --keychain "$KEYCHAIN")
+	if [[ "$SIGNING_MODE" == "developer-id" ]]; then
+		sign_options+=(--timestamp)
+	fi
 	log "signing $APP_DIR"
 
 	# Sign nested code first. Do not use --deep for signing.
-	codesign --force --options runtime \
+	codesign "${sign_options[@]}" \
 		--sign "$identity" \
 		--identifier "$BUNDLE_ID" \
 		"$APP_DIR/Contents/MacOS/dbx"
-	codesign --force --options runtime \
+	codesign "${sign_options[@]}" \
 		--sign "$identity" \
 		--identifier "$BUNDLE_ID" \
 		"$APP_DIR"

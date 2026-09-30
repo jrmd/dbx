@@ -1,0 +1,62 @@
+name: macOS release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Sign with Developer ID and notarize (requires Apple secrets)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Prepare Rust and native tools
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          brew install cmake
+          xcodebuild -runFirstLaunch
+          if ! xcrun --find metal; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          rustc --version
+          xcodebuild -version
+      - name: Run workspace tests
+        run: cargo test --locked --workspace
+      - name: Build, sign, and notarize
+        if: inputs.signed
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash scripts/release-macos.sh signed
+      - name: Build unsigned candidate
+        if: ${{ !inputs.signed }}
+        run: bash scripts/release-macos.sh unsigned
+      - name: Upload candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBX-macos-${{ inputs.signed && 'notarized' || 'unsigned' }}
+          path: |
+            target/macos/DBX-*.zip
+            target/macos/DBX-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
