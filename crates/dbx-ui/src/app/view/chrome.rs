@@ -285,10 +285,49 @@ impl DbxApp {
                         )
                     })
                     .child(self.render_appearance_menu(cx))
+                    .child(self.render_update_button(cx))
                     .when(!cfg!(target_os = "macos"), |view| {
                         view.child(self.render_window_controls(window))
                     }),
             )
+    }
+
+    fn render_update_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::updater::UpdateState;
+        let (label, detail, busy) = match &self.update_state {
+            UpdateState::Idle => (
+                "Updates".to_string(),
+                "Check for updates".to_string(),
+                false,
+            ),
+            UpdateState::Checking => ("Checking…".into(), "Checking GitHub releases".into(), true),
+            UpdateState::Current => ("Up to date".into(), "Check for updates".into(), false),
+            UpdateState::Available(update) => (
+                format!("Install {}", update.version),
+                "Download, verify, and install this update. Restart when you are ready.".into(),
+                false,
+            ),
+            UpdateState::Installing => (
+                "Updating…".into(),
+                "Downloading and verifying the release".into(),
+                true,
+            ),
+            UpdateState::Installed(_) => (
+                "Restart DBX".into(),
+                "Update installed. Finish your work before restarting; open sessions will close."
+                    .into(),
+                false,
+            ),
+            UpdateState::Failed(error) => ("Retry update".into(), error.clone(), false),
+        };
+        Button::new("app-update")
+            .with_size(Size::Small)
+            .compact()
+            .ghost()
+            .label(label)
+            .tooltip(detail)
+            .disabled(busy)
+            .on_click(cx.listener(|this, _, _, cx| this.activate_update(cx)))
     }
 
     fn render_appearance_menu(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -317,6 +356,9 @@ impl DbxApp {
                     );
                 }
                 let this = this.clone();
+                if cfg!(target_os = "macos") {
+                    return menu;
+                }
                 menu.separator().item(
                     PopupMenuItem::new("Reduce transparency")
                         .checked(reduce)

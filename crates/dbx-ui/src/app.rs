@@ -110,6 +110,7 @@ gpui::actions!(
         NextConnection,
         PreviousConnection,
         ToggleSidebar,
+        CheckForUpdates,
         SubmitVault,
         ApplyFilters
     ]
@@ -1408,6 +1409,7 @@ fn compact_connection_picker_visible(
 
 pub struct DbxApp {
     runtime: Arc<tokio::runtime::Runtime>,
+    update_state: crate::updater::UpdateState,
     logo: Arc<Image>,
     draft: ConnectionDraft,
     vault_editors: VaultEditors,
@@ -1508,6 +1510,7 @@ impl DbxApp {
 
         let mut this = Self {
             runtime: Arc::new(tokio::runtime::Runtime::new().expect("create DBX Tokio runtime")),
+            update_state: crate::updater::UpdateState::Idle,
             logo: Arc::new(Image::from_bytes(ImageFormat::Svg, LOGO_BYTES.to_vec())),
             draft,
             vault_editors,
@@ -1549,7 +1552,92 @@ impl DbxApp {
             error: profile_error,
         };
         this.try_device_unlock(cx);
+        if !cfg!(test) && std::env::var_os("DBX_DISABLE_UPDATES").is_none() {
+            this.check_for_updates(cx);
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(6 * 60 * 60))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        if matches!(
+                            this.update_state,
+                            crate::updater::UpdateState::Idle
+                                | crate::updater::UpdateState::Current
+                                | crate::updater::UpdateState::Failed(_)
+                        ) {
+                            this.check_for_updates(cx);
+                        }
+                    })?;
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
+        }
         this
+    }
+
+    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        use crate::updater::UpdateState;
+        if matches!(
+            self.update_state,
+            UpdateState::Checking | UpdateState::Installing | UpdateState::Installed(_)
+        ) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        cx.notify();
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime.spawn_blocking(crate::updater::check).await;
+            this.update(cx, |this, cx| {
+                this.update_state = match result {
+                    Ok(Ok(Some(update))) => UpdateState::Available(update),
+                    Ok(Ok(None)) => UpdateState::Current,
+                    Ok(Err(error)) => UpdateState::Failed(format!("{error:#}")),
+                    Err(error) => UpdateState::Failed(error.to_string()),
+                };
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    fn activate_update(&mut self, cx: &mut Context<Self>) {
+        use crate::updater::UpdateState;
+        match self.update_state.clone() {
+            UpdateState::Available(update) => {
+                self.update_state = UpdateState::Installing;
+                cx.notify();
+                let runtime = self.runtime.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = runtime
+                        .spawn_blocking(move || crate::updater::install(&update))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.update_state = match result {
+                            Ok(Ok(destination)) => UpdateState::Installed(destination),
+                            Ok(Err(error)) => UpdateState::Failed(format!("{error:#}")),
+                            Err(error) => UpdateState::Failed(error.to_string()),
+                        };
+                        cx.notify();
+                    })?;
+                    Ok::<(), anyhow::Error>(())
+                })
+                .detach();
+            }
+            UpdateState::Installed(destination) => match crate::updater::restart(&destination) {
+                Ok(()) => cx.quit(),
+                Err(error) => {
+                    self.error = Some(error.to_string());
+                    cx.notify();
+                }
+            },
+            UpdateState::Checking | UpdateState::Installing => {}
+            _ => self.check_for_updates(cx),
+        }
     }
 
     fn record_query_history(

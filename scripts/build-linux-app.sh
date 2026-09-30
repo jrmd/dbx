@@ -5,12 +5,23 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 APP_DIR="${DBX_LINUX_DIR:-$ROOT_DIR/target/linux/DBX}"
-ARCHIVE_PATH="${DBX_LINUX_ARCHIVE:-$ROOT_DIR/target/linux/dbx-linux.tar.gz}"
+VERSION="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' "$ROOT_DIR/Cargo.toml")"
+ARCHIVE_PATH="${DBX_LINUX_ARCHIVE:-$ROOT_DIR/target/linux/DBX-$VERSION-linux-$(uname -m).tar.gz}"
 CARGO_BIN="${CARGO:-cargo}"
+ARCH="$(uname -m)"
+APPDIR="${DBX_APPDIR:-$ROOT_DIR/target/linux/DBX.AppDir}"
+APPIMAGE_PATH="${DBX_APPIMAGE:-$ROOT_DIR/target/linux/DBX-$VERSION-linux-$ARCH.AppImage}"
+APPIMAGETOOL="${APPIMAGETOOL:-$ROOT_DIR/target/linux/tools/appimagetool-$ARCH.AppImage}"
+readonly APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
+# Keyboard libraries GPUI links directly. libxcb itself stays with the host
+# because it must match the running X server; Wayland, Vulkan, and fonts are
+# loaded from the host at runtime.
+readonly BUNDLED_LIBS=(libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1)
 
 readonly BINARY_PATH="$ROOT_DIR/target/release/dbx"
 readonly DESKTOP_FILE="$ROOT_DIR/packaging/linux/dbx.desktop"
 readonly LOGO_SVG="$ROOT_DIR/logo.svg"
+readonly LOGO_PNG="$ROOT_DIR/logo.png"
 
 log() {
 	printf 'DBX: %s\n' "$*"
@@ -34,7 +45,7 @@ check_inputs() {
 
 build_package() {
 	log "building release binary"
-	(cd "$ROOT_DIR" && "$CARGO_BIN" build --release --package dbx-ui)
+	(cd "$ROOT_DIR" && "$CARGO_BIN" build --locked --release --package dbx-ui)
 	[[ -x "$BINARY_PATH" ]] || die "release binary was not produced: $BINARY_PATH"
 
 	log "staging Linux application with desktop metadata and SVG icon"
@@ -48,8 +59,58 @@ build_package() {
 
 	mkdir -p "$(dirname -- "$ARCHIVE_PATH")"
 	tar -C "$APP_DIR" -czf "$ARCHIVE_PATH" .
+	(cd "$(dirname -- "$ARCHIVE_PATH")" && sha256sum "$(basename -- "$ARCHIVE_PATH")" > "$(basename -- "$ARCHIVE_PATH").sha256")
 	log "ready: $APP_DIR"
 	log "archive: $ARCHIVE_PATH"
+}
+
+library_path() {
+	local cache
+	cache="$(ldconfig -p)"
+	awk -v name="$1" -v arch="${ARCH/_/-}" '$1 == name && $0 ~ arch && !found { print $NF; found = 1 }' <<<"$cache"
+}
+
+fetch_appimagetool() {
+	[[ -x "$APPIMAGETOOL" ]] && return
+	require_command curl
+	log "downloading appimagetool"
+	mkdir -p "$(dirname -- "$APPIMAGETOOL")"
+	curl -fsSL --retry 3 -o "$APPIMAGETOOL.part" "$APPIMAGETOOL_URL"
+	chmod +x "$APPIMAGETOOL.part"
+	mv "$APPIMAGETOOL.part" "$APPIMAGETOOL"
+}
+
+build_appimage() {
+	log "assembling AppDir"
+	rm -rf "$APPDIR"
+	mkdir -p "$APPDIR/usr/lib"
+	cp -a "$APP_DIR/usr" "$APPDIR/"
+	cp "$DESKTOP_FILE" "$APPDIR/dbx.desktop"
+	cp "$LOGO_SVG" "$APPDIR/dbx.svg"
+	cp "$LOGO_PNG" "$APPDIR/.DirIcon"
+
+	local lib path
+	for lib in "${BUNDLED_LIBS[@]}"; do
+		path="$(library_path "$lib")"
+		[[ -n "$path" ]] || die "library to bundle not found: $lib"
+		cp -L "$path" "$APPDIR/usr/lib/$lib"
+	done
+
+	cat > "$APPDIR/AppRun" <<'APPRUN'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$HERE/usr/bin/dbx" "$@"
+APPRUN
+	chmod +x "$APPDIR/AppRun"
+
+	fetch_appimagetool
+	log "building AppImage"
+	rm -f "$APPIMAGE_PATH"
+	# Extract-and-run avoids needing FUSE on CI runners.
+	APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$APPIMAGETOOL" --no-appstream "$APPDIR" "$APPIMAGE_PATH"
+	(cd "$(dirname -- "$APPIMAGE_PATH")" && sha256sum "$(basename -- "$APPIMAGE_PATH")" > "$(basename -- "$APPIMAGE_PATH").sha256")
+	log "AppImage: $APPIMAGE_PATH"
 }
 
 main() {
@@ -60,12 +121,16 @@ main() {
 	build|package)
 		build_package
 		;;
+	appimage)
+		build_package
+		build_appimage
+		;;
 	run)
 		build_package
 		exec "$BINARY_PATH"
 		;;
 	*)
-		die "usage: $0 [build|package|run]"
+		die "usage: $0 [build|package|appimage|run]"
 		;;
 	esac
 }

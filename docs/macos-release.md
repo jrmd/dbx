@@ -1,6 +1,6 @@
 # macOS release candidates
 
-DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The workflow currently produces **Apple Silicon (arm64)** candidates. Intel and universal binaries are not supplied by this workflow.
+DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The manual candidate workflow produces **Apple Silicon (arm64)** candidates. The tag-triggered release workflow produces separate Apple Silicon and Intel bundles alongside Linux x86_64.
 
 ## Signing setup
 
@@ -52,6 +52,43 @@ Downloads are Actions artifacts, retained for 14 days:
 The private Keychain and temporary certificate are cleaned up at job exit. Rejected or timed-out notarization stops the workflow before the download upload. First-time submissions may exceed the 30-minute wait; use Apple's submission history to inspect the outcome before retrying.
 
 Artifacts are **release candidates**. The workflow does not create or publish a public GitHub Release. Before publication, download and extract the final archive on a Mac, confirm Gatekeeper launch, and smoke-test vault creation/device unlock, connection testing, table browsing, row editing, and queries. Automated Mac tests and signature checks do not establish that hands-on UI evidence.
+
+## Publish a release with updates
+
+The [release workflow](../.github/workflows/release.yml) builds all platforms from
+one version tag. Set the workspace version in `Cargo.toml`, update `Cargo.lock`,
+commit the release changes, and push a matching `vVERSION` tag. A manual workflow
+rerun must also select that tag. All five Apple secrets above must be available.
+The workflow rejects mismatched tags and prerelease versions, runs tests and
+Clippy, builds Linux x86_64 plus both Mac architectures, and requires successful
+notarization for both Mac bundles. It verifies archive checksums, uploads all
+assets to a draft release, then publishes it as latest. A failed build publishes
+nothing. If upload fails after draft creation, inspect/remove that draft before
+retrying; existing published releases are never overwritten by this workflow.
+
+Each release supplies `DBX-VERSION-linux-x86_64.AppImage`,
+`DBX-VERSION-linux-x86_64.tar.gz`, `DBX-VERSION-macos-arm64.zip`, and `DBX-VERSION-macos-x86_64.zip`, each with its own
+`.sha256` file. The updater accepts only exact platform/version filenames from
+`jrmd/dbx`, stable versions newer than the running version, and checksum-matching
+downloads. Unsigned candidate filenames cannot be selected.
+
+Mac updates require an installed Developer ID signed `DBX.app` in a writable
+location, outside a mounted disk image. Local self-signed/ad-hoc development
+builds cannot install updates. Before replacement, the downloaded bundle must
+match the running app's signing team and `dev.jrmd.dbx` identifier, pass code
+signature and Gatekeeper checks, and have the expected bundle version. The app
+bundle is exchanged atomically on the same filesystem using `renamex_np`.
+Linux extracts only the regular-file binary entry and replaces the executable
+with an atomic rename; root-owned installations require manual/package updates.
+An AppImage (detected through `APPIMAGE`) downloads the new AppImage and replaces
+that file the same way.
+Neither platform replaces the vault or user configuration. Restart is explicit;
+DBX does not save or restore open queries when restarting.
+
+macOS uses opaque surfaces and an opaque window backdrop. Light/dark/system
+appearance remains available, while the transparency toggle is hidden on Mac.
+Verify the final appearance and update/restart journey on both Mac architectures
+before calling them device-verified.
 
 ## Local verification
 

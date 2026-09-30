@@ -41,6 +41,7 @@ impl Render for DbxApp {
             .on_action(cx.listener(Self::next_connection_action))
             .on_action(cx.listener(Self::previous_connection_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
+            .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
             .child(self.render_topbar(window, cx))
             .child(
                 div()

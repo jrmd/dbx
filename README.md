@@ -60,15 +60,44 @@ make linux-build
 
 # Build and launch through the packaging helper.
 make linux-run
+
+# Build a single-file AppImage.
+make linux-appimage
 ```
 
 `make linux-build` produces:
 
 - `target/linux/DBX/usr/bin/dbx`
 - Desktop metadata and the SVG icon under `target/linux/DBX/usr/share/`
-- `target/linux/dbx-linux.tar.gz`
+- `target/linux/DBX-VERSION-linux-x86_64.tar.gz` and its `.sha256` checksum
 
-The archive contains a Linux staging tree, not a self-contained AppImage. The destination machine still needs compatible system libraries and graphics drivers. The raw Cargo binary is `target/release/dbx`.
+The archive contains a Linux staging tree. The destination machine still needs compatible system libraries and graphics drivers. The raw Cargo binary is `target/release/dbx`.
+
+`make linux-appimage` also produces `target/linux/DBX-VERSION-linux-x86_64.AppImage` and its checksum. It bundles the xkbcommon keyboard libraries and uses the host's X11/Wayland, Vulkan driver, and fonts. The first run downloads [appimagetool](https://github.com/AppImage/appimagetool) into `target/linux/tools/`. Build on an older distribution, as the release workflow does on Ubuntu 22.04, so the AppImage runs on systems with older glibc.
+
+The AppImage updates itself in place when its file is in a writable directory.
+For a user-owned install from the release tarball that supports in-app updates, extract the tarball
+and copy its `usr/` contents into `~/.local/` (binary, desktop file, and icon).
+The app needs a writable installation directory to update itself. System package
+installs should be updated through their package manager.
+
+### Updates and GitHub releases
+
+DBX checks stable [GitHub releases](https://github.com/jrmd/dbx/releases) on launch
+and every six hours. The titlebar shows **Install VERSION** when an update is
+available; downloads are verified against the release SHA-256 checksum before
+replacement. macOS also requires the same Apple signing team and Gatekeeper
+acceptance. Installation keeps the current session open. **Restart DBX** closes
+open sessions; finish your work before clicking it. You can also use **Check for
+Updates…** in the native Mac app menu. Set `DBX_DISABLE_UPDATES=1` to disable
+background checks (useful for development, QA, and package-managed installs).
+
+The [release workflow](.github/workflows/release.yml) runs on `vVERSION` tags
+matching the workspace version. It builds Linux x86_64 on Ubuntu 22.04 and signed,
+notarized macOS Apple Silicon and Intel bundles. All tests and all three builds
+must succeed; assets are uploaded to a draft before the complete release is
+published. The existing Mac candidate workflow remains available for testing.
+See [release setup](docs/macos-release.md) for the required Apple secrets.
 
 ### macOS
 
@@ -104,7 +133,7 @@ For terminal logs, use `DBX_FOREGROUND=1 make run`. `make macos-build` and `make
 
 ## Your own Mac signing key
 
-**You do not need the maintainer's signing key or a paid Apple Developer account to build and run DBX on your Mac.** For maintainer-signed release candidates, see the [macOS release workflow](docs/macos-release.md). A public notarized release is available only after that workflow and release validation succeed.
+**You do not need the maintainer's signing key or a paid Apple Developer account to build and run DBX on your Mac.** For maintainer-signed release candidates, see the [macOS release workflow](docs/macos-release.md). The tag-triggered release workflow publishes notarized bundles only after all platform builds and validation succeed.
 
 On the first `make build` or `make run`, [the Mac build helper](scripts/build-macos-app.sh) creates a self-signed **DBX Local Development** code-signing certificate and its private key in your login keychain. Later builds reuse that identity to sign the bundle with identifier `dev.jrmd.dbx`. macOS may ask you to unlock the keychain or allow `codesign` to use the key.
 
