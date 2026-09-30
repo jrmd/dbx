@@ -51,14 +51,28 @@ impl DbxApp {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        let Some((kind, redis_filter_editor, can_mutate, filter_rows, inspector_open)) =
-            self.session(session_id).map(|session| {
+        let Some(tab_id) = self
+            .session(session_id)
+            .and_then(|session| session.active_data_tab_id())
+        else {
+            return div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme().text_muted)
+                .child("Select a table to browse rows")
+                .into_any_element();
+        };
+        let Some((kind, redis_filter_editor, can_mutate, filter_rows, inspector_open)) = self
+            .session(session_id)
+            .zip(self.data_tab(session_id, tab_id))
+            .map(|(session, data)| {
                 (
                     session.kind,
                     session.editors.filter_editor.clone(),
-                    self.editable_table_for(session_id).is_some(),
-                    session
-                        .filters
+                    self.editable_table_for(session_id, tab_id).is_some(),
+                    data.filters
                         .rows()
                         .iter()
                         .map(|row| {
@@ -71,7 +85,7 @@ impl DbxApp {
                             )
                         })
                         .collect::<Vec<_>>(),
-                    session.inspector_open,
+                    data.inspector_open,
                 )
             })
         else {
@@ -88,7 +102,7 @@ impl DbxApp {
                 div()
                     .key_context("DbxFilters")
                     .on_action(cx.listener(move |this, _: &ApplyFilters, _, cx| {
-                        this.refresh_table_for(session_id, cx)
+                        this.refresh_table_for(session_id, tab_id, cx)
                     }))
                     .px(px(8.))
                     .py(px(6.))
@@ -127,7 +141,9 @@ impl DbxApp {
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
-                                                        this.add_filter_for(session_id, window, cx)
+                                                        this.add_filter_for(
+                                                            session_id, tab_id, window, cx,
+                                                        )
                                                     },
                                                 )),
                                         )
@@ -137,7 +153,7 @@ impl DbxApp {
                                             button("clear-filters", "Clear", ButtonKind::Quiet)
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.clear_filters_for(session_id, cx)
+                                                    this.clear_filters_for(session_id, tab_id, cx)
                                                 })),
                                         )
                                     })
@@ -155,7 +171,7 @@ impl DbxApp {
                                             .cursor_pointer()
                                             .on_click(
                                                 cx.listener(move |this, _, _, cx| {
-                                                    this.refresh_table_for(session_id, cx)
+                                                    this.refresh_table_for(session_id, tab_id, cx)
                                                 }),
                                             ),
                                         )
@@ -174,7 +190,7 @@ impl DbxApp {
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
                                                         this.begin_insert_for(
-                                                            session_id, window, cx,
+                                                            session_id, tab_id, window, cx,
                                                         )
                                                     },
                                                 )),
@@ -286,7 +302,9 @@ impl DbxApp {
                                                 .tooltip("Remove filter")
                                                 .child(icon(Icon::Close, theme().text_muted))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.remove_filter_for(session_id, row_id, cx)
+                                                    this.remove_filter_for(
+                                                        session_id, tab_id, row_id, cx,
+                                                    )
                                                 })),
                                             )
                                     },
@@ -299,7 +317,7 @@ impl DbxApp {
                                         .ghost()
                                         .text_color(theme().accent)
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.add_filter_for(session_id, window, cx)
+                                            this.add_filter_for(session_id, tab_id, window, cx)
                                         })),
                                 ),
                         )
@@ -310,25 +328,19 @@ impl DbxApp {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.render_grid(cx))
+                    .child(self.render_grid(session_id, tab_id))
                     .when(!self.narrow_workspace && inspector_open, |view| {
-                        view.child(self.render_inspector(cx))
+                        view.child(self.render_inspector(session_id, tab_id, cx))
                     }),
             )
             .into_any_element()
     }
 
-    fn render_grid(&mut self, _cx: &mut Context<Self>) -> AnyElement {
-        let Some(session_id) = self.active_session_id() else {
-            return div().into_any_element();
-        };
-        let Some((result_grid, has_result, busy)) = self.session(session_id).map(|session| {
-            (
-                session.data_grid.clone(),
-                session.result.is_some(),
-                session.busy,
-            )
-        }) else {
+    fn render_grid(&self, session_id: SessionId, tab_id: SecondaryTabId) -> AnyElement {
+        let Some((result_grid, has_result, busy)) = self
+            .data_tab(session_id, tab_id)
+            .map(|data| (data.data_grid.clone(), data.result.is_some(), data.busy))
+        else {
             return div().into_any_element();
         };
 
@@ -342,7 +354,7 @@ impl DbxApp {
                 .child(if busy {
                     "Loading rows…"
                 } else {
-                    "Select a table to browse rows"
+                    "No rows loaded"
                 })
                 .into_any_element();
         }
@@ -362,10 +374,12 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_inspector(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(session_id) = self.active_session_id() else {
-            return div().into_any_element();
-        };
+    fn render_inspector(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some((
             read_only_result,
             can_edit,
@@ -374,9 +388,9 @@ impl DbxApp {
             draft_mode,
             draft_fields,
             static_fields,
-        )) = self.session(session_id).map(|session| {
-            let can_mutate = self.editable_table_for(session_id).is_some();
-            let draft_fields = session
+        )) = self.data_tab(session_id, tab_id).map(|data| {
+            let can_mutate = self.editable_table_for(session_id, tab_id).is_some();
+            let draft_fields = data
                 .row_draft
                 .as_ref()
                 .map(|draft| {
@@ -402,11 +416,11 @@ impl DbxApp {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let static_fields = session
+            let static_fields = data
                 .selected_row
-                .and_then(|row_index| session.result.as_ref()?.rows.get(row_index))
+                .and_then(|row_index| data.result.as_ref()?.rows.get(row_index))
                 .and_then(|row| {
-                    session.result.as_ref().map(|result| {
+                    data.result.as_ref().map(|result| {
                         result
                             .columns
                             .iter()
@@ -425,11 +439,11 @@ impl DbxApp {
                 })
                 .unwrap_or_default();
             (
-                session.result.is_some() && session.result_table.is_none(),
+                data.result.is_some() && data.result_table.is_none(),
                 can_mutate,
-                session.selected_row.is_some(),
-                can_mutate && session.row_draft.is_some(),
-                session.draft_mode,
+                data.selected_row.is_some(),
+                can_mutate && data.row_draft.is_some(),
+                data.draft_mode,
                 draft_fields,
                 static_fields,
             )
@@ -488,7 +502,7 @@ impl DbxApp {
                                     .tooltip("Close")
                                     .child(icon(Icon::Close, theme().text_muted))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.close_inspector_for(session_id, cx)
+                                        this.close_inspector_for(session_id, tab_id, cx)
                                     })),
                             ),
                     ),
@@ -694,7 +708,7 @@ impl DbxApp {
                                     button("cancel-row-draft", "Cancel", ButtonKind::Quiet)
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.cancel_row_draft_for(session_id, cx)
+                                            this.cancel_row_draft_for(session_id, tab_id, cx)
                                         })),
                                 )
                                 .child(
@@ -711,7 +725,7 @@ impl DbxApp {
                                     .when(can_save, |button| {
                                         button.cursor_pointer().on_click(cx.listener(
                                             move |this, _, window, cx| {
-                                                this.save_draft_for(session_id, window, cx)
+                                                this.save_draft_for(session_id, tab_id, window, cx)
                                             },
                                         ))
                                     }),
@@ -733,14 +747,18 @@ impl DbxApp {
                                         .text_color(theme().danger)
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.request_delete_selected_for(session_id, window, cx)
+                                            this.request_delete_selected_for(
+                                                session_id, tab_id, window, cx,
+                                            )
                                         })),
                                 )
                                 .child(
                                     button("edit-row", "Edit row", ButtonKind::Primary)
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.begin_edit_selected_for(session_id, window, cx)
+                                            this.begin_edit_selected_for(
+                                                session_id, tab_id, window, cx,
+                                            )
                                         })),
                                 ),
                         )

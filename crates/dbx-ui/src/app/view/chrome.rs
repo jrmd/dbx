@@ -53,7 +53,9 @@ impl DbxApp {
 
     pub(super) fn render_app_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_pane = self.active_session().map(|session| session.pane);
-        let busy = self.active_session().is_some_and(|session| session.busy);
+        let busy = self.active_session().is_some_and(|session| {
+            session.busy || session.active_data_tab().is_some_and(|data| data.busy)
+        });
         div()
             .w(px(48.))
             .flex_none()
@@ -74,14 +76,18 @@ impl DbxApp {
                         Icon::Table,
                         "Data",
                         active_pane == Some(Pane::Data),
-                        cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.set_active_pane(Pane::Data, window, cx)
+                        }),
                     ))
                     .child(self.rail_button(
                         "rail-structure",
                         Icon::Structure,
                         "Structure",
                         active_pane == Some(Pane::Structure),
-                        cx.listener(|this, _, _, cx| this.set_active_pane(Pane::Structure, cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.set_active_pane(Pane::Structure, window, cx)
+                        }),
                     ))
                     .child(self.rail_button(
                         "rail-query",
@@ -107,38 +113,55 @@ impl DbxApp {
             })
     }
 
-    pub(super) fn set_active_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+    pub(super) fn set_active_pane(
+        &mut self,
+        pane: Pane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.connection_picker_open = false;
         let Some(session_id) = self.active_session_id else {
             return;
         };
         match pane {
             Pane::Data => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.active_secondary_tab = None;
-                    session.pane = Pane::Data;
+                let Some(session) = self.session(session_id) else {
+                    return;
+                };
+                if session.active_data_tab_id().is_some() {
+                    return;
+                }
+                // Return to the table viewed last, else the first open one.
+                let tab_id = session
+                    .recent_data_tab
+                    .filter(|id| session.data_tab(*id).is_some())
+                    .or_else(|| {
+                        session.secondary_tabs.iter().find_map(|tab| {
+                            matches!(tab.kind, SecondaryTabKind::Data(_)).then_some(tab.id)
+                        })
+                    });
+                match tab_id {
+                    Some(tab_id) => self.activate_secondary_tab_for(session_id, tab_id, window, cx),
+                    None => self.show_toast(ToastKind::Info, "Select a table to browse rows", cx),
                 }
             }
-            Pane::Query | Pane::Diagram => return,
+            Pane::Query | Pane::Diagram => {}
             Pane::Structure => {
                 let table = self.session(session_id).and_then(|session| {
-                    session.selected_table.as_ref().and_then(|selected| {
-                        session
-                            .tables
-                            .iter()
-                            .find(|table| table_ref(table) == *selected)
-                            .cloned()
-                    })
+                    let selected = &session.recent_data()?.table;
+                    session
+                        .tables
+                        .iter()
+                        .find(|table| table_ref(table) == *selected)
+                        .cloned()
                 });
                 if let Some(table) = table {
                     self.open_structure_tab_for(session_id, table, cx);
                     return;
                 }
                 self.show_toast(ToastKind::Info, "Select a table to view its structure", cx);
-                return;
             }
         }
-        cx.notify();
     }
 
     /// Arm the app-owned titlebar drag on any element: double-click zooms,
@@ -475,7 +498,7 @@ impl DbxApp {
                 session.sidebar.schema_select.clone(),
                 session.editors.sidebar_search_editor.clone(),
                 session.schema_filter.clone(),
-                session.selected_table.clone(),
+                session.active_data_tab().map(|data| data.table.clone()),
             )
         })
         else {
@@ -717,6 +740,7 @@ impl DbxApp {
                     .iter()
                     .map(|tab| {
                         let (label, kind) = match &tab.kind {
+                            SecondaryTabKind::Data(data) => (data.table.name.clone(), Icon::Table),
                             SecondaryTabKind::Query(_) => {
                                 query_number += 1;
                                 (format!("Query {query_number}"), Icon::Query)
@@ -735,7 +759,6 @@ impl DbxApp {
                 (session.active_secondary_tab, tabs)
             })
             .unwrap_or_default();
-        let data_selected = active_secondary_tab.is_none();
         div()
             .id("document-tabs")
             .h(px(40.))
@@ -750,14 +773,6 @@ impl DbxApp {
             .border_color(theme().border)
             .follow_top_corners(RADIUS_PANEL)
             .bg(theme().panel)
-            .child(
-                document_tab("document-data", Icon::Table, data_selected)
-                    .child("Data")
-                    .pr(px(12.))
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| this.set_active_pane(Pane::Data, cx)),
-                    ),
-            )
             .children(tabs.into_iter().map(|(tab_id, label, kind)| {
                 let selected = active_secondary_tab == Some(tab_id);
                 document_tab(
@@ -814,6 +829,30 @@ impl DbxApp {
                     .and_then(|tab_id| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
                 {
                     match &tab.kind {
+                        SecondaryTabKind::Data(data) => {
+                            let table_pagination = (session.kind.is_sql() && data.result.is_some())
+                                .then_some((
+                                    session.id,
+                                    tab.id,
+                                    data.table_page,
+                                    data.table_has_next_page,
+                                    data.busy,
+                                ));
+                            let status = if data.busy {
+                                data.status.clone()
+                            } else if session.busy {
+                                session.status.clone()
+                            } else {
+                                String::new()
+                            };
+                            return (
+                                data.error.clone().or_else(|| session.error.clone()),
+                                status,
+                                data.result.clone(),
+                                table_pagination,
+                                String::new(),
+                            );
+                        }
                         // Query tabs show their outcome and errors inline.
                         SecondaryTabKind::Query(_) => {
                             return (None, String::new(), None, None, String::new());
@@ -864,17 +903,6 @@ impl DbxApp {
                         }
                     }
                 }
-                let table_pagination = (session.kind.is_sql()
-                    && session.selected_table.is_some()
-                    && session.pane == Pane::Data
-                    && session.active_secondary_tab.is_none()
-                    && session.result.is_some())
-                .then_some((
-                    session.id,
-                    session.table_page,
-                    session.table_has_next_page,
-                    session.busy,
-                ));
                 (
                     session.error.clone(),
                     if session.busy {
@@ -882,8 +910,8 @@ impl DbxApp {
                     } else {
                         String::new()
                     },
-                    session.result.clone(),
-                    table_pagination,
+                    None,
+                    None,
                     String::new(),
                 )
             })
@@ -891,7 +919,7 @@ impl DbxApp {
         let result_summary = result
             .as_ref()
             .map(|result| {
-                if let Some((_, page, _, _)) = table_pagination {
+                if let Some((_, _, page, _, _)) = table_pagination {
                     let page_number = page.saturating_add(1);
                     if result.rows.is_empty() {
                         format!(
@@ -912,7 +940,7 @@ impl DbxApp {
             })
             .unwrap_or(summary);
         let pagination_controls =
-            table_pagination.map(|(session_id, page, has_next_page, busy)| {
+            table_pagination.map(|(session_id, tab_id, page, has_next_page, busy)| {
                 div()
                     .flex()
                     .items_center()
@@ -922,7 +950,7 @@ impl DbxApp {
                         "Previous",
                         !busy && page > 0,
                         cx.listener(move |this, _, _, cx| {
-                            this.set_table_page(session_id, page.saturating_sub(1), cx)
+                            this.set_table_page(session_id, tab_id, page.saturating_sub(1), cx)
                         }),
                     ))
                     .child(self.small_button_state(
@@ -930,7 +958,7 @@ impl DbxApp {
                         "Next",
                         !busy && has_next_page,
                         cx.listener(move |this, _, _, cx| {
-                            this.set_table_page(session_id, page.saturating_add(1), cx)
+                            this.set_table_page(session_id, tab_id, page.saturating_add(1), cx)
                         }),
                     ))
             });

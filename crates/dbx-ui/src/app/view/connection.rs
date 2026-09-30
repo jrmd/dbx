@@ -1,4 +1,5 @@
 use super::super::*;
+use gpui_component::checkbox::Checkbox;
 
 const VAULT_TEXT_EDITOR_CONTEXT: &str = "DbxTextEditor VaultGate";
 
@@ -288,6 +289,25 @@ impl DbxApp {
             .confirmation_editor
             .read(cx)
             .focus_handle();
+        let remember_device = Checkbox::new("vault-remember-device")
+            .label("Unlock automatically on this device")
+            .checked(self.remember_device)
+            .with_size(Size::Small)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_remember_device(cx)));
+        let submit_label = match (self.vault_busy, creating) {
+            (true, true) => "Creating…",
+            (true, false) => "Unlocking…",
+            (false, true) => "Create vault",
+            (false, false) => "Unlock",
+        };
+        let submit = button("submit-vault-passphrase", submit_label, ButtonKind::Primary).when(
+            !self.vault_busy,
+            |button| {
+                button.cursor_pointer().on_click(
+                    cx.listener(move |this, _, _, cx| this.submit_vault_passphrase(creating, cx)),
+                )
+            },
+        );
         div().key_context("VaultGate")
             .on_action(cx.listener(|_, _: &VaultFocusNext, window, cx| window.focus_next(cx)))
             .on_action(cx.listener(|_, _: &VaultFocusPrevious, window, cx| window.focus_prev(cx)))
@@ -305,7 +325,9 @@ impl DbxApp {
                 .when(!unavailable, |view| view
                     .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child("Passphrase (12 characters minimum)")).child(editor::input_with_key_context(self.vault_editors.passphrase_editor.clone(), passphrase_focus, false, VAULT_TEXT_EDITOR_CONTEXT)))
                     .when(creating, |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child("Confirm passphrase")).child(editor::input_with_key_context(self.vault_editors.confirmation_editor.clone(), confirmation_focus, false, VAULT_TEXT_EDITOR_CONTEXT))))
-                    .child(div().flex().justify_end().child(button("submit-vault-passphrase", if self.vault_busy { if creating { "Creating…" } else { "Unlocking…" } } else if creating { "Create vault" } else { "Unlock" }, ButtonKind::Primary).when(!self.vault_busy, |button| button.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.submit_vault_passphrase(creating, cx)))))))
+                    .child(div().flex().items_center().justify_between().gap(px(12.))
+                        .child(remember_device)
+                        .child(submit)))
                 .when_some(self.error.clone(), |view, error| view.child(div().text_size(px(11.)).text_color(theme().danger).child(error))))
     }
 }

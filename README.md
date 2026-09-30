@@ -86,7 +86,9 @@ identity in the Mac login keychain, then reuses it to sign a stable
 local development; it does not require an Apple Developer account and does not
 produce a distributable or notarized app. This signing identity is unrelated to
 DBX credential storage: normal saved credentials remain in the app-owned DBX
-Vault, not Keychain.
+Vault. The stable identity does matter for device unlock, though: the Keychain
+item holding the vault key trusts builds signed with it, so rebuilding does not
+trigger a new Keychain prompt.
 
 Use `DBX_FOREGROUND=1 make run` when you want the app's stdout/stderr in the
 terminal. `make cargo-build` and `make cargo-run` remain available for the raw
@@ -132,7 +134,7 @@ Never commit a real connection string, password, certificate private key, or loc
 
 DBX handles credentials and potentially destructive commands, so an MVP must be honest about what it does and does not protect:
 
-- Named profile metadata lives in the platform configuration directory rather than a process-only cache and never includes passwords. Normal saved credentials are encrypted in the app-owned DBX Vault with Argon2id + XChaCha20-Poly1305. The vault is unlocked once in-app per launch; its passphrase is never stored or recoverable. Selecting a saved connection eagerly hydrates its credential. Keychain/Secret Service is read only after an explicit **Import old system passwords** action, and imports are non-destructive: an existing vault credential is never overwritten.
+- Named profile metadata lives in the platform configuration directory rather than a process-only cache and never includes passwords. Normal saved credentials are encrypted in the app-owned DBX Vault with Argon2id + XChaCha20-Poly1305. The passphrase is never stored or recoverable. With **Unlock automatically on this device** (on by default), the vault's derived key — never the passphrase — is kept in the login Keychain on macOS or the Secret Service keyring on Linux, so later launches unlock without a prompt; turning it off forgets the key at the next unlock. Selecting a saved connection eagerly hydrates its credential. Keychain/Secret Service is read only after an explicit **Import old system passwords** action, and imports are non-destructive: an existing vault credential is never overwritten.
 - TLS certificate verification is enabled by default. An insecure or certificate-bypass option, if ever added, must be conspicuous and scoped to one connection.
 - Query text, parameters, result values, and credentials must not be written to logs or crash reports by default. Diagnostics should redact connection URLs and secrets.
 - GUI filters and edits use bound parameters wherever the target engine supports them. Identifiers are quoted by the connector, never interpolated from unchecked text.

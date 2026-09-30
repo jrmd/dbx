@@ -67,7 +67,7 @@ use crate::{
         segmented_track, set_appearance, set_reduce_transparency, set_system_appearance, shortcut,
         sync_component_theme, theme, tip, window_background,
     },
-    vault::VaultState,
+    vault::{VaultError, VaultState},
 };
 use redis_completion::redis_completion_items;
 use result_table::{ResultTableDelegate, foreign_key_target_table};
@@ -912,15 +912,182 @@ impl Drop for DiagramTab {
     }
 }
 
+/// One open table. Each tab owns its grid, filters, page, and row draft, so
+/// switching between tables keeps every view exactly where the user left it.
+struct DataTab {
+    table: TableRef,
+    data_grid: Entity<TableState<ResultTableDelegate>>,
+    result_column_widths: HashMap<String, Pixels>,
+    _data_grid_subscription: Subscription,
+    filters: FilterModel,
+    filter_subscriptions: Vec<Subscription>,
+    table_columns: Vec<ColumnInfo>,
+    foreign_keys: Vec<ForeignKeyInfo>,
+    result: Option<Arc<QueryResult>>,
+    /// The table that produced `result`, when it is safe to edit through the
+    /// grid. Cleared while a reload is in flight.
+    result_table: Option<TableRef>,
+    table_page: u64,
+    table_has_next_page: bool,
+    selected_row: Option<usize>,
+    selected_column: usize,
+    inspector_open: bool,
+    draft_mode: DraftMode,
+    row_draft: Option<RowDraftModel>,
+    row_draft_subscriptions: Vec<Subscription>,
+    suppress_next_grid_selection_event: bool,
+    busy: bool,
+    status: String,
+    error: Option<String>,
+    request_generation: u64,
+    abort_handle: AbortOnDrop,
+}
+
+impl DataTab {
+    fn new(
+        session_id: SessionId,
+        id: SecondaryTabId,
+        table: TableRef,
+        window: &mut Window,
+        cx: &mut Context<DbxApp>,
+    ) -> Self {
+        let data_grid = cx.new(|cx| {
+            TableState::new(ResultTableDelegate::default(), window, cx)
+                .col_resizable(true)
+                .col_movable(false)
+                .sortable(false)
+                .row_selectable(true)
+                .col_selectable(true)
+                .cell_selectable(false)
+        });
+        let data_grid_subscription =
+            cx.subscribe_in(&data_grid, window, move |this, _, event, window, cx| {
+                this.on_data_grid_event(session_id, id, event, window, cx)
+            });
+        Self {
+            table,
+            data_grid,
+            result_column_widths: HashMap::new(),
+            _data_grid_subscription: data_grid_subscription,
+            filters: FilterModel::new(),
+            filter_subscriptions: Vec::new(),
+            table_columns: Vec::new(),
+            foreign_keys: Vec::new(),
+            result: None,
+            result_table: None,
+            table_page: 0,
+            table_has_next_page: false,
+            selected_row: None,
+            selected_column: 0,
+            inspector_open: false,
+            draft_mode: DraftMode::Update,
+            row_draft: None,
+            row_draft_subscriptions: Vec::new(),
+            suppress_next_grid_selection_event: false,
+            busy: false,
+            status: String::new(),
+            error: None,
+            request_generation: 0,
+            abort_handle: AbortOnDrop::default(),
+        }
+    }
+
+    fn set_result(
+        &mut self,
+        result: Option<QueryResult>,
+        tables: &[TableInfo],
+        cx: &mut Context<DbxApp>,
+    ) {
+        self.result = result.map(Arc::new);
+        self.sync_result_grid(true, tables, cx);
+    }
+
+    fn sync_result_grid(
+        &mut self,
+        clear_selection: bool,
+        tables: &[TableInfo],
+        cx: &mut Context<DbxApp>,
+    ) {
+        let result = self.result.clone();
+        let remembered_widths = self.result_column_widths.clone();
+        let foreign_keys = self.foreign_keys.clone();
+        let tables = tables.to_vec();
+        self.data_grid.update(cx, move |table, cx| {
+            table
+                .delegate_mut()
+                .set_result(result, &remembered_widths, &foreign_keys, &tables);
+            table.refresh(cx);
+            if clear_selection {
+                table.clear_selection(cx);
+            }
+        });
+    }
+
+    fn clear_grid_selection(&self, cx: &mut Context<DbxApp>) {
+        self.data_grid
+            .update(cx, |table, cx| table.clear_selection(cx));
+    }
+
+    /// Drop the row selection and any open draft ahead of a reload, whose
+    /// result replaces the snapshot they point into.
+    fn reset_row_state(&mut self, cx: &mut Context<DbxApp>) {
+        self.result_table = None;
+        self.selected_row = None;
+        self.row_draft = None;
+        self.row_draft_subscriptions.clear();
+        self.clear_grid_selection(cx);
+    }
+
+    fn invalidate_request(&mut self) {
+        self.request_generation = self.request_generation.saturating_add(1);
+        self.abort_handle.cancel();
+        self.busy = false;
+    }
+}
+
+impl Drop for DataTab {
+    fn drop(&mut self) {
+        self.abort_handle.cancel();
+    }
+}
+
 enum SecondaryTabKind {
+    Data(Box<DataTab>),
     Query(Box<QueryTab>),
     Structure(StructureTab),
     Diagram(Box<DiagramTab>),
 }
 
+impl SecondaryTabKind {
+    fn pane(&self) -> Pane {
+        match self {
+            Self::Data(_) => Pane::Data,
+            Self::Query(_) => Pane::Query,
+            Self::Structure(_) => Pane::Structure,
+            Self::Diagram(_) => Pane::Diagram,
+        }
+    }
+}
+
 struct SecondaryTab {
     id: SecondaryTabId,
     kind: SecondaryTabKind,
+}
+
+/// Free functions rather than session methods so callers can hold a data tab
+/// and still update the session's other fields in the same scope.
+fn find_data_tab(tabs: &[SecondaryTab], id: SecondaryTabId) -> Option<&DataTab> {
+    tabs.iter().find_map(|tab| match &tab.kind {
+        SecondaryTabKind::Data(data) if tab.id == id => Some(data.as_ref()),
+        _ => None,
+    })
+}
+
+fn find_data_tab_mut(tabs: &mut [SecondaryTab], id: SecondaryTabId) -> Option<&mut DataTab> {
+    tabs.iter_mut().find_map(|tab| match &mut tab.kind {
+        SecondaryTabKind::Data(data) if tab.id == id => Some(data.as_mut()),
+        _ => None,
+    })
 }
 
 struct ConnectionSession {
@@ -931,14 +1098,12 @@ struct ConnectionSession {
     environment: ConnectionEnvironment,
     engine: Option<Arc<DatabaseEngine>>,
     editors: SessionEditors,
-    data_grid: Entity<TableState<ResultTableDelegate>>,
-    result_column_widths: HashMap<String, Pixels>,
-    _data_grid_subscription: Subscription,
-    filters: FilterModel,
-    filter_subscriptions: Vec<Subscription>,
     pane: Pane,
     secondary_tabs: Vec<SecondaryTab>,
     active_secondary_tab: Option<SecondaryTabId>,
+    /// The data tab viewed most recently, even while another kind of tab is
+    /// in front. Query completion and the Data/Structure rail use it.
+    recent_data_tab: Option<SecondaryTabId>,
     /// Recently closed query documents are retained for the current session
     /// only. Persisted history remains the durable source for executed work.
     closed_queries: Vec<String>,
@@ -960,22 +1125,8 @@ struct ConnectionSession {
     current_database: Option<String>,
     /// PostgreSQL-only navigator filter. `None` means all schemas.
     schema_filter: Option<String>,
-    selected_table: Option<TableRef>,
-    table_columns: Vec<ColumnInfo>,
-    foreign_keys: Vec<ForeignKeyInfo>,
-    result: Option<Arc<QueryResult>>,
-    /// The table that produced `result`, when it is safe to edit through the
-    /// grid. Ad-hoc query results deliberately have no table provenance.
-    result_table: Option<TableRef>,
-    table_page: u64,
-    table_has_next_page: bool,
-    selected_row: Option<usize>,
-    selected_column: usize,
-    inspector_open: bool,
-    draft_mode: DraftMode,
-    row_draft: Option<RowDraftModel>,
-    row_draft_subscriptions: Vec<Subscription>,
-    suppress_next_grid_selection_event: bool,
+    /// Connection-wide work (connecting, switching databases, table actions,
+    /// transfers). Each data tab tracks its own loads and row mutations.
     busy: bool,
     status: String,
     error: Option<String>,
@@ -996,20 +1147,6 @@ impl ConnectionSession {
         window: &mut Window,
         cx: &mut Context<DbxApp>,
     ) -> Self {
-        let data_grid = cx.new(|cx| {
-            TableState::new(ResultTableDelegate::default(), window, cx)
-                .col_resizable(true)
-                .col_movable(false)
-                .sortable(false)
-                .row_selectable(true)
-                .col_selectable(true)
-                .cell_selectable(false)
-        });
-        let data_grid_subscription =
-            cx.subscribe_in(&data_grid, window, move |this, _, event, window, cx| {
-                this.on_data_grid_event(id, event, window, cx)
-            });
-
         Self {
             id,
             profile_id,
@@ -1018,14 +1155,10 @@ impl ConnectionSession {
             environment,
             engine: None,
             editors: SessionEditors::new(window, cx),
-            data_grid,
-            result_column_widths: HashMap::new(),
-            _data_grid_subscription: data_grid_subscription,
-            filters: FilterModel::new(),
-            filter_subscriptions: Vec::new(),
             pane: Pane::Data,
             secondary_tabs: Vec::new(),
             active_secondary_tab: None,
+            recent_data_tab: None,
             closed_queries: Vec::new(),
             tables: Vec::new(),
             tables_revision: 0,
@@ -1035,20 +1168,6 @@ impl ConnectionSession {
             databases: Vec::new(),
             current_database: None,
             schema_filter: None,
-            selected_table: None,
-            table_columns: Vec::new(),
-            foreign_keys: Vec::new(),
-            result: None,
-            result_table: None,
-            table_page: 0,
-            table_has_next_page: false,
-            selected_row: None,
-            selected_column: 0,
-            inspector_open: false,
-            draft_mode: DraftMode::Update,
-            row_draft: None,
-            row_draft_subscriptions: Vec::new(),
-            suppress_next_grid_selection_event: false,
             busy: false,
             status: "Connecting…".into(),
             error: None,
@@ -1080,30 +1199,78 @@ impl ConnectionSession {
         self.background_tasks.cancel_all();
     }
 
-    fn set_result(&mut self, result: Option<QueryResult>, cx: &mut Context<DbxApp>) {
-        self.result = result.map(Arc::new);
-        self.sync_result_grid(true, cx);
+    fn data_tab(&self, id: SecondaryTabId) -> Option<&DataTab> {
+        find_data_tab(&self.secondary_tabs, id)
     }
 
-    fn sync_result_grid(&mut self, clear_selection: bool, cx: &mut Context<DbxApp>) {
-        let result = self.result.clone();
-        let remembered_widths = self.result_column_widths.clone();
-        let foreign_keys = self.foreign_keys.clone();
-        let tables = self.tables.clone();
-        self.data_grid.update(cx, move |table, cx| {
-            table
-                .delegate_mut()
-                .set_result(result, &remembered_widths, &foreign_keys, &tables);
-            table.refresh(cx);
-            if clear_selection {
-                table.clear_selection(cx);
+    fn data_tab_mut(&mut self, id: SecondaryTabId) -> Option<&mut DataTab> {
+        find_data_tab_mut(&mut self.secondary_tabs, id)
+    }
+
+    /// The data tab in front, if the front tab is one.
+    fn active_data_tab_id(&self) -> Option<SecondaryTabId> {
+        self.active_secondary_tab
+            .filter(|id| self.data_tab(*id).is_some())
+    }
+
+    fn active_data_tab(&self) -> Option<&DataTab> {
+        self.active_data_tab_id().and_then(|id| self.data_tab(id))
+    }
+
+    /// The data tab in front, else the one viewed most recently.
+    fn recent_data(&self) -> Option<&DataTab> {
+        self.active_data_tab()
+            .or_else(|| self.recent_data_tab.and_then(|id| self.data_tab(id)))
+    }
+
+    fn data_tab_for_table(&self, table: &TableRef) -> Option<SecondaryTabId> {
+        self.secondary_tabs.iter().find_map(|tab| match &tab.kind {
+            SecondaryTabKind::Data(data) if data.table == *table => Some(tab.id),
+            _ => None,
+        })
+    }
+
+    /// Close every data tab matching `predicate`, moving the front tab to a
+    /// neighbour when it was one of them.
+    fn close_data_tabs_where(&mut self, predicate: impl Fn(&DataTab) -> bool) {
+        let active_index = self
+            .active_secondary_tab
+            .and_then(|id| self.secondary_tabs.iter().position(|tab| tab.id == id));
+        let mut kept_before_active = 0;
+        let mut active_closed = false;
+        let mut index = 0;
+        self.secondary_tabs.retain(|tab| {
+            let close = matches!(&tab.kind, SecondaryTabKind::Data(data) if predicate(data));
+            if Some(index) == active_index {
+                active_closed = close;
+            } else if !close && active_index.is_some_and(|active| index < active) {
+                kept_before_active += 1;
             }
+            index += 1;
+            !close
         });
+        if self
+            .recent_data_tab
+            .is_some_and(|id| self.data_tab(id).is_none())
+        {
+            self.recent_data_tab = None;
+        }
+        if active_closed {
+            let next = kept_before_active.min(self.secondary_tabs.len().saturating_sub(1));
+            self.active_secondary_tab = self.secondary_tabs.get(next).map(|tab| tab.id);
+            self.pane = self
+                .secondary_tabs
+                .get(next)
+                .map(|tab| tab.kind.pane())
+                .unwrap_or(Pane::Data);
+            if self.pane == Pane::Data {
+                self.recent_data_tab = self.active_secondary_tab;
+            }
+        }
     }
 
-    fn clear_grid_selection(&self, cx: &mut Context<DbxApp>) {
-        self.data_grid
-            .update(cx, |table, cx| table.clear_selection(cx));
+    fn close_data_tabs(&mut self) {
+        self.close_data_tabs_where(|_| true);
     }
 }
 
@@ -1176,6 +1343,7 @@ enum ConfirmationAction {
     },
     DeleteRow {
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         table: TableRef,
         filters: Vec<Filter>,
     },
@@ -1245,6 +1413,9 @@ pub struct DbxApp {
     vault_editors: VaultEditors,
     vault_state: Option<VaultState>,
     vault_busy: bool,
+    /// Whether a passphrase unlock also trusts this device, keeping the vault
+    /// key in the system keychain so later launches skip the passphrase.
+    remember_device: bool,
     saving_connection: bool,
     vault_generation: u64,
     credential_hydrating: bool,
@@ -1335,13 +1506,16 @@ impl DbxApp {
             }
         };
 
-        Self {
+        let mut this = Self {
             runtime: Arc::new(tokio::runtime::Runtime::new().expect("create DBX Tokio runtime")),
             logo: Arc::new(Image::from_bytes(ImageFormat::Svg, LOGO_BYTES.to_vec())),
             draft,
             vault_editors,
             vault_state,
             vault_busy: false,
+            remember_device: SettingsStore::new()
+                .and_then(|store| store.load())
+                .map_or(true, |settings| settings.remember_device),
             saving_connection: false,
             vault_generation: 0,
             credential_hydrating: false,
@@ -1373,7 +1547,9 @@ impl DbxApp {
             testing_connection: false,
             _subscriptions: subscriptions,
             error: profile_error,
-        }
+        };
+        this.try_device_unlock(cx);
+        this
     }
 
     fn record_query_history(
@@ -1533,14 +1709,15 @@ impl DbxApp {
     }
 
     fn persist_settings(&mut self, cx: &mut Context<Self>) {
-        let settings =
-            Settings::new(self.appearance).with_reduce_transparency(self.reduce_transparency);
+        let settings = Settings::new(self.appearance)
+            .with_reduce_transparency(self.reduce_transparency)
+            .with_remember_device(self.remember_device);
         let failure = match &self.settings_store {
             Some(store) => store
                 .save(settings)
                 .err()
-                .map(|error| format!("Couldn’t save appearance preference: {error}")),
-            None => Some("Appearance preference storage is unavailable".into()),
+                .map(|error| format!("Couldn’t save preferences: {error}")),
+            None => Some("Preference storage is unavailable".into()),
         };
         if let Some(message) = failure {
             self.show_toast(ToastKind::Error, message, cx);
@@ -1614,6 +1791,7 @@ impl DbxApp {
         self.sessions[index].cancel_background_tasks();
         for tab in &mut self.sessions[index].secondary_tabs {
             match &mut tab.kind {
+                SecondaryTabKind::Data(data) => data.invalidate_request(),
                 SecondaryTabKind::Query(query) => query.invalidate_request(),
                 SecondaryTabKind::Diagram(diagram) => diagram.invalidate_request(),
                 SecondaryTabKind::Structure(_) => {}
@@ -1712,10 +1890,11 @@ impl DbxApp {
     fn row_draft_focus_for(
         &self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         field_id: Option<FieldId>,
         cx: &App,
     ) -> Option<FocusHandle> {
-        let draft = self.session(session_id)?.row_draft.as_ref()?;
+        let draft = self.data_tab(session_id, tab_id)?.row_draft.as_ref()?;
         let field = field_id
             .and_then(|field_id| {
                 draft
@@ -1767,8 +1946,9 @@ impl DbxApp {
             .last()
             .and_then(|tab| match &tab.kind {
                 SecondaryTabKind::Query(query) => Some(query.query_editor.read(cx).focus_handle()),
-                SecondaryTabKind::Structure(_) => None,
-                SecondaryTabKind::Diagram(_) => None,
+                SecondaryTabKind::Data(_)
+                | SecondaryTabKind::Structure(_)
+                | SecondaryTabKind::Diagram(_) => None,
             });
         if let Some(focus) = focus {
             focus.focus(window, cx);
@@ -2544,6 +2724,11 @@ impl DbxApp {
         };
         session.active_secondary_tab = Some(tab_id);
         let tab_focus = match &tab.kind {
+            SecondaryTabKind::Data(_) => {
+                session.pane = Pane::Data;
+                session.recent_data_tab = Some(tab_id);
+                None
+            }
             SecondaryTabKind::Query(query) => {
                 session.pane = Pane::Query;
                 Some(query.query_editor.read(cx).focus_handle())
@@ -2640,7 +2825,11 @@ impl DbxApp {
                 }
             }
             SecondaryTabKind::Diagram(mut diagram) => diagram.invalidate_request(),
+            SecondaryTabKind::Data(mut data) => data.invalidate_request(),
             SecondaryTabKind::Structure(_) => {}
+        }
+        if session.recent_data_tab == Some(tab_id) {
+            session.recent_data_tab = None;
         }
         if session.active_secondary_tab == Some(tab_id) {
             let next = index.min(session.secondary_tabs.len().saturating_sub(1));
@@ -2648,12 +2837,11 @@ impl DbxApp {
             session.pane = session
                 .secondary_tabs
                 .get(next)
-                .map(|tab| match &tab.kind {
-                    SecondaryTabKind::Query(_) => Pane::Query,
-                    SecondaryTabKind::Structure(_) => Pane::Structure,
-                    SecondaryTabKind::Diagram(_) => Pane::Diagram,
-                })
+                .map(|tab| tab.kind.pane())
                 .unwrap_or(Pane::Data);
+            if session.pane == Pane::Data {
+                session.recent_data_tab = session.active_secondary_tab;
+            }
         }
         cx.notify();
     }
@@ -2705,26 +2893,9 @@ impl DbxApp {
             return;
         }
 
+        // Open tabs outside the new schema stay open; the filter only narrows
+        // the navigator.
         session.schema_filter = schema;
-        let selected_table_is_visible = session.selected_table.as_ref().is_none_or(|table| {
-            table_is_visible(session.kind, session.schema_filter.as_deref(), table)
-        });
-        if !selected_table_is_visible {
-            // Changing the navigator filter is local and must not kick off a
-            // query for an implicitly selected table. Clear the stale snapshot
-            // instead and let the user choose a table in the new schema.
-            session.selected_table = None;
-            session.table_columns.clear();
-            session.set_result(None, cx);
-            session.result_table = None;
-            session.table_page = 0;
-            session.table_has_next_page = false;
-            session.selected_row = None;
-            session.row_draft = None;
-            session.row_draft_subscriptions.clear();
-            session.foreign_keys.clear();
-            session.selected_column = 0;
-        }
         session.error = None;
         cx.notify();
     }
@@ -2739,6 +2910,9 @@ impl DbxApp {
         self.select_table_with_filters_for(session_id, table, Vec::new(), window, cx);
     }
 
+    /// Bring a table's data tab to the front, opening one when the table is
+    /// not open yet. Filters (from foreign-key row navigation) replace the
+    /// tab's current filters and reload it.
     fn select_table_with_filters_for(
         &mut self,
         session_id: SessionId,
@@ -2747,18 +2921,73 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((engine, kind)) = self
+        let table_ref = table_ref(&table);
+        let Some(session) = self
             .session(session_id)
-            .and_then(|session| session.engine.clone().map(|engine| (engine, session.kind)))
+            .filter(|session| session.engine.is_some())
         else {
             return;
         };
-        let table_ref = table_ref(&table);
+        if let Some(tab_id) = session.data_tab_for_table(&table_ref) {
+            self.activate_secondary_tab_for(session_id, tab_id, window, cx);
+            let loaded = self
+                .session(session_id)
+                .and_then(|session| session.data_tab(tab_id))
+                .is_some_and(|data| data.result.is_some() || data.busy);
+            if !filters.is_empty() || !loaded {
+                self.load_data_tab_for(session_id, tab_id, filters, window, cx);
+            }
+            return;
+        }
+
+        let tab_id = Uuid::new_v4();
+        let data = DataTab::new(session_id, tab_id, table_ref, window, cx);
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.secondary_tabs.push(SecondaryTab {
+            id: tab_id,
+            kind: SecondaryTabKind::Data(Box::new(data)),
+        });
+        self.activate_secondary_tab_for(session_id, tab_id, window, cx);
+        self.load_data_tab_for(session_id, tab_id, filters, window, cx);
+    }
+
+    /// Load a data tab's structure and first page together, starting from
+    /// `filters`.
+    fn load_data_tab_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        filters: Vec<Filter>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, kind, table_ref, filter_columns)) =
+            self.session(session_id).and_then(|session| {
+                let data = session.data_tab(tab_id)?;
+                // Seed the filter editors with whatever columns are known
+                // before the structure request returns.
+                let columns = if data.table_columns.is_empty() {
+                    session
+                        .completion_columns
+                        .get(&completion_table_key(&data.table))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    data.table_columns.clone()
+                };
+                Some((
+                    session.engine.clone()?,
+                    session.kind,
+                    data.table.clone(),
+                    columns,
+                ))
+            })
+        else {
+            return;
+        };
         let runtime = self.runtime.clone();
-        let filter_columns = self
-            .session(session_id)
-            .map(|session| session.table_columns.clone())
-            .unwrap_or_default();
         let mut filter_model = FilterModel::new();
         for filter in &filters {
             if let Some(value) = filter.value.as_ref() {
@@ -2780,30 +3009,26 @@ impl DbxApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        session.active_secondary_tab = None;
-        session.pane = Pane::Data;
-        session.selected_table = Some(table_ref.clone());
-        session.table_page = 0;
-        session.table_has_next_page = false;
-        // Until this request completes, the visible snapshot belongs to the
-        // previous table and must not be used for a mutation.
-        session.result_table = None;
-        session.selected_row = None;
-        session.row_draft = None;
-        session.row_draft_subscriptions.clear();
-        session.foreign_keys.clear();
-        session.clear_grid_selection(cx);
-        session.filters = filter_model;
-        session.filter_subscriptions.clear();
-        session.busy = true;
         session.error = None;
-        session.status = format!("Loading {}…", table.name);
-        session.request_generation += 1;
-        let generation = session.request_generation;
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        data.table_page = 0;
+        data.table_has_next_page = false;
+        // Until this request completes, the visible snapshot must not be used
+        // for a mutation.
+        data.reset_row_state(cx);
+        data.filters = filter_model;
+        data.filter_subscriptions.clear();
+        data.busy = true;
+        data.error = None;
+        data.status = format!("Loading {}…", table_ref.name);
+        data.request_generation += 1;
+        let generation = data.request_generation;
         let result_table = table_ref.clone();
         let row_navigation = !filters.is_empty();
         for row_id in filter_row_ids {
-            self.watch_filter_row_for(session_id, row_id, window, cx);
+            self.watch_filter_row_for(session_id, tab_id, row_id, window, cx);
         }
         let task = runtime.spawn(async move {
             // Structure and the first page are independent, so overlap them
@@ -2835,44 +3060,51 @@ impl DbxApp {
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
+            if let Some(data) = session.data_tab_mut(tab_id) {
+                data.abort_handle.replace(task.abort_handle());
+            }
         }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = task.await?;
+            let Ok(result) = task.await else {
+                return Ok(());
+            };
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
                 };
-                if generation != session.request_generation {
+                let Some(data) = find_data_tab_mut(&mut session.secondary_tabs, tab_id) else {
+                    return;
+                };
+                if generation != data.request_generation {
                     return;
                 }
-                session.busy = false;
+                data.busy = false;
+                data.abort_handle.clear();
                 let mut referenced_row_missing = false;
                 match result {
                     Ok((structure, result, has_next_page)) => {
                         let has_rows = !result.rows.is_empty();
-                        session.table_columns = structure.columns;
+                        data.table_columns = structure.columns;
                         session.completion_columns.insert(
                             completion_table_key(&result_table),
-                            session.table_columns.clone(),
+                            data.table_columns.clone(),
                         );
-                        session.foreign_keys = structure.foreign_keys;
-                        session.table_page = 0;
-                        session.table_has_next_page = has_next_page;
-                        session.set_result(Some(result), cx);
-                        session.result_table = Some(result_table.clone());
+                        data.foreign_keys = structure.foreign_keys;
+                        data.table_page = 0;
+                        data.table_has_next_page = has_next_page;
+                        data.set_result(Some(result), &session.tables, cx);
+                        data.result_table = Some(result_table.clone());
                         referenced_row_missing = row_navigation && !has_rows;
-                        session.error = None;
-                        session.pane = Pane::Data;
+                        data.error = None;
                         if row_navigation && has_rows {
-                            session
-                                .data_grid
+                            data.data_grid
                                 .update(cx, |table, cx| table.set_selected_row(0, cx));
                         }
                     }
                     Err(error) => {
-                        session.error = Some(error.to_string());
+                        data.error = Some(error.to_string());
                     }
                 }
                 if referenced_row_missing {
@@ -2921,6 +3153,7 @@ impl DbxApp {
     fn navigate_to_foreign_key_row_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row_index: usize,
         column_index: usize,
         window: &mut Window,
@@ -2928,10 +3161,11 @@ impl DbxApp {
     ) {
         let Some((foreign_key, target_table, filters)) =
             self.session(session_id).and_then(|session| {
-                let result = session.result.as_ref()?;
+                let data = session.data_tab(tab_id)?;
+                let result = data.result.as_ref()?;
                 let row = result.rows.get(row_index)?;
                 let local_column = result.columns.get(column_index.checked_sub(1)?)?;
-                let foreign_key = session
+                let foreign_key = data
                     .foreign_keys
                     .iter()
                     .find(|foreign_key| foreign_key.columns.first() == Some(&local_column.name))?;
@@ -2972,9 +3206,13 @@ impl DbxApp {
         {
             self.select_schema_filter_for(session_id, target_table.schema.clone(), cx);
         }
+        let target_ref = table_ref(&target_table);
         self.select_table_with_filters_for(session_id, target_table, filters, window, cx);
-        if let Some(session) = self.session_mut(session_id) {
-            session.status = format!(
+        if let Some(data) = self.session_mut(session_id).and_then(|session| {
+            let tab_id = session.data_tab_for_table(&target_ref)?;
+            session.data_tab_mut(tab_id)
+        }) {
+            data.status = format!(
                 "Opening referenced row via {}",
                 foreign_key
                     .constraint_name
@@ -2986,60 +3224,47 @@ impl DbxApp {
     }
 
     fn refresh_table(&mut self, cx: &mut Context<Self>) {
-        let Some(session_id) = self.active_session_id() else {
+        let Some((session_id, tab_id)) = self
+            .active_session()
+            .and_then(|session| Some((session.id, session.active_data_tab_id()?)))
+        else {
             return;
         };
-        self.refresh_table_for(session_id, cx);
+        self.refresh_table_for(session_id, tab_id, cx);
     }
 
     fn add_filter_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((column, columns)) = self.session(session_id).map(|session| {
-            (
-                session
-                    .table_columns
-                    .first()
-                    .map(|column| column.name.clone())
-                    .unwrap_or_default(),
-                session.table_columns.clone(),
-            )
-        }) else {
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
-        let row_id = {
-            let Some(session) = self.session_mut(session_id) else {
-                return;
-            };
-            if session.table_columns.is_empty() {
-                return;
-            }
-            session.filters.add_row_with_columns(
-                column,
-                FilterOperator::Equals,
-                &columns,
-                window,
-                cx,
-            )
+        let Some(column) = data.table_columns.first().map(|column| column.name.clone()) else {
+            return;
         };
-        self.watch_filter_row_for(session_id, row_id, window, cx);
+        let columns = data.table_columns.clone();
+        let row_id =
+            data.filters
+                .add_row_with_columns(column, FilterOperator::Equals, &columns, window, cx);
+        self.watch_filter_row_for(session_id, tab_id, row_id, window, cx);
         cx.notify();
     }
 
     fn watch_filter_row_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row_id: FilterRowId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some((column_selector, operator_selector)) =
-            self.session(session_id).and_then(|session| {
-                session
-                    .filters
+            self.data_tab(session_id, tab_id).and_then(|data| {
+                data.filters
                     .rows()
                     .iter()
                     .find(|row| row.id == row_id)
@@ -3054,7 +3279,7 @@ impl DbxApp {
             move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
                 let SelectEvent::Confirm(value) = event;
                 if let Some(value) = value {
-                    this.set_filter_column_for(session_id, row_id, value.to_string(), cx);
+                    this.set_filter_column_for(session_id, tab_id, row_id, value.to_string(), cx);
                 }
             },
         );
@@ -3072,12 +3297,11 @@ impl DbxApp {
                 else {
                     return;
                 };
-                this.set_filter_operator_for(session_id, row_id, operator, cx);
+                this.set_filter_operator_for(session_id, tab_id, row_id, operator, cx);
             },
         );
-        if let Some(session) = self.session_mut(session_id) {
-            session
-                .filter_subscriptions
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.filter_subscriptions
                 .extend([column_subscription, operator_subscription]);
         }
     }
@@ -3085,19 +3309,25 @@ impl DbxApp {
     fn remove_filter_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row_id: FilterRowId,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.session_mut(session_id) {
-            session.filters.remove(row_id);
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.filters.remove(row_id);
             cx.notify();
         }
     }
 
-    fn clear_filters_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        if let Some(session) = self.session_mut(session_id) {
-            session.filters = FilterModel::new();
-            session.filter_subscriptions.clear();
+    fn clear_filters_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.filters = FilterModel::new();
+            data.filter_subscriptions.clear();
             cx.notify();
         }
     }
@@ -3105,12 +3335,13 @@ impl DbxApp {
     fn set_filter_column_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row_id: FilterRowId,
         column: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.session_mut(session_id) {
-            if let Some(row) = session
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            if let Some(row) = data
                 .filters
                 .rows_mut()
                 .iter_mut()
@@ -3125,12 +3356,13 @@ impl DbxApp {
     fn set_filter_operator_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row_id: FilterRowId,
         operator: FilterOperator,
         cx: &mut Context<Self>,
     ) {
-        if let Some(session) = self.session_mut(session_id) {
-            if let Some(row) = session
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            if let Some(row) = data
                 .filters
                 .rows_mut()
                 .iter_mut()
@@ -3142,72 +3374,81 @@ impl DbxApp {
         }
     }
 
-    fn refresh_table_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        self.load_table_page_for(session_id, 0, cx);
+    fn refresh_table_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_table_page_for(session_id, tab_id, 0, cx);
     }
 
-    fn set_table_page(&mut self, session_id: SessionId, page: u64, cx: &mut Context<Self>) {
-        let Some((current_page, has_next_page, busy)) = self.session(session_id).map(|session| {
-            (
-                session.table_page,
-                session.table_has_next_page,
-                session.busy,
-            )
-        }) else {
+    fn set_table_page(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        page: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((current_page, has_next_page, busy)) = self
+            .data_tab(session_id, tab_id)
+            .map(|data| (data.table_page, data.table_has_next_page, data.busy))
+        else {
             return;
         };
         if busy || page == current_page || (page > current_page && !has_next_page) {
             return;
         }
-        self.load_table_page_for(session_id, page, cx);
+        self.load_table_page_for(session_id, tab_id, page, cx);
     }
 
-    fn load_table_page_for(&mut self, session_id: SessionId, page: u64, cx: &mut Context<Self>) {
+    fn load_table_page_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        page: u64,
+        cx: &mut Context<Self>,
+    ) {
         let Some((engine, table, kind, busy, known_columns)) =
-            self.session(session_id).map(|session| {
-                (
+            self.session(session_id).and_then(|session| {
+                let data = session.data_tab(tab_id)?;
+                Some((
                     session.engine.clone(),
-                    session.selected_table.clone(),
+                    data.table.clone(),
                     session.kind,
-                    session.busy,
-                    session.table_columns.clone(),
-                )
+                    data.busy,
+                    data.table_columns.clone(),
+                ))
             })
         else {
             return;
         };
-        let (Some(engine), Some(table)) = (engine, table) else {
+        let Some(engine) = engine else {
             return;
         };
-        // Refresh is explicitly a table reload.  It must also work after an
-        // ad-hoc query, whose result_table provenance is intentionally None.
         if busy {
             return;
         }
-        let filters = match self.active_filters_for(session_id, cx) {
+        let filters = match self.active_filters_for(session_id, tab_id, cx) {
             Ok(filters) => filters,
             Err(error) => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.error = Some(error);
+                if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+                    data.error = Some(error);
                 }
                 cx.notify();
                 return;
             }
         };
         let runtime = self.runtime.clone();
-        let Some(session) = self.session_mut(session_id) else {
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
-        session.busy = true;
-        session.error = None;
-        session.status = format!("Loading page {}…", page + 1);
-        session.result_table = None;
-        session.selected_row = None;
-        session.row_draft = None;
-        session.row_draft_subscriptions.clear();
-        session.clear_grid_selection(cx);
-        session.request_generation += 1;
-        let generation = session.request_generation;
+        data.busy = true;
+        data.error = None;
+        data.status = format!("Loading page {}…", page + 1);
+        data.reset_row_state(cx);
+        data.request_generation += 1;
+        let generation = data.request_generation;
         let result_table = table.clone();
         let task = runtime.spawn(async move {
             if kind.is_sql() {
@@ -3244,31 +3485,38 @@ impl DbxApp {
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
+            if let Some(data) = session.data_tab_mut(tab_id) {
+                data.abort_handle.replace(task.abort_handle());
+            }
         }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result = task.await?;
+            let Ok(result) = task.await else {
+                return Ok(());
+            };
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
                 };
-                if generation != session.request_generation {
+                let Some(data) = find_data_tab_mut(&mut session.secondary_tabs, tab_id) else {
+                    return;
+                };
+                if generation != data.request_generation {
                     return;
                 }
-                session.busy = false;
+                data.busy = false;
+                data.abort_handle.clear();
                 match result {
                     Ok((result, has_next_page)) => {
-                        session.table_page = page;
-                        session.table_has_next_page = has_next_page;
-                        session.set_result(Some(result), cx);
-                        session.result_table = Some(result_table.clone());
-                        session.selected_row = None;
-                        session.row_draft = None;
-                        session.error = None;
+                        data.table_page = page;
+                        data.table_has_next_page = has_next_page;
+                        data.set_result(Some(result), &session.tables, cx);
+                        data.result_table = Some(result_table.clone());
+                        data.error = None;
                     }
                     Err(error) => {
-                        session.error = Some(error.to_string());
+                        data.error = Some(error.to_string());
                     }
                 }
                 cx.notify();
@@ -3278,21 +3526,29 @@ impl DbxApp {
         .detach();
     }
 
-    fn active_filters_for(&self, session_id: SessionId, cx: &App) -> Result<Vec<Filter>, String> {
+    fn active_filters_for(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &App,
+    ) -> Result<Vec<Filter>, String> {
         let Some(session) = self.session(session_id) else {
             return Ok(Vec::new());
         };
+        let Some(data) = session.data_tab(tab_id) else {
+            return Ok(Vec::new());
+        };
         if session.kind.is_sql() {
-            return session
+            return data
                 .filters
-                .validate(cx, &session.table_columns)
+                .validate(cx, &data.table_columns)
                 .map_err(|error| error.to_string());
         }
         let value = session.editors.filter_text.read(cx).trim();
         let column = selected_filter_column(
-            session.selected_column,
-            &session.table_columns,
-            session.result.as_deref(),
+            data.selected_column,
+            &data.table_columns,
+            data.result.as_deref(),
         )
         .map(|column| column.name.clone());
         Ok(match (value.is_empty(), column) {
@@ -3305,20 +3561,36 @@ impl DbxApp {
         })
     }
 
-    fn editable_table_for(&self, session_id: SessionId) -> Option<&TableRef> {
+    fn data_tab(&self, session_id: SessionId, tab_id: SecondaryTabId) -> Option<&DataTab> {
+        self.session(session_id)?.data_tab(tab_id)
+    }
+
+    fn data_tab_mut(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+    ) -> Option<&mut DataTab> {
+        self.session_mut(session_id)?.data_tab_mut(tab_id)
+    }
+
+    fn editable_table_for(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+    ) -> Option<&TableRef> {
         let session = self.session(session_id)?;
-        let selected_table = session.selected_table.as_ref()?;
+        let data = session.data_tab(tab_id)?;
         let is_real_table = session
             .tables
             .iter()
-            .any(|table| table.kind == EntityKind::Table && table_ref(table) == *selected_table);
+            .any(|table| table.kind == EntityKind::Table && table_ref(table) == data.table);
         can_mutate_result(
             session.kind,
-            session.busy,
-            session.selected_table.as_ref(),
-            session.result_table.as_ref(),
+            session.busy || data.busy,
+            Some(&data.table),
+            data.result_table.as_ref(),
         )
-        .then_some(selected_table)
+        .then_some(&data.table)
         .filter(|_| is_real_table)
     }
 
@@ -3337,6 +3609,7 @@ impl DbxApp {
             let text_revision = query_tab.query_revision;
             let query_text = query_tab.query_text.read(cx).clone();
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
+            let recent_data = session.recent_data();
             if session.kind.is_sql() {
                 let context = editor::sql_completion_context(&query_text, cursor)?;
                 let items = sql_completion_items(
@@ -3347,9 +3620,11 @@ impl DbxApp {
                         database_kind: session.kind,
                         tables: &session.tables,
                         completion_columns: &session.completion_columns,
-                        selected_table: session.selected_table.as_ref(),
-                        active_columns: &session.table_columns,
-                        result: session.result.as_deref(),
+                        selected_table: recent_data.map(|data| &data.table),
+                        active_columns: recent_data
+                            .map(|data| data.table_columns.as_slice())
+                            .unwrap_or_default(),
+                        result: recent_data.and_then(|data| data.result.as_deref()),
                         active_schema_filter: session.schema_filter.as_deref(),
                     },
                 );
@@ -3368,7 +3643,7 @@ impl DbxApp {
                     cursor,
                     session.redis_command_catalog.as_deref(),
                     query_tab.result.as_deref(),
-                    session.result.as_deref(),
+                    recent_data.and_then(|data| data.result.as_deref()),
                 )?;
                 (
                     tab_id,
@@ -3438,8 +3713,9 @@ impl DbxApp {
                         .focus_handle()
                         .is_focused(window),
                 ),
-                SecondaryTabKind::Structure(_) => None,
-                SecondaryTabKind::Diagram(_) => None,
+                SecondaryTabKind::Data(_)
+                | SecondaryTabKind::Structure(_)
+                | SecondaryTabKind::Diagram(_) => None,
             })
             .unwrap_or(false);
         if !editor_focused {
@@ -3604,8 +3880,9 @@ impl DbxApp {
             .and_then(|session| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
             .and_then(|tab| match &tab.kind {
                 SecondaryTabKind::Query(query) => Some(query.query_editor.clone()),
-                SecondaryTabKind::Structure(_) => None,
-                SecondaryTabKind::Diagram(_) => None,
+                SecondaryTabKind::Data(_)
+                | SecondaryTabKind::Structure(_)
+                | SecondaryTabKind::Diagram(_) => None,
             })
         else {
             return;
@@ -4532,6 +4809,7 @@ impl DbxApp {
                     diagram.stale = diagram.document.is_some();
                     diagram.error = None;
                 }
+                SecondaryTabKind::Data(data) => data.invalidate_request(),
                 SecondaryTabKind::Structure(_) => {}
             }
         }
@@ -4568,11 +4846,9 @@ impl DbxApp {
                     Ok(Ok(tables)) => {
                         session.set_tables(tables);
                         session.current_database = Some(database.clone());
-                        session.selected_table = None;
-                        session.table_columns.clear();
+                        // Open tables belong to the previous database.
+                        session.close_data_tabs();
                         session.completion_columns.clear();
-                        session.set_result(None, cx);
-                        session.result_table = None;
                         session.schema_filter = None;
                         let diagram_schemas = diagram_schema_names(session.kind, &session.tables);
                         let diagram_selection = diagram_initial_schema_selection(
@@ -4590,9 +4866,6 @@ impl DbxApp {
                                 diagram.drag_anchor = None;
                             }
                         }
-                        session.foreign_keys.clear();
-                        session.row_draft = None;
-                        session.row_draft_subscriptions.clear();
                         session.error = None;
                         diagram_needs_reload = diagram_open;
                     }
@@ -4631,15 +4904,16 @@ impl DbxApp {
     fn begin_insert_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editable_table_for(session_id).is_none() {
+        if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
         let Some(columns) = self
-            .session(session_id)
-            .map(|session| session.table_columns.clone())
+            .data_tab(session_id, tab_id)
+            .map(|data| data.table_columns.clone())
         else {
             return;
         };
@@ -4647,22 +4921,26 @@ impl DbxApp {
         for column in columns {
             row_draft.push(FieldRow::new_insert(column, None, window, cx));
         }
-        self.watch_draft_fields_for(session_id, &row_draft, window, cx);
+        self.watch_draft_fields_for(session_id, tab_id, &row_draft, window, cx);
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        session.draft_mode = DraftMode::Insert;
-        session.selected_row = None;
-        session.inspector_open = true;
-        session.clear_grid_selection(cx);
-        session.row_draft = Some(row_draft);
         session.error = None;
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        data.draft_mode = DraftMode::Insert;
+        data.selected_row = None;
+        data.inspector_open = true;
+        data.clear_grid_selection(cx);
+        data.row_draft = Some(row_draft);
         cx.notify();
     }
 
     fn watch_draft_fields_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row_draft: &RowDraftModel,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -4677,7 +4955,7 @@ impl DbxApp {
                     move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
                         let SelectEvent::Confirm(value) = event;
                         let value = value.as_ref().map(ToString::to_string);
-                        this.set_row_value_text_for(session_id, field_id, value, cx);
+                        this.set_row_value_text_for(session_id, tab_id, field_id, value, cx);
                     },
                 ));
             }
@@ -4689,7 +4967,7 @@ impl DbxApp {
                     move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
                         let SelectEvent::Confirm(value) = event;
                         let value = value.as_ref().map(ToString::to_string);
-                        this.set_row_value_text_for(session_id, field_id, value, cx);
+                        this.set_row_value_text_for(session_id, tab_id, field_id, value, cx);
                     },
                 ));
             }
@@ -4704,20 +4982,23 @@ impl DbxApp {
                             .as_ref()
                             .and_then(|value| FieldValueState::from_label(value.as_ref()));
                         if let Some(state) = state {
-                            this.set_row_field_state_for(session_id, field_id, state, window, cx);
+                            this.set_row_field_state_for(
+                                session_id, tab_id, field_id, state, window, cx,
+                            );
                         }
                     },
                 ));
             }
         }
-        if let Some(session) = self.session_mut(session_id) {
-            session.row_draft_subscriptions = subscriptions;
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.row_draft_subscriptions = subscriptions;
         }
     }
 
     fn set_row_value_text_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         field_id: FieldId,
         value: Option<String>,
         cx: &mut Context<Self>,
@@ -4728,12 +5009,15 @@ impl DbxApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        let Some(field) = session.row_draft.as_mut().and_then(|draft| {
-            draft
-                .fields_mut()
-                .iter_mut()
-                .find(|field| field.id == field_id)
-        }) else {
+        let Some(field) = find_data_tab_mut(&mut session.secondary_tabs, tab_id)
+            .and_then(|data| data.row_draft.as_mut())
+            .and_then(|draft| {
+                draft
+                    .fields_mut()
+                    .iter_mut()
+                    .find(|field| field.id == field_id)
+            })
+        else {
             return;
         };
         field.set_value();
@@ -4748,31 +5032,27 @@ impl DbxApp {
     fn on_data_grid_event(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         event: &TableEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if matches!(event, TableEvent::SelectRow(_) | TableEvent::ClearSelection)
-            && self.session_mut(session_id).is_some_and(|session| {
-                if session.suppress_next_grid_selection_event {
-                    session.suppress_next_grid_selection_event = false;
-                    true
-                } else {
-                    false
-                }
-            })
+            && self
+                .data_tab_mut(session_id, tab_id)
+                .is_some_and(|data| std::mem::take(&mut data.suppress_next_grid_selection_event))
         {
             return;
         }
         match event {
             TableEvent::ColumnWidthsChanged(widths) => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.result_column_widths =
-                        ResultTableDelegate::widths_by_key(session.result.as_deref(), widths);
+                if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+                    data.result_column_widths =
+                        ResultTableDelegate::widths_by_key(data.result.as_deref(), widths);
                 }
             }
             TableEvent::SelectRow(row_index) => {
-                self.select_row_for(session_id, *row_index, window, cx);
+                self.select_row_for(session_id, tab_id, *row_index, cx);
             }
             // The inline foreign-key action uses the table component's
             // existing cell event channel so the virtualized grid remains
@@ -4780,6 +5060,7 @@ impl DbxApp {
             TableEvent::DoubleClickedCell(row_index, column_index) => {
                 self.navigate_to_foreign_key_row_for(
                     session_id,
+                    tab_id,
                     *row_index,
                     *column_index,
                     window,
@@ -4787,15 +5068,15 @@ impl DbxApp {
                 );
             }
             TableEvent::SelectColumn(column_index) if *column_index > 0 => {
-                self.select_column_for(session_id, *column_index - 1, cx);
+                self.select_column_for(session_id, tab_id, *column_index - 1, cx);
             }
             TableEvent::ClearSelection => {
-                if let Some(session) = self.session_mut(session_id)
-                    && session.draft_mode == DraftMode::Update
+                if let Some(data) = self.data_tab_mut(session_id, tab_id)
+                    && data.draft_mode == DraftMode::Update
                 {
-                    session.selected_row = None;
-                    session.row_draft = None;
-                    session.row_draft_subscriptions.clear();
+                    data.selected_row = None;
+                    data.row_draft = None;
+                    data.row_draft_subscriptions.clear();
                     cx.notify();
                 }
             }
@@ -4849,17 +5130,17 @@ impl DbxApp {
     fn select_row_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row: usize,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pending_draft = self.session(session_id).and_then(|session| {
-            session.row_draft.as_ref()?;
-            Some((session.selected_row, session.data_grid.clone()))
+        let pending_draft = self.data_tab(session_id, tab_id).and_then(|data| {
+            data.row_draft.as_ref()?;
+            Some((data.selected_row, data.data_grid.clone()))
         });
         if let Some((selected_row, data_grid)) = pending_draft {
-            if let Some(session) = self.session_mut(session_id) {
-                session.suppress_next_grid_selection_event = true;
+            if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+                data.suppress_next_grid_selection_event = true;
             }
             data_grid.update(cx, |table, cx| {
                 if let Some(selected_row) = selected_row {
@@ -4878,17 +5159,21 @@ impl DbxApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        let Some(result) = session.result.as_ref() else {
+        let Some(data) = find_data_tab_mut(&mut session.secondary_tabs, tab_id) else {
             return;
         };
-        if result.rows.get(row).is_none() {
+        if data
+            .result
+            .as_ref()
+            .is_none_or(|result| result.rows.get(row).is_none())
+        {
             return;
         }
-        session.selected_row = Some(row);
-        session.draft_mode = DraftMode::Update;
-        session.inspector_open = true;
-        session.row_draft = None;
-        session.row_draft_subscriptions.clear();
+        data.selected_row = Some(row);
+        data.draft_mode = DraftMode::Update;
+        data.inspector_open = true;
+        data.row_draft = None;
+        data.row_draft_subscriptions.clear();
         session.error = None;
         cx.notify();
     }
@@ -4896,21 +5181,18 @@ impl DbxApp {
     fn begin_edit_selected_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editable_table_for(session_id).is_none() {
+        if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
-        let draft_data = self.session(session_id).and_then(|session| {
-            let row = session.selected_row?;
-            let result = session.result.as_ref()?;
+        let draft_data = self.data_tab(session_id, tab_id).and_then(|data| {
+            let row = data.selected_row?;
+            let result = data.result.as_ref()?;
             let values = result.rows.get(row)?.values.clone();
-            Some((
-                session.table_columns.clone(),
-                result.columns.clone(),
-                values,
-            ))
+            Some((data.table_columns.clone(), result.columns.clone(), values))
         });
         let Some((table_columns, result_columns, values)) = draft_data else {
             return;
@@ -4935,35 +5217,49 @@ impl DbxApp {
             };
             draft.push(FieldRow::new_update(column, original, window, cx));
         }
-        self.watch_draft_fields_for(session_id, &draft, window, cx);
+        self.watch_draft_fields_for(session_id, tab_id, &draft, window, cx);
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        session.draft_mode = DraftMode::Update;
-        session.inspector_open = true;
-        session.row_draft = Some(draft);
         session.error = None;
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        data.draft_mode = DraftMode::Update;
+        data.inspector_open = true;
+        data.row_draft = Some(draft);
         cx.notify();
     }
 
-    fn close_inspector_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        if let Some(session) = self.session_mut(session_id) {
-            session.inspector_open = false;
+    fn close_inspector_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.inspector_open = false;
             cx.notify();
         }
     }
 
-    fn select_column_for(&mut self, session_id: SessionId, column: usize, cx: &mut Context<Self>) {
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.selected_column = column;
-        cx.notify();
+    fn select_column_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        column: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.selected_column = column;
+            cx.notify();
+        }
     }
 
     fn set_row_field_state_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         field_id: FieldId,
         state: FieldValueState,
         window: &mut Window,
@@ -4972,7 +5268,11 @@ impl DbxApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        let Some(field) = session.row_draft.as_mut().and_then(|draft| {
+        let Some(data) = find_data_tab_mut(&mut session.secondary_tabs, tab_id) else {
+            return;
+        };
+        let draft_mode = data.draft_mode;
+        let Some(field) = data.row_draft.as_mut().and_then(|draft| {
             draft
                 .fields_mut()
                 .iter_mut()
@@ -4983,7 +5283,7 @@ impl DbxApp {
         if state == FieldValueState::Null && !field.column.nullable {
             return;
         }
-        if state == FieldValueState::Default && session.draft_mode != DraftMode::Insert {
+        if state == FieldValueState::Default && draft_mode != DraftMode::Insert {
             return;
         }
         field.set_state(state);
@@ -4995,41 +5295,54 @@ impl DbxApp {
         cx.notify();
     }
 
-    fn cancel_row_draft_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        if let Some(session) = self.session_mut(session_id) {
-            let was_insert = session.draft_mode == DraftMode::Insert;
-            session.row_draft = None;
-            session.row_draft_subscriptions.clear();
-            if was_insert {
-                session.selected_row = None;
-                session.clear_grid_selection(cx);
-            }
-            session.draft_mode = DraftMode::Update;
-            session.error = None;
-            cx.notify();
+    fn cancel_row_draft_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        session.error = None;
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        let was_insert = data.draft_mode == DraftMode::Insert;
+        data.row_draft = None;
+        data.row_draft_subscriptions.clear();
+        if was_insert {
+            data.selected_row = None;
+            data.clear_grid_selection(cx);
         }
+        data.draft_mode = DraftMode::Update;
+        cx.notify();
     }
 
     fn save_draft_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.session(session_id) else {
             return;
         };
-        if session.busy {
+        let Some(data) = session.data_tab(tab_id) else {
+            return;
+        };
+        if session.busy || data.busy {
             return;
         }
-        let draft_mode = session.draft_mode;
+        let draft_mode = data.draft_mode;
         if !session.kind.is_sql() {
             let return_focus = self
-                .row_draft_focus_for(session_id, None, cx)
+                .row_draft_focus_for(session_id, tab_id, None, cx)
                 .or_else(|| window.focused(cx));
             self.show_mutation_error_for(
                 session_id,
-                draft_mode,
+                tab_id,
                 "Edit Redis keys from the command console.".into(),
                 return_focus,
                 window,
@@ -5039,8 +5352,8 @@ impl DbxApp {
         }
         let (Some(engine), Some(table), Some(row_draft)) = (
             session.engine.clone(),
-            self.editable_table_for(session_id).cloned(),
-            session.row_draft.as_ref(),
+            self.editable_table_for(session_id, tab_id).cloned(),
+            data.row_draft.as_ref(),
         ) else {
             return;
         };
@@ -5056,9 +5369,9 @@ impl DbxApp {
                 })
                 .map_err(|error| (error.to_string(), Some(error.field_id()))),
             DraftMode::Update => {
-                let Some(row) = session
+                let Some(row) = data
                     .selected_row
-                    .and_then(|row| session.result.as_ref()?.rows.get(row))
+                    .and_then(|row| data.result.as_ref()?.rows.get(row))
                     .cloned()
                 else {
                     return;
@@ -5070,7 +5383,7 @@ impl DbxApp {
                         if assignments.is_empty() {
                             return Ok(None);
                         }
-                        self.identity_filters_for(session_id, &row)
+                        self.identity_filters_for(session_id, tab_id, &row)
                             .map_err(|error| (error, None))
                             .map(|filters| {
                                 Some(Mutation::Update(UpdateRequest::new_with_mutation_values(
@@ -5093,30 +5406,27 @@ impl DbxApp {
             }
             Err((error, field_id)) => {
                 let return_focus = self
-                    .row_draft_focus_for(session_id, field_id, cx)
+                    .row_draft_focus_for(session_id, tab_id, field_id, cx)
                     .or_else(|| window.focused(cx));
-                self.show_mutation_error_for(
-                    session_id,
-                    draft_mode,
-                    error,
-                    return_focus,
-                    window,
-                    cx,
-                );
+                self.show_mutation_error_for(session_id, tab_id, error, return_focus, window, cx);
                 return;
             }
         };
         let error_return_focus = self
-            .row_draft_focus_for(session_id, None, cx)
+            .row_draft_focus_for(session_id, tab_id, None, cx)
             .or_else(|| window.focused(cx));
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        session.busy = true;
         session.error = None;
-        session.status = "Applying row change…".into();
-        session.request_generation += 1;
-        let generation = session.request_generation;
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        data.busy = true;
+        data.error = None;
+        data.status = "Applying row change…".into();
+        data.request_generation += 1;
+        let generation = data.request_generation;
         let task = runtime.spawn(async move {
             match request {
                 Mutation::Insert(request) => engine.insert(&request).await,
@@ -5133,24 +5443,22 @@ impl DbxApp {
                 .map_err(|error| format!("Row mutation task failed: {error}"))
                 .and_then(|outcome| outcome.map_err(|error| error.to_string()));
             this.update_in(cx, |this, window, cx| {
-                let Some(session) = this.session(session_id) else {
+                let Some(data) = this.data_tab_mut(session_id, tab_id) else {
                     return;
                 };
-                if generation != session.request_generation {
+                if generation != data.request_generation {
                     return;
                 }
                 match outcome {
                     Ok(_) => {
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.busy = false;
-                            session.error = None;
-                        }
-                        this.refresh_table_for(session_id, cx);
+                        data.busy = false;
+                        data.error = None;
+                        this.refresh_table_for(session_id, tab_id, cx);
                     }
                     Err(error) => {
                         this.show_mutation_error_for(
                             session_id,
-                            draft_mode,
+                            tab_id,
                             error,
                             error_return_focus,
                             window,
@@ -5167,21 +5475,22 @@ impl DbxApp {
     fn request_delete_selected_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((table, selected_row, row)) = self.session(session_id).and_then(|session| {
-            let selected_row = session.selected_row?;
-            let row = session.result.as_ref()?.rows.get(selected_row)?.clone();
+        let Some((table, selected_row, row)) = self.data_tab(session_id, tab_id).and_then(|data| {
+            let selected_row = data.selected_row?;
+            let row = data.result.as_ref()?.rows.get(selected_row)?.clone();
             Some((
-                self.editable_table_for(session_id)?.clone(),
+                self.editable_table_for(session_id, tab_id)?.clone(),
                 selected_row,
                 row,
             ))
         }) else {
             return;
         };
-        let filters = match self.identity_filters_for(session_id, &row) {
+        let filters = match self.identity_filters_for(session_id, tab_id, &row) {
             Ok(filters) => filters,
             Err(error) => {
                 if let Some(session) = self.session_mut(session_id) {
@@ -5203,6 +5512,7 @@ impl DbxApp {
             tone: ConfirmationTone::Danger,
             action: ConfirmationAction::DeleteRow {
                 session_id,
+                tab_id,
                 table,
                 filters,
             },
@@ -5216,6 +5526,7 @@ impl DbxApp {
     fn delete_row_for(
         &mut self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         table: TableRef,
         filters: Vec<Filter>,
         cx: &mut Context<Self>,
@@ -5223,7 +5534,10 @@ impl DbxApp {
         let Some(session) = self.session(session_id) else {
             return;
         };
-        if session.busy {
+        let Some(data) = session.data_tab(tab_id) else {
+            return;
+        };
+        if session.busy || data.busy {
             return;
         }
         if !session.kind.is_sql() {
@@ -5236,20 +5550,24 @@ impl DbxApp {
         let Some(engine) = session.engine.clone() else {
             return;
         };
+        let known_columns = if data.table == table {
+            data.table_columns.clone()
+        } else {
+            Vec::new()
+        };
         let runtime = self.runtime.clone();
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        session.busy = true;
         session.error = None;
-        session.status = "Deleting row…".into();
-        session.request_generation += 1;
-        let generation = session.request_generation;
-        let known_columns = if session.selected_table.as_ref() == Some(&table) {
-            session.table_columns.clone()
-        } else {
-            Vec::new()
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
         };
+        data.busy = true;
+        data.error = None;
+        data.status = "Deleting row…".into();
+        data.request_generation += 1;
+        let generation = data.request_generation;
         let task = runtime.spawn(async move {
             engine
                 .delete_with_columns(&table, &filters, Some(&known_columns))
@@ -5262,25 +5580,20 @@ impl DbxApp {
         cx.spawn(async move |this, cx| {
             let outcome = task.await?;
             this.update(cx, |this, cx| {
-                let Some(session) = this.session(session_id) else {
+                let Some(data) = this.data_tab_mut(session_id, tab_id) else {
                     return;
                 };
-                if generation != session.request_generation {
+                if generation != data.request_generation {
                     return;
                 }
+                data.busy = false;
                 match outcome {
                     Ok(_) => {
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.busy = false;
-                            session.error = None;
-                        }
-                        this.refresh_table_for(session_id, cx);
+                        data.error = None;
+                        this.refresh_table_for(session_id, tab_id, cx);
                     }
                     Err(error) => {
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.busy = false;
-                            session.error = Some(error.to_string());
-                        }
+                        data.error = Some(error.to_string());
                         cx.notify();
                     }
                 }
@@ -5367,20 +5680,24 @@ impl DbxApp {
     fn show_mutation_error_for(
         &mut self,
         session_id: SessionId,
-        draft_mode: DraftMode,
+        tab_id: SecondaryTabId,
         detail: String,
         return_focus: Option<FocusHandle>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut draft_mode = DraftMode::Update;
+        if let Some(session) = self.session_mut(session_id) {
+            session.error = Some(detail.clone());
+            if let Some(data) = session.data_tab_mut(tab_id) {
+                data.busy = false;
+                draft_mode = data.draft_mode;
+            }
+        }
         let title = match draft_mode {
             DraftMode::Insert => "Couldn’t insert row",
             DraftMode::Update => "Couldn’t update row",
         };
-        if let Some(session) = self.session_mut(session_id) {
-            session.busy = false;
-            session.error = Some(detail.clone());
-        }
         let focus = cx.focus_handle();
         self.mutation_error_dialog = Some(MutationErrorDialog {
             session_id,
@@ -5443,9 +5760,10 @@ impl DbxApp {
             } => self.execute_table_action(action, session_id, table, cx),
             ConfirmationAction::DeleteRow {
                 session_id,
+                tab_id,
                 table,
                 filters,
-            } => self.delete_row_for(session_id, table, filters, cx),
+            } => self.delete_row_for(session_id, tab_id, table, filters, cx),
             ConfirmationAction::DatabaseImport { session_id, path } => {
                 self.execute_database_import(session_id, path, cx)
             }
@@ -5522,24 +5840,27 @@ impl DbxApp {
                         session.error = None;
                         Some(match action {
                             TableAction::Truncate => {
-                                if let Some(result) = session.result.as_mut() {
-                                    let result = Arc::make_mut(result);
+                                if let Some(tab_id) = session.data_tab_for_table(&target_table)
+                                    && let Some(data) =
+                                        find_data_tab_mut(&mut session.secondary_tabs, tab_id)
+                                {
+                                    data.invalidate_request();
+                                    let mut result = data
+                                        .result
+                                        .as_deref()
+                                        .cloned()
+                                        .unwrap_or_else(|| QueryResult::empty(None, 0));
                                     result.rows.clear();
                                     result.rows_affected = Some(outcome.rows_affected);
                                     result.elapsed_ms = outcome.elapsed_ms;
-                                    session.sync_result_grid(true, cx);
-                                } else {
-                                    session.set_result(
-                                        Some(QueryResult::empty(
-                                            Some(outcome.rows_affected),
-                                            outcome.elapsed_ms,
-                                        )),
-                                        cx,
-                                    );
+                                    data.set_result(Some(result), &session.tables, cx);
+                                    data.table_page = 0;
+                                    data.table_has_next_page = false;
+                                    data.result_table = Some(target_table.clone());
+                                    data.selected_row = None;
+                                    data.row_draft = None;
+                                    data.row_draft_subscriptions.clear();
                                 }
-                                session.result_table = Some(target_table.clone());
-                                session.selected_row = None;
-                                session.row_draft = None;
                                 format!(
                                     "Truncated {} · {}",
                                     table.name,
@@ -5547,17 +5868,10 @@ impl DbxApp {
                                 )
                             }
                             TableAction::Drop => {
-                                if session.selected_table.as_ref() == Some(&target_table) {
-                                    session.selected_table = None;
-                                    session.table_columns.clear();
-                                    session
-                                        .completion_columns
-                                        .remove(&completion_table_key(&target_table));
-                                    session.set_result(None, cx);
-                                    session.result_table = None;
-                                    session.selected_row = None;
-                                    session.row_draft = None;
-                                }
+                                session.close_data_tabs_where(|data| data.table == target_table);
+                                session
+                                    .completion_columns
+                                    .remove(&completion_table_key(&target_table));
                                 format!("Deleted table {}", table.name)
                             }
                         })
@@ -5580,13 +5894,14 @@ impl DbxApp {
     fn identity_filters_for(
         &self,
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         row: &RowData,
     ) -> Result<Vec<Filter>, String> {
-        let session = self
-            .session(session_id)
-            .ok_or("No connection session is loaded")?;
-        let result = session.result.as_ref().ok_or("No row result is loaded")?;
-        let primary_keys: Vec<_> = session
+        let data = self
+            .data_tab(session_id, tab_id)
+            .ok_or("No table is open")?;
+        let result = data.result.as_ref().ok_or("No row result is loaded")?;
+        let primary_keys: Vec<_> = data
             .table_columns
             .iter()
             .filter(|column| column.primary_key)
@@ -5885,10 +6200,6 @@ fn schema_filtered_tables(
         })
         .cloned()
         .collect()
-}
-
-fn table_is_visible(kind: DatabaseKind, schema_filter: Option<&str>, table: &TableRef) -> bool {
-    table_is_visible_in(kind, schema_filter, table.schema.as_deref())
 }
 
 fn table_is_visible_in(
@@ -6213,7 +6524,9 @@ mod tests {
                 })
                 .and_then(|tab| match &tab.kind {
                     SecondaryTabKind::Query(query) => Some(query.query_text.read(cx).clone()),
-                    SecondaryTabKind::Structure(_) | SecondaryTabKind::Diagram(_) => None,
+                    SecondaryTabKind::Data(_)
+                    | SecondaryTabKind::Structure(_)
+                    | SecondaryTabKind::Diagram(_) => None,
                 })
         });
         assert_eq!(query_text.as_deref(), Some("JSON.GET "));
@@ -6582,15 +6895,15 @@ mod tests {
             schema_filtered_tables(DatabaseKind::MySQL, &tables, Some("public")).len(),
             tables.len()
         );
-        assert!(table_is_visible(
+        assert!(table_is_visible_in(
             DatabaseKind::PostgreSQL,
             Some("public"),
-            &TableRef::in_schema("public", "users")
+            Some("public")
         ));
-        assert!(!table_is_visible(
+        assert!(!table_is_visible_in(
             DatabaseKind::PostgreSQL,
             Some("public"),
-            &TableRef::in_schema("analytics", "events")
+            Some("analytics")
         ));
     }
 }

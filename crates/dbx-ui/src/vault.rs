@@ -98,7 +98,6 @@ impl CredentialVault {
         }
     }
 
-    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -137,13 +136,37 @@ impl CredentialVault {
 
     pub fn unlock(&self, passphrase: impl Into<SecretString>) -> VaultResult<()> {
         let passphrase = passphrase.into();
+        self.unlock_with(|salt| derive_key(passphrase.expose_secret(), salt))
+    }
+
+    /// Unlock with a key previously taken from [`Self::key`], skipping the
+    /// passphrase. A key for another vault (or an older, recreated one)
+    /// fails authentication like a wrong passphrase.
+    pub fn unlock_with_key(&self, key: SecretBox<[u8; KEY_LEN]>) -> VaultResult<()> {
+        self.unlock_with(|_| Ok(key))
+    }
+
+    /// The derived vault key, for device unlock. It opens only this vault
+    /// and never reveals the passphrase.
+    pub fn key(&self) -> VaultResult<SecretBox<[u8; KEY_LEN]>> {
+        let state = self.lock_state()?;
+        let Inner::Unlocked(unlocked) = &*state else {
+            return Err(state_error(&state));
+        };
+        Ok(SecretBox::new(Box::new(*unlocked.key.expose_secret())))
+    }
+
+    fn unlock_with(
+        &self,
+        key_for_salt: impl FnOnce(&[u8; SALT_LEN]) -> VaultResult<SecretBox<[u8; KEY_LEN]>>,
+    ) -> VaultResult<()> {
         let mut state = self.lock_state()?;
         if matches!(*state, Inner::Uninitialized) {
             return Err(VaultError::Uninitialized);
         }
         let bytes = read_vault_bytes(&self.path)?;
         let (header, ciphertext) = Header::parse(&bytes).map_err(|_| VaultError::Authentication)?;
-        let key = derive_key(passphrase.expose_secret(), &header.salt)?;
+        let key = key_for_salt(&header.salt)?;
         let cipher = XChaCha20Poly1305::new_from_slice(key.expose_secret())
             .map_err(|_| VaultError::Authentication)?;
         let nonce = XNonce::try_from(&header.nonce[..]).map_err(|_| VaultError::Authentication)?;
@@ -434,6 +457,28 @@ mod tests {
         assert_eq!(vault.state(), VaultState::Locked);
         vault.unlock("right passphrase").unwrap();
         assert_eq!(vault.get("key").unwrap().unwrap().expose_secret(), "secret");
+    }
+    #[test]
+    fn exported_key_unlocks_only_its_own_vault() {
+        let (_dir, vault) = vault();
+        vault.create("right passphrase").unwrap();
+        vault.set("key", "secret").unwrap();
+        let key = vault.key().unwrap();
+        let reloaded = CredentialVault::at(vault.path());
+        assert_eq!(reloaded.key().err(), Some(VaultError::Locked));
+        reloaded
+            .unlock_with_key(SecretBox::new(Box::new(*key.expose_secret())))
+            .unwrap();
+        assert_eq!(
+            reloaded.get("key").unwrap().unwrap().expose_secret(),
+            "secret"
+        );
+
+        let (_other_dir, other) = self::vault();
+        other.create("right passphrase").unwrap();
+        other.lock().unwrap();
+        assert_eq!(other.unlock_with_key(key), Err(VaultError::Authentication));
+        assert_eq!(other.state(), VaultState::Locked);
     }
     #[test]
     fn tampering_is_an_authentication_error() {
