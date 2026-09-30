@@ -93,18 +93,16 @@ impl DbxApp {
                         }),
                     )),
             )
-            .child(
-                div()
-                    .id("rail-connection-health")
-                    .size(px(8.))
-                    .rounded_full()
-                    .bg(if busy {
-                        theme().warning
-                    } else {
-                        theme().success
-                    })
-                    .tooltip(tip(if busy { "Working…" } else { "Connected" })),
-            )
+            .when(busy, |rail| {
+                rail.child(
+                    div()
+                        .id("rail-connection-health")
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(theme().warning)
+                        .tooltip(tip("Working…")),
+                )
+            })
     }
 
     pub(super) fn set_active_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
@@ -589,11 +587,12 @@ impl DbxApp {
                         view.child(
                             div()
                                 .flex()
-                                .items_center()
+                                .items_start()
                                 .gap(px(4.))
                                 .child(
                                     div()
                                         .w(px(52.))
+                                        .pt(px(4.))
                                         .flex_none()
                                         .text_size(px(11.))
                                         .text_color(theme().text_muted)
@@ -605,8 +604,8 @@ impl DbxApp {
                                         .flex_1()
                                         .min_w_0()
                                         .flex()
+                                        .flex_wrap()
                                         .gap(px(4.))
-                                        .overflow_x_scroll()
                                         .children(databases.into_iter().map(|database| {
                                             let selected = current_database.as_deref()
                                                 == Some(database.as_str());
@@ -654,11 +653,12 @@ impl DbxApp {
                         view.child(
                             div()
                                 .flex()
-                                .items_center()
+                                .items_start()
                                 .gap(px(4.))
                                 .child(
                                     div()
                                         .w(px(52.))
+                                        .pt(px(4.))
                                         .flex_none()
                                         .text_size(px(11.))
                                         .text_color(theme().text_muted)
@@ -670,8 +670,8 @@ impl DbxApp {
                                         .flex_1()
                                         .min_w_0()
                                         .flex()
+                                        .flex_wrap()
                                         .gap(px(4.))
-                                        .overflow_x_scroll()
                                         .children(schema_options.into_iter().map(|schema| {
                                             let selected =
                                                 selected_schema.as_deref() == schema.as_deref();

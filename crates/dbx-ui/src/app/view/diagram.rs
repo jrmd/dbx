@@ -145,16 +145,6 @@ impl DbxApp {
                     .clamp(0.35, 1.0)
             })
             .unwrap_or(1.0);
-        let heading = document
-            .as_ref()
-            .map(|document| {
-                format!(
-                    "{} tables · {} relationships",
-                    document.nodes.len(),
-                    document.edges.len()
-                )
-            })
-            .unwrap_or_else(|| "Loading tables…".into());
         let schema_filter_active = selected_schemas.is_some();
         let schema_filter_control = (kind == DatabaseKind::PostgreSQL
             && !available_schemas.is_empty())
@@ -272,27 +262,6 @@ impl DbxApp {
                     .flex()
                     .items_center()
                     .gap(px(9.))
-                    .child(icon(Icon::Diagram, theme().accent))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme().text)
-                                    .child("Database diagram"),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(9.))
-                                    .text_color(theme().text_muted)
-                                    .child(heading),
-                            ),
-                    )
                     .when(busy || stale, |view| {
                         view.child(
                             div()

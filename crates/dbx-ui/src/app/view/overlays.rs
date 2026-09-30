@@ -132,19 +132,6 @@ impl DbxApp {
         } else {
             "Select all"
         };
-        let destination_label = if format == DumpFormat::Sql {
-            format!(
-                "One {} file{}",
-                format.extension().to_ascii_uppercase(),
-                if gzipped { " (gzip)" } else { "" }
-            )
-        } else {
-            format!(
-                "One {} file per table{}",
-                format.extension().to_ascii_uppercase(),
-                if gzipped { " (gzip)" } else { "" }
-            )
-        };
 
         let overlay = div()
             .absolute()
@@ -179,23 +166,13 @@ impl DbxApp {
                             .items_start()
                             .justify_between()
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(3.))
-                                    .child(
-                                        div()
-                                            .text_size(px(16.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme().text)
-                                            .child("Export database"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(theme().text_muted)
-                                            .child(destination_label),
-                                    ),
+                                div().flex().flex_col().child(
+                                    div()
+                                        .text_size(px(16.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme().text)
+                                        .child("Export database"),
+                                ),
                             )
                             .child(
                                 Button::new("close-database-export")
@@ -330,7 +307,6 @@ impl DbxApp {
                             .py(px(12.))
                             .border_t_1()
                             .border_color(theme().border)
-                            .bg(theme().panel_raised)
                             .flex()
                             .items_center()
                             .justify_between()
@@ -461,7 +437,6 @@ impl DbxApp {
                             .py(px(12.))
                             .border_t_1()
                             .border_color(theme().border)
-                            .bg(theme().panel_raised)
                             .flex()
                             .items_center()
                             .justify_end()
@@ -567,7 +542,6 @@ impl DbxApp {
                             .py(px(12.))
                             .border_t_1()
                             .border_color(theme().border)
-                            .bg(theme().panel_raised)
                             .flex()
                             .items_center()
                             .justify_between()
@@ -698,15 +672,6 @@ impl DbxApp {
                         .child(div().my(px(4.)).border_t_1().border_color(theme().border))
                         .child(
                             div()
-                                .px(px(8.))
-                                .py(px(4.))
-                                .text_size(px(9.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme().text_muted)
-                                .child("TRANSFER"),
-                        )
-                        .child(
-                            div()
                                 .id("context-export-table")
                                 .px(px(8.))
                                 .py(px(7.))
@@ -754,15 +719,6 @@ impl DbxApp {
                                 })),
                         )
                         .child(div().my(px(4.)).border_t_1().border_color(theme().border))
-                        .child(
-                            div()
-                                .px(px(8.))
-                                .py(px(4.))
-                                .text_size(px(9.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme().text_muted)
-                                .child("DESTRUCTIVE"),
-                        )
                         .child(
                             div()
                                 .id("context-truncate-table")
