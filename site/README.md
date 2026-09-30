@@ -13,11 +13,9 @@ pnpm dev
 
 Set `GITHUB_TOKEN` in the Vercel project to avoid the unauthenticated API rate limit (a fine-grained token with no extra permissions is enough).
 
-## Deploying to Vercel
+## Deployment
 
-1. Import `jrmd/dbx` in Vercel and set **Root Directory** to `site`. The framework preset is detected as Next.js.
-2. Add the domain `dbx.jrmd.dev`, then create the `CNAME` record Vercel shows for it (`dbx` → `cname.vercel-dns.com`).
-3. Optional: under **Git → Ignored Build Step**, use `git diff --quiet HEAD^ HEAD -- .` so Rust-only commits don't redeploy the site.
+The Vercel project `dbx` is connected to `jrmd/dbx` with **Root Directory** `site`, so every push to `main` that touches `site/` deploys to production. The ignored build step `git diff --quiet HEAD^ HEAD -- .` skips commits that only change the app. `dbx.jrmd.dev` is a Cloudflare `CNAME` to `cname.vercel-dns.com`.
 
 ## Jez UI components
 
