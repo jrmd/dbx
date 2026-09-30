@@ -73,7 +73,7 @@ make linux-appimage
 
 The archive contains a Linux staging tree. The destination machine still needs compatible system libraries and graphics drivers. The raw Cargo binary is `target/release/dbx`.
 
-`make linux-appimage` also produces `target/linux/DBX-VERSION-linux-x86_64.AppImage` and its checksum. It bundles the xkbcommon keyboard libraries and uses the host's X11/Wayland, Vulkan driver, and fonts. The first run downloads [appimagetool](https://github.com/AppImage/appimagetool) into `target/linux/tools/`. Build on an older distribution, as the release workflow does on Ubuntu 22.04, so the AppImage runs on systems with older glibc.
+`make linux-appimage` also produces `target/linux/DBX-VERSION-linux-x86_64.AppImage` and its checksum. It uses the host's X11/Wayland, xkbcommon, Vulkan driver, and fonts. The first run downloads [appimagetool](https://github.com/AppImage/appimagetool) into `target/linux/tools/`. Build on an older distribution, as the release workflow does on Ubuntu 22.04, so the AppImage runs on systems with older glibc.
 
 The AppImage updates itself in place when its file is in a writable directory.
 For a user-owned install from the release tarball that supports in-app updates, extract the tarball
@@ -94,7 +94,7 @@ background checks (useful for development, QA, and package-managed installs).
 
 The [release workflow](.github/workflows/release.yml) runs on `vVERSION` tags
 matching the workspace version. It builds Linux x86_64 on Ubuntu 22.04 and signed,
-notarized macOS Apple Silicon and Intel bundles. All tests and all three builds
+notarized macOS Apple Silicon bundles; Intel Macs are not supported. All tests and both builds
 must succeed; assets are uploaded to a draft before the complete release is
 published. The existing Mac candidate workflow remains available for testing.
 See [release setup](docs/macos-release.md) for the required Apple secrets.
