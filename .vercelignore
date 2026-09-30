@@ -1,0 +1,5 @@
+# Vercel builds only the marketing site (project root directory: site).
+/*
+!/site
+/site/node_modules
+/site/.next

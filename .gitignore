@@ -41,3 +41,5 @@ Desktop.ini
 *.orig
 
 .codegraph
+.vercel
+.env*
