@@ -678,7 +678,7 @@ impl DbxApp {
                 match result {
                     Ok((engine, tables, databases, current_database, schema_filter, initial)) => {
                         session.engine = Some(engine);
-                        session.tables = tables;
+                        session.set_tables(tables);
                         session.databases = databases;
                         session.current_database = current_database;
                         session.schema_filter = schema_filter;
