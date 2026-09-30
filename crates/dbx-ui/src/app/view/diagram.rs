@@ -566,11 +566,7 @@ impl DbxApp {
                         let horizontal_padding = (12.0 * zoom).max(4.0);
                         let key_width = (26.0 * zoom).max(12.0);
                         let radius = (10.0 * zoom).max(3.0);
-                        let schema = node
-                            .table
-                            .schema
-                            .clone()
-                            .unwrap_or_else(|| "default".into());
+                        let schema = node.table.schema.clone();
                         let column_total = node.columns.len() + node.omitted_columns;
                         let rows = node.columns.iter().enumerate().map(|(index, column)| {
                             let key = if column.primary_key {
@@ -716,13 +712,15 @@ impl DbxApp {
                                                     .text_color(theme().text)
                                                     .child(node.table.name.clone()),
                                             )
-                                            .child(
-                                                div()
-                                                    .truncate()
-                                                    .text_size(px(schema_size))
-                                                    .text_color(theme().text_muted)
-                                                    .child(schema),
-                                            ),
+                                            .when_some(schema, |view, schema| {
+                                                view.child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(schema_size))
+                                                        .text_color(theme().text_muted)
+                                                        .child(schema),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()

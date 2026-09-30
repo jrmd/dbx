@@ -11,11 +11,40 @@ use gpui_component::{
     table::{Column as DataColumn, TableDelegate, TableEvent, TableState},
 };
 
+use crate::diagram::display_type;
 use crate::row_drafts::{FieldValueKind, field_value_kind};
 use crate::theme::{Icon, icon, theme};
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
+/// Longest text handed to a grid cell. The column ellipsizes visually; this only
+/// keeps huge values from being shaped or copied every frame.
+const CELL_TEXT_LIMIT: usize = 300;
+
+/// Single-line display text for a cell, capped at `CELL_TEXT_LIMIT` characters.
+fn cell_display_text(value: &CellValue) -> String {
+    let full;
+    let text = match value {
+        CellValue::Text(text) => text.as_str(),
+        CellValue::Bytes(bytes) => {
+            let shown = &bytes[..bytes.len().min(CELL_TEXT_LIMIT / 2)];
+            full = format!(
+                "{}{}",
+                CellValue::Bytes(shown.to_vec()),
+                if shown.len() < bytes.len() { "…" } else { "" }
+            );
+            full.as_str()
+        }
+        value => {
+            full = value.to_string();
+            full.as_str()
+        }
+    };
+    match text.char_indices().nth(CELL_TEXT_LIMIT) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
+}
 
 /// Shared, virtualized backing model for both table browsing and ad-hoc query results.
 ///
@@ -26,6 +55,9 @@ pub(super) struct ResultTableDelegate {
     columns: Vec<DataColumn>,
     /// Per data column: numeric values are right-aligned so digits line up.
     numeric: Vec<bool>,
+    /// Lazily filled display text, row-major over data columns, so scrolling
+    /// never re-formats or re-copies values that were already rendered.
+    cell_text: Vec<Option<SharedString>>,
     foreign_keys: Vec<ForeignKeyInfo>,
 }
 
@@ -35,6 +67,7 @@ impl Default for ResultTableDelegate {
             result: None,
             columns: vec![Self::row_number_column()],
             numeric: Vec::new(),
+            cell_text: Vec::new(),
             foreign_keys: Vec::new(),
         }
     }
@@ -152,7 +185,7 @@ impl ResultTableDelegate {
             .iter()
             .take(AUTO_WIDTH_SAMPLE_ROWS)
             .filter_map(|row| row.values.get(column_index))
-            .map(|value| value.to_string().chars().count())
+            .map(|value| cell_display_text(value).chars().count())
             .max()
             .unwrap_or_default();
 
@@ -205,6 +238,9 @@ impl ResultTableDelegate {
                     .collect()
             })
             .unwrap_or_default();
+        self.cell_text = result.as_deref().map_or_else(Vec::new, |result| {
+            vec![None; result.rows.len() * result.columns.len()]
+        });
         self.result = result;
         self.columns = columns;
         self.foreign_keys = foreign_keys
@@ -501,7 +537,7 @@ impl TableDelegate for ResultTableDelegate {
                 .flex_none()
                 .text_size(px(9.))
                 .text_color(theme().text_muted)
-                .child(column.data_type.to_ascii_lowercase()),
+                .child(display_type(&column.data_type)),
         )
     }
 
@@ -529,23 +565,41 @@ impl TableDelegate for ResultTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let mut null = false;
-        let (text, text_color) = if col_ix == 0 {
-            ((row_ix + 1).to_string(), theme().text_muted)
+        let (text, text_color): (SharedString, _) = if col_ix == 0 {
+            ((row_ix + 1).to_string().into(), theme().text_muted)
         } else {
-            self.result
-                .as_ref()
-                .and_then(|result| result.rows.get(row_ix))
-                .and_then(|row| row.values.get(col_ix - 1))
-                .map(|value| match value {
-                    CellValue::Null => {
-                        null = true;
-                        ("NULL".to_owned(), theme().text_muted.alpha(0.7))
-                    }
-                    CellValue::Boolean(true) => ("true".to_owned(), theme().success),
-                    CellValue::Boolean(false) => ("false".to_owned(), theme().text_muted),
-                    value => (value.to_string(), theme().text),
-                })
-                .unwrap_or_else(|| ("—".to_owned(), theme().text_muted))
+            let column_count = self.columns.len() - 1;
+            let color = match self.cell_value(row_ix, col_ix - 1) {
+                None => None,
+                Some(CellValue::Null) => {
+                    null = true;
+                    Some(theme().text_muted.alpha(0.7))
+                }
+                Some(CellValue::Boolean(true)) => Some(theme().success),
+                Some(CellValue::Boolean(false)) => Some(theme().text_muted),
+                Some(_) => Some(theme().text),
+            };
+            match color {
+                None => ("—".into(), theme().text_muted),
+                Some(color) => {
+                    let slot = row_ix * column_count + col_ix - 1;
+                    let text = match self.cell_text.get(slot).cloned().flatten() {
+                        Some(text) => text,
+                        None => {
+                            let text: SharedString = self
+                                .cell_value(row_ix, col_ix - 1)
+                                .map(cell_display_text)
+                                .unwrap_or_default()
+                                .into();
+                            if let Some(cached) = self.cell_text.get_mut(slot) {
+                                *cached = Some(text.clone());
+                            }
+                            text
+                        }
+                    };
+                    (text, color)
+                }
+            }
         };
         let foreign_key = self.foreign_key_for_cell(row_ix, col_ix);
         let numeric = col_ix
@@ -590,7 +644,14 @@ impl TableDelegate for ResultTableDelegate {
                     })),
                 );
         } else {
-            cell = cell.child(text);
+            cell = cell.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(numeric, |value| value.text_right())
+                    .child(text),
+            );
         }
         cell
     }
