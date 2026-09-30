@@ -22,6 +22,7 @@ function Code({ lines }: { lines: string[] }) {
 
 export function Download({ release }: { release: Release | null }) {
   const mac = release?.macos;
+  const macIntel = release?.macosIntel;
   const linux = release?.linux;
   const version = release?.version ?? "0.1.0";
 
@@ -46,7 +47,8 @@ export function Download({ release }: { release: Release | null }) {
             <AppleIcon className="size-8" />
             <h3 className="mt-6 text-2xl font-medium tracking-tight">macOS</h3>
             <p className="mt-2 text-muted-foreground">
-              Apple Silicon. Signed with Developer ID and notarized by Apple.
+              {macIntel ? "Apple Silicon and Intel." : "Apple Silicon."} Signed
+              with Developer ID and notarized by Apple.
             </p>
             <div className="mt-auto pt-10">
               <a
@@ -76,6 +78,15 @@ export function Download({ release }: { release: Release | null }) {
                   "Unzip and move DBX.app into Applications."
                 )}
               </p>
+              {macIntel && (
+                <a
+                  href={macIntel.url}
+                  className="mt-2 inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  Download for Intel Macs · {formatSize(macIntel.size)}
+                  <ArrowUpRight className="size-3.5" />
+                </a>
+              )}
             </div>
           </div>
 
