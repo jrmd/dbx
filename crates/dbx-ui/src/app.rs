@@ -33,13 +33,13 @@ use gpui::{
     FocusHandle, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent,
     MouseButton, PathPromptOptions, Pixels, Point, Render, ResizeEdge, Rgba, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement, Subscription, Window, WindowControlArea,
-    WindowHandle, anchored, deferred, div, img, point, prelude::*, px,
+    WindowHandle, anchored, deferred, div, img, point, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    Disableable as _, FocusTrapElement as _, Selectable as _, Sizable as _, Size,
+    Disableable as _, FocusTrapElement as _, IndexPath, Selectable as _, Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     resizable::ResizableState,
-    select::{SearchableVec, Select, SelectEvent},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
     table::{DataTable, TableEvent, TableState},
 };
 use secrecy::SecretString;
@@ -61,10 +61,10 @@ use crate::{
     row_drafts::{FieldId, FieldRow, FieldValueKind, FieldValueState, RowDraftModel},
     settings::{Settings, SettingsStore},
     theme::{
-        Appearance, ButtonKind, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS, RADIUS_PANEL,
-        appearance, badge, button, connection_tab, database_logo, glass, glass_icon_button,
-        glass_raised, glass_shadow, icon, panel_header, reduce_transparency, segmented_track,
-        set_appearance, set_reduce_transparency, set_system_appearance, shortcut,
+        Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS,
+        RADIUS_PANEL, appearance, badge, button, connection_tab, database_logo, glass,
+        glass_icon_button, glass_raised, glass_shadow, icon, panel_header, reduce_transparency,
+        segmented_track, set_appearance, set_reduce_transparency, set_system_appearance, shortcut,
         sync_component_theme, theme, tip, window_background,
     },
     vault::VaultState,
@@ -314,6 +314,9 @@ impl ConnectionDraft {
 struct SessionEditors {
     filter_text: Entity<String>,
     filter_editor: Entity<TextEditor>,
+    /// Text typed into the sidebar's table search field.
+    sidebar_search: Entity<String>,
+    sidebar_search_editor: Entity<TextEditor>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -321,13 +324,241 @@ impl SessionEditors {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let filter_text = cx.new(|_| String::new());
         let filter_editor = cx.new(|cx| TextEditor::new(filter_text.clone(), false, window, cx));
-        let subscriptions = vec![cx.observe(&filter_text, |_, _, cx| cx.notify())];
+        let sidebar_search = cx.new(|_| String::new());
+        let sidebar_search_editor =
+            cx.new(|cx| TextEditor::new(sidebar_search.clone(), false, window, cx));
+        let subscriptions = vec![
+            cx.observe(&filter_text, |_, _, cx| cx.notify()),
+            cx.observe(&sidebar_search, |_, _, cx| cx.notify()),
+        ];
 
         Self {
             filter_text,
             filter_editor,
+            sidebar_search,
+            sidebar_search_editor,
             _subscriptions: subscriptions,
         }
+    }
+}
+
+/// Height shared by every control at the top of the sidebar.
+const SIDEBAR_CONTROL_HEIGHT: f32 = 28.0;
+const ALL_SCHEMAS_LABEL: &str = "All schemas";
+
+type SidebarSelect = Entity<SelectState<SearchableVec<SharedString>>>;
+
+/// The sidebar's database and schema dropdowns plus the cached list of rows
+/// they and the search field produce.
+struct SidebarState {
+    database_select: SidebarSelect,
+    schema_select: SidebarSelect,
+    synced_databases: Vec<String>,
+    synced_schemas: Vec<Option<String>>,
+    list: SidebarList,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SidebarState {
+    fn new(
+        id: SessionId,
+        kind: DatabaseKind,
+        window: &mut Window,
+        cx: &mut Context<DbxApp>,
+    ) -> Self {
+        let make_select = |window: &mut Window, cx: &mut Context<DbxApp>| {
+            cx.new(|select_cx| {
+                SelectState::new(
+                    SearchableVec::new(Vec::<SharedString>::new()),
+                    None,
+                    window,
+                    select_cx,
+                )
+                .searchable(true)
+            })
+        };
+        let database_select = make_select(window, cx);
+        let schema_select = make_select(window, cx);
+        let database_subscription = cx.subscribe_in(
+            &database_select,
+            window,
+            move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let database = this.session(id).and_then(|session| {
+                    session
+                        .databases
+                        .iter()
+                        .find(|database| database_label(kind, database) == value.as_ref())
+                        .cloned()
+                });
+                if let Some(database) = database {
+                    this.switch_database_for(id, database, cx);
+                }
+                // A refused switch (busy session) must snap the select back.
+                cx.notify();
+            },
+        );
+        let schema_subscription = cx.subscribe_in(
+            &schema_select,
+            window,
+            move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let schema = (value.as_ref() != ALL_SCHEMAS_LABEL).then(|| value.to_string());
+                this.select_schema_filter_for(id, schema, cx);
+                cx.notify();
+            },
+        );
+        Self {
+            database_select,
+            schema_select,
+            synced_databases: Vec::new(),
+            synced_schemas: Vec::new(),
+            list: SidebarList::default(),
+            _subscriptions: vec![database_subscription, schema_subscription],
+        }
+    }
+
+    /// Push changed items into the dropdowns and keep their selection equal to
+    /// the session's real state. Cheap when nothing changed.
+    fn sync_selectors(
+        &mut self,
+        kind: DatabaseKind,
+        databases: &[String],
+        current_database: Option<&str>,
+        schema_filter: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<DbxApp>,
+    ) {
+        let databases_changed = self.synced_databases != databases;
+        if databases_changed {
+            let labels = databases
+                .iter()
+                .map(|database| SharedString::from(database_label(kind, database)))
+                .collect::<Vec<_>>();
+            self.database_select.update(cx, |select, cx| {
+                select.set_items(SearchableVec::new(labels), window, cx)
+            });
+            self.synced_databases = databases.to_vec();
+        }
+        let database_index = current_database
+            .and_then(|current| databases.iter().position(|database| database == current))
+            .map(IndexPath::new);
+        sync_select_index(
+            &self.database_select,
+            database_index,
+            databases_changed,
+            window,
+            cx,
+        );
+
+        let schema_options = self.list.schema_options.clone();
+        let schemas_changed = *self.synced_schemas != *schema_options;
+        if schemas_changed {
+            let labels = schema_options
+                .iter()
+                .map(|schema| {
+                    SharedString::from(schema.clone().unwrap_or_else(|| ALL_SCHEMAS_LABEL.into()))
+                })
+                .collect::<Vec<_>>();
+            self.schema_select.update(cx, |select, cx| {
+                select.set_items(SearchableVec::new(labels), window, cx)
+            });
+            self.synced_schemas = schema_options.to_vec();
+        }
+        let schema_index = schema_options
+            .iter()
+            .position(|schema| schema.as_deref() == schema_filter)
+            .map(IndexPath::new);
+        sync_select_index(
+            &self.schema_select,
+            schema_index,
+            schemas_changed,
+            window,
+            cx,
+        );
+    }
+}
+
+fn sync_select_index(
+    select: &SidebarSelect,
+    index: Option<IndexPath>,
+    force: bool,
+    window: &mut Window,
+    cx: &mut Context<DbxApp>,
+) {
+    if force || select.read(cx).selected_index(cx) != index {
+        select.update(cx, |select, cx| {
+            select.set_selected_index(index, window, cx)
+        });
+    }
+}
+
+fn database_label(kind: DatabaseKind, database: &str) -> String {
+    if kind == DatabaseKind::Redis {
+        format!("db{database}")
+    } else {
+        database.to_owned()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SidebarListKey {
+    revision: u64,
+    schema_filter: Option<String>,
+    search: String,
+}
+
+/// The rows the sidebar shows, rebuilt only when the table list, the schema
+/// filter or the search text changes rather than on every frame.
+#[derive(Default)]
+struct SidebarList {
+    key: Option<SidebarListKey>,
+    visible: Arc<Vec<TableInfo>>,
+    schema_options: Arc<Vec<Option<String>>>,
+}
+
+impl SidebarList {
+    /// Returns whether the list was rebuilt.
+    fn refresh(
+        &mut self,
+        kind: DatabaseKind,
+        tables: &[TableInfo],
+        revision: u64,
+        schema_filter: Option<&str>,
+        search: &str,
+    ) -> bool {
+        let search = search.trim();
+        if self.key.as_ref().is_some_and(|key| {
+            key.revision == revision
+                && key.schema_filter.as_deref() == schema_filter
+                && key.search == search
+        }) {
+            return false;
+        }
+        if self.key.as_ref().is_none_or(|key| key.revision != revision) {
+            self.schema_options = Arc::new(schema_filter_options(kind, tables));
+        }
+        let needle = search.to_lowercase();
+        self.visible = Arc::new(
+            tables
+                .iter()
+                .filter(|table| {
+                    table_is_visible_in(kind, schema_filter, table.schema.as_deref())
+                        && (needle.is_empty() || table.name.to_lowercase().contains(&needle))
+                })
+                .cloned()
+                .collect(),
+        );
+        self.key = Some(SidebarListKey {
+            revision,
+            schema_filter: schema_filter.map(str::to_owned),
+            search: search.to_owned(),
+        });
+        true
     }
 }
 
@@ -712,6 +943,9 @@ struct ConnectionSession {
     /// only. Persisted history remains the durable source for executed work.
     closed_queries: Vec<String>,
     tables: Vec<TableInfo>,
+    /// Bumped whenever `tables` is replaced so derived lists know to rebuild.
+    tables_revision: u64,
+    sidebar: SidebarState,
     /// Schema metadata already fetched for completion. The navigator always
     /// supplies table names; columns are added as tables are opened or their
     /// structure is inspected, avoiding a metadata query for every keystroke.
@@ -794,6 +1028,8 @@ impl ConnectionSession {
             active_secondary_tab: None,
             closed_queries: Vec::new(),
             tables: Vec::new(),
+            tables_revision: 0,
+            sidebar: SidebarState::new(id, kind, window, cx),
             completion_columns: HashMap::new(),
             redis_command_catalog: None,
             databases: Vec::new(),
@@ -818,6 +1054,21 @@ impl ConnectionSession {
             error: None,
             request_generation: 0,
             background_tasks: BackgroundTaskSet::default(),
+        }
+    }
+
+    fn set_tables(&mut self, tables: Vec<TableInfo>) {
+        self.tables = tables;
+        self.tables_revision += 1;
+        // A dropped schema would otherwise leave an empty list behind a
+        // selector that hides itself when fewer than two schemas remain.
+        if let Some(schema) = self.schema_filter.as_deref()
+            && !self
+                .tables
+                .iter()
+                .any(|table| table.schema.as_deref() == Some(schema))
+        {
+            self.schema_filter = default_schema_filter(self.kind, &self.tables);
         }
     }
 
@@ -3964,7 +4215,7 @@ impl DbxApp {
                     return;
                 }
                 let diagram_open = if let Some(session) = this.session_mut(session_id) {
-                    session.tables = tables;
+                    session.set_tables(tables);
                     for tab in &mut session.secondary_tabs {
                         if let SecondaryTabKind::Diagram(diagram) = &mut tab.kind {
                             // Table discovery is the authoritative signal that
@@ -4315,7 +4566,7 @@ impl DbxApp {
                 let mut diagram_needs_reload = false;
                 match result {
                     Ok(Ok(tables)) => {
-                        session.tables = tables;
+                        session.set_tables(tables);
                         session.current_database = Some(database.clone());
                         session.selected_table = None;
                         session.table_columns.clear();
@@ -5267,7 +5518,7 @@ impl DbxApp {
                 session.busy = false;
                 let toast = match result {
                     Ok((outcome, tables)) => {
-                        session.tables = tables;
+                        session.set_tables(tables);
                         session.error = None;
                         Some(match action {
                             TableAction::Truncate => {
@@ -5637,16 +5888,15 @@ fn schema_filtered_tables(
 }
 
 fn table_is_visible(kind: DatabaseKind, schema_filter: Option<&str>, table: &TableRef) -> bool {
-    kind != DatabaseKind::PostgreSQL
-        || schema_filter.is_none()
-        || table.schema.as_deref() == schema_filter
+    table_is_visible_in(kind, schema_filter, table.schema.as_deref())
 }
 
-fn schema_filter_id(schema: Option<&str>) -> String {
-    format!(
-        "schema-filter-{}",
-        schema.unwrap_or("all").replace([' ', '/'], "-")
-    )
+fn table_is_visible_in(
+    kind: DatabaseKind,
+    schema_filter: Option<&str>,
+    table_schema: Option<&str>,
+) -> bool {
+    kind != DatabaseKind::PostgreSQL || schema_filter.is_none() || table_schema == schema_filter
 }
 
 fn can_mutate_result(
@@ -6263,6 +6513,55 @@ mod tests {
             schema_filter_options(DatabaseKind::PostgreSQL, &tables),
             vec![None, Some("analytics".into()), Some("public".into())]
         );
+    }
+
+    #[test]
+    fn sidebar_list_rebuilds_only_when_its_inputs_change() {
+        let tables = vec![
+            TableInfo::table("Events", Some("analytics".into())),
+            TableInfo::table("users", Some("public".into())),
+            TableInfo::table("accounts", Some("public".into())),
+        ];
+        let kind = DatabaseKind::PostgreSQL;
+        let names = |list: &SidebarList| {
+            list.visible
+                .iter()
+                .map(|table| table.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut list = SidebarList::default();
+
+        assert!(list.refresh(kind, &tables, 1, None, ""));
+        assert_eq!(names(&list), vec!["Events", "users", "accounts"]);
+        let first_visible = list.visible.clone();
+        let first_options = list.schema_options.clone();
+
+        // Same inputs, including whitespace-only search noise: no rebuild.
+        assert!(!list.refresh(kind, &tables, 1, None, "  "));
+        assert!(Arc::ptr_eq(&first_visible, &list.visible));
+
+        // Search is case-insensitive and keeps the schema options cached.
+        assert!(list.refresh(kind, &tables, 1, None, "EVE"));
+        assert_eq!(names(&list), vec!["Events"]);
+        assert!(Arc::ptr_eq(&first_options, &list.schema_options));
+
+        assert!(list.refresh(kind, &tables, 1, Some("public"), ""));
+        assert_eq!(names(&list), vec!["users", "accounts"]);
+
+        // A new table list bumps the revision and rebuilds the options too.
+        let mut more = tables.clone();
+        more.push(TableInfo::table("orders", Some("sales".into())));
+        assert!(list.refresh(kind, &more, 2, Some("public"), ""));
+        assert_eq!(list.schema_options.len(), 4);
+    }
+
+    #[test]
+    fn sidebar_list_ignores_schema_filter_outside_postgres() {
+        let tables = vec![TableInfo::table("t", None), TableInfo::table("u", None)];
+        let mut list = SidebarList::default();
+        assert!(list.refresh(DatabaseKind::SQLite, &tables, 1, None, ""));
+        assert_eq!(list.visible.len(), 2);
+        assert!(list.schema_options.is_empty());
     }
 
     #[test]

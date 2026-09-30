@@ -4,7 +4,7 @@ use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 impl DbxApp {
     pub(super) fn render_workspace(
         &mut self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let sidebar_visible = !self.sidebar_hidden;
@@ -16,7 +16,9 @@ impl DbxApp {
             .pr(px(GLASS_INSET))
             .pb(px(GLASS_INSET))
             .gap(px(GLASS_INSET))
-            .when(sidebar_visible, |view| view.child(self.render_sidebar(cx)))
+            .when(sidebar_visible, |view| {
+                view.child(self.render_sidebar(window, cx))
+            })
             .child(
                 // The content sheet: the one opaque surface, so data never
                 // competes with whatever is behind the window.
@@ -422,30 +424,56 @@ impl DbxApp {
             })
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
-        // Filter inside the borrow so the table list is copied once, not twice.
+        let Some(search) = self
+            .session(session_id)
+            .map(|session| session.editors.sidebar_search.read(cx).clone())
+        else {
+            return div().into_any_element();
+        };
+        // Rebuild the row list only when its inputs changed, then keep the
+        // dropdowns in step with the session.
+        let Some(session) = self.session_mut(session_id) else {
+            return div().into_any_element();
+        };
+        session.sidebar.list.refresh(
+            session.kind,
+            &session.tables,
+            session.tables_revision,
+            session.schema_filter.as_deref(),
+            &search,
+        );
+        session.sidebar.sync_selectors(
+            session.kind,
+            &session.databases,
+            session.current_database.as_deref(),
+            session.schema_filter.as_deref(),
+            window,
+            cx,
+        );
         let Some((
             kind,
-            schema_options,
             visible_tables,
-            databases,
-            current_database,
+            show_database_select,
+            show_schema_select,
+            database_select,
+            schema_select,
+            search_editor,
             selected_schema,
             selected_table,
         )) = self.session(session_id).map(|session| {
             (
                 session.kind,
-                schema_filter_options(session.kind, &session.tables),
-                schema_filtered_tables(
-                    session.kind,
-                    &session.tables,
-                    session.schema_filter.as_deref(),
-                ),
-                session.databases.clone(),
-                session.current_database.clone(),
+                session.sidebar.list.visible.clone(),
+                session.databases.len() > 1,
+                session.kind == DatabaseKind::PostgreSQL
+                    && session.sidebar.list.schema_options.len() > 2,
+                session.sidebar.database_select.clone(),
+                session.sidebar.schema_select.clone(),
+                session.editors.sidebar_search_editor.clone(),
                 session.schema_filter.clone(),
                 session.selected_table.clone(),
             )
@@ -453,6 +481,7 @@ impl DbxApp {
         else {
             return div().into_any_element();
         };
+        let search_focus = search_editor.read(cx).focus_handle();
         let explorer_actions = cx.entity().downgrade();
         let table_count = visible_tables.len();
         glass(div(), RADIUS_GLASS, 8.)
@@ -594,202 +623,63 @@ impl DbxApp {
                                     }),
                             ),
                     )
-                    .when(databases.len() > 1, |view| {
+                    .when(show_database_select, |view| {
                         view.child(
                             div()
-                                .flex()
-                                .items_start()
-                                .gap(px(4.))
-                                .child(
-                                    div()
-                                        .w(px(52.))
-                                        .pt(px(4.))
-                                        .flex_none()
-                                        .text_size(px(11.))
-                                        .text_color(theme().text_muted)
-                                        .child("Database"),
-                                )
-                                .child(
-                                    div()
-                                        .id("database-switcher-scroll")
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap(px(4.))
-                                        .children(databases.into_iter().map(|database| {
-                                            let selected = current_database.as_deref()
-                                                == Some(database.as_str());
-                                            let label = if kind == DatabaseKind::Redis {
-                                                format!("db{database}")
-                                            } else {
-                                                database.clone()
-                                            };
-                                            div()
-                                                .id(SharedString::from(format!("db-{database}")))
-                                                .flex_none()
-                                                .px(px(9.))
-                                                .py(px(3.))
-                                                .rounded_full()
-                                                .bg(if selected {
-                                                    theme().accent_soft
-                                                } else {
-                                                    theme().glass_hover
-                                                })
-                                                .text_color(if selected {
-                                                    theme().accent
-                                                } else {
-                                                    theme().text_muted
-                                                })
-                                                .text_size(px(11.))
-                                                .cursor_pointer()
-                                                .hover(|style| {
-                                                    style
-                                                        .bg(theme().glass_selected)
-                                                        .text_color(theme().text)
-                                                })
-                                                .child(label)
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.switch_database_for(
-                                                        session_id,
-                                                        database.clone(),
-                                                        cx,
-                                                    )
-                                                }))
-                                        })),
-                                ),
+                                .id("database-select")
+                                .child(sidebar_select(&database_select)),
                         )
                     })
-                    .when(kind == DatabaseKind::PostgreSQL, |view| {
+                    .when(show_schema_select, |view| {
                         view.child(
                             div()
+                                .id("schema-select")
+                                .child(sidebar_select(&schema_select)),
+                        )
+                    })
+                    .when(kind != DatabaseKind::Redis, |view| {
+                        view.child(
+                            div()
+                                .h(px(SIDEBAR_CONTROL_HEIGHT))
+                                .px(px(8.))
                                 .flex()
-                                .items_start()
-                                .gap(px(4.))
-                                .child(
-                                    div()
-                                        .w(px(52.))
-                                        .pt(px(4.))
-                                        .flex_none()
-                                        .text_size(px(11.))
-                                        .text_color(theme().text_muted)
-                                        .child("Schema"),
-                                )
-                                .child(
-                                    div()
-                                        .id("schema-filter-scroll")
-                                        .flex_1()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap(px(4.))
-                                        .children(schema_options.into_iter().map(|schema| {
-                                            let selected =
-                                                selected_schema.as_deref() == schema.as_deref();
-                                            let label =
-                                                schema.as_deref().unwrap_or("All").to_owned();
-                                            let schema_id = schema_filter_id(schema.as_deref());
-                                            div()
-                                                .id(SharedString::from(schema_id))
-                                                .flex_none()
-                                                .px(px(9.))
-                                                .py(px(3.))
-                                                .rounded_full()
-                                                .bg(if selected {
-                                                    theme().accent_soft
-                                                } else {
-                                                    theme().glass_hover
-                                                })
-                                                .text_color(if selected {
-                                                    theme().accent
-                                                } else {
-                                                    theme().text_muted
-                                                })
-                                                .text_size(px(11.))
-                                                .cursor_pointer()
-                                                .hover(|style| {
-                                                    style
-                                                        .bg(theme().glass_selected)
-                                                        .text_color(theme().text)
-                                                })
-                                                .child(label)
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.select_schema_filter_for(
-                                                        session_id,
-                                                        schema.clone(),
-                                                        cx,
-                                                    )
-                                                }))
-                                        })),
-                                ),
+                                .items_center()
+                                .gap(px(6.))
+                                .rounded(px(RADIUS_CONTROL))
+                                .bg(theme().glass_hover)
+                                .border_1()
+                                .border_color(theme().hairline)
+                                .child(icon(Icon::Search, theme().text_muted))
+                                .child(div().flex_1().min_w_0().child(editor::bare_input(
+                                    search_editor,
+                                    search_focus,
+                                    px(SIDEBAR_CONTROL_HEIGHT - 2.),
+                                ))),
                         )
                     }),
             )
             .child(
-                div()
-                    .id("sidebar-scroll")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .py(px(6.))
-                    .children(visible_tables.into_iter().map(|table| {
-                        let selected = selected_table.as_ref().is_some_and(|current| {
-                            current.name == table.name && current.schema == table.schema
-                        });
-                        let label = table_sidebar_label(&table, selected_schema.as_deref());
-                        let menu_table = table.clone();
-                        div()
-                            .id(SharedString::from(table_sidebar_id(&table)))
-                            .mx(px(6.))
-                            .h(px(28.))
-                            .px(px(8.))
-                            .rounded(px(RADIUS_CONTROL))
-                            .when(selected, |row| {
-                                row.bg(theme().accent_soft).font_weight(FontWeight::MEDIUM)
-                            })
-                            .text_color(if selected {
-                                theme().accent
-                            } else {
-                                theme().text
-                            })
-                            .text_size(px(12.))
-                            .flex()
-                            .items_center()
-                            .gap(px(7.))
-                            .cursor_pointer()
-                            .when(!selected, |row| {
-                                row.hover(|style| style.bg(theme().glass_hover))
-                            })
-                            .child(icon(
-                                if table.kind == EntityKind::Table {
-                                    Icon::Table
-                                } else {
-                                    Icon::Search
-                                },
-                                if selected {
-                                    theme().accent
-                                } else {
-                                    theme().text_muted
-                                },
-                            ))
-                            .child(div().truncate().child(label))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.select_table_for(session_id, table.clone(), window, cx);
-                            }))
-                            .on_aux_click(cx.listener(
-                                move |this, event: &gpui::ClickEvent, _, cx| {
-                                    if table_click_action(event)
-                                        == TableClickAction::OpenContextMenu
-                                    {
-                                        this.open_table_context_menu(
-                                            session_id,
-                                            menu_table.clone(),
-                                            event.position(),
-                                            cx,
-                                        );
-                                    }
-                                },
-                            ))
-                    })),
+                div().flex_1().min_h_0().py(px(6.)).child(
+                    uniform_list(
+                        "sidebar-tables",
+                        visible_tables.len(),
+                        cx.processor(move |_this, range: Range<usize>, _window, cx| {
+                            range
+                                .filter_map(|index| visible_tables.get(index))
+                                .map(|table| {
+                                    sidebar_row(
+                                        session_id,
+                                        table,
+                                        selected_table.as_ref(),
+                                        selected_schema.as_deref(),
+                                        cx,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .h_full(),
+                ),
             )
             .into_any_element()
     }
@@ -858,6 +748,7 @@ impl DbxApp {
             .overflow_x_scroll()
             .border_b_1()
             .border_color(theme().border)
+            .follow_top_corners(RADIUS_PANEL)
             .bg(theme().panel)
             .child(
                 document_tab("document-data", Icon::Table, data_selected)
@@ -1053,6 +944,7 @@ impl DbxApp {
             .gap(px(12.))
             .border_t_1()
             .border_color(theme().border)
+            .follow_bottom_corners(RADIUS_PANEL)
             .bg(theme().panel)
             .text_size(px(11.))
             .text_color(theme().text_muted)
@@ -1172,4 +1064,81 @@ fn window_control_button(id: &'static str, kind: Icon, destructive: bool) -> Sta
             }
         })
         .child(icon(kind, theme().text).size(px(12.)))
+}
+
+fn sidebar_select(state: &SidebarSelect) -> impl IntoElement {
+    Select::new(state)
+        .with_size(Size::Small)
+        .h(px(SIDEBAR_CONTROL_HEIGHT))
+        .rounded(px(RADIUS_CONTROL))
+        .w_full()
+        .menu_max_h(px(260.))
+        .text_size(px(12.))
+        .bg(theme().glass_hover)
+        .border_color(theme().hairline)
+        .text_color(theme().text)
+}
+
+fn sidebar_row(
+    session_id: SessionId,
+    table: &TableInfo,
+    selected_table: Option<&TableRef>,
+    selected_schema: Option<&str>,
+    cx: &mut Context<DbxApp>,
+) -> Div {
+    let selected = selected_table
+        .is_some_and(|current| current.name == table.name && current.schema == table.schema);
+    let label = table_sidebar_label(table, selected_schema);
+    let menu_table = table.clone();
+    let table_ref = table.clone();
+    div().w_full().px(px(6.)).child(
+        div()
+            .id(SharedString::from(table_sidebar_id(table)))
+            .w_full()
+            .h(px(28.))
+            .px(px(8.))
+            .rounded(px(RADIUS_CONTROL))
+            .when(selected, |row| {
+                row.bg(theme().accent_soft).font_weight(FontWeight::MEDIUM)
+            })
+            .text_color(if selected {
+                theme().accent
+            } else {
+                theme().text
+            })
+            .text_size(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(7.))
+            .cursor_pointer()
+            .when(!selected, |row| {
+                row.hover(|style| style.bg(theme().glass_hover))
+            })
+            .child(icon(
+                if table.kind == EntityKind::Table {
+                    Icon::Table
+                } else {
+                    Icon::Search
+                },
+                if selected {
+                    theme().accent
+                } else {
+                    theme().text_muted
+                },
+            ))
+            .child(div().truncate().child(label))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_table_for(session_id, table_ref.clone(), window, cx);
+            }))
+            .on_aux_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                if table_click_action(event) == TableClickAction::OpenContextMenu {
+                    this.open_table_context_menu(
+                        session_id,
+                        menu_table.clone(),
+                        event.position(),
+                        cx,
+                    );
+                }
+            })),
+    )
 }

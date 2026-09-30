@@ -812,6 +812,7 @@ impl DbxApp {
                     .child(
                         structure_row()
                             .h(px(30.))
+                            .follow_top_corners(RADIUS_PANEL)
                             .bg(theme().panel_raised)
                             .border_b_1()
                             .border_color(theme().border_strong)
@@ -851,6 +852,9 @@ impl DbxApp {
                             .text_size(px(12.))
                             .when(index > 0, |row| {
                                 row.border_t_1().border_color(theme().border)
+                            })
+                            .when(index + 1 == table_columns.len(), |row| {
+                                row.follow_bottom_corners(RADIUS_PANEL)
                             })
                             .when(index % 2 == 1, |row| row.bg(theme().grid_alternate))
                             .hover(|style| style.bg(theme().glass_hover))

@@ -392,6 +392,27 @@ pub fn glass_shadow(elevation: f32) -> Vec<BoxShadow> {
     ]
 }
 
+/// GPUI clips `overflow_hidden` to the bounding rectangle, not the rounded
+/// rect, so a child with its own background (a tab strip, header row or
+/// footer) paints square over its parent's curved corners. Children that touch
+/// a rounded container's corners take the container's radius, less its
+/// one-pixel border, on the corners they share.
+pub trait FollowCorners: Styled + Sized {
+    /// The child's top edge sits on the container's top corners.
+    fn follow_top_corners(self, outer_radius: f32) -> Self {
+        let radius = px((outer_radius - 1.).max(0.));
+        self.rounded_tl(radius).rounded_tr(radius)
+    }
+
+    /// The child's bottom edge sits on the container's bottom corners.
+    fn follow_bottom_corners(self, outer_radius: f32) -> Self {
+        let radius = px((outer_radius - 1.).max(0.));
+        self.rounded_bl(radius).rounded_br(radius)
+    }
+}
+
+impl<E: Styled + Sized> FollowCorners for E {}
+
 /// Style any element as a floating pane of glass.
 pub fn glass<E: Styled>(element: E, radius: f32, elevation: f32) -> E {
     let theme = theme();

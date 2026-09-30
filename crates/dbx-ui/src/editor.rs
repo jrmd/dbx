@@ -3231,6 +3231,24 @@ pub fn input_with_key_context(
     input_with_context(editor, focus, multiline, key_context, false)
 }
 
+/// Render a single-line editor without its own chrome, sized to `height`.
+///
+/// The caller supplies the surrounding field (border, background, icon) so the
+/// input can sit flush with sibling controls of the same height.
+pub fn bare_input(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    height: Pixels,
+) -> impl IntoElement {
+    input_with_context(editor, focus, false, TEXT_EDITOR_CONTEXT, false)
+        .h(height)
+        .px(px(0.))
+        .py(px(0.))
+        .pt(px(3.))
+        .bg(gpui::transparent_black())
+        .border_0()
+}
+
 /// Render the SQL editor with both its text-editing and completion contexts.
 #[allow(dead_code)]
 pub fn sql_input(
@@ -3255,7 +3273,7 @@ fn input_with_context(
     multiline: bool,
     key_context: &'static str,
     fill_height: bool,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(gpui::SharedString::from(format!(
             "dbx-text-editor-{:?}",
