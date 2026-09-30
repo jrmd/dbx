@@ -13,6 +13,7 @@ mod query_history;
 mod row_drafts;
 mod settings;
 mod theme;
+mod updater;
 mod vault;
 
 use app::DbxApp;
@@ -56,6 +57,8 @@ fn app_menus() -> Vec<Menu> {
         Menu {
             name: APP_NAME.into(),
             items: vec![
+                MenuItem::action("Check for Updates…", app::CheckForUpdates),
+                MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Quit DBX", Quit),

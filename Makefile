@@ -5,7 +5,7 @@ LINUX_APP_SCRIPT := scripts/build-linux-app.sh
 MACOS_APP := target/macos/DBX.app
 INSTALL_DIR ?= /Applications
 
-.PHONY: build run install macos-build macos-run linux-build linux-run linux-package cargo-build cargo-run
+.PHONY: build run install macos-build macos-run linux-build linux-run linux-package linux-appimage cargo-build cargo-run
 
 # Local Mac workflow. The helper creates a stable, self-signed development
 # identity once, packages the Rust binary as DBX.app, signs it, and launches it.
@@ -32,6 +32,9 @@ linux-build:
 	bash $(LINUX_APP_SCRIPT) build
 
 linux-package: linux-build
+
+linux-appimage:
+	bash $(LINUX_APP_SCRIPT) appimage
 
 linux-run:
 	bash $(LINUX_APP_SCRIPT) run

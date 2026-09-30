@@ -263,7 +263,9 @@ pub fn set_reduce_transparency(reduce: bool) {
 }
 
 pub fn reduce_transparency() -> bool {
-    REDUCE_TRANSPARENCY.load(Ordering::Acquire)
+    // Keep AppKit's whole-window vibrancy out of the data workbench. The
+    // translucent GPUI layers do not map cleanly to native sidebar materials.
+    cfg!(target_os = "macos") || REDUCE_TRANSPARENCY.load(Ordering::Acquire)
 }
 
 /// The window backdrop that matches the current material setting. Blurred
@@ -788,6 +790,16 @@ mod tests {
             );
             // Content stays opaque so data never competes with the desktop.
             assert_eq!(palette.canvas.a, 1.0);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_workbench_always_uses_opaque_materials() {
+        assert!(reduce_transparency());
+        assert_eq!(window_background(), WindowBackgroundAppearance::Opaque);
+        for material in [theme().window, theme().glass, theme().glass_raised] {
+            assert_eq!(material.a, 1.0);
         }
     }
 
