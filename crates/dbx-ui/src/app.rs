@@ -64,8 +64,8 @@ use crate::{
         Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS,
         RADIUS_PANEL, appearance, badge, button, connection_tab, database_logo, glass,
         glass_icon_button, glass_raised, glass_shadow, icon, panel_header, reduce_transparency,
-        segmented_track, set_appearance, set_reduce_transparency, set_system_appearance, shortcut,
-        sync_component_theme, theme, tip, window_background,
+        segment, segmented_track, set_appearance, set_reduce_transparency, set_system_appearance,
+        shortcut, sync_component_theme, theme, tip, window_background,
     },
     vault::{VaultError, VaultState},
 };
@@ -1437,6 +1437,8 @@ pub struct DbxApp {
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
+    /// Focus target for the open Settings dialog; `None` while it is closed.
+    settings_dialog: Option<FocusHandle>,
     appearance: Appearance,
     reduce_transparency: bool,
     settings_store: Option<SettingsStore>,
@@ -1536,6 +1538,7 @@ impl DbxApp {
             database_export_dialog: None,
             confirmation_dialog: None,
             mutation_error_dialog: None,
+            settings_dialog: None,
             appearance: appearance(),
             reduce_transparency: reduce_transparency(),
             settings_store: SettingsStore::new().ok(),
@@ -1593,7 +1596,16 @@ impl DbxApp {
             let result = runtime.spawn_blocking(crate::updater::check).await;
             this.update(cx, |this, cx| {
                 this.update_state = match result {
-                    Ok(Ok(Some(update))) => UpdateState::Available(update),
+                    Ok(Ok(Some(update))) => {
+                        if this.settings_dialog.is_none() {
+                            this.show_toast(
+                                ToastKind::Info,
+                                format!("DBX {} is available in Settings", update.version),
+                                cx,
+                            );
+                        }
+                        UpdateState::Available(update)
+                    }
                     Ok(Ok(None)) => UpdateState::Current,
                     Ok(Err(error)) => UpdateState::Failed(format!("{error:#}")),
                     Err(error) => UpdateState::Failed(error.to_string()),
@@ -1605,7 +1617,20 @@ impl DbxApp {
         .detach();
     }
 
-    fn activate_update(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        self.settings_dialog = Some(focus);
+        cx.notify();
+    }
+
+    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_dialog.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn activate_update(&mut self, cx: &mut Context<Self>) {
         use crate::updater::UpdateState;
         match self.update_state.clone() {
             UpdateState::Available(update) => {
@@ -1828,6 +1853,7 @@ impl DbxApp {
             true
         } else {
             self.database_export_dialog.take().is_some()
+                || self.settings_dialog.take().is_some()
                 || self.table_context_menu.take().is_some()
                 || self.dismiss_connection_picker()
         };

@@ -29,6 +29,8 @@ pub enum UpdateState {
 #[derive(Clone, Debug)]
 pub struct Update {
     pub version: Version,
+    /// Markdown release notes, tidied for display inside DBX.
+    pub notes: Option<String>,
     asset: Asset,
     checksum: Asset,
 }
@@ -45,6 +47,8 @@ struct Release {
     tag_name: String,
     draft: bool,
     prerelease: bool,
+    #[serde(default)]
+    body: Option<String>,
     assets: Vec<Asset>,
 }
 
@@ -115,9 +119,38 @@ fn select(release: Release, current: &Version, platform: &str) -> Result<Option<
     );
     Ok(Some(Update {
         version,
+        notes: release.body.as_deref().and_then(release_notes),
         asset,
         checksum,
     }))
+}
+
+/// GitHub's generated notes are written for the web: they credit authors,
+/// link every PR, and end with contributor and changelog footers. Keep the
+/// change list and drop the rest.
+fn release_notes(body: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## New Contributors") {
+            break;
+        }
+        if trimmed.starts_with("## What's Changed") || trimmed.starts_with("**Full Changelog**") {
+            continue;
+        }
+        let line = match line.rsplit_once(" by @") {
+            Some((change, credit))
+                if (line.trim_start().starts_with("* ") || line.trim_start().starts_with("- "))
+                    && credit.contains(" in https://") =>
+            {
+                change
+            }
+            _ => line,
+        };
+        lines.push(line.trim_end());
+    }
+    let notes = lines.join("\n").trim().to_string();
+    (!notes.is_empty()).then_some(notes)
 }
 
 pub fn check() -> Result<Option<Update>> {
@@ -463,6 +496,7 @@ mod tests {
             tag_name: format!("v{version}"),
             draft: false,
             prerelease: false,
+            body: None,
             assets: [name.clone(), format!("{name}.sha256")]
                 .into_iter()
                 .map(|name| Asset {
@@ -475,6 +509,34 @@ mod tests {
                 .collect(),
         }
     }
+    #[test]
+    fn tidies_generated_release_notes() {
+        let body = "## What's Changed\r\n* feat: add schema-aware SQL completion (DBX-18) by @jrmd in https://github.com/jrmd/dbx/pull/3\r\n- fix: keep a dash by @mention intact\r\n\r\n## New Contributors\r\n* @jrmd made their first contribution in https://github.com/jrmd/dbx/pull/1\r\n\r\n**Full Changelog**: https://github.com/jrmd/dbx/commits/v0.1.0";
+        assert_eq!(
+            release_notes(body).as_deref(),
+            Some(
+                "* feat: add schema-aware SQL completion (DBX-18)\n- fix: keep a dash by @mention intact"
+            )
+        );
+        assert_eq!(
+            release_notes("**Full Changelog**: https://github.com/jrmd/dbx/commits/v0.1.0"),
+            None
+        );
+        let mut with_notes = release("0.2.0");
+        with_notes.body = Some("## Highlights\n\nFaster grids.".into());
+        let update = select(
+            with_notes,
+            &Version::parse("0.1.0").unwrap(),
+            "linux-x86_64.tar.gz",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            update.notes.as_deref(),
+            Some("## Highlights\n\nFaster grids.")
+        );
+    }
+
     #[test]
     fn selects_only_new_stable_matching_assets() {
         let current = Version::parse("0.1.0").unwrap();
@@ -569,6 +631,7 @@ mod tests {
             });
             let update = Update {
                 version: Version::parse("0.2.0")?,
+                notes: None,
                 asset: Asset {
                     name: "test.tar.gz".into(),
                     browser_download_url: format!("{base}/archive"),

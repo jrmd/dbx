@@ -53,6 +53,7 @@ impl Render for DbxApp {
                     .when(!connected, |view| view.pl(px(GLASS_INSET)))
                     .child(content),
             )
+            .child(self.render_settings_dialog(cx))
             .child(self.render_toasts(cx))
             .children(resize_edges(window))
     }
