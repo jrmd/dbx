@@ -277,6 +277,7 @@ fn kind_for_scheme(scheme: &str) -> Result<DatabaseKind, ConnectionFieldsError> 
         "kafka" => Ok(DatabaseKind::Kafka),
         "turso" | "libsql" => Ok(DatabaseKind::Turso),
         "d1" => Ok(DatabaseKind::CloudflareD1),
+        "clickhouse" => Ok(DatabaseKind::ClickHouse),
         _ => Err(ConnectionFieldsError::UnsupportedScheme(scheme.to_owned())),
     }
 }
@@ -447,6 +448,24 @@ fn decode(value: &str) -> Result<String, ConnectionFieldsError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clickhouse_urls_support_details_and_explicit_https_provider_selection() {
+        use super::*;
+        let mut fields =
+            ConnectionFields::from_url("clickhouse://default:p%40ss@localhost:8123/default")
+                .unwrap();
+        assert_eq!(fields.kind, DatabaseKind::ClickHouse);
+        assert_eq!(fields.password, "p@ss");
+        fields.use_structured_fields();
+        assert!(fields.config().is_ok());
+        let mut fields =
+            ConnectionFields::from_url("https://user:secret@cloud.example:8443/default").unwrap();
+        fields.kind = DatabaseKind::ClickHouse;
+        assert_eq!(
+            fields.config().unwrap().url,
+            "https://user:secret@cloud.example:8443/default"
+        );
+    }
     use super::*;
 
     #[test]

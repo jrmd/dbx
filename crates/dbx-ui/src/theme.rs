@@ -507,6 +507,7 @@ pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
         DatabaseKind::Kafka => assets::LOGO_KAFKA,
         DatabaseKind::Turso => assets::LOGO_TURSO,
         DatabaseKind::CloudflareD1 => assets::LOGO_CLOUDFLARE_D1,
+        DatabaseKind::ClickHouse => assets::LOGO_CLICKHOUSE,
     };
 
     svg().path(path).size(px(16.)).text_color(color)

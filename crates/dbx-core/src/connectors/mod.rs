@@ -1,4 +1,5 @@
 //! Native and HTTP connectors. Each retains its provider's query language.
+mod clickhouse;
 mod d1_binding;
 mod duck;
 mod http;
@@ -14,6 +15,9 @@ use std::time::Instant;
 
 pub(crate) async fn connect(config: ConnectionConfig) -> Result<Box<dyn Engine>> {
     match config.kind {
+        DatabaseKind::ClickHouse => Ok(Box::new(
+            clickhouse::ClickHouseEngine::connect(config).await?,
+        )),
         DatabaseKind::DuckDB => Ok(Box::new(duck::DuckEngine::connect(config).await?)),
         DatabaseKind::MongoDB => Ok(Box::new(mongo::MongoEngine::connect(config).await?)),
         DatabaseKind::Kafka => Ok(Box::new(kafka::KafkaEngine::connect(config).await?)),

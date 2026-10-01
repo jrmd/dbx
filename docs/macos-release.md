@@ -90,6 +90,24 @@ appearance remains available, while the transparency toggle is hidden on Mac.
 Verify the final appearance and update/restart journey on both Mac architectures
 before calling them device-verified.
 
+## Build reuse
+
+Both release workflows run tests and Clippy in the release profile, matching
+the packaging scripts. This avoids compiling the shared dependencies once in
+debug mode and again in release mode. GPUI's test-support feature still needs
+a separate test variant; the distributed binary keeps its production features.
+
+The shared preparation action caches Cargo downloads and `target/release`
+dependency artifacts per operating system, architecture, compiler, and Cargo
+inputs. Packaged apps and notarization output are excluded. The
+[release build check](../.github/workflows/build-check.yml) runs on relevant
+`main` pushes and can be dispatched manually to warm the default-branch cache.
+GitHub allows new release tags to restore that cache; a cache saved only on an
+older tag is unavailable to a new tag. For fastest releases, let the build check
+finish on `main` before pushing the version tag. Cold caches or toolchain/native
+dependency changes can still require a full build. Signing, notarization, and
+the signed updater installation check always run for each release.
+
 ## Local verification
 
 ```bash

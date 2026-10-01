@@ -6190,6 +6190,9 @@ impl DbxApp {
             }
             DatabaseKind::DuckDB => "CREATE TABLE new_table (id BIGINT PRIMARY KEY, name VARCHAR);",
             DatabaseKind::BigQuery => "CREATE TABLE new_table (id INT64, name STRING);",
+            DatabaseKind::ClickHouse => {
+                "CREATE TABLE new_table (\n    id UInt64,\n    name String\n) ENGINE = MergeTree ORDER BY id;"
+            }
             _ => kind.default_query(),
         };
         let is_query_active = self.session(session_id).is_some_and(|session| {

@@ -18,10 +18,11 @@ pub enum DatabaseKind {
     Kafka,
     Turso,
     CloudflareD1,
+    ClickHouse,
 }
 
 impl DatabaseKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::PostgreSQL,
         Self::MySQL,
         Self::SQLite,
@@ -34,8 +35,9 @@ impl DatabaseKind {
         Self::Kafka,
         Self::Turso,
         Self::CloudflareD1,
+        Self::ClickHouse,
     ];
-    pub const SQL: [Self; 8] = [
+    pub const SQL: [Self; 9] = [
         Self::PostgreSQL,
         Self::MySQL,
         Self::SQLite,
@@ -44,6 +46,7 @@ impl DatabaseKind {
         Self::BigQuery,
         Self::Turso,
         Self::CloudflareD1,
+        Self::ClickHouse,
     ];
 
     pub const fn is_sql(self) -> bool {
@@ -57,6 +60,7 @@ impl DatabaseKind {
                 | Self::BigQuery
                 | Self::Turso
                 | Self::CloudflareD1
+                | Self::ClickHouse
         )
     }
 
@@ -78,16 +82,20 @@ impl DatabaseKind {
     }
     pub const fn supports_details(self) -> bool {
         self.supports_transport()
-            || matches!(self, Self::MongoDB | Self::Elasticsearch | Self::Kafka)
+            || matches!(
+                self,
+                Self::MongoDB | Self::Elasticsearch | Self::Kafka | Self::ClickHouse
+            )
     }
     pub const fn supports_row_mutations(self) -> bool {
-        self.is_sql() && !matches!(self, Self::BigQuery)
+        self.is_sql() && !matches!(self, Self::BigQuery | Self::ClickHouse)
     }
     pub fn accepts_scheme(self, scheme: &str) -> bool {
         match self {
             Self::PostgreSQL | Self::CockroachDB => matches!(scheme, "postgres" | "postgresql"),
             Self::MongoDB => matches!(scheme, "mongodb" | "mongodb+srv"),
             Self::Elasticsearch => matches!(scheme, "http" | "https"),
+            Self::ClickHouse => matches!(scheme, "clickhouse" | "http" | "https"),
             Self::Turso => matches!(scheme, "libsql" | "turso" | "https" | "http"),
             _ => scheme == self.scheme(),
         }
@@ -101,6 +109,7 @@ impl DatabaseKind {
             Self::MongoDB => Some("27017"),
             Self::Elasticsearch => Some("9200"),
             Self::Kafka => Some("9092"),
+            Self::ClickHouse => Some("8123"),
             _ => None,
         }
     }
@@ -118,10 +127,14 @@ impl DatabaseKind {
             Self::BigQuery => "bigquery://project/dataset",
             Self::Turso => "libsql://database-organization.turso.io",
             Self::CloudflareD1 => "d1://account-id/database-id",
+            Self::ClickHouse => "clickhouse://default@localhost:8123/default",
         }
     }
     pub const fn connection_help(self) -> &'static str {
         match self {
+            Self::ClickHouse => {
+                "Use clickhouse://user:password@host:8123/database for HTTP, or https://user:password@host:8443/database for TLS (ClickHouse Cloud). Row editing is disabled; run writes in SQL."
+            }
             Self::PostgreSQL => "Supabase: use your direct or session-pooler PostgreSQL URL.",
             Self::CockroachDB => {
                 "Use a PostgreSQL URL with the TLS options supplied by CockroachDB."
@@ -156,6 +169,7 @@ impl DatabaseKind {
             Self::MySQL => "SELECT DATABASE(), CURRENT_USER();",
             Self::SQLite | Self::Turso | Self::CloudflareD1 => "SELECT sqlite_version();",
             Self::DuckDB => "SELECT version();",
+            Self::ClickHouse => "SELECT currentDatabase(), currentUser(), version();",
             Self::BigQuery => "SELECT 1 AS connected;",
             Self::Redis => "SCAN 0 COUNT 100",
             Self::MongoDB => "{\"ping\": 1}",
@@ -177,6 +191,7 @@ impl DatabaseKind {
             Self::Kafka => "kafka",
             Self::Turso => "libsql",
             Self::CloudflareD1 => "d1",
+            Self::ClickHouse => "clickhouse",
         }
     }
 }
@@ -196,6 +211,7 @@ impl fmt::Display for DatabaseKind {
             Self::Kafka => "Kafka",
             Self::Turso => "Turso",
             Self::CloudflareD1 => "Cloudflare D1",
+            Self::ClickHouse => "ClickHouse",
         })
     }
 }

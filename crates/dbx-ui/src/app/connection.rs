@@ -140,7 +140,20 @@ impl DbxApp {
             ) && self.draft.kind.accepts_scheme(original.scheme())
             {
                 rebuilt.set_query(original.query());
-                if self.draft.kind == DatabaseKind::Elasticsearch {
+                if matches!(
+                    self.draft.kind,
+                    DatabaseKind::Elasticsearch | DatabaseKind::ClickHouse
+                ) {
+                    if self.draft.kind == DatabaseKind::ClickHouse
+                        && original.scheme() != "clickhouse"
+                    {
+                        rebuilt = url::Url::parse(&format!(
+                            "{}://{}",
+                            original.scheme(),
+                            rebuilt.as_str().split_once("://").unwrap().1
+                        ))
+                        .expect("validated HTTP connection URL");
+                    }
                     let _ = rebuilt.set_scheme(original.scheme());
                 }
                 fields.connection_string = rebuilt.into();

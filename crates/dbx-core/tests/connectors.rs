@@ -1,5 +1,197 @@
 use dbx_core::*;
 
+#[tokio::test]
+#[ignore = "requires disposable ClickHouse on port 58123"]
+async fn clickhouse_live_sql_metadata_filters_limits_and_database_switching() {
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(
+        DatabaseKind::ClickHouse,
+        "clickhouse://dbx_test:dbx_test_password@127.0.0.1:58123/dbx_test",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(engine.current_database().await.unwrap(), "dbx_test");
+    engine
+        .execute_sql("DROP TABLE IF EXISTS dbx_qa_items")
+        .await
+        .unwrap();
+    engine.execute_sql("CREATE TABLE dbx_qa_items (id UInt64, name String, optional Nullable(String), amount Decimal(20, 4), nested Array(UInt8)) ENGINE = MergeTree ORDER BY id").await.unwrap();
+    engine.execute_sql("INSERT INTO dbx_qa_items VALUES (18446744073709551615, 'O\'\'Reilly %_\\\\ end', NULL, 1234567890123456.1234, [1, 2]), (2, 'other', 'present', 2, [])").await.unwrap();
+    let table = TableRef::new("dbx_qa_items");
+    assert!(
+        engine
+            .list_tables()
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.name == table.name)
+    );
+    let columns = engine.describe_table(&table).await.unwrap();
+    assert_eq!(columns.len(), 5);
+    assert!(columns[2].nullable);
+    assert!(!columns.iter().any(|c| c.primary_key));
+    let result = engine
+        .query_table(
+            &table,
+            &[],
+            &[Filter::new(
+                "id",
+                FilterOperator::Equals,
+                Some(CellValue::Unsigned(u64::MAX)),
+            )],
+            &[],
+            None,
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], CellValue::Unsigned(u64::MAX));
+    assert_eq!(result.rows[0].values[2], CellValue::Null);
+    assert_eq!(
+        result.rows[0].values[3],
+        CellValue::Text("1234567890123456.1234".into())
+    );
+    assert_eq!(
+        result.rows[0].values[4],
+        CellValue::Json(serde_json::json!([1, 2]))
+    );
+    let name = result.rows[0].values[1].clone();
+    assert_eq!(
+        engine
+            .query_table(
+                &table,
+                &[],
+                &[Filter::new("name", FilterOperator::Equals, Some(name))],
+                &[],
+                None,
+                QueryOptions::default()
+            )
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(
+        engine
+            .query_table(
+                &table,
+                &[],
+                &[Filter::new(
+                    "name",
+                    FilterOperator::Contains,
+                    Some(CellValue::Text("%_\\".into()))
+                )],
+                &[],
+                None,
+                QueryOptions::default()
+            )
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    let result = engine
+        .query(
+            "SELECT number FROM numbers(100)",
+            QueryOptions { max_rows: Some(2) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows.len(), 2);
+    assert!(result.truncated);
+    let result = engine
+        .query(
+            "SELECT id, name FROM dbx_qa_items WHERE 0",
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.columns.len(), 2);
+    assert!(result.rows.is_empty());
+    let result = engine
+        .query(
+            "SELECT 1 AS duplicate, 1 AS duplicate",
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.rows[0].values.len(), 2);
+    assert!(
+        engine
+            .query("SELECT missing_column", QueryOptions::default())
+            .await
+            .is_err()
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let csv = directory.path().join("items.csv");
+    assert_eq!(
+        export_table(&engine, &table, &csv)
+            .await
+            .unwrap()
+            .rows_exported,
+        2
+    );
+    assert!(
+        std::fs::read_to_string(&csv)
+            .unwrap()
+            .contains("18446744073709551615")
+    );
+    assert!(
+        export_table(&engine, &table, &directory.path().join("items.sql"))
+            .await
+            .is_err()
+    );
+    assert!(import_file(&engine, Some(&table), &csv).await.is_err());
+    assert!(
+        engine
+            .insert(&InsertRequest::from_row(
+                table.clone(),
+                vec![("id".into(), CellValue::Integer(3))]
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .delete(
+                &table,
+                &[Filter::new(
+                    "id",
+                    FilterOperator::Equals,
+                    Some(CellValue::Integer(2))
+                )]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .list_databases()
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d == "default")
+    );
+    engine.use_database("default").await.unwrap();
+    assert_eq!(
+        engine
+            .query("SELECT currentDatabase()", QueryOptions::default())
+            .await
+            .unwrap()
+            .rows[0]
+            .values[0],
+        CellValue::Text("default".into())
+    );
+    assert!(engine.use_database("dbx_missing_database").await.is_err());
+    assert_eq!(engine.current_database().await.unwrap(), "default");
+    engine.use_database("dbx_test").await.unwrap();
+    engine.truncate_table(&table).await.unwrap();
+    engine.drop_table(&table).await.unwrap();
+}
+
 #[test]
 fn provider_urls_and_sql_dialects_are_explicit() {
     for kind in DatabaseKind::ALL {

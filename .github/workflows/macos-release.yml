@@ -21,29 +21,14 @@ jobs:
     timeout-minutes: 120
     env:
       CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - name: Prepare Rust and native tools
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          brew install cmake
-          xcodebuild -runFirstLaunch
-          if ! xcrun --find metal; then
-            xcodebuild -downloadComponent MetalToolchain
-          fi
-          rustc --version
-          xcodebuild -version
+      - uses: ./.github/actions/prepare-rust-build
       - name: Run workspace tests
-        run: cargo test --locked --workspace
+        run: cargo test --locked --release --workspace
       - name: Build, sign, and notarize
         if: inputs.signed
         env:

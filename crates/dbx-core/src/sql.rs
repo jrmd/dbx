@@ -28,6 +28,16 @@ pub fn quote_identifier(kind: DatabaseKind, identifier: &str) -> Result<String> 
     if identifier.trim().is_empty() {
         return Err(DbxError::Parse("identifier cannot be empty".into()));
     }
+    if kind == DatabaseKind::ClickHouse {
+        if identifier.contains('\0') || identifier.split('.').any(str::is_empty) {
+            return Err(DbxError::Parse("Invalid ClickHouse identifier".into()));
+        }
+        return Ok(identifier
+            .split('.')
+            .map(|part| format!("`{}`", part.replace('\\', "\\\\").replace('`', "\\`")))
+            .collect::<Vec<_>>()
+            .join("."));
+    }
     if kind == DatabaseKind::BigQuery {
         if identifier.contains('\0') || identifier.split('.').any(str::is_empty) {
             return Err(DbxError::Parse("Invalid BigQuery identifier".into()));
@@ -431,6 +441,7 @@ pub fn build_truncate_table(kind: DatabaseKind, table: &TableRef) -> Result<SqlS
         DatabaseKind::PostgreSQL
         | DatabaseKind::MySQL
         | DatabaseKind::DuckDB
+        | DatabaseKind::ClickHouse
         | DatabaseKind::BigQuery => {
             format!("TRUNCATE TABLE {}", quote_table(kind, table)?)
         }
@@ -723,7 +734,7 @@ fn push_like_predicate(
     }
     statement.push_str(" LIKE ");
     statement.push_str(&placeholder(kind, params.len() + 1));
-    let escaped = if kind == DatabaseKind::BigQuery {
+    let escaped = if matches!(kind, DatabaseKind::BigQuery | DatabaseKind::ClickHouse) {
         value
             .replace('\\', "\\\\")
             .replace('%', "\\%")

@@ -13,6 +13,7 @@ const KIND_GROUPS: [(&str, &[DatabaseKind]); 4] = [
             DatabaseKind::SQLite,
             DatabaseKind::CockroachDB,
             DatabaseKind::DuckDB,
+            DatabaseKind::ClickHouse,
         ],
     ),
     (

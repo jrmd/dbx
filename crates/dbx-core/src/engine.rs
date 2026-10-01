@@ -322,12 +322,14 @@ impl DatabaseEngine {
     }
 
     pub async fn create_table(&self, request: &CreateTableRequest) -> Result<ExecResult> {
+        ensure_clickhouse_sql_writes(self.kind(), "create_table")?;
         ensure_sql(self.kind(), "create_table")?;
         let statement = build_create_table(self.kind(), request)?;
         self.execute(&statement).await
     }
 
     pub async fn insert(&self, request: &InsertRequest) -> Result<ExecResult> {
+        ensure_clickhouse_sql_writes(self.kind(), "insert")?;
         ensure_sql(self.kind(), "insert")?;
         let columns = self.describe_table(&request.table).await?;
         let statement = build_insert_with_columns(self.kind(), request, &columns)?;
@@ -335,6 +337,7 @@ impl DatabaseEngine {
     }
 
     pub async fn update(&self, request: &UpdateRequest) -> Result<ExecResult> {
+        ensure_clickhouse_sql_writes(self.kind(), "update")?;
         ensure_sql(self.kind(), "update")?;
         let columns = self.describe_table(&request.table).await?;
         ensure_primary_key_filters(&columns, &request.filters)?;
@@ -355,6 +358,7 @@ impl DatabaseEngine {
         known_columns: Option<&[ColumnInfo]>,
     ) -> Result<ExecResult> {
         ensure_sql(self.kind(), "delete")?;
+        ensure_clickhouse_sql_writes(self.kind(), "delete")?;
         let metadata = self.filter_metadata(table, filters, known_columns).await?;
         let statement = build_delete_with_columns(
             self.kind(),
@@ -386,6 +390,17 @@ fn ensure_sql(kind: DatabaseKind, operation: &str) -> Result<()> {
             operation: operation.to_owned(),
             kind,
         })
+    }
+}
+
+fn ensure_clickhouse_sql_writes(kind: DatabaseKind, operation: &str) -> Result<()> {
+    if kind == DatabaseKind::ClickHouse {
+        Err(DbxError::Unsupported {
+            operation: format!("{operation} through row editor; use SQL"),
+            kind,
+        })
+    } else {
+        Ok(())
     }
 }
 
