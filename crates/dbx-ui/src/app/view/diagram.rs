@@ -146,7 +146,7 @@ impl DbxApp {
             })
             .unwrap_or(1.0);
         let schema_filter_active = selected_schemas.is_some();
-        let schema_filter_control = (kind == DatabaseKind::PostgreSQL
+        let schema_filter_control = (kind.dialect() == DatabaseKind::PostgreSQL
             && !available_schemas.is_empty())
         .then(|| {
             let summary =

@@ -31,9 +31,9 @@ fn safe_host(host: &str) -> bool {
 }
 
 pub(crate) fn validate(config: &ConnectionConfig) -> Result<()> {
-    if config.kind == DatabaseKind::SQLite && (config.socket.is_some() || config.ssh.is_some()) {
+    if !config.kind.supports_transport() && (config.socket.is_some() || config.ssh.is_some()) {
         return Err(invalid(
-            "SQLite uses a local file, not a socket or SSH tunnel.",
+            "This connector does not support Unix sockets or SSH forwarding.",
         ));
     }
     if let Some(socket) = &config.socket {
@@ -105,7 +105,7 @@ impl Drop for Tunnel {
 
 fn forwarded_address(config: &ConnectionConfig, port: u16) -> Result<String> {
     if let Some(path) = &config.socket {
-        let path = if config.kind == DatabaseKind::PostgreSQL {
+        let path = if config.kind.dialect() == DatabaseKind::PostgreSQL {
             path.join(format!(".s.PGSQL.{port}"))
         } else {
             path.clone()
@@ -151,9 +151,10 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
     let url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL."))?;
     let remote_port = url.port().unwrap_or(match config.kind {
         DatabaseKind::PostgreSQL => 5432,
+        DatabaseKind::CockroachDB => 26257,
         DatabaseKind::MySQL => 3306,
         DatabaseKind::Redis => 6379,
-        DatabaseKind::SQLite => unreachable!(),
+        _ => unreachable!("transport validated"),
     });
     let endpoint = forwarded_address(config, remote_port)?;
     let listener = TcpListener::bind("127.0.0.1:0")

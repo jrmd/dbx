@@ -145,7 +145,7 @@ impl SqlxEngine {
         let connect_error = |error: sqlx::Error| {
             DbxError::Connection(crate::error::connection_message(&config.url, error))
         };
-        let pool = match config.kind {
+        let pool = match config.kind.dialect() {
             DatabaseKind::PostgreSQL => SqlxPool::Postgres(
                 pool_options::<Postgres>(max_connections, timeout, idle_timeout)
                     .connect_with(postgres_options(&config, &config.url).map_err(connect_error)?)
@@ -164,7 +164,7 @@ impl SqlxEngine {
                     .await
                     .map_err(connect_error)?,
             ),
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         Ok(Self {
             kind: config.kind,
@@ -484,7 +484,7 @@ impl SqlxEngine {
     }
 
     async fn list_sql_tables(&self) -> Result<Vec<TableInfo>> {
-        let result = match self.kind {
+        let result = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 self.metadata_query(
                     "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -511,11 +511,11 @@ impl SqlxEngine {
                 )
                 .await?
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         let mut tables = Vec::with_capacity(result.rows.len());
         for row in result.rows {
-            let (schema, name, entity_kind) = match self.kind {
+            let (schema, name, entity_kind) = match self.kind.dialect() {
                 DatabaseKind::SQLite => (
                     None,
                     text_value(&row, 0)?,
@@ -532,7 +532,7 @@ impl SqlxEngine {
                         _ => EntityKind::Table,
                     },
                 ),
-                DatabaseKind::Redis => unreachable!(),
+                _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
             };
             tables.push(TableInfo {
                 name,
@@ -544,7 +544,7 @@ impl SqlxEngine {
     }
 
     async fn describe_sql_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
-        let result = match self.kind {
+        let result = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 // PRAGMA accepts a quoted string for the table name. Escaping
                 // here prevents a table name from changing the pragma query.
@@ -573,7 +573,7 @@ impl SqlxEngine {
                 )
                 .await?
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         result
             .rows
@@ -586,7 +586,7 @@ impl SqlxEngine {
     /// Parse one column-metadata row whose column fields start at `offset`
     /// (bulk queries prefix the owning table's schema and name).
     fn column_from_row(&self, row: &RowData, offset: usize, index: usize) -> Result<ColumnInfo> {
-        let (name, data_type, nullable, ordinal, primary_key) = match self.kind {
+        let (name, data_type, nullable, ordinal, primary_key) = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 let primary_key = boolish_value(row, offset + 5)?;
                 (
@@ -605,12 +605,12 @@ impl SqlxEngine {
                 integer_value(row, offset + 3)?.max(1) as usize,
                 boolish_value(row, offset + 4)?,
             ),
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
-        let enum_values = match self.kind {
+        let enum_values = match self.kind.dialect() {
             DatabaseKind::PostgreSQL => enum_values_from_postgres_metadata(row, offset + 5)?,
             DatabaseKind::MySQL => parse_mysql_enum_definition(&text_value(row, offset + 5)?),
-            DatabaseKind::SQLite | DatabaseKind::Redis => Vec::new(),
+            _ => Vec::new(),
         };
         Ok(ColumnInfo {
             name,
@@ -623,7 +623,7 @@ impl SqlxEngine {
     }
 
     async fn foreign_keys(&self, table: &TableRef) -> Result<Vec<ForeignKeyInfo>> {
-        let result = match self.kind {
+        let result = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 let escaped = table.name.replace('\'', "''");
                 self.metadata_query(&format!("PRAGMA foreign_key_list('{escaped}')"), &[])
@@ -647,7 +647,7 @@ impl SqlxEngine {
                 )
                 .await?
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         foreign_keys_from_rows(self.kind, result.rows)
     }
@@ -665,7 +665,7 @@ impl SqlxEngine {
     async fn bulk_columns(&self) -> Result<HashMap<TableKey, Vec<ColumnInfo>>> {
         // Each query prefixes the owning table's (schema, name) and then
         // repeats the per-table column layout, so `column_from_row` is shared.
-        let sql = match self.kind {
+        let sql = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 "SELECT NULL, m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, p.cid"
             }
@@ -675,7 +675,7 @@ impl SqlxEngine {
             DatabaseKind::MySQL => {
                 "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         let result = self.metadata_query(sql, &[]).await?;
         let mut tables: HashMap<TableKey, Vec<ColumnInfo>> = HashMap::new();
@@ -690,7 +690,7 @@ impl SqlxEngine {
 
     /// Every foreign key in the active database, in one query.
     async fn bulk_foreign_keys(&self) -> Result<HashMap<TableKey, Vec<ForeignKeyInfo>>> {
-        let sql = match self.kind {
+        let sql = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 "SELECT NULL, m.name, f.id, f.seq, f.\"table\", f.\"from\", f.\"to\", f.on_update, f.on_delete FROM sqlite_master m, pragma_foreign_key_list(m.name) f WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, f.id, f.seq"
                     .to_owned()
@@ -702,7 +702,7 @@ impl SqlxEngine {
                 "SELECT CAST(kcu.TABLE_SCHEMA AS CHAR), CAST(kcu.TABLE_NAME AS CHAR), CAST(kcu.CONSTRAINT_NAME AS CHAR), CAST(kcu.COLUMN_NAME AS CHAR), CAST(kcu.REFERENCED_TABLE_SCHEMA AS CHAR), CAST(kcu.REFERENCED_TABLE_NAME AS CHAR), CAST(kcu.REFERENCED_COLUMN_NAME AS CHAR), CAST(rc.UPDATE_RULE AS CHAR), CAST(rc.DELETE_RULE AS CHAR) FROM information_schema.key_column_usage kcu LEFT JOIN information_schema.referential_constraints rc ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND rc.TABLE_NAME = kcu.TABLE_NAME WHERE kcu.TABLE_SCHEMA = DATABASE() AND kcu.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION"
                     .to_owned()
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         let result = self.metadata_query(&sql, &[]).await?;
         // Rows arrive grouped by table, so split them into per-table runs
@@ -751,7 +751,7 @@ impl SqlxEngine {
     }
 
     async fn list_sql_databases(&self) -> Result<Vec<String>> {
-        let result = match self.kind {
+        let result = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 self.metadata_query("PRAGMA database_list", &[]).await?
             }
@@ -769,7 +769,7 @@ impl SqlxEngine {
                 )
                 .await?
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         let mut names = Vec::with_capacity(result.rows.len());
         for row in result.rows {
@@ -786,7 +786,7 @@ impl SqlxEngine {
     }
 
     async fn current_sql_database(&self) -> Result<String> {
-        match self.kind {
+        match self.kind.dialect() {
             DatabaseKind::SQLite => Ok("main".to_owned()),
             DatabaseKind::PostgreSQL => {
                 let result = self
@@ -808,13 +808,13 @@ impl SqlxEngine {
                     .transpose()
                     .map(|value| value.unwrap_or_default())
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         }
     }
 
     async fn use_sql_database(&self, name: &str) -> Result<()> {
         validate_database_name(name)?;
-        match self.kind {
+        match self.kind.dialect() {
             DatabaseKind::SQLite => Err(DbxError::Unsupported {
                 operation: "use_database".to_owned(),
                 kind: self.kind,
@@ -866,7 +866,7 @@ impl SqlxEngine {
                 *self.pool.write().await = SqlxPool::Postgres(pool);
                 Ok(())
             }
-            DatabaseKind::Redis => unreachable!(),
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         }
     }
 }
@@ -1292,7 +1292,7 @@ fn foreign_keys_from_rows(kind: DatabaseKind, rows: Vec<RowData>) -> Result<Vec<
             }
             Ok(foreign_keys)
         }
-        DatabaseKind::Redis => unreachable!(),
+        _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
     }
 }
 

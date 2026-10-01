@@ -36,7 +36,9 @@ pub trait Engine: Send + Sync {
     /// Names of the databases reachable through this connection. For SQLite
     /// these are the attached database aliases; for Redis they are the
     /// logical indexes.
-    async fn list_databases(&self) -> Result<Vec<String>>;
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        Ok(vec![self.current_database().await?])
+    }
 
     /// Name (or index label) of the database the connection currently uses.
     async fn current_database(&self) -> Result<String>;
@@ -46,14 +48,47 @@ pub trait Engine: Send + Sync {
     /// MySQL issues `USE`, Redis issues `SELECT`, PostgreSQL swaps the
     /// internal pool for one connected to the target database, and SQLite
     /// rejects the operation because a file is itself one database.
-    async fn use_database(&self, name: &str) -> Result<()>;
+    async fn use_database(&self, _name: &str) -> Result<()> {
+        Err(DbxError::Unsupported {
+            operation: "use_database".into(),
+            kind: self.kind(),
+        })
+    }
 
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
 
-    async fn table_structure(&self, table: &TableRef) -> Result<TableStructure>;
+    async fn table_structure(&self, table: &TableRef) -> Result<TableStructure> {
+        Ok(TableStructure {
+            columns: self.describe_table(table).await?,
+            foreign_keys: Vec::new(),
+        })
+    }
 
     /// Load a complete relational metadata snapshot for the active database.
-    async fn relational_schema(&self) -> Result<RelationalSchema>;
+    async fn relational_schema(&self) -> Result<RelationalSchema> {
+        if !self.kind().is_sql() {
+            return Err(DbxError::Unsupported {
+                operation: "relational_schema".into(),
+                kind: self.kind(),
+            });
+        }
+        let mut tables = Vec::new();
+        for info in self.list_tables().await? {
+            let table = TableRef {
+                name: info.name.clone(),
+                schema: info.schema.clone(),
+            };
+            let structure = self.table_structure(&table).await?;
+            tables.push(crate::RelationalTable {
+                table: info,
+                structure,
+            });
+        }
+        Ok(RelationalSchema {
+            database: self.current_database().await?,
+            tables,
+        })
+    }
 
     async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult>;
 
@@ -61,9 +96,26 @@ pub trait Engine: Send + Sync {
         &self,
         statement: &SqlStatement,
         options: QueryOptions,
-    ) -> Result<QueryResult>;
+    ) -> Result<QueryResult> {
+        if !statement.params.is_empty() {
+            return Err(DbxError::Unsupported {
+                operation: "bound parameters".into(),
+                kind: self.kind(),
+            });
+        }
+        self.query(&statement.sql, options).await
+    }
 
-    async fn execute(&self, statement: &SqlStatement) -> Result<ExecResult>;
+    async fn execute(&self, statement: &SqlStatement) -> Result<ExecResult> {
+        let result = self
+            .query_statement(statement, QueryOptions::default())
+            .await?;
+        Ok(ExecResult {
+            rows_affected: result.rows_affected.unwrap_or(0),
+            last_insert_id: None,
+            elapsed_ms: result.elapsed_ms,
+        })
+    }
 }
 
 /// A connected database. The enum keeps backend-specific dependencies behind
@@ -71,6 +123,7 @@ pub trait Engine: Send + Sync {
 pub enum DatabaseEngine {
     Sql(SqlxEngine),
     Redis(RedisEngine),
+    Other(Box<dyn Engine>),
 }
 
 impl std::fmt::Debug for DatabaseEngine {
@@ -85,10 +138,18 @@ impl std::fmt::Debug for DatabaseEngine {
 impl DatabaseEngine {
     pub async fn connect(config: ConnectionConfig) -> Result<Self> {
         config.validate()?;
-        if config.kind.is_sql() {
+        if matches!(
+            config.kind,
+            DatabaseKind::PostgreSQL
+                | DatabaseKind::MySQL
+                | DatabaseKind::SQLite
+                | DatabaseKind::CockroachDB
+        ) {
             Ok(Self::Sql(SqlxEngine::connect(config).await?))
-        } else {
+        } else if config.kind == DatabaseKind::Redis {
             Ok(Self::Redis(RedisEngine::connect(config).await?))
+        } else {
+            Ok(Self::Other(crate::connectors::connect(config).await?))
         }
     }
 
@@ -96,6 +157,7 @@ impl DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.kind(),
             Self::Redis(engine) => engine.kind(),
+            Self::Other(engine) => engine.kind(),
         }
     }
 
@@ -103,7 +165,7 @@ impl DatabaseEngine {
     pub async fn redis_command_catalog(&self) -> Result<crate::RedisCommandCatalog> {
         match self {
             Self::Redis(engine) => engine.command_catalog().await,
-            Self::Sql(_) => Err(DbxError::Unsupported {
+            _ => Err(DbxError::Unsupported {
                 operation: "redis_command_catalog".into(),
                 kind: self.kind(),
             }),
@@ -164,7 +226,7 @@ impl DatabaseEngine {
     pub async fn execute_transaction(&self, statements: &[String]) -> Result<()> {
         match self {
             Self::Sql(engine) => engine.execute_transaction(statements).await,
-            Self::Redis(_) => Err(DbxError::Unsupported {
+            _ => Err(DbxError::Unsupported {
                 operation: "execute_transaction".into(),
                 kind: self.kind(),
             }),
@@ -198,6 +260,18 @@ impl DatabaseEngine {
         options: QueryOptions,
         known_columns: Option<&[ColumnInfo]>,
     ) -> Result<QueryResult> {
+        if !self.kind().is_sql() {
+            if !filters.is_empty() || !order.is_empty() || !columns.is_empty() {
+                return Err(DbxError::Unsupported {
+                    operation: "structured filters".into(),
+                    kind: self.kind(),
+                });
+            }
+            if let Self::Other(engine) = self {
+                let command = crate::connectors::browse_command(self.kind(), table, page)?;
+                return engine.query(&command, options).await;
+            }
+        }
         ensure_sql(self.kind(), "query_table")?;
         let metadata = self.filter_metadata(table, filters, known_columns).await?;
         let statement = build_select_with_columns(
@@ -215,7 +289,7 @@ impl DatabaseEngine {
                     .query_statement_headerless(&statement, options)
                     .await?
             }
-            Self::Redis(_) => self.query_statement(&statement, options).await?,
+            _ => self.query_statement(&statement, options).await?,
         };
         // An empty `SELECT` exposes no result-set metadata. Fall back to the
         // table schema (already known to many callers) so an empty table still
@@ -238,7 +312,7 @@ impl DatabaseEngine {
         filters: &[Filter],
         known_columns: Option<&[ColumnInfo]>,
     ) -> Result<Option<Vec<ColumnInfo>>> {
-        if self.kind() != DatabaseKind::PostgreSQL || filters.is_empty() {
+        if self.kind().dialect() != DatabaseKind::PostgreSQL || filters.is_empty() {
             return Ok(None);
         }
         match known_columns {
@@ -357,6 +431,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.list_tables().await,
             Self::Redis(engine) => engine.list_tables().await,
+            Self::Other(engine) => engine.list_tables().await,
         }
     }
 
@@ -364,6 +439,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.list_databases().await,
             Self::Redis(engine) => engine.list_databases().await,
+            Self::Other(engine) => engine.list_databases().await,
         }
     }
 
@@ -371,6 +447,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.current_database().await,
             Self::Redis(engine) => engine.current_database().await,
+            Self::Other(engine) => engine.current_database().await,
         }
     }
 
@@ -378,6 +455,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.use_database(name).await,
             Self::Redis(engine) => engine.use_database(name).await,
+            Self::Other(engine) => engine.use_database(name).await,
         }
     }
 
@@ -385,6 +463,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.describe_table(table).await,
             Self::Redis(engine) => engine.describe_table(table).await,
+            Self::Other(engine) => engine.describe_table(table).await,
         }
     }
 
@@ -392,6 +471,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.table_structure(table).await,
             Self::Redis(engine) => engine.table_structure(table).await,
+            Self::Other(engine) => engine.table_structure(table).await,
         }
     }
 
@@ -399,6 +479,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.relational_schema().await,
             Self::Redis(engine) => engine.relational_schema().await,
+            Self::Other(engine) => engine.relational_schema().await,
         }
     }
 
@@ -406,6 +487,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.query(sql, options).await,
             Self::Redis(engine) => engine.query(sql, options).await,
+            Self::Other(engine) => engine.query(sql, options).await,
         }
     }
 
@@ -417,6 +499,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.query_statement(statement, options).await,
             Self::Redis(engine) => engine.query_statement(statement, options).await,
+            Self::Other(engine) => engine.query_statement(statement, options).await,
         }
     }
 
@@ -424,6 +507,7 @@ impl Engine for DatabaseEngine {
         match self {
             Self::Sql(engine) => engine.execute(statement).await,
             Self::Redis(engine) => engine.execute(statement).await,
+            Self::Other(engine) => engine.execute(statement).await,
         }
     }
 }

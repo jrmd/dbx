@@ -4,7 +4,7 @@
 
 <h1 align="center">DBX</h1>
 <p align="center">A native database workbench. Built with Rust and GPUI.</p>
-<p align="center">PostgreSQL · MySQL · SQLite · Redis</p>
+<p align="center">PostgreSQL · MySQL · SQLite · Redis · MongoDB · CockroachDB · DuckDB · Elasticsearch · BigQuery · Kafka · Turso · Cloudflare D1</p>
 
 Browse your data, follow relationships, edit rows, and run queries in a responsive desktop app. DBX uses [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for its window, input, and GPU rendering.
 
@@ -14,13 +14,13 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 
 ## Inside the workbench
 
-- **Four database engines:** PostgreSQL, MySQL, and SQLite through SQLx; Redis through redis-rs, with incremental `SCAN` browsing and a command console.
+- **Twelve database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
 - **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
 - **Data you can work with:** virtualized grids over bounded row pages, structured filters, foreign-key navigation, and an all-field row inspector.
 - **Explicit edits:** typed insert/update drafts, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
 - **A query editor:** syntax highlighting, SQL completion, result grids, and per-connection query history.
 - **Import and export:** SQL, CSV, and TSV transfers; database exports with table selection, gzip, and schema-only SQL options.
-- **Saved connections:** named profiles, environment labels, connection testing, and encrypted credentials in the DBX Vault.
+- **Saved connections:** named profiles, colour-coded tags managed in Settings, connection testing, and encrypted credentials in the DBX Vault.
 - **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
 - **Native appearance:** light, dark, and system themes, with an option to reduce transparency.
 
@@ -207,7 +207,7 @@ Use `DBX_SIGNING_MODE=developer-id` with `DBX_SIGNING_NAME` for distribution bui
 ## First connection
 
 1. Create a DBX Vault with a passphrase. Keep it somewhere safe: DBX cannot recover it.
-2. Choose PostgreSQL, MySQL, SQLite, or Redis. Add a connection name, environment, and connection details; for SQLite, choose a database file.
+2. Choose your database provider, or paste a connection URL to detect it. Add a connection name, a tag, and connection details; for SQLite or DuckDB, choose a database file. The [connector guide](docs/database-connectors.md) covers cloud tokens and query examples.
 3. Test the connection, save it if desired, and connect.
 4. Open a table, inspect a row, or create a query tab. Review the target connection before applying writes.
 

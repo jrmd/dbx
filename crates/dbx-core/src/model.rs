@@ -10,21 +10,173 @@ pub enum DatabaseKind {
     MySQL,
     SQLite,
     Redis,
+    MongoDB,
+    CockroachDB,
+    DuckDB,
+    Elasticsearch,
+    BigQuery,
+    Kafka,
+    Turso,
+    CloudflareD1,
 }
 
 impl DatabaseKind {
-    pub const SQL: [Self; 3] = [Self::PostgreSQL, Self::MySQL, Self::SQLite];
+    pub const ALL: [Self; 12] = [
+        Self::PostgreSQL,
+        Self::MySQL,
+        Self::SQLite,
+        Self::Redis,
+        Self::MongoDB,
+        Self::CockroachDB,
+        Self::DuckDB,
+        Self::Elasticsearch,
+        Self::BigQuery,
+        Self::Kafka,
+        Self::Turso,
+        Self::CloudflareD1,
+    ];
+    pub const SQL: [Self; 8] = [
+        Self::PostgreSQL,
+        Self::MySQL,
+        Self::SQLite,
+        Self::CockroachDB,
+        Self::DuckDB,
+        Self::BigQuery,
+        Self::Turso,
+        Self::CloudflareD1,
+    ];
 
     pub const fn is_sql(self) -> bool {
-        matches!(self, Self::PostgreSQL | Self::MySQL | Self::SQLite)
+        matches!(
+            self,
+            Self::PostgreSQL
+                | Self::MySQL
+                | Self::SQLite
+                | Self::CockroachDB
+                | Self::DuckDB
+                | Self::BigQuery
+                | Self::Turso
+                | Self::CloudflareD1
+        )
+    }
+
+    pub const fn dialect(self) -> Self {
+        match self {
+            Self::CockroachDB => Self::PostgreSQL,
+            Self::Turso | Self::CloudflareD1 => Self::SQLite,
+            other => other,
+        }
+    }
+    pub const fn is_file(self) -> bool {
+        matches!(self, Self::SQLite | Self::DuckDB)
+    }
+    pub const fn supports_transport(self) -> bool {
+        matches!(
+            self,
+            Self::PostgreSQL | Self::MySQL | Self::Redis | Self::CockroachDB
+        )
+    }
+    pub const fn supports_details(self) -> bool {
+        self.supports_transport()
+            || matches!(self, Self::MongoDB | Self::Elasticsearch | Self::Kafka)
+    }
+    pub const fn supports_row_mutations(self) -> bool {
+        self.is_sql() && !matches!(self, Self::BigQuery)
+    }
+    pub fn accepts_scheme(self, scheme: &str) -> bool {
+        match self {
+            Self::PostgreSQL | Self::CockroachDB => matches!(scheme, "postgres" | "postgresql"),
+            Self::MongoDB => matches!(scheme, "mongodb" | "mongodb+srv"),
+            Self::Elasticsearch => matches!(scheme, "http" | "https"),
+            Self::Turso => matches!(scheme, "libsql" | "turso" | "https" | "http"),
+            _ => scheme == self.scheme(),
+        }
+    }
+    pub const fn default_port(self) -> Option<&'static str> {
+        match self {
+            Self::PostgreSQL => Some("5432"),
+            Self::CockroachDB => Some("26257"),
+            Self::MySQL => Some("3306"),
+            Self::Redis => Some("6379"),
+            Self::MongoDB => Some("27017"),
+            Self::Elasticsearch => Some("9200"),
+            Self::Kafka => Some("9092"),
+            _ => None,
+        }
+    }
+    pub const fn default_url(self) -> &'static str {
+        match self {
+            Self::PostgreSQL => "postgres://postgres@localhost:5432/postgres",
+            Self::MySQL => "mysql://root@localhost:3306/mysql",
+            Self::SQLite => "sqlite://dbx.db?mode=rwc",
+            Self::Redis => "redis://127.0.0.1:6379/0",
+            Self::CockroachDB => "postgres://root@localhost:26257/defaultdb?sslmode=require",
+            Self::MongoDB => "mongodb://localhost:27017/test",
+            Self::DuckDB => "duckdb::memory:",
+            Self::Elasticsearch => "http://localhost:9200",
+            Self::Kafka => "kafka://localhost:9092",
+            Self::BigQuery => "bigquery://project/dataset",
+            Self::Turso => "libsql://database-organization.turso.io",
+            Self::CloudflareD1 => "d1://account-id/database-id",
+        }
+    }
+    pub const fn connection_help(self) -> &'static str {
+        match self {
+            Self::PostgreSQL => "Supabase: use your direct or session-pooler PostgreSQL URL.",
+            Self::CockroachDB => {
+                "Use a PostgreSQL URL with the TLS options supplied by CockroachDB."
+            }
+            Self::MongoDB => {
+                "MongoDB URI, including mongodb+srv:// and driver options. Queries use JSON database commands."
+            }
+            Self::DuckDB => {
+                "Open a DuckDB file with duckdb:///absolute/path.duckdb or use duckdb::memory:."
+            }
+            Self::Elasticsearch => {
+                "HTTP(S) endpoint. Use username/password for Basic auth, or :API_KEY@host for API-key auth. Queries: METHOD /path followed by JSON."
+            }
+            Self::BigQuery => {
+                "bigquery://project/dataset?location=US. Enter a Google OAuth access token with BigQuery permissions below."
+            }
+            Self::Kafka => {
+                "kafka://host:9092?brokers=host:9092,other:9092. TLS/SASL options: security.protocol, sasl.mechanism; username/password in URL. Queries use JSON actions."
+            }
+            Self::Turso => {
+                "libsql://database-organization.turso.io (also accepts turso:// and HTTPS). Enter your database token below."
+            }
+            Self::CloudflareD1 => {
+                "d1://account-id/database-id. Enter an API token with D1 permissions below."
+            }
+            _ => "",
+        }
+    }
+    pub const fn default_query(self) -> &'static str {
+        match self {
+            Self::PostgreSQL | Self::CockroachDB => "SELECT current_database(), current_user;",
+            Self::MySQL => "SELECT DATABASE(), CURRENT_USER();",
+            Self::SQLite | Self::Turso | Self::CloudflareD1 => "SELECT sqlite_version();",
+            Self::DuckDB => "SELECT version();",
+            Self::BigQuery => "SELECT 1 AS connected;",
+            Self::Redis => "SCAN 0 COUNT 100",
+            Self::MongoDB => "{\"ping\": 1}",
+            Self::Elasticsearch => "GET /",
+            Self::Kafka => "{\"action\": \"topics\"}",
+        }
     }
 
     pub const fn scheme(self) -> &'static str {
         match self {
-            Self::PostgreSQL => "postgres",
+            Self::PostgreSQL | Self::CockroachDB => "postgres",
             Self::MySQL => "mysql",
             Self::SQLite => "sqlite",
             Self::Redis => "redis",
+            Self::MongoDB => "mongodb",
+            Self::DuckDB => "duckdb",
+            Self::Elasticsearch => "https",
+            Self::BigQuery => "bigquery",
+            Self::Kafka => "kafka",
+            Self::Turso => "libsql",
+            Self::CloudflareD1 => "d1",
         }
     }
 }
@@ -36,6 +188,14 @@ impl fmt::Display for DatabaseKind {
             Self::MySQL => "MySQL",
             Self::SQLite => "SQLite",
             Self::Redis => "Redis",
+            Self::MongoDB => "MongoDB",
+            Self::CockroachDB => "CockroachDB",
+            Self::DuckDB => "DuckDB",
+            Self::Elasticsearch => "Elasticsearch",
+            Self::BigQuery => "BigQuery",
+            Self::Kafka => "Kafka",
+            Self::Turso => "Turso",
+            Self::CloudflareD1 => "Cloudflare D1",
         })
     }
 }
@@ -105,14 +265,33 @@ impl ConnectionConfig {
             ));
         }
         let expected = self.kind.scheme();
-        let scheme = self.url.split_once("://").map(|(scheme, _)| scheme);
-        if let Some(scheme) = scheme
-            && !scheme.eq_ignore_ascii_case(expected)
-            && !(self.kind == DatabaseKind::PostgreSQL && scheme.eq_ignore_ascii_case("postgresql"))
+        let scheme = self
+            .url
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_ascii_lowercase());
+        if !scheme
+            .as_deref()
+            .is_some_and(|scheme| self.kind.accepts_scheme(scheme))
         {
             return Err(crate::DbxError::InvalidConfig(format!(
-                "expected a {expected} URL, got {scheme}"
+                "expected a {expected} connection URL"
             )));
+        }
+        if let Some((_, query)) = self.url.split_once('?') {
+            for (key, _) in
+                url::form_urlencoded::parse(query.split('#').next().unwrap_or_default().as_bytes())
+            {
+                let key = key.to_ascii_lowercase();
+                if key.contains("token")
+                    || key.contains("password")
+                    || key.contains("secret")
+                    || key == "apikey"
+                    || key == "api_key"
+                    || key == "authmechanismproperties"
+                {
+                    return Err(crate::DbxError::InvalidConfig("Store credentials in the URL password field so DBX can keep them in the vault".into()));
+                }
+            }
         }
         Ok(())
     }

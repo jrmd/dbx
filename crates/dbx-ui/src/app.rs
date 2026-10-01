@@ -53,7 +53,8 @@ use crate::{
     editor::{self, TextEditor},
     filters::{FilterModel, FilterRowId, filter_operator_options, operator_requires_value},
     profiles::{
-        ConnectionEnvironment, ConnectionProfileDraft, ProfileStore, SavedConnection, sqlite_url,
+        ConnectionProfileDraft, ConnectionTag, ProfileStore, SavedConnection, default_tags,
+        sqlite_url,
     },
     query_history::{
         QueryHistoryConnection, QueryHistoryEntry, QueryHistoryOutcome, QueryHistoryStore,
@@ -223,7 +224,11 @@ struct ConnectionDraft {
     kind: DatabaseKind,
     mode: ConnectionFormMode,
     selected_profile: Option<Uuid>,
-    environment: ConnectionEnvironment,
+    /// New connections start on the type grid; the form follows a choice.
+    choosing_kind: bool,
+    import_url: Entity<String>,
+    import_url_editor: Entity<TextEditor>,
+    tag: Option<ConnectionTag>,
     connection_name: Entity<String>,
     connection_name_editor: Entity<TextEditor>,
     connection_url: Entity<String>,
@@ -285,6 +290,31 @@ impl ConnectionTransportDraft {
     }
 }
 
+/// The create/edit form for shared connection tags in Settings.
+struct TagEditor {
+    editing: Option<Uuid>,
+    name: Entity<String>,
+    name_editor: Entity<TextEditor>,
+    color: Entity<String>,
+    color_editor: Entity<TextEditor>,
+}
+
+impl TagEditor {
+    fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
+        let name = cx.new(|_| String::new());
+        let color = cx.new(|_| "82AAFF".to_owned());
+        let name_editor = cx.new(|cx| TextEditor::new(name.clone(), false, window, cx));
+        let color_editor = cx.new(|cx| TextEditor::new(color.clone(), false, window, cx));
+        Self {
+            editing: None,
+            name,
+            name_editor,
+            color,
+            color_editor,
+        }
+    }
+}
+
 struct VaultEditors {
     passphrase: Entity<String>,
     passphrase_editor: Entity<TextEditor>,
@@ -315,6 +345,8 @@ impl VaultEditors {
 impl ConnectionDraft {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let connection_name = cx.new(|_| String::new());
+        let import_url = cx.new(|_| String::new());
+        let import_url_editor = cx.new(|cx| TextEditor::new(import_url.clone(), false, window, cx));
         let fields = ConnectionFields::from_url("sqlite://dbx.db?mode=rwc")
             .expect("default SQLite connection URL is valid");
         let connection_url = cx.new(|_| fields.connection_string.clone());
@@ -338,7 +370,10 @@ impl ConnectionDraft {
             kind: DatabaseKind::SQLite,
             mode: ConnectionFormMode::Details,
             selected_profile: None,
-            environment: ConnectionEnvironment::default(),
+            choosing_kind: true,
+            import_url,
+            import_url_editor,
+            tag: Some(default_tags().remove(3)),
             connection_name,
             connection_name_editor,
             connection_url,
@@ -718,8 +753,9 @@ impl QueryTab {
         let query_editor = cx.new(|cx| match query_editor_language(kind) {
             editor::EditorLanguage::Sql => TextEditor::new_sql(query_text.clone(), window, cx),
             editor::EditorLanguage::Redis => TextEditor::new_redis(query_text.clone(), window, cx),
-            editor::EditorLanguage::PlainText | editor::EditorLanguage::Json => {
-                unreachable!("query tabs only use SQL or Redis syntax")
+            editor::EditorLanguage::Json => TextEditor::new_json(query_text.clone(), window, cx),
+            editor::EditorLanguage::PlainText => {
+                TextEditor::new(query_text.clone(), true, window, cx)
             }
         });
         let split_state = cx.new(|_| ResizableState::default());
@@ -801,10 +837,13 @@ impl QueryTab {
 }
 
 fn query_editor_language(kind: DatabaseKind) -> editor::EditorLanguage {
-    match kind {
-        DatabaseKind::Redis => editor::EditorLanguage::Redis,
-        DatabaseKind::PostgreSQL | DatabaseKind::MySQL | DatabaseKind::SQLite => {
-            editor::EditorLanguage::Sql
+    if kind.is_sql() {
+        editor::EditorLanguage::Sql
+    } else {
+        match kind {
+            DatabaseKind::Redis => editor::EditorLanguage::Redis,
+            DatabaseKind::MongoDB | DatabaseKind::Kafka => editor::EditorLanguage::Json,
+            _ => editor::EditorLanguage::PlainText,
         }
     }
 }
@@ -1142,7 +1181,7 @@ struct ConnectionSession {
     profile_id: Option<Uuid>,
     name: String,
     kind: DatabaseKind,
-    environment: ConnectionEnvironment,
+    tag: Option<ConnectionTag>,
     engine: Option<Arc<DatabaseEngine>>,
     editors: SessionEditors,
     pane: Pane,
@@ -1190,7 +1229,7 @@ impl ConnectionSession {
         profile_id: Option<Uuid>,
         name: String,
         kind: DatabaseKind,
-        environment: ConnectionEnvironment,
+        tag: Option<ConnectionTag>,
         window: &mut Window,
         cx: &mut Context<DbxApp>,
     ) -> Self {
@@ -1199,7 +1238,7 @@ impl ConnectionSession {
             profile_id,
             name,
             kind,
-            environment,
+            tag,
             engine: None,
             editors: SessionEditors::new(window, cx),
             pane: Pane::Data,
@@ -1471,6 +1510,7 @@ pub struct DbxApp {
     credential_connect_window: Option<WindowHandle<DbxApp>>,
     profile_store: Option<ProfileStore>,
     saved_connections: Vec<SavedConnection>,
+    connection_tags: Vec<ConnectionTag>,
     query_history_store: Option<QueryHistoryStore>,
     /// Newest-first cache for the history UI. Disk access is never performed
     /// from render or query completion on the GPUI thread.
@@ -1484,7 +1524,8 @@ pub struct DbxApp {
     confirmation_dialog: Option<ConfirmationDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     /// Focus target for the open Settings dialog; `None` while it is closed.
-    settings_dialog: Option<FocusHandle>,
+    settings_open: bool,
+    tag_editor: TagEditor,
     appearance: Appearance,
     reduce_transparency: bool,
     settings_store: Option<SettingsStore>,
@@ -1506,6 +1547,7 @@ pub struct DbxApp {
 impl DbxApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let draft = ConnectionDraft::new(window, cx);
+        let tag_editor = TagEditor::new(window, cx);
         let vault_editors = VaultEditors::new(window, cx);
 
         let subscriptions = vec![
@@ -1535,6 +1577,10 @@ impl DbxApp {
             },
             Err(error) => (None, Vec::new(), Some(error.to_string())),
         };
+        let connection_tags = profile_store
+            .as_ref()
+            .and_then(|store| store.tags().ok())
+            .unwrap_or_else(default_tags);
         let compact_connection_form_open = saved_connections.is_empty();
         let vault_state = profile_store
             .as_ref()
@@ -1579,6 +1625,7 @@ impl DbxApp {
             credential_connect_window: None,
             profile_store,
             saved_connections,
+            connection_tags,
             query_history_store,
             recent_query_history,
             sessions: Vec::new(),
@@ -1589,7 +1636,8 @@ impl DbxApp {
             database_export_dialog: None,
             confirmation_dialog: None,
             mutation_error_dialog: None,
-            settings_dialog: None,
+            settings_open: false,
+            tag_editor,
             appearance: appearance(),
             reduce_transparency: reduce_transparency(),
             settings_store: SettingsStore::new().ok(),
@@ -1648,7 +1696,7 @@ impl DbxApp {
             this.update(cx, |this, cx| {
                 this.update_state = match result {
                     Ok(Ok(Some(update))) => {
-                        if this.settings_dialog.is_none() {
+                        if !this.settings_open {
                             this.show_toast(
                                 ToastKind::Info,
                                 format!("DBX {} is available in Settings", update.version),
@@ -1668,15 +1716,14 @@ impl DbxApp {
         .detach();
     }
 
-    pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let focus = cx.focus_handle();
-        focus.focus(window, cx);
-        self.settings_dialog = Some(focus);
+    pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = true;
         cx.notify();
     }
 
     pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
-        if self.settings_dialog.take().is_some() {
+        if std::mem::take(&mut self.settings_open) {
+            self.edit_tag(None, cx);
             cx.notify();
         }
     }
@@ -1932,7 +1979,7 @@ impl DbxApp {
             true
         } else {
             self.database_export_dialog.take().is_some()
-                || self.settings_dialog.take().is_some()
+                || std::mem::take(&mut self.settings_open)
                 || self.table_context_menu.take().is_some()
                 || self.dismiss_connection_picker()
         };
@@ -1943,12 +1990,7 @@ impl DbxApp {
     }
 
     fn default_query(kind: DatabaseKind) -> &'static str {
-        match kind {
-            DatabaseKind::PostgreSQL => "SELECT current_database(), current_user;",
-            DatabaseKind::MySQL => "SELECT DATABASE(), CURRENT_USER();",
-            DatabaseKind::SQLite => "SELECT sqlite_version();",
-            DatabaseKind::Redis => "SCAN 0 COUNT 100",
-        }
+        kind.default_query()
     }
 
     fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
@@ -2032,6 +2074,7 @@ impl DbxApp {
             }
             self.active_session_id = Some(session_id);
             self.connection_picker_open = false;
+            self.settings_open = false;
             cx.notify();
         }
     }
@@ -3082,7 +3125,7 @@ impl DbxApp {
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
-        if session.kind != DatabaseKind::PostgreSQL || session.schema_filter == schema {
+        if session.kind.dialect() != DatabaseKind::PostgreSQL || session.schema_filter == schema {
             return;
         }
 
@@ -3227,7 +3270,7 @@ impl DbxApp {
             // Structure and the first page are independent, so overlap them
             // instead of paying two sequential round trips.
             let first_page = async {
-                if kind.is_sql() {
+                if kind != DatabaseKind::Redis {
                     let mut result = engine
                         .query_table(
                             &table_ref,
@@ -3336,7 +3379,7 @@ impl DbxApp {
         // the selected table in the same visible context before loading data.
         if self
             .session(session_id)
-            .is_some_and(|session| session.kind == DatabaseKind::PostgreSQL)
+            .is_some_and(|session| session.kind.dialect() == DatabaseKind::PostgreSQL)
         {
             self.select_schema_filter_for(session_id, target_table.schema.clone(), cx);
         }
@@ -3395,7 +3438,7 @@ impl DbxApp {
 
         if self
             .session(session_id)
-            .is_some_and(|session| session.kind == DatabaseKind::PostgreSQL)
+            .is_some_and(|session| session.kind.dialect() == DatabaseKind::PostgreSQL)
         {
             self.select_schema_filter_for(session_id, target_table.schema.clone(), cx);
         }
@@ -3644,7 +3687,7 @@ impl DbxApp {
         let generation = data.request_generation;
         let result_table = table.clone();
         let task = runtime.spawn(async move {
-            if kind.is_sql() {
+            if kind != DatabaseKind::Redis {
                 // The open table's columns are already cached; passing them
                 // saves the PostgreSQL filter-cast lookup on every page.
                 let mut result = engine
@@ -3736,6 +3779,9 @@ impl DbxApp {
                 .filters
                 .validate(cx, &data.table_columns)
                 .map_err(|error| error.to_string());
+        }
+        if session.kind != DatabaseKind::Redis {
+            return Ok(Vec::new());
         }
         let value = session.editors.filter_text.read(cx).trim();
         let column = selected_filter_column(
@@ -4223,8 +4269,10 @@ impl DbxApp {
             editor::QueryExecutionScope::Document
         } else if kind.is_sql() {
             editor::QueryExecutionScope::SelectionOrStatement
-        } else {
+        } else if kind == DatabaseKind::Redis {
             editor::QueryExecutionScope::SelectionOrCurrentLine
+        } else {
+            editor::QueryExecutionScope::Document
         };
         let range = if run_all {
             0..full_query.len()
@@ -6130,7 +6178,7 @@ impl DbxApp {
         let Some(kind) = self.session(session_id).map(|session| session.kind) else {
             return;
         };
-        let sql = match kind {
+        let sql = match kind.dialect() {
             DatabaseKind::PostgreSQL => {
                 "CREATE TABLE public.new_table (\n    id BIGSERIAL PRIMARY KEY,\n    name TEXT NOT NULL\n);"
             }
@@ -6140,7 +6188,9 @@ impl DbxApp {
             DatabaseKind::SQLite => {
                 "CREATE TABLE new_table (\n    id INTEGER PRIMARY KEY,\n    name TEXT NOT NULL\n);"
             }
-            DatabaseKind::Redis => "SET new_key value",
+            DatabaseKind::DuckDB => "CREATE TABLE new_table (id BIGINT PRIMARY KEY, name VARCHAR);",
+            DatabaseKind::BigQuery => "CREATE TABLE new_table (id INT64, name STRING);",
+            _ => kind.default_query(),
         };
         let is_query_active = self.session(session_id).is_some_and(|session| {
             session.active_secondary_tab.is_some_and(|tab_id| {
@@ -6240,28 +6290,21 @@ fn transfer_name_stem(value: &str) -> String {
     }
 }
 
-/// Semantic color per deployment environment: production is risky (red),
-/// staging warns, develop stays neutral-accent, local is healthy.
-fn environment_color(environment: ConnectionEnvironment) -> Rgba {
-    match environment {
-        ConnectionEnvironment::Production => theme().danger,
-        ConnectionEnvironment::Staging => theme().warning,
-        ConnectionEnvironment::Develop => theme().accent,
-        ConnectionEnvironment::Local => theme().success,
-    }
-}
-
-fn environment_badge(environment: ConnectionEnvironment) -> Div {
-    div()
-        .px(px(6.))
-        .py(px(2.))
-        .rounded_full()
-        .border_1()
-        .border_color(environment_color(environment))
-        .text_size(px(9.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(environment_color(environment))
-        .child(environment.to_string())
+fn tag_badge(tag: Option<&ConnectionTag>) -> Option<Div> {
+    tag.map(|tag| {
+        let color = gpui::rgb(tag.color);
+        div()
+            .flex_none()
+            .px(px(6.))
+            .py(px(2.))
+            .rounded_full()
+            .border_1()
+            .border_color(color)
+            .text_size(px(9.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(color)
+            .child(tag.name.clone())
+    })
 }
 
 fn display_url(raw: &str) -> String {
@@ -6275,7 +6318,7 @@ fn display_url(raw: &str) -> String {
 }
 
 fn default_schema_filter(kind: DatabaseKind, tables: &[TableInfo]) -> Option<String> {
-    (kind == DatabaseKind::PostgreSQL
+    (kind.dialect() == DatabaseKind::PostgreSQL
         && tables
             .iter()
             .any(|table| table.schema.as_deref() == Some("public")))
@@ -6283,7 +6326,7 @@ fn default_schema_filter(kind: DatabaseKind, tables: &[TableInfo]) -> Option<Str
 }
 
 fn schema_filter_options(kind: DatabaseKind, tables: &[TableInfo]) -> Vec<Option<String>> {
-    if kind != DatabaseKind::PostgreSQL {
+    if kind.dialect() != DatabaseKind::PostgreSQL {
         return Vec::new();
     }
 
@@ -6301,7 +6344,7 @@ fn schema_filter_options(kind: DatabaseKind, tables: &[TableInfo]) -> Vec<Option
 }
 
 fn diagram_schema_names(kind: DatabaseKind, tables: &[TableInfo]) -> Vec<String> {
-    if kind != DatabaseKind::PostgreSQL {
+    if kind.dialect() != DatabaseKind::PostgreSQL {
         return Vec::new();
     }
 
@@ -6329,7 +6372,7 @@ fn diagram_initial_schema_selection(
     kind: DatabaseKind,
     explorer_schema: Option<&str>,
 ) -> Option<BTreeSet<String>> {
-    (kind == DatabaseKind::PostgreSQL)
+    (kind.dialect() == DatabaseKind::PostgreSQL)
         .then(|| explorer_schema.map(|schema| BTreeSet::from([schema.to_owned()])))
         .flatten()
 }
@@ -6387,7 +6430,7 @@ fn schema_filtered_tables(
     tables
         .iter()
         .filter(|table| {
-            kind != DatabaseKind::PostgreSQL
+            kind.dialect() != DatabaseKind::PostgreSQL
                 || schema_filter.is_none()
                 || table.schema.as_deref() == schema_filter
         })
@@ -6400,7 +6443,9 @@ fn table_is_visible_in(
     schema_filter: Option<&str>,
     table_schema: Option<&str>,
 ) -> bool {
-    kind != DatabaseKind::PostgreSQL || schema_filter.is_none() || table_schema == schema_filter
+    kind.dialect() != DatabaseKind::PostgreSQL
+        || schema_filter.is_none()
+        || table_schema == schema_filter
 }
 
 fn can_mutate_result(
@@ -6410,7 +6455,7 @@ fn can_mutate_result(
     result_table: Option<&TableRef>,
 ) -> bool {
     !busy
-        && kind.is_sql()
+        && kind.supports_row_mutations()
         && matches!((selected_table, result_table), (Some(selected), Some(result)) if selected == result)
 }
 
@@ -6603,6 +6648,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn connection_tag_is_single_and_updates_shared_colours(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.profile_store = Some(store.clone());
+                app.connection_tags = store.tags().unwrap();
+                app.vault_state = Some(VaultState::Unlocked);
+                let prod = default_tags().remove(0);
+                app.select_tag(prod.clone(), cx);
+                assert_eq!(app.draft.tag.as_ref().map(|tag| tag.id), Some(prod.id));
+                app.sessions.push(ConnectionSession::new(
+                    Uuid::new_v4(),
+                    None,
+                    "Test".into(),
+                    DatabaseKind::SQLite,
+                    app.draft.tag.clone(),
+                    window,
+                    cx,
+                ));
+                app.edit_tag(Some(prod.clone()), cx);
+                app.tag_editor.color.update(cx, |value, cx| {
+                    *value = "#B48EAD".into();
+                    cx.notify();
+                });
+                app.save_connection_tag(cx);
+                assert_eq!(app.draft.tag.as_ref().unwrap().color, 0xb48ead);
+                assert_eq!(app.sessions[0].tag.as_ref().unwrap().color, 0xb48ead);
+                assert_eq!(store.tags().unwrap()[0].color, 0xb48ead);
+                app.select_tag(prod.clone(), cx);
+                assert!(app.draft.tag.is_none());
+                let _ = gpui::Render::render(app, window, cx);
+                app.compact_layout = true;
+                let _ = gpui::Render::render(app, window, cx);
+            });
+        });
+    }
+
+    #[gpui::test]
     fn double_click_queues_open_while_saved_password_is_hydrating(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let directory = tempfile::tempdir().expect("create profile directory");
@@ -6656,7 +6742,7 @@ mod tests {
                 None,
                 "Redis test".into(),
                 DatabaseKind::Redis,
-                ConnectionEnvironment::Local,
+                Some(default_tags().remove(3)),
                 window,
                 cx,
             );

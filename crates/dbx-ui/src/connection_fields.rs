@@ -74,9 +74,14 @@ impl ConnectionFields {
     /// URL options while repairing unescaped credentials.
     pub fn from_url(connection_string: impl Into<String>) -> Result<Self, ConnectionFieldsError> {
         let connection_string = normalize_connection_string(&connection_string.into())?;
+        if is_mongo_seed_list(&connection_string) {
+            let mut fields = Self::new(DatabaseKind::MongoDB);
+            fields.connection_string = connection_string;
+            return Ok(fields);
+        }
         let url = Url::parse(&connection_string).map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         let kind = kind_for_scheme(url.scheme())?;
-        if kind == DatabaseKind::SQLite {
+        if kind.is_file() {
             return Ok(Self {
                 kind,
                 host: String::new(),
@@ -102,8 +107,9 @@ impl ConnectionFields {
             kind,
             host: host.to_owned(),
             port: url
-                .port_or_known_default()
+                .port()
                 .map(|port| port.to_string())
+                .or_else(|| kind.default_port().map(str::to_owned))
                 .unwrap_or_default(),
             username,
             password,
@@ -125,13 +131,26 @@ impl ConnectionFields {
     pub fn url(&self) -> Result<String, ConnectionFieldsError> {
         if !self.connection_string.trim().is_empty() {
             let connection_string = normalize_connection_string(&self.connection_string)?;
-            let url =
+            if self.kind == DatabaseKind::MongoDB && is_mongo_seed_list(&connection_string) {
+                return Ok(connection_string);
+            }
+            let mut url =
                 Url::parse(&connection_string).map_err(|_| ConnectionFieldsError::InvalidUrl)?;
             let actual = kind_for_scheme(url.scheme())?;
-            if actual != self.kind {
+            if actual != self.kind && !self.kind.accepts_scheme(url.scheme()) {
                 return Err(ConnectionFieldsError::MismatchedScheme {
                     expected: self.kind,
                 });
+            }
+            if !self.password.is_empty()
+                && matches!(
+                    self.kind,
+                    DatabaseKind::BigQuery | DatabaseKind::Turso | DatabaseKind::CloudflareD1
+                )
+            {
+                set_url_password(&mut url, Some(&self.password))
+                    .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+                return Ok(url.into());
             }
             return Ok(connection_string);
         }
@@ -156,7 +175,7 @@ impl ConnectionFields {
     }
 
     fn structured_url(&self) -> Result<String, ConnectionFieldsError> {
-        if self.kind == DatabaseKind::SQLite {
+        if self.kind.is_file() {
             return Err(ConnectionFieldsError::MissingSqliteConnectionString);
         }
         if self.host.trim().is_empty() && !self.socket_enabled {
@@ -173,8 +192,13 @@ impl ConnectionFields {
         if port == 0 {
             return Err(ConnectionFieldsError::InvalidPort);
         }
-        if matches!(self.kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL)
-            && self.database.trim().is_empty()
+        if matches!(
+            self.kind,
+            DatabaseKind::PostgreSQL
+                | DatabaseKind::CockroachDB
+                | DatabaseKind::MySQL
+                | DatabaseKind::MongoDB
+        ) && self.database.trim().is_empty()
         {
             return Err(ConnectionFieldsError::MissingDatabase(self.kind));
         }
@@ -246,6 +270,13 @@ fn kind_for_scheme(scheme: &str) -> Result<DatabaseKind, ConnectionFieldsError> 
         "mysql" => Ok(DatabaseKind::MySQL),
         "redis" => Ok(DatabaseKind::Redis),
         "sqlite" => Ok(DatabaseKind::SQLite),
+        "duckdb" => Ok(DatabaseKind::DuckDB),
+        "mongodb" | "mongodb+srv" => Ok(DatabaseKind::MongoDB),
+        "http" | "https" => Ok(DatabaseKind::Elasticsearch),
+        "bigquery" => Ok(DatabaseKind::BigQuery),
+        "kafka" => Ok(DatabaseKind::Kafka),
+        "turso" | "libsql" => Ok(DatabaseKind::Turso),
+        "d1" => Ok(DatabaseKind::CloudflareD1),
         _ => Err(ConnectionFieldsError::UnsupportedScheme(scheme.to_owned())),
     }
 }
@@ -265,8 +296,45 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     if raw.is_empty() {
         return Err(ConnectionFieldsError::InvalidUrl);
     }
+    if is_mongo_seed_list(raw) {
+        let (scheme, rest) = raw
+            .split_once("://")
+            .ok_or(ConnectionFieldsError::InvalidUrl)?;
+        let (userinfo, suffix) = rest
+            .rsplit_once('@')
+            .map_or((None, rest), |(u, s)| (Some(u), s));
+        let hosts = suffix.split(['/', '?']).next().unwrap_or_default();
+        for host in hosts.split(',') {
+            let url = Url::parse(&format!("mongodb://{host}"))
+                .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+            if url.host_str().is_none() {
+                return Err(ConnectionFieldsError::InvalidUrl);
+            }
+        }
+        let prefix = if let Some(userinfo) = userinfo {
+            let (user, password) = userinfo
+                .split_once(':')
+                .map_or((userinfo, None), |(u, p)| (u, Some(p)));
+            let mut url = Url::parse("mongodb://placeholder").unwrap();
+            set_url_username(&mut url, &decode(user)?)
+                .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+            set_url_password(&mut url, password.map(decode).transpose()?.as_deref())
+                .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+            format!(
+                "{}@",
+                url.as_str()
+                    .trim_start_matches("mongodb://")
+                    .split('@')
+                    .next()
+                    .unwrap()
+            )
+        } else {
+            String::new()
+        };
+        return Ok(format!("{scheme}://{prefix}{suffix}"));
+    }
     if let Ok(mut url) = Url::parse(raw) {
-        if url.scheme().eq_ignore_ascii_case("sqlite") {
+        if matches!(url.scheme(), "sqlite" | "duckdb") {
             return Ok(raw.to_owned());
         }
         // A network URL without a host may still be recoverable below if its
@@ -291,7 +359,19 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     let scheme_lower = scheme.to_ascii_lowercase();
     if !matches!(
         scheme_lower.as_str(),
-        "postgres" | "postgresql" | "mysql" | "redis"
+        "postgres"
+            | "postgresql"
+            | "mysql"
+            | "redis"
+            | "mongodb"
+            | "mongodb+srv"
+            | "http"
+            | "https"
+            | "bigquery"
+            | "kafka"
+            | "libsql"
+            | "turso"
+            | "d1"
     ) {
         return Err(ConnectionFieldsError::InvalidUrl);
     }
@@ -329,6 +409,18 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     Err(ConnectionFieldsError::InvalidUrl)
 }
 
+pub(crate) fn is_mongo_seed_list(raw: &str) -> bool {
+    raw.strip_prefix("mongodb://").is_some_and(|rest| {
+        rest.rsplit('@')
+            .next()
+            .unwrap_or_default()
+            .split(['/', '?'])
+            .next()
+            .unwrap_or_default()
+            .contains(',')
+    })
+}
+
 /// Set a decoded username on a URL without allowing a literal `%` to be
 /// mistaken for the start of an existing percent-escape.
 fn set_url_username(url: &mut Url, username: &str) -> Result<(), ()> {
@@ -351,21 +443,6 @@ fn decode(value: &str) -> Result<String, ConnectionFieldsError> {
         .decode_utf8()
         .map(|value| value.into_owned())
         .map_err(|_| ConnectionFieldsError::InvalidUrl)
-}
-
-trait DatabaseKindUrlExt {
-    fn default_port(self) -> Option<&'static str>;
-}
-
-impl DatabaseKindUrlExt for DatabaseKind {
-    fn default_port(self) -> Option<&'static str> {
-        match self {
-            DatabaseKind::PostgreSQL => Some("5432"),
-            DatabaseKind::MySQL => Some("3306"),
-            DatabaseKind::Redis => Some("6379"),
-            DatabaseKind::SQLite => None,
-        }
-    }
 }
 
 #[cfg(test)]

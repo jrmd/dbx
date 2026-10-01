@@ -63,7 +63,11 @@ pub(crate) fn redact_url(url: &str) -> String {
     let Some(at) = url[scheme_end + 3..].find('@') else {
         return format!("{scheme}<redacted>");
     };
-    format!("{scheme}<redacted>@{}", &url[scheme_end + 3 + at + 1..])
+    let address = url[scheme_end + 3 + at + 1..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    format!("{scheme}<redacted>@{address}")
 }
 
 /// Formats an error with a connection URL stripped of credentials.

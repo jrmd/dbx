@@ -126,7 +126,11 @@ impl DbxApp {
                                         .child(if kind.is_sql() {
                                             "Filters"
                                         } else {
-                                            "Key pattern"
+                                            if kind == DatabaseKind::Redis {
+                                                "Key pattern"
+                                            } else {
+                                                "Records"
+                                            }
                                         }),
                                 ),
                             )
@@ -157,7 +161,7 @@ impl DbxApp {
                                                 })),
                                         )
                                     })
-                                    .when(!kind.is_sql() || has_filter_rows, |view| {
+                                    .when(kind == DatabaseKind::Redis || has_filter_rows, |view| {
                                         view.child(
                                             button(
                                                 "apply-filter",
@@ -198,7 +202,7 @@ impl DbxApp {
                                     }),
                             ),
                     )
-                    .when(!kind.is_sql(), |view| {
+                    .when(kind == DatabaseKind::Redis, |view| {
                         view.child(div().min_w_0().child(editor::input(
                             redis_filter_editor,
                             redis_filter_focus,

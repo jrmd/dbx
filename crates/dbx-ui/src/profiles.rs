@@ -30,39 +30,35 @@ use crate::connection_fields::{normalize_connection_string, set_url_password};
 use crate::vault::{CredentialVault, VaultError};
 
 /// Version of the on-disk profile document.
-pub const PROFILE_FILE_VERSION: u32 = 1;
+pub const PROFILE_FILE_VERSION: u32 = 2;
 
-/// Deployment environment label a connection can be tagged with.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConnectionEnvironment {
-    Production,
-    Staging,
-    Develop,
-    #[default]
-    Local,
+/// A reusable connection tag. Colours are stored as 24-bit RGB values.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectionTag {
+    pub id: Uuid,
+    pub name: String,
+    pub color: u32,
 }
 
-impl ConnectionEnvironment {
-    /// Every label in display order for pickers.
-    pub const ALL: [ConnectionEnvironment; 4] = [
-        ConnectionEnvironment::Production,
-        ConnectionEnvironment::Staging,
-        ConnectionEnvironment::Develop,
-        ConnectionEnvironment::Local,
-    ];
+pub fn default_tags() -> Vec<ConnectionTag> {
+    [
+        ("Prod", 0xef6b73),
+        ("Staging", 0xe5b567),
+        ("Dev", 0x82aaff),
+        ("Local", 0x8fcf9c),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (name, color))| ConnectionTag {
+        id: Uuid::from_u128(index as u128 + 1),
+        name: name.into(),
+        color,
+    })
+    .collect()
 }
 
-impl fmt::Display for ConnectionEnvironment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            ConnectionEnvironment::Production => "Production",
-            ConnectionEnvironment::Staging => "Staging",
-            ConnectionEnvironment::Develop => "Develop",
-            ConnectionEnvironment::Local => "Local",
-        };
-        f.write_str(label)
-    }
+fn local_tag() -> Option<ConnectionTag> {
+    Some(default_tags().remove(3))
 }
 
 /// Name of the profile file below the platform configuration directory.
@@ -164,7 +160,7 @@ pub struct SavedConnection {
     pub kind: DatabaseKind,
     /// A normalized connection URL with no password in its userinfo.
     pub url: String,
-    pub environment: ConnectionEnvironment,
+    pub tag: Option<ConnectionTag>,
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
     pub socket: Option<PathBuf>,
@@ -197,7 +193,7 @@ pub struct ConnectionProfileDraft {
     pub id: Option<Uuid>,
     pub name: String,
     pub config: ConnectionConfig,
-    pub environment: ConnectionEnvironment,
+    pub tag: Option<ConnectionTag>,
     pub secret: Option<String>,
 }
 
@@ -233,7 +229,7 @@ impl ConnectionProfileDraft {
             id: None,
             name: name.into(),
             config,
-            environment: ConnectionEnvironment::default(),
+            tag: local_tag(),
             secret: None,
         }
     }
@@ -252,9 +248,8 @@ impl ConnectionProfileDraft {
         self
     }
 
-    /// Tag the profile with a deployment environment label.
-    pub fn with_environment(mut self, environment: ConnectionEnvironment) -> Self {
-        self.environment = environment;
+    pub fn with_tag(mut self, tag: Option<ConnectionTag>) -> Self {
+        self.tag = tag;
         self
     }
 
@@ -396,6 +391,43 @@ impl ProfileStore {
         &self.path
     }
 
+    pub fn tags(&self) -> ProfileResult<Vec<ConnectionTag>> {
+        let _lock = self.lock()?;
+        Ok(self.read_document()?.tags)
+    }
+
+    pub fn save_tag(&self, mut tag: ConnectionTag) -> ProfileResult<Vec<ConnectionTag>> {
+        let _lock = self.lock()?;
+        tag.name = tag.name.trim().to_owned();
+        if tag.name.is_empty() || tag.name.chars().count() > 32 || tag.color > 0xffffff {
+            return Err(ProfileError::Invalid(
+                "Use a tag name of 1–32 characters and an RGB colour".into(),
+            ));
+        }
+        let mut document = self.read_document()?;
+        if document
+            .tags
+            .iter()
+            .any(|item| item.id != tag.id && item.name.eq_ignore_ascii_case(&tag.name))
+        {
+            return Err(ProfileError::Invalid(
+                "A tag with that name already exists".into(),
+            ));
+        }
+        if let Some(existing) = document.tags.iter_mut().find(|item| item.id == tag.id) {
+            *existing = tag.clone();
+        } else {
+            document.tags.push(tag.clone());
+        }
+        for profile in &mut document.connections {
+            if let Some(existing) = profile.tag.as_mut().filter(|item| item.id == tag.id) {
+                *existing = tag.clone();
+            }
+        }
+        self.write_document(&document)?;
+        Ok(document.tags)
+    }
+
     /// List profiles sorted by display name, without loading any secrets.
     pub fn list(&self) -> ProfileResult<Vec<SavedConnection>> {
         let _lock = self.lock()?;
@@ -451,12 +483,20 @@ impl ProfileStore {
                 .as_ref()
                 .and_then(|profile| profile.secret_key.clone())
         });
+        if let Some(tag) = draft.tag.as_mut() {
+            *tag = document
+                .tags
+                .iter()
+                .find(|item| item.id == tag.id)
+                .cloned()
+                .ok_or_else(|| ProfileError::Invalid("Unknown connection tag".into()))?;
+        }
         let replacement = StoredConnection {
             id,
             name: std::mem::take(&mut draft.name),
             kind: draft.config.kind,
             url,
-            environment: draft.environment,
+            tag: draft.tag.take(),
             max_connections: draft.config.max_connections,
             connect_timeout_ms: draft.config.connect_timeout_ms,
             socket: draft.config.socket.clone(),
@@ -599,7 +639,50 @@ impl ProfileStore {
             return Ok(ProfileDocument::empty());
         }
         let bytes = fs::read(&self.path)?;
-        let document: ProfileDocument = serde_json::from_slice(&bytes)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if version != 1 && version != PROFILE_FILE_VERSION {
+            return Err(ProfileError::UnsupportedVersion {
+                found: version,
+                expected: PROFILE_FILE_VERSION,
+            });
+        }
+        // Preserve old labels, including the Local fallback, while allowing
+        // explicitly empty tag selections in new documents.
+        if let Some(connections) = value.get_mut("connections").and_then(|v| v.as_array_mut()) {
+            for profile in connections {
+                if version == 1
+                    && profile.is_object()
+                    && profile.get("tag").is_none()
+                    && profile.get("tags").is_none()
+                {
+                    let index = match profile.get("environment").and_then(|v| v.as_str()) {
+                        Some("production") => 0,
+                        Some("staging") => 1,
+                        Some("develop") => 2,
+                        _ => 3,
+                    };
+                    profile["tag"] = serde_json::to_value(default_tags().remove(index))?;
+                }
+                if let Some(object) = profile.as_object_mut() {
+                    object.remove("environment");
+                    // Early v2 builds allowed several tags; keep the first.
+                    if let Some(tags) = object.remove("tags") {
+                        let first = tags.as_array().and_then(|tags| tags.first()).cloned();
+                        object.insert("tag".into(), first.unwrap_or_default());
+                    }
+                }
+            }
+        }
+        value["version"] = PROFILE_FILE_VERSION.into();
+        let mut document: ProfileDocument = serde_json::from_value(value)?;
+        for profile in &mut document.connections {
+            if let Some(tag) = profile.tag.as_mut()
+                && let Some(definition) = document.tags.iter().find(|item| item.id == tag.id)
+            {
+                *tag = definition.clone();
+            }
+        }
         document.validate()?;
         Ok(document)
     }
@@ -617,6 +700,8 @@ struct ProfileDocument {
     version: u32,
     #[serde(default)]
     connections: Vec<StoredConnection>,
+    #[serde(default = "default_tags")]
+    tags: Vec<ConnectionTag>,
 }
 
 impl ProfileDocument {
@@ -624,6 +709,7 @@ impl ProfileDocument {
         Self {
             version: PROFILE_FILE_VERSION,
             connections: Vec::new(),
+            tags: default_tags(),
         }
     }
 
@@ -634,8 +720,29 @@ impl ProfileDocument {
                 expected: PROFILE_FILE_VERSION,
             });
         }
+        let mut tag_ids = std::collections::HashSet::new();
+        let mut tag_names = std::collections::HashSet::new();
+        for tag in &self.tags {
+            if tag.name.trim().is_empty()
+                || tag.name.chars().count() > 32
+                || tag.color > 0xffffff
+                || !tag_ids.insert(tag.id)
+                || !tag_names.insert(tag.name.to_lowercase())
+            {
+                return Err(ProfileError::Invalid(
+                    "Invalid or duplicate tag definition".into(),
+                ));
+            }
+        }
         let mut ids = std::collections::HashSet::with_capacity(self.connections.len());
         for profile in &self.connections {
+            if profile
+                .tag
+                .as_ref()
+                .is_some_and(|tag| !tag_ids.contains(&tag.id))
+            {
+                return Err(ProfileError::Invalid("Unknown profile tag".into()));
+            }
             validate_name(&profile.name)?;
             if !ids.insert(profile.id) {
                 return Err(ProfileError::Invalid(format!(
@@ -674,7 +781,7 @@ struct StoredConnection {
     kind: DatabaseKind,
     url: String,
     #[serde(default)]
-    environment: ConnectionEnvironment,
+    tag: Option<ConnectionTag>,
     max_connections: u32,
     connect_timeout_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -692,7 +799,7 @@ impl StoredConnection {
             name: self.name,
             kind: self.kind,
             url: self.url,
-            environment: self.environment,
+            tag: self.tag,
             max_connections: self.max_connections,
             connect_timeout_ms: self.connect_timeout_ms,
             socket: self.socket,
@@ -721,6 +828,24 @@ fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
     }
     let normalized = normalize_connection_string(raw)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
+    if crate::connection_fields::is_mongo_seed_list(&normalized) {
+        let rest = normalized.trim_start_matches("mongodb://");
+        let Some((userinfo, suffix)) = rest.rsplit_once('@') else {
+            return Ok((normalized, None));
+        };
+        let (username, password) = userinfo
+            .split_once(':')
+            .map_or((userinfo, None), |(u, p)| (u, Some(p)));
+        let secret = password
+            .map(|p| {
+                percent_decode_str(p)
+                    .decode_utf8()
+                    .map(|s| s.into_owned())
+                    .map_err(|_| ProfileError::Invalid("Invalid MongoDB password encoding".into()))
+            })
+            .transpose()?;
+        return Ok((format!("mongodb://{username}@{suffix}"), secret));
+    }
     let mut parsed = Url::parse(&normalized)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
     let secret = parsed
@@ -742,9 +867,88 @@ fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
     Ok((parsed.to_string(), secret))
 }
 
+#[cfg(test)]
+mod provider_credential_tests {
+    use super::*;
+    #[test]
+    fn new_provider_tokens_round_trip_through_vault_without_entering_profile_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("profiles.json"));
+        store
+            .vault()
+            .unwrap()
+            .create("connector QA passphrase")
+            .unwrap();
+        for (kind, url) in [
+            (
+                DatabaseKind::CloudflareD1,
+                "d1://:fixture-token@account/database",
+            ),
+            (
+                DatabaseKind::Turso,
+                "libsql://:fixture-token@database.turso.io",
+            ),
+            (
+                DatabaseKind::BigQuery,
+                "bigquery://:fixture-token@project/dataset?location=EU",
+            ),
+            (
+                DatabaseKind::MongoDB,
+                "mongodb+srv://user:fixture-token@cluster.example.test/app",
+            ),
+            (
+                DatabaseKind::MongoDB,
+                "mongodb://user:fixture-token@first.example.test:27017,second.example.test:27017/app?replicaSet=rs0",
+            ),
+            (
+                DatabaseKind::Elasticsearch,
+                "https://:fixture-token@search.example.test",
+            ),
+            (
+                DatabaseKind::Kafka,
+                "kafka://user:fixture-token@broker.example.test:9092?security.protocol=SASL_SSL&sasl.mechanism=PLAIN",
+            ),
+            (
+                DatabaseKind::CockroachDB,
+                "postgres://user:fixture-token@db.example.test:26257/app?sslmode=require",
+            ),
+        ] {
+            let saved = store
+                .save(ConnectionProfileDraft::new(kind.to_string(), kind, url))
+                .unwrap();
+            assert!(!saved.url.contains("fixture-token"));
+            let loaded = store.load(saved.id).unwrap();
+            assert_eq!(loaded.config.kind, kind);
+            assert!(loaded.config.url.contains("fixture-token"));
+            assert!(
+                !std::fs::read_to_string(directory.path().join("profiles.json"))
+                    .unwrap()
+                    .contains("fixture-token")
+            );
+        }
+    }
+}
+
 fn add_password(raw: &str, secret: &str) -> ProfileResult<String> {
     let normalized = normalize_connection_string(raw)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
+    if crate::connection_fields::is_mongo_seed_list(&normalized) {
+        let rest = normalized.trim_start_matches("mongodb://");
+        let (username, suffix) = rest.rsplit_once('@').unwrap_or(("", rest));
+        let mut encoded = Url::parse(&format!("mongodb://{username}@placeholder"))
+            .map_err(|_| ProfileError::Invalid("Invalid MongoDB username".into()))?;
+        set_url_password(&mut encoded, Some(secret))
+            .map_err(|_| ProfileError::Invalid("Invalid MongoDB password".into()))?;
+        return Ok(format!(
+            "mongodb://{}@{suffix}",
+            encoded
+                .as_str()
+                .trim_start_matches("mongodb://")
+                .split('@')
+                .next()
+                .unwrap()
+        ));
+    }
     let mut parsed = Url::parse(&normalized)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
     set_url_password(&mut parsed, Some(secret))
@@ -1180,34 +1384,89 @@ mod tests {
     }
 
     #[test]
-    fn environment_labels_round_trip_and_default_for_older_documents() {
-        let (_directory, store, _secrets) = test_store();
+    fn tags_round_trip_and_shared_colour_updates() {
+        let (_directory, store, _) = test_store();
+        let tag = ConnectionTag {
+            id: Uuid::new_v4(),
+            name: "Analytics".into(),
+            color: 0x123456,
+        };
+        store.save_tag(tag.clone()).unwrap();
         let saved = store
             .save(
-                ConnectionProfileDraft::new(
-                    "Prod",
-                    DatabaseKind::PostgreSQL,
-                    "postgres://alice@example.test/app",
-                )
-                .with_environment(ConnectionEnvironment::Production),
+                ConnectionProfileDraft::new("DB", DatabaseKind::SQLite, "sqlite::memory:")
+                    .with_tag(Some(tag.clone())),
             )
-            .expect("save profile");
-        assert_eq!(saved.environment, ConnectionEnvironment::Production);
-        assert_eq!(
-            store.list().unwrap()[0].environment,
-            ConnectionEnvironment::Production
+            .unwrap();
+        assert_eq!(store.get(saved.id).unwrap().unwrap().tag, Some(tag.clone()));
+        let mut changed = tag;
+        changed.color = 0xabcdef;
+        store.save_tag(changed.clone()).unwrap();
+        assert_eq!(store.list().unwrap()[0].tag, Some(changed));
+        assert!(
+            store
+                .save_tag(ConnectionTag {
+                    id: Uuid::new_v4(),
+                    name: "analytics".into(),
+                    color: 0
+                })
+                .is_err()
         );
+        assert!(
+            !fs::read_to_string(store.path())
+                .unwrap()
+                .contains("environment")
+        );
+        store
+            .save(
+                ConnectionProfileDraft::new("DB", DatabaseKind::SQLite, "sqlite::memory:")
+                    .with_id(saved.id)
+                    .with_tag(None),
+            )
+            .unwrap();
+        assert!(store.list().unwrap()[0].tag.is_none());
+    }
 
-        // A document written before environments existed still loads, and the
-        // connection defaults to Local.
-        let id = Uuid::new_v4();
+    #[test]
+    fn early_multi_tag_profiles_keep_their_first_tag() {
+        let (_directory, store, _) = test_store();
+        let [prod, staging, ..]: [ConnectionTag; 4] = default_tags().try_into().unwrap();
+        let profile = serde_json::json!({"id": Uuid::new_v4(), "name": "Early", "kind": "postgresql", "url": "postgres://u@example.test/db", "max_connections": 8, "connect_timeout_ms": 10000, "tags": [prod, staging]});
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
-        let json = format!(
-            r#"{{"version":1,"connections":[{{"id":"{id}","name":"Legacy","kind":"postgresql","url":"postgres://u@example.test/db","max_connections":8,"connect_timeout_ms":10000}}]}}"#
-        );
-        fs::write(store.path(), json).unwrap();
-        let listed = store.list().unwrap();
-        assert_eq!(listed[0].environment, ConnectionEnvironment::Local);
+        fs::write(
+            store.path(),
+            serde_json::to_vec(&serde_json::json!({"version": 2, "connections": [profile]}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(store.list().unwrap()[0].tag, Some(prod));
+    }
+
+    #[test]
+    fn legacy_environments_migrate_to_default_tags() {
+        let (_directory, store, _) = test_store();
+        for (environment, index) in [
+            (Some("production"), 0),
+            (Some("staging"), 1),
+            (Some("develop"), 2),
+            (Some("local"), 3),
+            (None, 3),
+        ] {
+            let mut profile = serde_json::json!({"id": Uuid::new_v4(), "name": "Legacy", "kind": "postgresql", "url": "postgres://u@example.test/db", "max_connections": 8, "connect_timeout_ms": 10000});
+            if let Some(environment) = environment {
+                profile["environment"] = environment.into();
+            }
+            fs::write(
+                store.path(),
+                serde_json::to_vec(&serde_json::json!({"version": 1, "connections": [profile]}))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.list().unwrap()[0].tag,
+                Some(default_tags().remove(index))
+            );
+        }
     }
 
     #[test]

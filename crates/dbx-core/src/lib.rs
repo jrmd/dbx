@@ -5,6 +5,7 @@
 //! manager) and exposes database-agnostic metadata, query, and mutation
 //! operations for the GPUI client.
 
+mod connectors;
 mod engine;
 mod error;
 mod model;

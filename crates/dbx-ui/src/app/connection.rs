@@ -49,12 +49,7 @@ impl DbxApp {
     }
 
     fn default_url(kind: DatabaseKind) -> &'static str {
-        match kind {
-            DatabaseKind::PostgreSQL => "postgres://postgres@localhost:5432/postgres",
-            DatabaseKind::MySQL => "mysql://root@localhost:3306/mysql",
-            DatabaseKind::SQLite => "sqlite://dbx.db?mode=rwc",
-            DatabaseKind::Redis => "redis://127.0.0.1:6379/0",
-        }
+        kind.default_url()
     }
 
     fn hydrate_connection_fields(
@@ -65,10 +60,25 @@ impl DbxApp {
     ) {
         let mut fields =
             ConnectionFields::from_url(url.clone()).unwrap_or_else(|_| ConnectionFields::new(kind));
-        let normalized_url = fields.url().unwrap_or(url);
+        fields.kind = kind;
+        let mut normalized_url = fields.url().unwrap_or(url);
+        if matches!(
+            kind,
+            DatabaseKind::BigQuery | DatabaseKind::Turso | DatabaseKind::CloudflareD1
+        ) && let Ok(mut parsed) = url::Url::parse(&normalized_url)
+        {
+            let _ = parsed.set_password(None);
+            normalized_url = parsed.into();
+        }
         self.draft.kind = kind;
         self.hydrate_transport(None, None, cx);
-        self.draft.mode = ConnectionFormMode::Details;
+        let simple_address = url::Url::parse(&normalized_url)
+            .is_ok_and(|url| url.query().is_none() && url.scheme() == kind.scheme());
+        self.draft.mode = if kind.supports_details() && simple_address {
+            ConnectionFormMode::Details
+        } else {
+            ConnectionFormMode::ConnectionString
+        };
         self.draft.connection_url.update(cx, |value, cx| {
             *value = normalized_url;
             cx.notify();
@@ -114,11 +124,27 @@ impl DbxApp {
                 .then(|| transport.ssh_key.read(cx).trim().into()),
         });
         if self.draft.mode == ConnectionFormMode::ConnectionString
-            || self.draft.kind == DatabaseKind::SQLite
+            || !self.draft.kind.supports_details()
         {
             fields.connection_string = self.draft.connection_url.read(cx).clone();
         } else {
             fields.use_structured_fields();
+            // Keep TLS, replica-set and driver options while editing ordinary
+            // address fields. Rebuilding only the authority must not weaken TLS.
+            if let (Ok(mut rebuilt), Ok(original)) = (
+                fields.url().and_then(|u| {
+                    url::Url::parse(&u)
+                        .map_err(|_| crate::connection_fields::ConnectionFieldsError::InvalidUrl)
+                }),
+                url::Url::parse(self.draft.connection_url.read(cx)),
+            ) && self.draft.kind.accepts_scheme(original.scheme())
+            {
+                rebuilt.set_query(original.query());
+                if self.draft.kind == DatabaseKind::Elasticsearch {
+                    let _ = rebuilt.set_scheme(original.scheme());
+                }
+                fields.connection_string = rebuilt.into();
+            }
         }
         fields
     }
@@ -321,12 +347,13 @@ impl DbxApp {
             return;
         }
         self.vault_state = Some(VaultState::Locked);
+        self.settings_open = false;
         self.cancel_credential_hydration();
         self.draft.password.update(cx, |value, cx| {
             value.zeroize();
             cx.notify();
         });
-        if self.draft.kind != DatabaseKind::SQLite {
+        if !self.draft.kind.is_file() {
             self.draft.connection_url.update(cx, |value, cx| {
                 value.zeroize();
                 cx.notify();
@@ -355,10 +382,21 @@ impl DbxApp {
         }
 
         match mode {
-            ConnectionFormMode::Details if self.draft.kind != DatabaseKind::SQLite => {
+            ConnectionFormMode::Details if self.draft.kind.supports_details() => {
                 let connection_string = self.draft.connection_url.read(cx).trim().to_owned();
+                if connection_string.starts_with("mongodb+srv:") {
+                    self.set_error("SRV connections use DNS rather than a fixed host/port; edit this URI in Connection string mode".into());
+                    cx.notify();
+                    return;
+                }
                 let mut fields = match ConnectionFields::from_url(connection_string) {
-                    Ok(fields) if fields.kind == self.draft.kind => fields,
+                    Ok(mut fields)
+                        if fields.kind == self.draft.kind
+                            || self.draft.kind.accepts_scheme(fields.kind.scheme()) =>
+                    {
+                        fields.kind = self.draft.kind;
+                        fields
+                    }
                     Ok(_) => {
                         self.set_error(format!(
                             "Connection string must be for {}",
@@ -420,17 +458,124 @@ impl DbxApp {
     pub(super) fn select_kind(&mut self, kind: DatabaseKind, cx: &mut Context<Self>) {
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
+        self.draft.choosing_kind = false;
         self.hydrate_connection_fields(kind, Self::default_url(kind).to_owned(), cx);
         self.error = None;
         cx.notify();
     }
 
-    pub(super) fn select_environment(
-        &mut self,
-        environment: ConnectionEnvironment,
-        cx: &mut Context<Self>,
-    ) {
-        self.draft.environment = environment;
+    /// The type a pasted connection URL implies, if DBX recognises it.
+    pub(super) fn import_url_kind(&self, cx: &App) -> Option<DatabaseKind> {
+        let url = self.draft.import_url.read(cx);
+        ConnectionFields::from_url(url.trim())
+            .ok()
+            .map(|fields| fields.kind)
+    }
+
+    pub(super) fn continue_with_import_url(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = self.import_url_kind(cx) else {
+            return;
+        };
+        let url = self.draft.import_url.update(cx, |value, cx| {
+            cx.notify();
+            std::mem::take(value)
+        });
+        self.cancel_credential_hydration();
+        self.draft.selected_profile = None;
+        self.draft.choosing_kind = false;
+        self.hydrate_connection_fields(kind, url.trim().to_owned(), cx);
+        self.error = None;
+        cx.notify();
+    }
+
+    pub(super) fn change_connection_kind(&mut self, cx: &mut Context<Self>) {
+        self.draft.choosing_kind = true;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// A connection carries at most one tag; choosing the current tag again
+    /// clears it.
+    pub(super) fn select_tag(&mut self, tag: ConnectionTag, cx: &mut Context<Self>) {
+        if self
+            .draft
+            .tag
+            .as_ref()
+            .is_some_and(|item| item.id == tag.id)
+        {
+            self.draft.tag = None;
+        } else {
+            self.draft.tag = Some(tag);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn edit_tag(&mut self, tag: Option<ConnectionTag>, cx: &mut Context<Self>) {
+        self.tag_editor.editing = tag.as_ref().map(|tag| tag.id);
+        self.tag_editor.name.update(cx, |value, cx| {
+            *value = tag.as_ref().map(|tag| tag.name.clone()).unwrap_or_default();
+            cx.notify();
+        });
+        self.tag_editor.color.update(cx, |value, cx| {
+            *value = format!(
+                "{:06X}",
+                tag.as_ref().map(|tag| tag.color).unwrap_or(0x82aaff)
+            );
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    pub(super) fn save_connection_tag(&mut self, cx: &mut Context<Self>) {
+        let raw = self
+            .tag_editor
+            .color
+            .read(cx)
+            .trim()
+            .trim_start_matches('#');
+        let color = if raw.len() == 6 {
+            u32::from_str_radix(raw, 16).ok()
+        } else {
+            None
+        };
+        let Some(color) = color else {
+            self.show_toast(
+                ToastKind::Error,
+                "Enter a six-digit hex colour, such as #82AAFF",
+                cx,
+            );
+            return;
+        };
+        let tag = ConnectionTag {
+            id: self.tag_editor.editing.unwrap_or_else(Uuid::new_v4),
+            name: self.tag_editor.name.read(cx).trim().to_owned(),
+            color,
+        };
+        let Some(store) = self.profile_store.as_ref() else {
+            self.show_toast(
+                ToastKind::Error,
+                "Connection profile storage is unavailable",
+                cx,
+            );
+            return;
+        };
+        match store.save_tag(tag.clone()) {
+            Ok(tags) => {
+                self.connection_tags = tags;
+                let current = std::iter::once(&mut self.draft.tag)
+                    .chain(self.sessions.iter_mut().map(|session| &mut session.tag));
+                for existing in current.flatten() {
+                    if existing.id == tag.id {
+                        *existing = tag.clone();
+                    }
+                }
+                if let Ok(profiles) = store.list() {
+                    self.saved_connections = profiles;
+                }
+                self.edit_tag(None, cx);
+            }
+            Err(error) => self.show_toast(ToastKind::Error, error.to_string(), cx),
+        }
         cx.notify();
     }
 
@@ -444,7 +589,8 @@ impl DbxApp {
         let has_saved_password = profile.has_secret();
         let profile_id = profile.id;
         self.draft.selected_profile = Some(profile.id);
-        self.draft.environment = profile.environment;
+        self.draft.choosing_kind = false;
+        self.draft.tag = profile.tag;
         self.draft.connection_name.update(cx, |name, cx| {
             *name = profile.name;
             cx.notify();
@@ -594,8 +740,8 @@ impl DbxApp {
                 return;
             }
         };
-        let mut draft = ConnectionProfileDraft::from_config(name, config)
-            .with_environment(self.draft.environment);
+        let mut draft =
+            ConnectionProfileDraft::from_config(name, config).with_tag(self.draft.tag.clone());
         if !fields.password.is_empty() {
             draft = draft.with_secret(std::mem::take(&mut fields.password));
         }
@@ -628,6 +774,11 @@ impl DbxApp {
                 );
                 match save_result {
                     Ok(profile) if unchanged => {
+                        for session in &mut this.sessions {
+                            if session.profile_id == Some(profile.id) {
+                                session.tag = profile.tag.clone();
+                            }
+                        }
                         this.draft.selected_profile = Some(profile.id);
                         this.show_toast(
                             ToastKind::Success,
@@ -673,6 +824,7 @@ impl DbxApp {
     }
 
     pub(super) fn choose_sqlite_file(&mut self, cx: &mut Context<Self>) {
+        let requested_kind = self.draft.kind;
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -684,15 +836,16 @@ impl DbxApp {
                 Ok(Ok(Some(paths))) => {
                     if let Some(path) = paths.into_iter().next() {
                         this.update(cx, |this, cx| {
-                            if this.draft.kind != DatabaseKind::SQLite {
+                            if this.draft.kind != requested_kind || !requested_kind.is_file() {
                                 return;
                             }
                             this.draft.selected_profile = None;
-                            this.hydrate_connection_fields(
-                                DatabaseKind::SQLite,
-                                sqlite_url(&path),
-                                cx,
-                            );
+                            let url = if requested_kind == DatabaseKind::DuckDB {
+                                sqlite_url(&path).replacen("sqlite:", "duckdb:", 1)
+                            } else {
+                                sqlite_url(&path)
+                            };
+                            this.hydrate_connection_fields(requested_kind, url, cx);
                             this.error = None;
                             cx.notify();
                         })?;
@@ -741,16 +894,9 @@ impl DbxApp {
         let profile_id = self.draft.selected_profile;
         let session_id = Uuid::new_v4();
         let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let environment = profile_id
-            .and_then(|id| {
-                self.saved_connections
-                    .iter()
-                    .find(|profile| profile.id == id)
-            })
-            .map(|profile| profile.environment)
-            .unwrap_or(self.draft.environment);
+        let tag = self.draft.tag.clone();
         let mut session =
-            ConnectionSession::new(session_id, profile_id, name, kind, environment, window, cx);
+            ConnectionSession::new(session_id, profile_id, name, kind, tag, window, cx);
         session.busy = true;
         session.request_generation = 1;
         let generation = session.request_generation;
@@ -906,7 +1052,9 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.compact_connection_form_open = true;
         self.draft.selected_profile = None;
-        self.draft.environment = ConnectionEnvironment::default();
+        self.draft.tag = Some(default_tags().remove(3));
+        self.draft.choosing_kind = true;
+        self.settings_open = false;
         self.draft.connection_name.update(cx, |name, cx| {
             name.clear();
             cx.notify();
@@ -937,6 +1085,52 @@ impl DbxApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn provider_forms_preserve_tls_and_keep_api_tokens_in_masked_fields(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                for kind in DatabaseKind::ALL {
+                    app.hydrate_connection_fields(kind, kind.default_url().into(), cx);
+                    assert_eq!(app.connection_fields(cx).config().unwrap().kind, kind);
+                    let tab = QueryTab::new(kind, Uuid::new_v4(), Uuid::new_v4(), window, cx);
+                    assert_eq!(tab.query_text.read(cx), kind.default_query());
+                }
+                let url = "postgres://root@localhost:26257/app?sslmode=require";
+                app.hydrate_connection_fields(DatabaseKind::CockroachDB, url.into(), cx);
+                app.set_connection_form_mode(ConnectionFormMode::Details, cx);
+                assert_eq!(app.connection_fields(cx).url().unwrap(), url);
+                for (kind, url) in [
+                    (
+                        DatabaseKind::BigQuery,
+                        "bigquery://:fixture-token@project/dataset?location=EU",
+                    ),
+                    (
+                        DatabaseKind::Turso,
+                        "libsql://:fixture-token@database.turso.io",
+                    ),
+                    (
+                        DatabaseKind::CloudflareD1,
+                        "d1://:fixture-token@account/database",
+                    ),
+                ] {
+                    app.hydrate_connection_fields(kind, url.into(), cx);
+                    assert!(!app.draft.connection_url.read(cx).contains("fixture-token"));
+                    assert_eq!(app.draft.password.read(cx), "fixture-token");
+                    assert!(
+                        app.connection_fields(cx)
+                            .url()
+                            .unwrap()
+                            .contains("fixture-token")
+                    );
+                }
+            });
+        });
+    }
 
     #[gpui::test]
     fn saved_transports_hydrate_and_changes_invalidate_connection_tests(

@@ -26,6 +26,14 @@ pub const LOGO_POSTGRESQL: &str = "icons/postgresql.svg";
 pub const LOGO_MYSQL: &str = "icons/mysql.svg";
 pub const LOGO_SQLITE: &str = "icons/sqlite.svg";
 pub const LOGO_REDIS: &str = "icons/redis.svg";
+pub const LOGO_MONGODB: &str = "icons/mongodb.svg";
+pub const LOGO_COCKROACHDB: &str = "icons/cockroachdb.svg";
+pub const LOGO_DUCKDB: &str = "icons/duckdb.svg";
+pub const LOGO_ELASTICSEARCH: &str = "icons/elasticsearch.svg";
+pub const LOGO_BIGQUERY: &str = "icons/bigquery.svg";
+pub const LOGO_KAFKA: &str = "icons/kafka.svg";
+pub const LOGO_TURSO: &str = "icons/turso.svg";
+pub const LOGO_CLOUDFLARE_D1: &str = "icons/cloudflare-d1.svg";
 pub const LOGO: &str = "logo.svg";
 pub const LOGO_BYTES: &[u8] = include_bytes!("../../../logo.svg");
 
@@ -60,6 +68,14 @@ impl AssetSource for Assets {
             LOGO_MYSQL => include_bytes!("../assets/icons/mysql.svg").as_slice(),
             LOGO_SQLITE => include_bytes!("../assets/icons/sqlite.svg").as_slice(),
             LOGO_REDIS => include_bytes!("../assets/icons/redis.svg").as_slice(),
+            LOGO_MONGODB => include_bytes!("../assets/icons/mongodb.svg").as_slice(),
+            LOGO_COCKROACHDB => include_bytes!("../assets/icons/cockroachdb.svg").as_slice(),
+            LOGO_DUCKDB => include_bytes!("../assets/icons/duckdb.svg").as_slice(),
+            LOGO_ELASTICSEARCH => include_bytes!("../assets/icons/elasticsearch.svg").as_slice(),
+            LOGO_BIGQUERY => include_bytes!("../assets/icons/bigquery.svg").as_slice(),
+            LOGO_KAFKA => include_bytes!("../assets/icons/kafka.svg").as_slice(),
+            LOGO_TURSO => include_bytes!("../assets/icons/turso.svg").as_slice(),
+            LOGO_CLOUDFLARE_D1 => include_bytes!("../assets/icons/cloudflare-d1.svg").as_slice(),
             LOGO => LOGO_BYTES,
             // gpui-component draws its own glyphs (menu checkmarks, select
             // carets, dialog closes) from its bundled icon set.
@@ -98,6 +114,14 @@ impl AssetSource for Assets {
                 "mysql.svg",
                 "sqlite.svg",
                 "redis.svg",
+                "mongodb.svg",
+                "cockroachdb.svg",
+                "duckdb.svg",
+                "elasticsearch.svg",
+                "bigquery.svg",
+                "kafka.svg",
+                "turso.svg",
+                "cloudflare-d1.svg",
             ]
             .into_iter()
             .map(SharedString::from)
