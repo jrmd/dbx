@@ -285,19 +285,15 @@ impl DbxApp {
                         )
                     })
                     .child(
-                        glass_icon_button(
-                            "open-settings",
-                            Icon::Settings,
-                            self.settings_dialog.is_some(),
-                        )
-                        .tooltip(tip("Settings"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if this.settings_dialog.is_some() {
-                                this.close_settings(cx);
-                            } else {
-                                this.open_settings(window, cx);
-                            }
-                        })),
+                        glass_icon_button("open-settings", Icon::Settings, self.settings_open)
+                            .tooltip(tip("Settings"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.settings_open {
+                                    this.close_settings(cx);
+                                } else {
+                                    this.open_settings(cx);
+                                }
+                            })),
                     )
                     .when(!cfg!(target_os = "macos"), |view| {
                         view.child(self.render_window_controls(window))
@@ -363,7 +359,7 @@ impl DbxApp {
                     session.busy,
                     session.kind,
                     session.profile_id.is_some(),
-                    session.environment,
+                    session.tag.clone(),
                 )
             })
             .collect();
@@ -377,43 +373,43 @@ impl DbxApp {
             .items_center()
             .gap(px(4.))
             .overflow_x_scroll()
-            .children(sessions.into_iter().map(
-                |(session_id, label, busy, kind, saved, environment)| {
-                    let selected = active_session_id == Some(session_id);
-                    connection_tab(kind, label, selected)
-                        .id(SharedString::from(format!("connection-tab-{session_id}")))
-                        .flex_none()
-                        .cursor_pointer()
-                        .when(busy, |tab| {
-                            tab.child(div().size(px(6.)).rounded_full().bg(theme().warning))
-                        })
-                        .when(saved, |tab| tab.child(environment_badge(environment)))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!(
-                                    "close-connection-tab-{session_id}"
-                                )))
-                                .size(px(18.))
-                                .rounded_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme().glass_hover))
-                                .tooltip(tip("Close connection"))
-                                .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.close_session(session_id, cx)
-                                })),
-                        )
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| {
+            .children(
+                sessions
+                    .into_iter()
+                    .map(|(session_id, label, busy, kind, _saved, tag)| {
+                        let selected = active_session_id == Some(session_id);
+                        connection_tab(kind, label, selected)
+                            .id(SharedString::from(format!("connection-tab-{session_id}")))
+                            .flex_none()
+                            .cursor_pointer()
+                            .when(busy, |tab| {
+                                tab.child(div().size(px(6.)).rounded_full().bg(theme().warning))
+                            })
+                            .children(tag_badge(tag.as_ref()))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "close-connection-tab-{session_id}"
+                                    )))
+                                    .size(px(18.))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme().glass_hover))
+                                    .tooltip(tip("Close connection"))
+                                    .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_session(session_id, cx)
+                                    })),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
                                 this.activate_session(session_id, cx)
-                            }),
-                        )
-                },
-            ))
+                            }))
+                    }),
+            )
             // The connection list already offers "new" while it is showing.
             .when(has_sessions && !self.connection_picker_open, |view| {
                 view.child(
@@ -469,7 +465,7 @@ impl DbxApp {
                 session.kind,
                 session.sidebar.list.visible.clone(),
                 session.databases.len() > 1,
-                session.kind == DatabaseKind::PostgreSQL
+                session.kind.dialect() == DatabaseKind::PostgreSQL
                     && session.sidebar.list.schema_options.len() > 2,
                 session.sidebar.database_select.clone(),
                 session.sidebar.schema_select.clone(),
@@ -807,14 +803,15 @@ impl DbxApp {
                 {
                     match &tab.kind {
                         SecondaryTabKind::Data(data) => {
-                            let table_pagination = (session.kind.is_sql() && data.result.is_some())
-                                .then_some((
-                                    session.id,
-                                    tab.id,
-                                    data.table_page,
-                                    data.table_has_next_page,
-                                    data.busy,
-                                ));
+                            let table_pagination = (session.kind != DatabaseKind::Redis
+                                && data.result.is_some())
+                            .then_some((
+                                session.id,
+                                tab.id,
+                                data.table_page,
+                                data.table_has_next_page,
+                                data.busy,
+                            ));
                             let status = if data.busy {
                                 data.status.clone()
                             } else if session.busy {

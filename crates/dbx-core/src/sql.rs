@@ -28,6 +28,15 @@ pub fn quote_identifier(kind: DatabaseKind, identifier: &str) -> Result<String> 
     if identifier.trim().is_empty() {
         return Err(DbxError::Parse("identifier cannot be empty".into()));
     }
+    if kind == DatabaseKind::BigQuery {
+        if identifier.contains('\0') || identifier.split('.').any(str::is_empty) {
+            return Err(DbxError::Parse("Invalid BigQuery identifier".into()));
+        }
+        return Ok(format!(
+            "`{}`",
+            identifier.replace('\\', "\\\\").replace('`', "\\`")
+        ));
+    }
     let quote = if kind == DatabaseKind::MySQL {
         '`'
     } else {
@@ -132,12 +141,15 @@ pub fn build_insert_with_columns(
         // default (for example, an identity-only table). MySQL spells this
         // form with an empty column list; PostgreSQL and SQLite support the
         // standard DEFAULT VALUES form.
-        let statement = match kind {
+        let statement = match kind.dialect() {
             DatabaseKind::MySQL => format!("INSERT INTO {table} () VALUES ()"),
-            DatabaseKind::PostgreSQL | DatabaseKind::SQLite => {
+            DatabaseKind::PostgreSQL
+            | DatabaseKind::SQLite
+            | DatabaseKind::DuckDB
+            | DatabaseKind::BigQuery => {
                 format!("INSERT INTO {table} DEFAULT VALUES")
             }
-            DatabaseKind::Redis => {
+            _ => {
                 return Err(DbxError::Unsupported {
                     operation: "insert".to_owned(),
                     kind,
@@ -290,7 +302,7 @@ fn append_column_value(
 ) -> Result<()> {
     let cast = match (kind, value, column) {
         (
-            DatabaseKind::PostgreSQL,
+            DatabaseKind::PostgreSQL | DatabaseKind::CockroachDB,
             MutationValue::Parameter(CellValue::Text(_) | CellValue::Null),
             Some(column),
         ) => cast_type_name(&column.data_type),
@@ -415,15 +427,18 @@ pub fn build_truncate_table(kind: DatabaseKind, table: &TableRef) -> Result<SqlS
             kind,
         });
     }
-    let statement = match kind {
-        DatabaseKind::PostgreSQL | DatabaseKind::MySQL => {
+    let statement = match kind.dialect() {
+        DatabaseKind::PostgreSQL
+        | DatabaseKind::MySQL
+        | DatabaseKind::DuckDB
+        | DatabaseKind::BigQuery => {
             format!("TRUNCATE TABLE {}", quote_table(kind, table)?)
         }
         // SQLite has no TRUNCATE statement. DELETE keeps the schema and
         // indexes intact while matching the operation's row-removal
         // semantics.
         DatabaseKind::SQLite => format!("DELETE FROM {}", quote_table(kind, table)?),
-        DatabaseKind::Redis => unreachable!("non-SQL kinds are rejected above"),
+        _ => unreachable!("non-SQL kinds are rejected above"),
     };
     Ok(SqlStatement::new(statement, Vec::new()))
 }
@@ -635,11 +650,11 @@ fn filter_parameter_cast<'a>(
     column: Option<&'a ColumnInfo>,
 ) -> Option<&'a str> {
     match (kind, value, column) {
-        (DatabaseKind::PostgreSQL, CellValue::Text(_), Some(column))
-            if !is_postgres_text_type(&column.data_type) =>
-        {
-            cast_type_name(&column.data_type)
-        }
+        (
+            DatabaseKind::PostgreSQL | DatabaseKind::CockroachDB,
+            CellValue::Text(_),
+            Some(column),
+        ) if !is_postgres_text_type(&column.data_type) => cast_type_name(&column.data_type),
         _ => None,
     }
 }
@@ -698,7 +713,7 @@ fn push_like_predicate(
     // PostgreSQL has no LIKE operator for uuid, numeric, timestamp, enum, and
     // other non-character types; match against their text rendering instead.
     // Without metadata the cast is still safe because text-to-text is a no-op.
-    let cast_to_text = kind == DatabaseKind::PostgreSQL
+    let cast_to_text = kind.dialect() == DatabaseKind::PostgreSQL
         && column.is_none_or(|column| !is_postgres_text_type(&column.data_type));
     if cast_to_text {
         write!(statement, "CAST({identifier} AS text)")
@@ -708,11 +723,18 @@ fn push_like_predicate(
     }
     statement.push_str(" LIKE ");
     statement.push_str(&placeholder(kind, params.len() + 1));
-    statement.push_str(" ESCAPE '!'");
-    let escaped = value
-        .replace('!', "!!")
-        .replace('%', "!%")
-        .replace('_', "!_");
+    let escaped = if kind == DatabaseKind::BigQuery {
+        value
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    } else {
+        statement.push_str(" ESCAPE '!'");
+        value
+            .replace('!', "!!")
+            .replace('%', "!%")
+            .replace('_', "!_")
+    };
     params.push(CellValue::Text(format!("{prefix}{escaped}{suffix}")));
     Ok(())
 }
@@ -764,7 +786,7 @@ fn append_page(
 }
 
 fn placeholder(kind: DatabaseKind, position: usize) -> String {
-    if kind == DatabaseKind::PostgreSQL {
+    if kind.dialect() == DatabaseKind::PostgreSQL {
         format!("${position}")
     } else {
         "?".to_owned()

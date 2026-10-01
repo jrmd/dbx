@@ -4,6 +4,7 @@ mod data;
 mod diagram;
 mod overlays;
 mod query;
+mod settings;
 
 use super::*;
 
@@ -14,7 +15,9 @@ impl Render for DbxApp {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle, cx);
         }
-        let content = if self.connection_picker_open || self.active_session().is_none() {
+        let content = if self.settings_open {
+            self.render_settings(cx)
+        } else if self.connection_picker_open || self.active_session().is_none() {
             self.render_connection(cx).into_any_element()
         } else {
             self.render_workspace(window, cx).into_any_element()
@@ -53,7 +56,6 @@ impl Render for DbxApp {
                     .when(!connected, |view| view.pl(px(GLASS_INSET)))
                     .child(content),
             )
-            .child(self.render_settings_dialog(cx))
             .child(self.render_toasts(cx))
             .children(resize_edges(window))
     }

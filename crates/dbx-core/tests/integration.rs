@@ -746,7 +746,7 @@ fn qualified_table_named(kind: DatabaseKind, name: &str) -> String {
         DatabaseKind::PostgreSQL => format!("\"public\".\"{name}\""),
         DatabaseKind::MySQL => name.to_owned(),
         DatabaseKind::SQLite => format!("\"{name}\""),
-        DatabaseKind::Redis => unreachable!("Redis does not use SQL tables"),
+        _ => unreachable!("This fixture covers PostgreSQL, MySQL and SQLite"),
     }
 }
 

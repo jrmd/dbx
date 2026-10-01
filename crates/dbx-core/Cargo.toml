@@ -18,6 +18,12 @@ thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
 tempfile.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+base64 = "0.22"
+percent-encoding.workspace = true
+mongodb = "3.3"
+duckdb = { version = "1.4", features = ["bundled"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
 
 [dev-dependencies]
 serde_json.workspace = true

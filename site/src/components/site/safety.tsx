@@ -20,10 +20,10 @@ const points = [
   },
 ];
 
-const environments = [
-  { label: "Production", className: "border-danger/50 text-danger bg-danger/10" },
+const tags = [
+  { label: "Prod", className: "border-danger/50 text-danger bg-danger/10" },
   { label: "Staging", className: "border-warning/50 text-warning bg-warning/10" },
-  { label: "Develop", className: "border-primary/60 text-[#82aaff] bg-primary/10" },
+  { label: "Dev", className: "border-primary/60 text-[#82aaff] bg-primary/10" },
   { label: "Local", className: "border-success/50 text-success bg-success/10" },
 ];
 
@@ -36,12 +36,12 @@ export function Safety() {
             Destructive changes ask first
           </h2>
           <p className="mt-6 max-w-md text-lg leading-relaxed text-muted-foreground">
-            Label every connection with its environment. Production is red
-            everywhere you see it, so you always know what you&apos;re about
-            to change.
+            Organise connections with colour-coded tags. Start with Prod,
+            Staging, Dev, and Local, then add your own tags and pick their
+            colours.
           </p>
           <div className="mt-10 flex flex-wrap gap-2">
-            {environments.map((env) => (
+            {tags.map((env) => (
               <span
                 key={env.label}
                 className={cn(

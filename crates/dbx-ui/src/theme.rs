@@ -499,6 +499,14 @@ pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
         DatabaseKind::MySQL => assets::LOGO_MYSQL,
         DatabaseKind::SQLite => assets::LOGO_SQLITE,
         DatabaseKind::Redis => assets::LOGO_REDIS,
+        DatabaseKind::MongoDB => assets::LOGO_MONGODB,
+        DatabaseKind::CockroachDB => assets::LOGO_COCKROACHDB,
+        DatabaseKind::DuckDB => assets::LOGO_DUCKDB,
+        DatabaseKind::Elasticsearch => assets::LOGO_ELASTICSEARCH,
+        DatabaseKind::BigQuery => assets::LOGO_BIGQUERY,
+        DatabaseKind::Kafka => assets::LOGO_KAFKA,
+        DatabaseKind::Turso => assets::LOGO_TURSO,
+        DatabaseKind::CloudflareD1 => assets::LOGO_CLOUDFLARE_D1,
     };
 
     svg().path(path).size(px(16.)).text_color(color)

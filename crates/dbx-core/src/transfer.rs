@@ -321,7 +321,7 @@ pub async fn export_database(
             output.extend_from_slice(
                 format!("-- Table: {}\n", quote_table(kind, &export_table.table)?).as_bytes(),
             );
-            let schema = if kind == DatabaseKind::SQLite {
+            let schema = if kind.dialect() == DatabaseKind::SQLite {
                 render_sql_schema(
                     kind,
                     &export_table.table,
@@ -362,7 +362,7 @@ pub async fn export_database(
         // foreign keys remain in CREATE TABLE. PostgreSQL and MySQL can add
         // them after the data phase, which also handles cycles and arbitrary
         // selection order without disabling referential checks.
-        if kind != DatabaseKind::SQLite {
+        if kind.dialect() != DatabaseKind::SQLite {
             output.extend_from_slice(b"-- Foreign-key constraints\n");
             for &index in &table_order {
                 append_sql_foreign_keys(
@@ -425,7 +425,7 @@ fn append_database_prelude(
     table_order: &[usize],
     output: &mut Vec<u8>,
 ) -> Result<()> {
-    if kind == DatabaseKind::PostgreSQL {
+    if kind.dialect() == DatabaseKind::PostgreSQL {
         let schemas: BTreeSet<&str> = tables
             .iter()
             .filter_map(|table| table.schema.as_deref())
@@ -450,7 +450,7 @@ fn append_database_prelude(
         .rev()
         .map(|index| &tables[*index])
         .collect();
-    if kind == DatabaseKind::SQLite {
+    if kind.dialect() == DatabaseKind::SQLite {
         for table in reverse_order {
             output.extend_from_slice(
                 format!("DROP TABLE IF EXISTS {};\n", quote_table(kind, table)?).as_bytes(),
@@ -1149,12 +1149,13 @@ fn delimited_field_to_cell(field: Option<String>) -> CellValue {
 }
 
 fn max_params_per_statement(kind: DatabaseKind) -> usize {
-    match kind {
+    match kind.dialect() {
         // Conservative bound for SQLite's historical 999-parameter default.
         DatabaseKind::SQLite => 900,
         DatabaseKind::PostgreSQL => 60_000,
         DatabaseKind::MySQL => 65_000,
-        DatabaseKind::Redis => 0,
+        DatabaseKind::DuckDB | DatabaseKind::BigQuery => 1000,
+        _ => 0,
     }
 }
 
