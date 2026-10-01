@@ -1912,7 +1912,8 @@ fn quoted_completion_identifier(
 
 fn quoted_identifier_is_closed(raw: &str, quote: char) -> bool {
     let mut characters = raw.chars();
-    debug_assert_eq!(characters.next(), Some(quote));
+    let opening_quote = characters.next();
+    debug_assert_eq!(opening_quote, Some(quote));
     while let Some(character) = characters.next() {
         if character != quote {
             continue;
@@ -4995,6 +4996,26 @@ mod tests {
                 (JsonTokenKind::String, "\"still typing 🦀"),
             ]
         );
+    }
+
+    #[test]
+    fn quoted_identifier_closure_handles_unfinished_and_escaped_quotes() {
+        for quote in ['"', '`'] {
+            assert!(!quoted_identifier_is_closed(&format!("{quote}"), quote));
+            assert!(!quoted_identifier_is_closed(&format!("{quote}us"), quote));
+            assert!(!quoted_identifier_is_closed(
+                &format!("{quote}user{quote}{quote}name"),
+                quote,
+            ));
+            assert!(quoted_identifier_is_closed(
+                &format!("{quote}{quote}"),
+                quote
+            ));
+            assert!(quoted_identifier_is_closed(
+                &format!("{quote}user{quote}{quote}name{quote}"),
+                quote,
+            ));
+        }
     }
 
     #[test]
