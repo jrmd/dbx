@@ -389,7 +389,7 @@ impl DbxApp {
                 Some(format!("Version {} is available", update.version)),
                 false,
             ),
-            UpdateState::Installing => (Some("Downloading and verifying…".into()), false),
+            UpdateState::Installing(progress) => (Some(progress.label()), false),
             UpdateState::Installed(_) => (
                 Some("Restart to finish updating. Open sessions will close.".into()),
                 false,
@@ -410,7 +410,7 @@ impl DbxApp {
                 ButtonKind::Primary,
                 false,
             ),
-            UpdateState::Installing => ("Installing…".into(), ButtonKind::Quiet, true),
+            UpdateState::Installing(_) => ("Updating…".into(), ButtonKind::Quiet, true),
             UpdateState::Installed(_) => ("Restart DBX".into(), ButtonKind::Primary, false),
             UpdateState::Failed(_) => ("Try again".into(), ButtonKind::Quiet, false),
         };

@@ -13,6 +13,9 @@ mod redis_engine;
 mod sql;
 mod sqlx_engine;
 mod transfer;
+mod transport;
+
+pub use transport::SshConfig;
 
 pub use engine::{DatabaseEngine, Engine, QueryOptions};
 pub use error::{DbxError, Result};

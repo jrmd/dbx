@@ -21,6 +21,7 @@ impl DbxApp {
         let environment = self.draft.environment;
         let saved_connections = self.saved_connections.clone();
         let selected_profile = self.draft.selected_profile;
+        let transport = self.render_connection_transport(cx);
 
         if compact_connection_picker_visible(
             self.compact_layout,
@@ -77,13 +78,81 @@ impl DbxApp {
                                 .child(div().flex().gap(px(8.)).child(div().flex_1().min_w_0().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Host")).child(editor::input(self.draft.host_editor.clone(), host_focus, false))).child(div().w(px(110.)).flex_none().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Port")).child(editor::input(self.draft.port_editor.clone(), port_focus, false))))
                                 .child(div().flex().gap(px(8.)).child(div().flex_1().min_w_0().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Username")).child(editor::input(self.draft.username_editor.clone(), username_focus, false))).child(div().flex_1().min_w_0().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Password")).child(editor::input(self.draft.password_editor.clone(), password_focus, false))))
                                 .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::Redis { "Database index (optional)" } else { "Database" })).child(editor::input(self.draft.database_editor.clone(), database_focus, false))))
-                            .when(!details, |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::SQLite { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false))).when(kind == DatabaseKind::SQLite, |view| view.child(button("choose-sqlite-file", "Choose file…", ButtonKind::Quiet).h(px(32.)).flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx)))))))))))
+                            .when(!details, |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::SQLite { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false))).when(kind == DatabaseKind::SQLite, |view| view.child(button("choose-sqlite-file", "Choose file…", ButtonKind::Quiet).h(px(32.)).flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx))))))))
+                            .when(kind != DatabaseKind::SQLite, |view| view.child(transport)))))
                 .child(div().flex_none().border_t_1().border_color(theme().border).follow_bottom_corners(RADIUS_PANEL).bg(theme().panel).px(if self.compact_layout { px(14.) } else { px(24.) }).py(px(12.)).flex().items_center().justify_between().gap(px(12.))
                     .child(div().min_w_0().flex_1().when_some(self.error.clone(), |view, error| view.child(div().id("connection-error").truncate().text_size(px(12.)).text_color(theme().danger).tooltip(tip(error.clone())).child(error))))
                     .child(div().flex_none().flex().items_center().gap(px(8.))
                         .child(button("test-connection", if self.testing_connection { "Testing…" } else if self.credential_hydrating { "Loading password…" } else { "Test connection" }, ButtonKind::Quiet).when(!self.testing_connection && !self.credential_hydrating, |button| button.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.test_connection(cx)))))
                         .child(button("save-connection", if self.saving_connection { "Saving…" } else { "Save" }, ButtonKind::Quiet).when(!self.vault_busy && !self.saving_connection, |button| button.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.save_connection(cx)))))
                         .child(button("connect", if self.credential_hydrating { "Loading password…" } else { "Connect" }, ButtonKind::Primary).when(!self.credential_hydrating, |button| button.cursor_pointer().on_click(cx.listener(|this, _, window, cx| this.connect(window, cx)))))))).into_any_element()
+    }
+
+    fn render_connection_transport(&self, cx: &mut Context<Self>) -> AnyElement {
+        let transport = &self.draft.transport;
+        let socket_enabled = transport.socket_enabled;
+        let ssh_enabled = transport.ssh_enabled;
+        let input = |label: &'static str, entity: Entity<TextEditor>| {
+            let focus = entity.read(cx).focus_handle();
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(5.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme().text_muted)
+                        .child(label),
+                )
+                .child(editor::input(entity, focus, false))
+                .into_any_element()
+        };
+        let socket = input(
+            if self.draft.kind == DatabaseKind::PostgreSQL {
+                "Socket directory (e.g. /var/run/postgresql)"
+            } else {
+                "Socket file (e.g. /tmp/mysql.sock)"
+            },
+            transport.socket_editor.clone(),
+        );
+        let host = input("SSH host", transport.ssh_host_editor.clone());
+        let port = input("SSH port", transport.ssh_port_editor.clone());
+        let user = input("SSH username", transport.ssh_user_editor.clone());
+        let key = input(
+            "Private key file (optional; leave blank to use SSH agent/config)",
+            transport.ssh_key_editor.clone(),
+        );
+        div().debug_selector(|| "connection-transport-form".into()).border_t_1().border_color(theme().hairline).pt(px(12.))
+            .flex().flex_col().gap(px(10.))
+            .child(Checkbox::new("connection-unix-socket").label("Use Unix socket")
+                .checked(socket_enabled).with_size(Size::Small)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.draft.transport.socket_enabled = *checked;
+                    this.error = None;
+                    cx.notify();
+                })))
+            .when(socket_enabled, |view| view.child(socket).child(
+                div().text_size(px(11.)).text_color(theme().text_muted)
+                    .child(if ssh_enabled { "Socket on the SSH server. PostgreSQL uses the database port to select its socket." }
+                        else { "Local socket. Host is ignored; PostgreSQL uses the database port to select its socket." })))
+            .child(Checkbox::new("connection-ssh-tunnel").label("Connect through SSH tunnel")
+                .checked(ssh_enabled).with_size(Size::Small)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.draft.transport.ssh_enabled = *checked;
+                    this.error = None;
+                    cx.notify();
+                })))
+            .when(ssh_enabled, |view| view
+                .child(div().flex().gap(px(8.)).child(host).child(div().w(px(110.)).child(port)))
+                .child(user)
+                .child(div().flex().items_end().gap(px(8.)).child(key)
+                    .child(button("choose-ssh-key", "Choose key…", ButtonKind::Quiet)
+                        .cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_ssh_key(cx)))))
+                .child(div().text_size(px(11.)).text_color(theme().text_muted)
+                    .child("Database host is resolved from the SSH server. Uses your SSH agent or key; load encrypted keys into the agent. Verify a new SSH host in a terminal first.")))
+            .into_any_element()
     }
 
     fn render_compact_connection_picker(

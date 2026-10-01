@@ -238,6 +238,51 @@ struct ConnectionDraft {
     password_editor: Entity<TextEditor>,
     database: Entity<String>,
     database_editor: Entity<TextEditor>,
+    transport: ConnectionTransportDraft,
+}
+
+struct ConnectionTransportDraft {
+    socket_enabled: bool,
+    ssh_enabled: bool,
+    socket: Entity<String>,
+    socket_editor: Entity<TextEditor>,
+    ssh_host: Entity<String>,
+    ssh_host_editor: Entity<TextEditor>,
+    ssh_port: Entity<String>,
+    ssh_port_editor: Entity<TextEditor>,
+    ssh_user: Entity<String>,
+    ssh_user_editor: Entity<TextEditor>,
+    ssh_key: Entity<String>,
+    ssh_key_editor: Entity<TextEditor>,
+}
+
+impl ConnectionTransportDraft {
+    fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
+        let mut field = |initial: &str| {
+            let value = cx.new(|_| initial.to_owned());
+            let editor = cx.new(|cx| TextEditor::new(value.clone(), false, window, cx));
+            (value, editor)
+        };
+        let (socket, socket_editor) = field("");
+        let (ssh_host, ssh_host_editor) = field("");
+        let (ssh_port, ssh_port_editor) = field("22");
+        let (ssh_user, ssh_user_editor) = field("");
+        let (ssh_key, ssh_key_editor) = field("");
+        Self {
+            socket_enabled: false,
+            ssh_enabled: false,
+            socket,
+            socket_editor,
+            ssh_host,
+            ssh_host_editor,
+            ssh_port,
+            ssh_port_editor,
+            ssh_user,
+            ssh_user_editor,
+            ssh_key,
+            ssh_key_editor,
+        }
+    }
 }
 
 struct VaultEditors {
@@ -308,6 +353,7 @@ impl ConnectionDraft {
             password_editor,
             database,
             database_editor,
+            transport: ConnectionTransportDraft::new(window, cx),
         }
     }
 }
@@ -1470,6 +1516,11 @@ impl DbxApp {
             cx.observe(&draft.username, |_, _, cx| cx.notify()),
             cx.observe(&draft.password, |_, _, cx| cx.notify()),
             cx.observe(&draft.database, |_, _, cx| cx.notify()),
+            cx.observe(&draft.transport.socket, |_, _, cx| cx.notify()),
+            cx.observe(&draft.transport.ssh_host, |_, _, cx| cx.notify()),
+            cx.observe(&draft.transport.ssh_port, |_, _, cx| cx.notify()),
+            cx.observe(&draft.transport.ssh_user, |_, _, cx| cx.notify()),
+            cx.observe(&draft.transport.ssh_key, |_, _, cx| cx.notify()),
             // Follow live OS light/dark changes when the preference is System.
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_material(window, cx);
@@ -1585,7 +1636,7 @@ impl DbxApp {
         use crate::updater::UpdateState;
         if matches!(
             self.update_state,
-            UpdateState::Checking | UpdateState::Installing | UpdateState::Installed(_)
+            UpdateState::Checking | UpdateState::Installing(_) | UpdateState::Installed(_)
         ) {
             return;
         }
@@ -1634,19 +1685,47 @@ impl DbxApp {
         use crate::updater::UpdateState;
         match self.update_state.clone() {
             UpdateState::Available(update) => {
-                self.update_state = UpdateState::Installing;
+                self.update_state =
+                    UpdateState::Installing(crate::updater::UpdateProgress::Checksum);
                 cx.notify();
                 let runtime = self.runtime.clone();
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
                 cx.spawn(async move |this, cx| {
-                    let result = runtime
-                        .spawn_blocking(move || crate::updater::install(&update))
-                        .await;
+                    let mut task = runtime.spawn_blocking(move || {
+                        crate::updater::install(&update, |progress| {
+                            let _ = progress_tx.send(progress);
+                        })
+                    });
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut task => break result,
+                            Some(progress) = progress_rx.recv() => {
+                                this.update(cx, |this, cx| {
+                                    this.update_state = UpdateState::Installing(progress);
+                                    cx.notify();
+                                })?;
+                            }
+                        }
+                    };
                     this.update(cx, |this, cx| {
                         this.update_state = match result {
                             Ok(Ok(destination)) => UpdateState::Installed(destination),
                             Ok(Err(error)) => UpdateState::Failed(format!("{error:#}")),
                             Err(error) => UpdateState::Failed(error.to_string()),
                         };
+                        match &this.update_state {
+                            UpdateState::Installed(_) => this.show_toast(
+                                ToastKind::Success,
+                                "Update installed. Restart DBX from Settings to finish.",
+                                cx,
+                            ),
+                            UpdateState::Failed(_) => this.show_toast(
+                                ToastKind::Error,
+                                "Update failed. Open Settings for the error and retry.",
+                                cx,
+                            ),
+                            _ => {}
+                        }
                         cx.notify();
                     })?;
                     Ok::<(), anyhow::Error>(())
@@ -1660,7 +1739,7 @@ impl DbxApp {
                     cx.notify();
                 }
             },
-            UpdateState::Checking | UpdateState::Installing => {}
+            UpdateState::Checking | UpdateState::Installing(_) => {}
             _ => self.check_for_updates(cx),
         }
     }

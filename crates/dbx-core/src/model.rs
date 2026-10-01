@@ -52,6 +52,11 @@ pub struct ConnectionConfig {
     pub max_connections: u32,
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// PostgreSQL socket directory, or MySQL/Redis socket file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<crate::SshConfig>,
 }
 
 fn default_max_connections() -> u32 {
@@ -69,6 +74,8 @@ impl ConnectionConfig {
             url: url.into(),
             max_connections: default_max_connections(),
             connect_timeout_ms: default_connect_timeout_ms(),
+            socket: None,
+            ssh: None,
         }
     }
 
@@ -82,7 +89,8 @@ impl ConnectionConfig {
         self
     }
 
-    pub(crate) fn validate(&self) -> crate::Result<()> {
+    pub fn validate(&self) -> crate::Result<()> {
+        crate::transport::validate(self)?;
         if self.url.trim().is_empty() {
             return Err(crate::DbxError::InvalidConfig("URL cannot be empty".into()));
         }
@@ -118,6 +126,8 @@ impl fmt::Debug for ConnectionConfig {
             .field("url", &crate::error::redact_url(&self.url))
             .field("max_connections", &self.max_connections)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("socket", &self.socket)
+            .field("ssh", &self.ssh)
             .finish()
     }
 }

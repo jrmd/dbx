@@ -3,9 +3,9 @@ use std::{borrow::Cow, collections::HashMap, time::Instant};
 use futures_util::TryStreamExt;
 use sqlx::{
     Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
-    mysql::{MySqlArguments, MySqlRow},
+    mysql::{MySqlArguments, MySqlConnectOptions, MySqlRow},
     postgres::{
-        PgArguments, PgPool, PgRow,
+        PgArguments, PgConnectOptions, PgPool, PgRow,
         types::{PgInterval, PgMoney},
     },
     sqlite::{SqliteArguments, SqliteRow},
@@ -25,6 +25,27 @@ use async_trait::async_trait;
 /// How long an unused pooled connection lives before it is closed. Stale
 /// connections are recycled here instead of being pinged on every acquire.
 const IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+fn postgres_options(
+    config: &ConnectionConfig,
+    url: &str,
+) -> std::result::Result<PgConnectOptions, sqlx::Error> {
+    let mut options = url.parse::<PgConnectOptions>()?;
+    if let Some(socket) = &config.socket {
+        options = options.socket(socket);
+    }
+    Ok(options)
+}
+
+fn mysql_options(
+    config: &ConnectionConfig,
+) -> std::result::Result<MySqlConnectOptions, sqlx::Error> {
+    let mut options = config.url.parse::<MySqlConnectOptions>()?;
+    if let Some(socket) = &config.socket {
+        options = options.socket(socket);
+    }
+    Ok(options)
+}
 
 /// Maps `pg_constraint` action codes to the rule names `information_schema`
 /// used, as the last two columns of a foreign-key row.
@@ -57,6 +78,7 @@ pub struct SqlxEngine {
     /// pool (an `Arc`-backed handle) instead of holding the lock across a
     /// query, so in-flight queries never block a database switch for long.
     pool: RwLock<SqlxPool>,
+    _tunnel: Option<crate::transport::Tunnel>,
 }
 
 /// Native SQLx pools for the supported SQL drivers.
@@ -102,6 +124,7 @@ impl SqlxEngine {
             )));
         }
         config.validate()?;
+        let (config, tunnel) = crate::transport::prepare(config).await?;
         let timeout = std::time::Duration::from_millis(config.connect_timeout_ms);
         // Every connection to `sqlite::memory:` owns a different database.
         // A one-connection pool keeps the in-memory database stable across
@@ -125,13 +148,13 @@ impl SqlxEngine {
         let pool = match config.kind {
             DatabaseKind::PostgreSQL => SqlxPool::Postgres(
                 pool_options::<Postgres>(max_connections, timeout, idle_timeout)
-                    .connect(&config.url)
+                    .connect_with(postgres_options(&config, &config.url).map_err(connect_error)?)
                     .await
                     .map_err(connect_error)?,
             ),
             DatabaseKind::MySQL => SqlxPool::MySql(
                 pool_options::<MySql>(max_connections, timeout, idle_timeout)
-                    .connect(&config.url)
+                    .connect_with(mysql_options(&config).map_err(connect_error)?)
                     .await
                     .map_err(connect_error)?,
             ),
@@ -147,6 +170,7 @@ impl SqlxEngine {
             kind: config.kind,
             config,
             pool: RwLock::new(pool),
+            _tunnel: tunnel,
         })
     }
 
@@ -796,9 +820,29 @@ impl SqlxEngine {
                 kind: self.kind,
             }),
             DatabaseKind::MySQL => {
-                let escaped = name.replace('`', "``");
-                self.execute_statement(&SqlStatement::new(format!("USE `{escaped}`"), Vec::new()))
-                    .await?;
+                // USE is unsupported by MySQL's prepared statement protocol,
+                // and changing only one pooled connection leaves the others
+                // on the old database. Rebuild the pool on the same transport.
+                let timeout = std::time::Duration::from_millis(self.config.connect_timeout_ms);
+                let options = mysql_options(&self.config)
+                    .map_err(|error| {
+                        DbxError::Connection(crate::error::connection_message(
+                            &self.config.url,
+                            error,
+                        ))
+                    })?
+                    .database(name);
+                let pool = pool_options::<MySql>(
+                    self.config.max_connections,
+                    timeout,
+                    Some(IDLE_CONNECTION_TIMEOUT),
+                )
+                .connect_with(options)
+                .await
+                .map_err(|error| {
+                    DbxError::Connection(crate::error::connection_message(&self.config.url, error))
+                })?;
+                *self.pool.write().await = SqlxPool::MySql(pool);
                 Ok(())
             }
             DatabaseKind::PostgreSQL => {
@@ -812,7 +856,9 @@ impl SqlxEngine {
                     timeout,
                     Some(IDLE_CONNECTION_TIMEOUT),
                 )
-                .connect(&url)
+                .connect_with(postgres_options(&self.config, &url).map_err(|error| {
+                    DbxError::Connection(crate::error::connection_message(&url, error))
+                })?)
                 .await
                 .map_err(|error| {
                     DbxError::Connection(crate::error::connection_message(&url, error))
