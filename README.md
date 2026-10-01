@@ -21,6 +21,7 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 - **A query editor:** syntax highlighting, SQL completion, result grids, and per-connection query history.
 - **Import and export:** SQL, CSV, and TSV transfers; database exports with table selection, gzip, and schema-only SQL options.
 - **Saved connections:** named profiles, environment labels, connection testing, and encrypted credentials in the DBX Vault.
+- **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
 - **Native appearance:** light, dark, and system themes, with an option to reduce transparency.
 
 ### Write SQL, see the results
@@ -84,13 +85,40 @@ installs should be updated through their package manager.
 ### Updates and GitHub releases
 
 DBX checks stable [GitHub releases](https://github.com/jrmd/dbx/releases) on launch
-and every six hours. The titlebar shows **Install VERSION** when an update is
-available; downloads are verified against the release SHA-256 checksum before
+and every six hours. Open **Settings** to install an available version and read
+its release notes. Downloads show byte progress, retry transient failures up to
+three times, and are verified against the release SHA-256 checksum before
 replacement. macOS also requires the same Apple signing team and Gatekeeper
 acceptance. Installation keeps the current session open. **Restart DBX** closes
 open sessions; finish your work before clicking it. You can also use **Check for
 Updates…** in the native Mac app menu. Set `DBX_DISABLE_UPDATES=1` to disable
 background checks (useful for development, QA, and package-managed installs).
+Failures appear in Settings with a notification even if the dialog is closed.
+The app distinguishes checksum download, archive download, verification, and
+installation so a failed attempt can be diagnosed without guessing its stage.
+
+### Unix sockets and SSH tunnels
+
+For PostgreSQL, MySQL, or Redis, enable **Use Unix socket** in the connection
+form. Enter an absolute directory for PostgreSQL (for example,
+`/var/run/postgresql`); its database port selects `.s.PGSQL.PORT` inside that
+directory. MySQL and Redis take an absolute socket file path. The database host
+is ignored in socket mode. SQLite continues to use a local database file.
+
+Enable **Connect through SSH tunnel** and enter the SSH host, port, and username.
+Leave the key field blank to use your existing OpenSSH agent/config, or choose
+a private key file. Load encrypted keys into your agent first. DBX uses key/agent
+authentication; SSH password prompts are not supported. Connect to a new SSH
+host from a terminal first to verify and save its host key. DBX refuses unknown
+or changed host keys and binds forwarding only on loopback. This follows
+[OpenSSH's forwarding and authentication behavior](https://man.openbsd.org/ssh).
+
+The database host/port are interpreted from the SSH server. Enabling both socket
+and SSH modes forwards to a socket on that server. Test Connection, Connect,
+and saved profiles use the same settings; the tunnel closes when its engine is
+released. TLS options are retained. The current SQL drivers cannot preserve TLS
+hostname verification through loopback forwarding, so DBX rejects `verify-full`
+and MySQL `verify_identity` in SSH mode; use a direct connection for those modes.
 
 The [release workflow](.github/workflows/release.yml) runs on `vVERSION` tags
 matching the workspace version. It builds Linux x86_64 on Ubuntu 22.04 and signed,
@@ -195,6 +223,9 @@ cargo test --locked --workspace
 # Disposable connector tests (requires Docker Compose).
 ./scripts/test-integration.sh
 
+# Live local socket and SSH checks (Docker and OpenSSH client/server required).
+python3 scripts/test-transports.py
+
 # Isolated native UI session (Linux; requires Python 3).
 ./scripts/run-ui-test.sh
 ```
@@ -207,6 +238,6 @@ The native UI launcher keeps its test vault, profiles, and database under `targe
 
 DBX is a client, not a database privilege boundary. GUI filters and row changes use bound parameters and quoted identifiers. Raw SQL and Redis commands execute with your connection's privileges. Use least-privilege accounts and review destructive actions.
 
-Browsing is paged and bounded; grid virtualization does not imply loading an entire database. Table creation starts from an engine-aware SQL template. Redis mutations use the command console. SSH tunnels, migration/schema-diff workflows, server monitoring, and formal audit logs remain outside the current scope.
+Browsing is paged and bounded; grid virtualization does not imply loading an entire database. Table creation starts from an engine-aware SQL template. Redis mutations use the command console. Migration/schema-diff workflows, server monitoring, and formal audit logs remain outside the current scope.
 
 Never commit real connection strings, passwords, private keys, or local database files. Contributions should preserve native responsiveness and parameterized operations, with connector-level coverage for engine-specific changes.

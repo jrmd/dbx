@@ -9,6 +9,108 @@ const FOREIGN_KEY_PARENT_TABLE: &str = "dbx_integration_fk_parent";
 const FOREIGN_KEY_CHILD_TABLE: &str = "dbx_integration_fk_child";
 
 #[tokio::test]
+#[ignore = "run scripts/test-transports.py for disposable databases and SSH server"]
+async fn socket_and_ssh_connections_integration() -> Result<()> {
+    let root = std::path::PathBuf::from(
+        std::env::var("DBX_TEST_TRANSPORT_DIRECTORY").expect("transport fixtures required"),
+    );
+    let ssh = dbx_core::SshConfig {
+        host: "127.0.0.1".into(),
+        port: std::env::var("DBX_TEST_SSH_PORT").unwrap().parse().unwrap(),
+        username: std::env::var("DBX_TEST_SSH_USER").unwrap(),
+        identity_file: Some(root.join("identity")),
+    };
+    for (kind, socket) in [
+        (DatabaseKind::PostgreSQL, root.join("sockets/pg")),
+        (DatabaseKind::MySQL, root.join("sockets/mysql.sock")),
+        (DatabaseKind::Redis, root.join("sockets/redis.sock")),
+    ] {
+        for mode in ["socket", "ssh-tcp", "ssh-socket"] {
+            let database = if kind == DatabaseKind::Redis {
+                "0"
+            } else {
+                "dbx_test"
+            };
+            let userinfo = if kind == DatabaseKind::Redis {
+                ""
+            } else {
+                "dbx_test:dbx_test_password@"
+            };
+            let address_port = if mode == "ssh-tcp" {
+                let name = match kind {
+                    DatabaseKind::PostgreSQL => "POSTGRES",
+                    DatabaseKind::MySQL => "MYSQL",
+                    _ => "REDIS",
+                };
+                std::env::var(format!("DBX_TEST_TRANSPORT_{name}_PORT"))
+                    .unwrap()
+                    .parse::<u16>()
+                    .unwrap()
+            } else {
+                match kind {
+                    DatabaseKind::PostgreSQL => 5432,
+                    DatabaseKind::MySQL => 3306,
+                    _ => 6379,
+                }
+            };
+            let mut config = ConnectionConfig::new(
+                kind,
+                format!(
+                    "{}://{userinfo}127.0.0.1:{address_port}/{database}",
+                    kind.scheme()
+                ),
+            );
+            if mode != "ssh-tcp" {
+                config.socket = Some(socket.clone());
+            }
+            if mode != "socket" {
+                config.ssh = Some(ssh.clone());
+            }
+            let engine = DatabaseEngine::connect(config).await?;
+            let result = engine
+                .query(
+                    if kind == DatabaseKind::Redis {
+                        "PING"
+                    } else {
+                        "SELECT 42"
+                    },
+                    QueryOptions::default(),
+                )
+                .await?;
+            assert_eq!(result.rows.len(), 1, "{kind} via {mode}");
+            if kind != DatabaseKind::Redis {
+                assert_eq!(result.rows[0].values[0], CellValue::Integer(42));
+                engine.use_database(database).await?;
+                engine.query("SELECT 43", QueryOptions::default()).await?;
+            } else {
+                engine.use_database("1").await?;
+                assert_eq!(engine.current_database().await?, "1");
+            }
+            eprintln!("verified {kind} via {mode}");
+        }
+    }
+    let mut untrusted = ConnectionConfig::new(
+        DatabaseKind::Redis,
+        format!(
+            "redis://127.0.0.1:{}/0",
+            std::env::var("DBX_TEST_TRANSPORT_REDIS_PORT").unwrap()
+        ),
+    );
+    untrusted.ssh = Some(dbx_core::SshConfig {
+        host: "localhost".into(),
+        ..ssh
+    });
+    let error = DatabaseEngine::connect(untrusted)
+        .await
+        .expect_err("unknown host must be rejected");
+    assert!(
+        error.to_string().contains("Host key verification failed"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires the disposable integration databases"]
 async fn postgresql_crud_integration() -> Result<()> {
     run_sql_scenario(DatabaseKind::PostgreSQL, "DBX_TEST_POSTGRES_URL").await

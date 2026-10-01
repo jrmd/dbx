@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use dbx_core::DatabaseKind;
+use dbx_core::{ConnectionConfig, DatabaseKind, SshConfig};
 use thiserror::Error;
 use url::Url;
 use zeroize::Zeroize;
@@ -20,6 +20,9 @@ pub struct ConnectionFields {
     pub password: String,
     pub database: String,
     pub connection_string: String,
+    pub socket: String,
+    pub socket_enabled: bool,
+    pub ssh: Option<SshConfig>,
 }
 
 impl Drop for ConnectionFields {
@@ -60,6 +63,9 @@ impl ConnectionFields {
             password: String::new(),
             database: String::new(),
             connection_string: String::new(),
+            socket: String::new(),
+            socket_enabled: false,
+            ssh: None,
         }
     }
 
@@ -79,6 +85,9 @@ impl ConnectionFields {
                 password: String::new(),
                 database: String::new(),
                 connection_string,
+                socket: String::new(),
+                socket_enabled: false,
+                ssh: None,
             });
         }
 
@@ -100,6 +109,9 @@ impl ConnectionFields {
             password,
             database,
             connection_string,
+            socket: String::new(),
+            socket_enabled: false,
+            ssh: None,
         })
     }
 
@@ -126,7 +138,17 @@ impl ConnectionFields {
         self.structured_url()
     }
 
+    pub fn config(&self) -> Result<ConnectionConfig, String> {
+        let mut config =
+            ConnectionConfig::new(self.kind, self.url().map_err(|error| error.to_string())?);
+        config.socket = self.socket_enabled.then(|| self.socket.trim().into());
+        config.ssh = self.ssh.clone();
+        config.validate().map_err(|error| error.to_string())?;
+        Ok(config)
+    }
+
     /// Return the address without a password, suitable for labels and logs.
+    #[cfg(test)]
     pub fn redacted_url(&self) -> Result<String, ConnectionFieldsError> {
         let mut url = Url::parse(&self.url()?).map_err(|_| ConnectionFieldsError::InvalidUrl)?;
         let _ = url.set_password(None);
@@ -137,7 +159,7 @@ impl ConnectionFields {
         if self.kind == DatabaseKind::SQLite {
             return Err(ConnectionFieldsError::MissingSqliteConnectionString);
         }
-        if self.host.trim().is_empty() {
+        if self.host.trim().is_empty() && !self.socket_enabled {
             return Err(ConnectionFieldsError::MissingHost(self.kind));
         }
         if self.port.trim().is_empty() {
@@ -159,7 +181,11 @@ impl ConnectionFields {
 
         let mut url = Url::parse(&format!("{}://placeholder", self.kind.scheme()))
             .expect("database schemes are valid URLs");
-        let host = self.host.trim();
+        let host = if !self.socket_enabled {
+            self.host.trim()
+        } else {
+            "localhost"
+        };
         let url_host = if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
             format!("[{host}]")
         } else {
@@ -202,6 +228,8 @@ impl fmt::Debug for ConnectionFields {
             .field("password", &"[REDACTED]")
             .field("database", &self.database)
             .field("connection_string", &"[REDACTED]")
+            .field("socket", &self.socket)
+            .field("ssh", &self.ssh)
             .finish()
     }
 }
@@ -343,6 +371,24 @@ impl DatabaseKindUrlExt for DatabaseKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_form_connects_without_a_host_and_rejects_empty_paths() {
+        let mut fields = ConnectionFields::new(DatabaseKind::MySQL);
+        fields.database = "app".into();
+        fields.username = "alice".into();
+        fields.password = "p@ss%word".into();
+        fields.socket_enabled = true;
+        assert!(fields.config().is_err());
+        fields.socket = "/tmp/mysql.sock".into();
+        let config = fields.config().unwrap();
+        assert_eq!(config.socket, Some("/tmp/mysql.sock".into()));
+        assert_eq!(
+            Url::parse(&config.url).unwrap().host_str(),
+            Some("localhost")
+        );
+        assert!(!format!("{fields:?}").contains("p@ss"));
+    }
     use crate::profiles::{ConnectionProfileDraft, ProfileStore};
     use dbx_core::{ConnectionConfig, DatabaseEngine};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

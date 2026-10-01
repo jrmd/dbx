@@ -21,6 +21,7 @@ pub struct RedisEngine {
     /// connection share one socket, so `SELECT` through any clone moves every
     /// subsequent command to that index.
     database: AtomicUsize,
+    _tunnel: Option<crate::transport::Tunnel>,
 }
 
 impl std::fmt::Debug for RedisEngine {
@@ -41,7 +42,16 @@ impl RedisEngine {
             )));
         }
         config.validate()?;
-        let client = Client::open(config.url.as_str()).map_err(|error| {
+        let (config, tunnel) = crate::transport::prepare(config).await?;
+        let mut info = redis::IntoConnectionInfo::into_connection_info(config.url.as_str())
+            .map_err(|error| {
+                DbxError::Connection(crate::error::connection_message(&config.url, error))
+            })?;
+        if let Some(socket) = &config.socket {
+            info.addr = redis::ConnectionAddr::Unix(socket.clone());
+        }
+        let database = info.redis.db as usize;
+        let client = Client::open(info).map_err(|error| {
             DbxError::Connection(crate::error::connection_message(&config.url, error))
         })?;
         let timeout = Duration::from_millis(config.connect_timeout_ms);
@@ -51,18 +61,11 @@ impl RedisEngine {
             .map_err(|error| {
                 DbxError::Connection(crate::error::connection_message(&config.url, error))
             })?;
-        // The URL path selects the initial logical database, defaulting to 0.
-        let database = config
-            .url
-            .split_once("://")
-            .and_then(|(_, rest)| rest.rsplit_once('/'))
-            .and_then(|(_, path)| path.split(['?', '#']).next())
-            .and_then(|path| path.parse::<usize>().ok())
-            .unwrap_or(0);
         Ok(Self {
             client,
             connection,
             database: AtomicUsize::new(database),
+            _tunnel: tunnel,
         })
     }
 

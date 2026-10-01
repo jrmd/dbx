@@ -1552,7 +1552,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "dbx-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "flate2",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-ui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7616,6 +7616,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

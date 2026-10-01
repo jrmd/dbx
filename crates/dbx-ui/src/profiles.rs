@@ -167,6 +167,8 @@ pub struct SavedConnection {
     pub environment: ConnectionEnvironment,
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
+    pub socket: Option<PathBuf>,
+    pub ssh: Option<dbx_core::SshConfig>,
     secret_key: Option<String>,
 }
 
@@ -221,6 +223,7 @@ impl Drop for ConnectionProfileDraft {
 }
 
 impl ConnectionProfileDraft {
+    #[cfg(test)]
     pub fn new(name: impl Into<String>, kind: DatabaseKind, url: impl Into<String>) -> Self {
         Self::from_config(name, ConnectionConfig::new(kind, url))
     }
@@ -427,6 +430,10 @@ impl ProfileStore {
     pub fn save(&self, mut draft: ConnectionProfileDraft) -> ProfileResult<SavedConnection> {
         let _lock = self.lock()?;
         validate_name(&draft.name)?;
+        draft
+            .config
+            .validate()
+            .map_err(|error| ProfileError::Invalid(error.to_string()))?;
         let (url, embedded_secret) = scrub_url(&draft.config.url)?;
         let secret = draft.secret.take().or(embedded_secret).map(Zeroizing::new);
         let id = draft.id.unwrap_or_else(Uuid::new_v4);
@@ -452,6 +459,8 @@ impl ProfileStore {
             environment: draft.environment,
             max_connections: draft.config.max_connections,
             connect_timeout_ms: draft.config.connect_timeout_ms,
+            socket: draft.config.socket.clone(),
+            ssh: draft.config.ssh.clone(),
             secret_key: new_secret_key.clone(),
         };
 
@@ -538,12 +547,12 @@ impl ProfileStore {
         } else {
             stored.url
         };
-        Ok(LoadedConnection {
-            profile,
-            config: ConnectionConfig::new(stored.kind, url)
-                .with_max_connections(stored.max_connections)
-                .with_connect_timeout_ms(stored.connect_timeout_ms),
-        })
+        let mut config = ConnectionConfig::new(stored.kind, url)
+            .with_max_connections(stored.max_connections)
+            .with_connect_timeout_ms(stored.connect_timeout_ms);
+        config.socket = stored.socket;
+        config.ssh = stored.ssh;
+        Ok(LoadedConnection { profile, config })
     }
 
     /// Delete a profile and its associated credential.  Returns `true` when a
@@ -669,6 +678,10 @@ struct StoredConnection {
     max_connections: u32,
     connect_timeout_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    socket: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh: Option<dbx_core::SshConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     secret_key: Option<String>,
 }
 
@@ -682,6 +695,8 @@ impl StoredConnection {
             environment: self.environment,
             max_connections: self.max_connections,
             connect_timeout_ms: self.connect_timeout_ms,
+            socket: self.socket,
+            ssh: self.ssh,
             secret_key: self.secret_key,
         }
     }
@@ -843,6 +858,40 @@ fn sync_directory(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_profiles_round_trip_without_exposing_database_passwords() {
+        let (_directory, store, _) = test_store();
+        let mut config = ConnectionConfig::new(
+            DatabaseKind::MySQL,
+            "mysql://alice:secret-password@localhost:3306/app",
+        );
+        config.socket = Some("/tmp/mysql.sock".into());
+        config.ssh = Some(dbx_core::SshConfig {
+            host: "bastion.example".into(),
+            port: 2222,
+            username: "alice".into(),
+            identity_file: Some("/home/alice/.ssh/id_ed25519".into()),
+        });
+        let saved = store
+            .save(ConnectionProfileDraft::from_config(
+                "Tunnel",
+                config.clone(),
+            ))
+            .unwrap();
+        let json = fs::read_to_string(store.path()).unwrap();
+        assert!(!json.contains("secret-password"));
+        assert_eq!(saved.socket, config.socket);
+        assert_eq!(saved.ssh, config.ssh);
+        assert_eq!(store.load(saved.id).unwrap().config, config);
+        let mut direct = config;
+        direct.socket = None;
+        direct.ssh = None;
+        store
+            .save(ConnectionProfileDraft::from_config("Direct", direct.clone()).with_id(saved.id))
+            .unwrap();
+        assert_eq!(store.load(saved.id).unwrap().config, direct);
+    }
     use crate::connection_fields::ConnectionFields;
     use std::sync::Mutex;
 

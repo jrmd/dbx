@@ -11,6 +11,43 @@ fn hydration_matches_current_draft(
 }
 
 impl DbxApp {
+    fn hydrate_transport(
+        &mut self,
+        socket: Option<std::path::PathBuf>,
+        ssh: Option<dbx_core::SshConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft.transport.socket_enabled = socket.is_some();
+        self.draft.transport.ssh_enabled = ssh.is_some();
+        let socket = socket
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (host, port, user, key) = ssh
+            .map(|ssh| {
+                (
+                    ssh.host,
+                    ssh.port.to_string(),
+                    ssh.username,
+                    ssh.identity_file
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_else(|| (String::new(), "22".into(), String::new(), String::new()));
+        for (entity, text) in [
+            (&self.draft.transport.socket, socket),
+            (&self.draft.transport.ssh_host, host),
+            (&self.draft.transport.ssh_port, port),
+            (&self.draft.transport.ssh_user, user),
+            (&self.draft.transport.ssh_key, key),
+        ] {
+            entity.update(cx, |value, cx| {
+                *value = text;
+                cx.notify();
+            });
+        }
+    }
+
     fn default_url(kind: DatabaseKind) -> &'static str {
         match kind {
             DatabaseKind::PostgreSQL => "postgres://postgres@localhost:5432/postgres",
@@ -30,6 +67,7 @@ impl DbxApp {
             ConnectionFields::from_url(url.clone()).unwrap_or_else(|_| ConnectionFields::new(kind));
         let normalized_url = fields.url().unwrap_or(url);
         self.draft.kind = kind;
+        self.hydrate_transport(None, None, cx);
         self.draft.mode = ConnectionFormMode::Details;
         self.draft.connection_url.update(cx, |value, cx| {
             *value = normalized_url;
@@ -65,6 +103,16 @@ impl DbxApp {
         fields.username = self.draft.username.read(cx).clone();
         fields.password = self.draft.password.read(cx).clone();
         fields.database = self.draft.database.read(cx).clone();
+        let transport = &self.draft.transport;
+        fields.socket_enabled = transport.socket_enabled;
+        fields.socket = transport.socket.read(cx).clone();
+        fields.ssh = transport.ssh_enabled.then(|| dbx_core::SshConfig {
+            host: transport.ssh_host.read(cx).trim().to_owned(),
+            port: transport.ssh_port.read(cx).trim().parse().unwrap_or(0),
+            username: transport.ssh_user.read(cx).trim().to_owned(),
+            identity_file: (!transport.ssh_key.read(cx).trim().is_empty())
+                .then(|| transport.ssh_key.read(cx).trim().into()),
+        });
         if self.draft.mode == ConnectionFormMode::ConnectionString
             || self.draft.kind == DatabaseKind::SQLite
         {
@@ -85,7 +133,7 @@ impl DbxApp {
     /// Saved credentials are restored eagerly when the profile is selected.
     fn resolve_draft(&self, cx: &App) -> Result<(DatabaseKind, String, ConnectionConfig), String> {
         let (kind, visible_url) = self.draft_connection(cx)?;
-        let config = ConnectionConfig::new(kind, visible_url.clone());
+        let config = self.connection_fields(cx).config()?;
         Ok((kind, visible_url, config))
     }
 
@@ -292,14 +340,9 @@ impl DbxApp {
     fn draft_test_fingerprint(
         &self,
         cx: &App,
-    ) -> Result<(DatabaseKind, ConnectionFormMode, String, String), String> {
+    ) -> Result<(ConnectionFormMode, ConnectionConfig), String> {
         let fields = self.connection_fields(cx);
-        Ok((
-            fields.kind,
-            self.draft.mode,
-            fields.url().map_err(|error| error.to_string())?,
-            fields.redacted_url().map_err(|error| error.to_string())?,
-        ))
+        Ok((self.draft.mode, fields.config()?))
     }
 
     pub(super) fn set_connection_form_mode(
@@ -407,6 +450,7 @@ impl DbxApp {
             cx.notify();
         });
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
+        self.hydrate_transport(profile.socket, profile.ssh, cx);
         self.error = None;
         if has_saved_password {
             self.hydrate_saved_credential(profile_id, cx);
@@ -542,16 +586,16 @@ impl DbxApp {
         let name = self.draft.connection_name.read(cx).trim().to_owned();
         let mut fields = self.connection_fields(cx);
         let mut requested_fields = fields.clone();
-        let (kind, url) = match fields.url() {
-            Ok(url) => (fields.kind, url),
+        let config = match fields.config() {
+            Ok(config) => config,
             Err(error) => {
                 self.set_error(error.to_string());
                 cx.notify();
                 return;
             }
         };
-        let mut draft =
-            ConnectionProfileDraft::new(name, kind, url).with_environment(self.draft.environment);
+        let mut draft = ConnectionProfileDraft::from_config(name, config)
+            .with_environment(self.draft.environment);
         if !fields.password.is_empty() {
             draft = draft.with_secret(std::mem::take(&mut fields.password));
         }
@@ -600,6 +644,29 @@ impl DbxApp {
                 requested_fields.connection_string.zeroize();
                 cx.notify();
             })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    pub(super) fn choose_ssh_key(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Choose SSH private key")),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                this.update(cx, |this, cx| {
+                    this.draft.transport.ssh_key.update(cx, |value, cx| {
+                        *value = path.to_string_lossy().into_owned();
+                        cx.notify();
+                    });
+                })?;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .detach();
@@ -870,6 +937,75 @@ impl DbxApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn saved_transports_hydrate_and_changes_invalidate_connection_tests(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        let mut config = ConnectionConfig::new(
+            DatabaseKind::PostgreSQL,
+            "postgres://developer@localhost:5432/app",
+        );
+        config.socket = Some("/var/run/postgresql".into());
+        config.ssh = Some(dbx_core::SshConfig {
+            host: "bastion.example".into(),
+            port: 2222,
+            username: "developer".into(),
+            identity_file: None,
+        });
+        let profile = store
+            .save(ConnectionProfileDraft::from_config(
+                "Socket via SSH",
+                config.clone(),
+            ))
+            .unwrap();
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.profile_store = Some(store);
+                app.vault_state = Some(VaultState::Unlocked);
+                app.connection_picker_open = true;
+                app.select_saved_connection(profile, cx);
+                assert_eq!(app.resolve_draft(cx).unwrap().2, config);
+                let original = app.draft_test_fingerprint(cx).unwrap();
+                app.draft.transport.ssh_port.update(cx, |value, cx| {
+                    *value = "22".into();
+                    cx.notify();
+                });
+                assert_ne!(original, app.draft_test_fingerprint(cx).unwrap());
+                app.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx);
+                assert!(app.resolve_draft(cx).unwrap().2.ssh.is_some());
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("connection-transport-form").is_some());
+        cx.simulate_resize(gpui::Size {
+            width: px(640.),
+            height: px(600.),
+        });
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.compact_layout = true;
+                app.compact_connection_form_open = true;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let compact_bounds = cx
+            .debug_bounds("connection-transport-form")
+            .expect("transport fields remain visible in the compact connection form");
+        assert!(compact_bounds.size.width >= px(250.));
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.begin_new_connection(cx);
+                assert!(!app.draft.transport.ssh_enabled);
+                assert!(!app.draft.transport.socket_enabled);
+            });
+        });
+    }
 
     #[test]
     fn hydration_only_applies_to_the_selected_unchanged_draft() {

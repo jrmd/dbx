@@ -21,9 +21,33 @@ pub enum UpdateState {
     Checking,
     Current,
     Available(Update),
-    Installing,
+    Installing(UpdateProgress),
     Installed(PathBuf),
     Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum UpdateProgress {
+    Checksum,
+    Downloading { received: u64, total: u64 },
+    Verifying,
+    Installing,
+}
+
+impl UpdateProgress {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Checksum => "Downloading release checksum…".into(),
+            Self::Downloading { received, total } => format!(
+                "Downloading… {}% ({:.1} / {:.1} MB)",
+                received.saturating_mul(100) / total.max(&1),
+                *received as f64 / 1_048_576.,
+                *total as f64 / 1_048_576.,
+            ),
+            Self::Verifying => "Verifying release checksum…".into(),
+            Self::Installing => "Validating and installing update…".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -194,16 +218,79 @@ fn expected_checksum(text: &str, name: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
+fn with_download_retries<T>(mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    for index in 0..3 {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let retryable = error.chain().any(|cause| {
+                    if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+                        error.is_timeout()
+                            || error.is_connect()
+                            || error.is_body()
+                            || error.status().is_some_and(|status| {
+                                status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+                            })
+                    } else {
+                        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::TimedOut
+                            ) || error
+                                .get_ref()
+                                .and_then(|cause| cause.downcast_ref::<reqwest::Error>())
+                                .is_some_and(|error| error.is_body() || error.is_timeout())
+                        })
+                    }
+                });
+                if !retryable || index == 2 {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(500 * (index + 1)));
+            }
+        }
+    }
+    unreachable!()
+}
+
+#[cfg(test)]
 fn download(client: &Client, update: &Update, path: &Path) -> Result<()> {
-    let mut checksum = String::new();
-    client
-        .get(&update.checksum.browser_download_url)
-        .send()?
-        .error_for_status()?
-        .take(4097)
-        .read_to_string(&mut checksum)?;
+    download_with_progress(client, update, path, &mut |_| {})
+}
+
+fn download_with_progress(
+    client: &Client,
+    update: &Update,
+    path: &Path,
+    progress: &mut impl FnMut(UpdateProgress),
+) -> Result<()> {
+    progress(UpdateProgress::Checksum);
+    let checksum = with_download_retries(|| {
+        let mut checksum = String::new();
+        client
+            .get(&update.checksum.browser_download_url)
+            .send()?
+            .error_for_status()?
+            .take(4097)
+            .read_to_string(&mut checksum)?;
+        Ok(checksum)
+    })
+    .context("Could not download the release checksum. Check your network and retry.")?;
     ensure!(checksum.len() <= 4096, "Checksum file is too large.");
     let expected = expected_checksum(&checksum, &update.asset.name)?;
+    with_download_retries(|| download_archive(client, update, path, &expected, progress))
+        .context("Could not download and verify the update. The installed app was left untouched.")
+}
+
+fn download_archive(
+    client: &Client,
+    update: &Update,
+    path: &Path,
+    expected: &str,
+    progress: &mut impl FnMut(UpdateProgress),
+) -> Result<()> {
     let mut response = client
         .get(&update.asset.browser_download_url)
         .send()?
@@ -212,6 +299,11 @@ fn download(client: &Client, update: &Update, path: &Path) -> Result<()> {
     let mut digest = Sha256::new();
     let mut size = 0u64;
     let mut buffer = [0; 64 * 1024];
+    let mut last_percent = 0;
+    progress(UpdateProgress::Downloading {
+        received: 0,
+        total: update.asset.size,
+    });
     loop {
         let count = response.read(&mut buffer)?;
         if count == 0 {
@@ -224,9 +316,24 @@ fn download(client: &Client, update: &Update, path: &Path) -> Result<()> {
         );
         digest.update(&buffer[..count]);
         file.write_all(&buffer[..count])?;
+        let percent = size.saturating_mul(100) / update.asset.size.max(1);
+        if percent != last_percent {
+            last_percent = percent;
+            progress(UpdateProgress::Downloading {
+                received: size,
+                total: update.asset.size,
+            });
+        }
     }
     file.sync_all()?;
-    ensure!(size == update.asset.size, "Incomplete release download.");
+    if size != update.asset.size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "Incomplete release download.",
+        )
+        .into());
+    }
+    progress(UpdateProgress::Verifying);
     ensure!(
         format!("{:x}", digest.finalize()) == expected,
         "Release checksum mismatch; the installed app was left untouched."
@@ -234,15 +341,19 @@ fn download(client: &Client, update: &Update, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn install(update: &Update) -> Result<PathBuf> {
+pub fn install(update: &Update, mut progress: impl FnMut(UpdateProgress)) -> Result<PathBuf> {
     let executable = match appimage() {
         Some(path) => path,
         None => std::env::current_exe()?.canonicalize()?,
     };
-    install_at(update, &executable)
+    install_at(update, &executable, &mut progress)
 }
 
-fn install_at(update: &Update, executable: &Path) -> Result<PathBuf> {
+fn install_at(
+    update: &Update,
+    executable: &Path,
+    progress: &mut impl FnMut(UpdateProgress),
+) -> Result<PathBuf> {
     ensure!(
         !executable.components().any(|c| c.as_os_str() == "target"),
         "Development builds cannot update themselves. Install a release build first."
@@ -261,7 +372,8 @@ fn install_at(update: &Update, executable: &Path) -> Result<PathBuf> {
         let staging = tempfile::Builder::new().prefix(".dbx-update-").tempdir_in(parent)
             .context("The installation directory is not writable. Move DBX to a user-writable location or update it manually.")?;
         let archive = staging.path().join(&update.asset.name);
-        download(&client()?, update, &archive)?;
+        download_with_progress(&client()?, update, &archive, progress)?;
+        progress(UpdateProgress::Installing);
         #[cfg(target_os = "linux")]
         install_linux(&archive, &destination, staging.path())?;
         #[cfg(target_os = "macos")]
@@ -490,6 +602,97 @@ pub fn restart(destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_an_interrupted_archive_download() {
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let checksum = format!("{:x}  test.zip", Sha256::digest(b"valid"));
+        let worker = std::thread::spawn(move || {
+            let responses = [
+                (checksum.into_bytes(), 80usize),
+                (b"va".to_vec(), 5),
+                (b"valid".to_vec(), 5),
+            ];
+            for (index, (body, size)) in responses.into_iter().enumerate() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match server.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                let size = if index == 0 { body.len() } else { size };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let update = Update {
+            version: Version::parse("0.2.0").unwrap(),
+            notes: None,
+            asset: Asset {
+                name: "test.zip".into(),
+                browser_download_url: format!("{base}/archive"),
+                size: 5,
+            },
+            checksum: Asset {
+                name: "test.zip.sha256".into(),
+                browser_download_url: format!("{base}/checksum"),
+                size: 80,
+            },
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive");
+        let result = download(
+            &Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+            &update,
+            &path,
+        );
+        worker.join().unwrap();
+        result.expect("interrupted download should restart and verify the complete archive");
+        assert_eq!(fs::read(path).unwrap(), b"valid");
+    }
+
+    #[test]
+    #[ignore = "downloads the published Mac release over the public network"]
+    fn published_macos_download_from_0_1_0() {
+        let client = client().unwrap();
+        let release: Release = client
+            .get("https://api.github.com/repos/jrmd/dbx/releases/tags/v0.2.0")
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        let update = select(
+            release,
+            &Version::parse("0.1.0").unwrap(),
+            "macos-arm64.zip",
+        )
+        .unwrap()
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        download(&client, &update, &directory.path().join(&update.asset.name)).unwrap();
+    }
     fn release(version: &str) -> Release {
         let name = format!("DBX-{version}-linux-x86_64.tar.gz");
         Release {
