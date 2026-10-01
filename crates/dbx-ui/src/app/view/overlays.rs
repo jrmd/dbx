@@ -357,6 +357,230 @@ impl DbxApp {
         deferred(overlay).with_priority(30).into_any_element()
     }
 
+    pub(super) fn render_settings_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::updater::UpdateState;
+        let Some(focus) = self.settings_dialog.clone() else {
+            return div().into_any_element();
+        };
+        let current = self.appearance;
+        let section_label = |label: &'static str| {
+            div()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme().text_muted)
+                .child(label)
+        };
+        let appearance_choices = Appearance::ALL.into_iter().map(|option| {
+            segment(option.label(), option == current)
+                .id(SharedString::from(format!(
+                    "settings-appearance-{}",
+                    option.label()
+                )))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_appearance_preference(option, window, cx)
+                }))
+        });
+
+        let (status, failed) = match &self.update_state {
+            UpdateState::Idle => (None, false),
+            UpdateState::Checking => (Some("Checking for updates…".to_string()), false),
+            UpdateState::Current => (Some("Up to date".into()), false),
+            UpdateState::Available(update) => (
+                Some(format!("Version {} is available", update.version)),
+                false,
+            ),
+            UpdateState::Installing => (Some("Downloading and verifying…".into()), false),
+            UpdateState::Installed(_) => (
+                Some("Restart to finish updating. Open sessions will close.".into()),
+                false,
+            ),
+            UpdateState::Failed(error) => (Some(error.clone()), true),
+        };
+        let notes = match &self.update_state {
+            UpdateState::Available(update) => update.notes.clone(),
+            _ => None,
+        };
+        let (action_label, action_kind, busy) = match &self.update_state {
+            UpdateState::Idle | UpdateState::Current => {
+                ("Check for updates".to_string(), ButtonKind::Quiet, false)
+            }
+            UpdateState::Checking => ("Checking…".into(), ButtonKind::Quiet, true),
+            UpdateState::Available(update) => (
+                format!("Install {}", update.version),
+                ButtonKind::Primary,
+                false,
+            ),
+            UpdateState::Installing => ("Installing…".into(), ButtonKind::Quiet, true),
+            UpdateState::Installed(_) => ("Restart DBX".into(), ButtonKind::Primary, false),
+            UpdateState::Failed(_) => ("Try again".into(), ButtonKind::Quiet, false),
+        };
+
+        let overlay = div()
+            .absolute()
+            .top(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme().overlay)
+            .child(
+                div()
+                    .id("settings-dialog")
+                    .w(px(440.))
+                    .rounded(px(RADIUS_GLASS))
+                    .border_1()
+                    .border_color(theme().hairline)
+                    .bg(theme().glass_raised)
+                    .shadow(glass_shadow(28.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .border_b_1()
+                            .border_color(theme().border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme().text)
+                                    .child("Settings"),
+                            )
+                            .child(
+                                Button::new("close-settings")
+                                    .with_size(Size::XSmall)
+                                    .compact()
+                                    .ghost()
+                                    .tooltip("Close")
+                                    .child(icon(Icon::Close, theme().text_muted))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.close_settings(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(section_label("APPEARANCE"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .child(segmented_track().flex().children(appearance_choices)),
+                            )
+                            .when(!cfg!(target_os = "macos"), |view| {
+                                view.child(
+                                    gpui_component::checkbox::Checkbox::new(
+                                        "settings-reduce-transparency",
+                                    )
+                                    .label("Reduce transparency")
+                                    .checked(self.reduce_transparency)
+                                    .with_size(Size::Small)
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.toggle_reduce_transparency(window, cx)
+                                        },
+                                    )),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .px(px(16.))
+                            .py(px(14.))
+                            .border_t_1()
+                            .border_color(theme().border)
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(section_label("UPDATES"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(theme().text)
+                                                    .child(concat!(
+                                                        "DBX ",
+                                                        env!("CARGO_PKG_VERSION")
+                                                    )),
+                                            )
+                                            .when_some(status, |view, status| {
+                                                view.child(
+                                                    div()
+                                                        .id("settings-update-status")
+                                                        .text_size(px(11.))
+                                                        .text_color(if failed {
+                                                            theme().danger
+                                                        } else {
+                                                            theme().text_muted
+                                                        })
+                                                        .truncate()
+                                                        .when(failed, |view| {
+                                                            view.tooltip(tip(status.clone()))
+                                                        })
+                                                        .child(status),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        button("settings-update-action", action_label, action_kind)
+                                            .flex_none()
+                                            .disabled(busy)
+                                            .when(!busy, |button| {
+                                                button.cursor_pointer().on_click(cx.listener(
+                                                    |this, _, _, cx| this.activate_update(cx),
+                                                ))
+                                            }),
+                                    ),
+                            )
+                            .when_some(notes, |view, notes| {
+                                view.child(
+                                    div()
+                                        .id("settings-release-notes")
+                                        .max_h(px(220.))
+                                        .px(px(12.))
+                                        .py(px(10.))
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(theme().border)
+                                        .bg(theme().canvas)
+                                        .overflow_y_scroll()
+                                        .text_size(px(12.))
+                                        .child(
+                                            gpui_component::text::TextView::markdown(
+                                                "settings-release-notes-text",
+                                                notes,
+                                            )
+                                            .selectable(true),
+                                        ),
+                                )
+                            }),
+                    )
+                    .focus_trap("settings-focus-trap", &focus),
+            );
+
+        deferred(overlay).with_priority(35).into_any_element()
+    }
+
     pub(super) fn render_confirmation_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(dialog) = self.confirmation_dialog.as_ref() else {
             return div().into_any_element();
