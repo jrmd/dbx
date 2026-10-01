@@ -34,6 +34,7 @@ pub const LOGO_BIGQUERY: &str = "icons/bigquery.svg";
 pub const LOGO_KAFKA: &str = "icons/kafka.svg";
 pub const LOGO_TURSO: &str = "icons/turso.svg";
 pub const LOGO_CLOUDFLARE_D1: &str = "icons/cloudflare-d1.svg";
+pub const LOGO_CLICKHOUSE: &str = "icons/clickhouse.svg";
 pub const LOGO: &str = "logo.svg";
 pub const LOGO_BYTES: &[u8] = include_bytes!("../../../logo.svg");
 
@@ -76,6 +77,7 @@ impl AssetSource for Assets {
             LOGO_KAFKA => include_bytes!("../assets/icons/kafka.svg").as_slice(),
             LOGO_TURSO => include_bytes!("../assets/icons/turso.svg").as_slice(),
             LOGO_CLOUDFLARE_D1 => include_bytes!("../assets/icons/cloudflare-d1.svg").as_slice(),
+            LOGO_CLICKHOUSE => include_bytes!("../assets/icons/clickhouse.svg").as_slice(),
             LOGO => LOGO_BYTES,
             // gpui-component draws its own glyphs (menu checkmarks, select
             // carets, dialog closes) from its bundled icon set.
@@ -122,6 +124,7 @@ impl AssetSource for Assets {
                 "kafka.svg",
                 "turso.svg",
                 "cloudflare-d1.svg",
+                "clickhouse.svg",
             ]
             .into_iter()
             .map(SharedString::from)

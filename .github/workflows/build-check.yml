@@ -1,0 +1,45 @@
+name: Release build check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'scripts/**'
+      - 'packaging/**'
+      - '.github/actions/prepare-rust-build/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-rust-build
+      - name: Validate release build and populate default-branch cache
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --release --workspace
+          cargo clippy --locked --release --workspace --all-targets -- -D warnings
+          python3 scripts/test-macos-release.py
+          cargo build --locked --release --package dbx-ui

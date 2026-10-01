@@ -31,3 +31,4 @@ fi
 export DBX_TEST_POSTGRES_URL DBX_TEST_MYSQL_URL DBX_TEST_REDIS_URL DBX_TEST_SQLITE_URL
 
 cargo test -p dbx-core --test integration -- --ignored --test-threads=1 --skip socket_and_ssh_connections_integration
+cargo test -p dbx-core --test connectors clickhouse_live -- --ignored --test-threads=1

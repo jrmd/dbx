@@ -179,6 +179,12 @@ pub async fn export_table(
         });
     }
     let file_format = detect_file_format(path)?;
+    if kind == DatabaseKind::ClickHouse && file_format.format == DumpFormat::Sql {
+        return Err(DbxError::Unsupported {
+            operation: "ClickHouse SQL dump export; use CSV or TSV".into(),
+            kind,
+        });
+    }
     let columns = engine.describe_table(table).await?;
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
 
@@ -279,6 +285,12 @@ pub async fn export_database(
         return Err(DbxError::Parse(
             "database export requires at least one table".into(),
         ));
+    }
+    if kind == DatabaseKind::ClickHouse && request.format == DumpFormat::Sql {
+        return Err(DbxError::Unsupported {
+            operation: "ClickHouse SQL dump export; use CSV or TSV".into(),
+            kind,
+        });
     }
     if request.schema_only && request.format != DumpFormat::Sql {
         return Err(DbxError::Parse(
@@ -989,6 +1001,12 @@ pub async fn import_file(
 ) -> Result<ImportReport> {
     let started = Instant::now();
     let kind = engine.kind();
+    if kind == DatabaseKind::ClickHouse {
+        return Err(DbxError::Unsupported {
+            operation: "ClickHouse file import; use SQL or the native bulk loader".into(),
+            kind,
+        });
+    }
     if !kind.is_sql() {
         return Err(DbxError::Unsupported {
             operation: "import_file".to_owned(),

@@ -1,6 +1,22 @@
 name: dbx-integration-test
 
 services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8
+    environment:
+      CLICKHOUSE_DB: dbx_test
+      CLICKHOUSE_USER: dbx_test
+      CLICKHOUSE_PASSWORD: dbx_test_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:58123:8123"
+    tmpfs:
+      - /var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user dbx_test --password dbx_test_password --query 'SELECT 1'"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
   postgres:
     image: postgres:16-alpine
     environment:

@@ -4,7 +4,7 @@
 
 <h1 align="center">DBX</h1>
 <p align="center">A native database workbench. Built with Rust and GPUI.</p>
-<p align="center">PostgreSQL · MySQL · SQLite · Redis · MongoDB · CockroachDB · DuckDB · Elasticsearch · BigQuery · Kafka · Turso · Cloudflare D1</p>
+<p align="center">PostgreSQL · MySQL · SQLite · Redis · MongoDB · CockroachDB · DuckDB · Elasticsearch · BigQuery · Kafka · Turso · Cloudflare D1 · ClickHouse</p>
 
 Browse your data, follow relationships, edit rows, and run queries in a responsive desktop app. DBX uses [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for its window, input, and GPU rendering.
 
@@ -14,7 +14,7 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 
 ## Inside the workbench
 
-- **Twelve database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
+- **Thirteen database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
 - **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
 - **Data you can work with:** virtualized grids over bounded row pages, structured filters, foreign-key navigation, and an all-field row inspector.
 - **Explicit edits:** typed insert/update drafts, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
@@ -38,7 +38,7 @@ Screenshots show the real Linux application with fictional SQLite demo data and 
 - **Git**, a native C/C++ build toolchain, and **CMake** for native dependencies.
 - **macOS:** Xcode and its command-line tools, including the Metal tooling required by GPUI. Open Xcode once to complete setup, then check `xcode-select -p`. See [GPUI/Zed's macOS build guide](https://zed.dev/docs/development/macos) for current platform requirements.
 - **Linux:** a Wayland or X11 desktop, a working Vulkan driver, `pkg-config`, and development libraries for XCB, xkbcommon, and fontconfig. Distribution package names vary; [Zed's Linux dependency guide](https://zed.dev/docs/development/linux) is a useful reference for GPUI's platform dependencies. A desktop file portal is needed for native file dialogs.
-- **Optional:** Docker Compose for the disposable PostgreSQL/MySQL/Redis integration suite; Python 3 for the Linux UI fixtures.
+- **Optional:** Docker Compose for the disposable PostgreSQL/MySQL/Redis/ClickHouse integration suite; Python 3 for the Linux UI fixtures.
 
 ```bash
 git clone https://github.com/jrmd/dbx.git
@@ -230,7 +230,7 @@ python3 scripts/test-transports.py
 ./scripts/run-ui-test.sh
 ```
 
-The integration script starts PostgreSQL 16, MySQL 8.4, and Redis 7 on loopback-only ports, uses temporary SQLite storage, runs connector tests serially, and tears down its containers. `DBX_TEST_POSTGRES_URL`, `DBX_TEST_MYSQL_URL`, `DBX_TEST_REDIS_URL`, and `DBX_TEST_SQLITE_URL` override its defaults; point them only at disposable databases because the tests perform writes.
+The integration script starts PostgreSQL 16, MySQL 8.4, Redis 7, and ClickHouse 26.8 on loopback-only ports, uses temporary SQLite storage, runs connector tests serially, and tears down its containers. `DBX_TEST_POSTGRES_URL`, `DBX_TEST_MYSQL_URL`, `DBX_TEST_REDIS_URL`, and `DBX_TEST_SQLITE_URL` override its defaults; point them only at disposable databases because the tests perform writes. ClickHouse uses the fixed disposable endpoint on port 58123.
 
 The native UI launcher keeps its test vault, profiles, and database under `target/ui-test/`, separate from normal user configuration. See [desktop QA](docs/desktop-qa.md) for fixture credentials and platform checks, and [architecture](docs/architecture.md) for the core/UI boundaries.
 

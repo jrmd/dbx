@@ -881,6 +881,14 @@ mod provider_credential_tests {
             .unwrap();
         for (kind, url) in [
             (
+                DatabaseKind::ClickHouse,
+                "https://user:fixture-token@clickhouse.example.test:8443/default",
+            ),
+            (
+                DatabaseKind::ClickHouse,
+                "clickhouse://user:fixture-token@localhost:8123/default",
+            ),
+            (
                 DatabaseKind::CloudflareD1,
                 "d1://:fixture-token@account/database",
             ),

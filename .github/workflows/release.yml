@@ -45,38 +45,17 @@ jobs:
     timeout-minutes: 120
     env:
       CARGO_INCREMENTAL: '0'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
-      - name: Linux native dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake pkg-config clang libclang-dev libssl-dev libcurl4-openssl-dev libfontconfig1-dev libfreetype6-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev libxcb-render0-dev libxcb-sync-dev libxcb-xkb-dev libxcb-composite0-dev libxcb-damage0-dev libxcb-present-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libasound2-dev libudev-dev
-      - name: Mac native tools
-        if: runner.os == 'macOS'
-        run: |
-          brew install cmake
-          xcodebuild -runFirstLaunch
-          if ! xcrun --find metal; then
-            xcodebuild -downloadComponent MetalToolchain
-          fi
+      - uses: ./.github/actions/prepare-rust-build
       - name: Validate
         run: |
           cargo fmt --all -- --check
-          cargo test --locked --workspace
-          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --release --workspace
+          cargo clippy --locked --release --workspace --all-targets -- -D warnings
           python3 scripts/test-macos-release.py
       - name: Linux package
         if: runner.os == 'Linux'
@@ -94,7 +73,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           export DBX_MACOS_UPDATE_ARCHIVE="$(pwd)/$(echo target/macos/DBX-*-macos-arm64.zip)"
-          cargo test --locked -p dbx-ui signed_macos_archive_installs_and_preserves_app_on_rejection -- --ignored --nocapture
+          cargo test --locked --release -p dbx-ui signed_macos_archive_installs_and_preserves_app_on_rejection -- --ignored --nocapture
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.os }}
