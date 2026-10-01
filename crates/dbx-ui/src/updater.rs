@@ -506,9 +506,7 @@ fn install_macos(
         ],
     )?;
     let replacement = extracted.join("DBX.app");
-    let requirement = format!(
-        "anchor apple generic and identifier \"dev.jrmd.dbx\" and certificate leaf[subject.OU] = \"{team}\""
-    );
+    let requirement = macos_signing_requirement(team);
     command(
         "/usr/bin/codesign",
         &[
@@ -544,6 +542,15 @@ fn install_macos(
     );
     swap_bundles(&replacement, destination)?;
     Ok(())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_signing_requirement(team: &str) -> String {
+    // codesign -R interprets bare text as a requirement file path. The leading
+    // '=' selects inline requirement syntax; shell quoting cannot replace it.
+    format!(
+        "=anchor apple generic and identifier \"dev.jrmd.dbx\" and certificate leaf[subject.OU] = \"{team}\""
+    )
 }
 
 /// AppKit bundles need an atomic directory exchange: a power loss must not
@@ -602,6 +609,126 @@ pub fn restart(destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_signing_requirement_is_inline_not_a_filename() {
+        let requirement = macos_signing_requirement("DQGERVCCWV");
+        assert!(
+            requirement.starts_with('='),
+            "codesign treats bare requirements as filenames: {requirement}"
+        );
+        assert!(requirement.contains("identifier \"dev.jrmd.dbx\""));
+        assert!(requirement.contains("certificate leaf[subject.OU] = \"DQGERVCCWV\""));
+    }
+
+    /// Runs against the actual signed/notarized release archive on the Mac
+    /// runner. All installation paths are disposable copies, never the source.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires DBX_MACOS_UPDATE_ARCHIVE containing a signed release"]
+    fn signed_macos_archive_installs_and_preserves_app_on_rejection() {
+        use std::{ffi::OsStr, os::unix::fs::MetadataExt};
+        let archive = PathBuf::from(std::env::var_os("DBX_MACOS_UPDATE_ARCHIVE").unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        command(
+            "/usr/bin/ditto",
+            &[
+                OsStr::new("-x"),
+                OsStr::new("-k"),
+                archive.as_os_str(),
+                dir.path().as_os_str(),
+            ],
+        )
+        .unwrap();
+        let destination = dir.path().join("DBX.app");
+        let original_inode = fs::metadata(&destination).unwrap().ino();
+        let signature = command(
+            "/usr/bin/codesign",
+            &[
+                OsStr::new("-dv"),
+                OsStr::new("--verbose=4"),
+                destination.as_os_str(),
+            ],
+        )
+        .unwrap();
+        let signature = String::from_utf8_lossy(&signature.stderr);
+        let team = signature
+            .lines()
+            .find_map(|line| line.strip_prefix("TeamIdentifier="))
+            .unwrap();
+        let requirement = macos_signing_requirement(team);
+        // Reproduce the reported old-updater failure with the same signed app.
+        let old_requirement = requirement.trim_start_matches('=');
+        let error = command(
+            "/usr/bin/codesign",
+            &[
+                OsStr::new("--verify"),
+                OsStr::new("-R"),
+                OsStr::new(old_requirement),
+                destination.as_os_str(),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("No such file or directory"), "{error}");
+        let wrong_team = if team == "AAAAAAAAAA" {
+            "BBBBBBBBBB"
+        } else {
+            "AAAAAAAAAA"
+        };
+        assert!(
+            command(
+                "/usr/bin/codesign",
+                &[
+                    OsStr::new("--verify"),
+                    OsStr::new("-R"),
+                    OsStr::new(&macos_signing_requirement(wrong_team)),
+                    destination.as_os_str(),
+                ]
+            )
+            .is_err()
+        );
+        let rejected = tempfile::tempdir_in(dir.path()).unwrap();
+        let error = install_macos(
+            &archive,
+            &destination,
+            rejected.path(),
+            &Version::parse("999.0.0").unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("Bundle version does not match"),
+            "{error}"
+        );
+        assert_eq!(fs::metadata(&destination).unwrap().ino(), original_inode);
+        let accepted = tempfile::tempdir_in(dir.path()).unwrap();
+        install_macos(
+            &archive,
+            &destination,
+            accepted.path(),
+            &Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(fs::metadata(&destination).unwrap().ino(), original_inode);
+        assert_eq!(
+            fs::metadata(accepted.path().join("extracted/DBX.app"))
+                .unwrap()
+                .ino(),
+            original_inode
+        );
+        command(
+            "/usr/bin/codesign",
+            &[
+                OsStr::new("--verify"),
+                OsStr::new("--deep"),
+                OsStr::new("--strict"),
+                OsStr::new("-R"),
+                OsStr::new(&requirement),
+                destination.as_os_str(),
+            ],
+        )
+        .unwrap();
+    }
 
     #[test]
     fn retries_an_interrupted_archive_download() {
