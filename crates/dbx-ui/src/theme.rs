@@ -460,6 +460,11 @@ pub enum Icon {
     Sidebar,
     Appearance,
     Lock,
+    Sparkles,
+    Trash,
+    Pencil,
+    Tag,
+    Download,
 }
 
 /// Draw a 16px icon from the embedded SVG set. Consumers provide the color so
@@ -486,6 +491,11 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
         Icon::Sidebar => assets::ICON_SIDEBAR,
         Icon::Appearance => assets::ICON_APPEARANCE,
         Icon::Lock => assets::ICON_LOCK,
+        Icon::Sparkles => assets::ICON_SPARKLES,
+        Icon::Trash => assets::ICON_TRASH,
+        Icon::Pencil => assets::ICON_PENCIL,
+        Icon::Tag => assets::ICON_TAG,
+        Icon::Download => assets::ICON_DOWNLOAD,
     };
 
     svg().path(path).size(px(16.)).text_color(color)
@@ -692,6 +702,69 @@ pub fn button(
         ButtonKind::Quiet => button.outline(),
         ButtonKind::Danger => button.danger().outline(),
     }
+}
+
+/// An inset group of settings rows, separated by hairlines, in the style of
+/// the platform's own preference panes.
+pub fn settings_group(rows: impl IntoIterator<Item = gpui::AnyElement>) -> Div {
+    let theme = theme();
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(RADIUS_PANEL))
+        .border_1()
+        .border_color(theme.hairline)
+        .bg(theme.panel)
+        .overflow_hidden()
+        .children(rows.into_iter().enumerate().map(|(index, row)| {
+            div()
+                .when(index > 0, |view| {
+                    view.border_t_1().border_color(theme.hairline)
+                })
+                .child(row)
+        }))
+}
+
+/// A settings row: a label and optional detail on the left, its control on
+/// the right.
+pub fn settings_row(
+    label: impl gpui::IntoElement,
+    detail: Option<SharedString>,
+    control: impl gpui::IntoElement,
+) -> Div {
+    let theme = theme();
+    div()
+        .min_h(px(48.))
+        .px(px(SPACE_4))
+        .py(px(SPACE_2))
+        .flex()
+        .items_center()
+        .gap(px(SPACE_4))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().text_size(px(13.)).text_color(theme.text).child(label))
+                .when_some(detail, |view, detail| {
+                    view.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_muted)
+                            .child(detail),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(SPACE_2))
+                .child(control),
+        )
 }
 
 pub fn badge(label: impl Into<SharedString>, color: Rgba) -> Div {

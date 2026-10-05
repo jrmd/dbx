@@ -171,6 +171,9 @@ impl DbxApp {
     /// Resolve the already-hydrated visible form for Test and Connect.
     /// Saved credentials are restored eagerly when the profile is selected.
     fn resolve_draft(&self, cx: &App) -> Result<(DatabaseKind, String, ConnectionConfig), String> {
+        if self.vault_state != Some(VaultState::Unlocked) {
+            return Err("Unlock the vault before connecting".into());
+        }
         let (kind, visible_url) = self.draft_connection(cx)?;
         let config = self.connection_fields(cx).config()?;
         Ok((kind, visible_url, config))
@@ -347,6 +350,51 @@ impl DbxApp {
         .detach();
     }
 
+    fn has_pending_lock_work(&self) -> bool {
+        self.testing_connection
+            || self.credential_hydrating
+            || self.sessions.iter().any(|session| {
+                session.busy
+                    || session.background_tasks.has_pending()
+                    || session.secondary_tabs.iter().any(|tab| match &tab.kind {
+                        SecondaryTabKind::Query(query) => query.busy || query.agent.is_busy(),
+                        SecondaryTabKind::Data(data) => data.busy,
+                        SecondaryTabKind::Diagram(diagram) => diagram.busy,
+                        SecondaryTabKind::Structure(structure) => structure.busy,
+                    })
+            })
+    }
+
+    pub(super) fn request_lock_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_state != Some(VaultState::Unlocked)
+            || self.vault_busy
+            || self.saving_connection
+        {
+            return;
+        }
+        if self.has_pending_lock_work() {
+            let focus = cx.focus_handle();
+            self.confirmation_dialog = Some(ConfirmationDialog {
+                title: "Cancel work and lock?".into(),
+                detail: "Work is still in progress. Locking will cancel what you’re doing and close all connections.".into(),
+                confirm_label: "Cancel work and lock",
+                tone: ConfirmationTone::Warning,
+                action: ConfirmationAction::LockVault,
+                focus: focus.clone(),
+                return_focus: window.focused(cx),
+            });
+            focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        self.lock_vault(cx);
+        self.vault_editors
+            .passphrase_editor
+            .read(cx)
+            .focus_handle()
+            .focus(window, cx);
+    }
+
     pub(super) fn lock_vault(&mut self, cx: &mut Context<Self>) {
         if self.saving_connection {
             return;
@@ -360,7 +408,20 @@ impl DbxApp {
             return;
         }
         self.vault_state = Some(VaultState::Locked);
+        // Use the normal teardown so queries, connection attempts, and tab
+        // tasks are cancelled and their database engines are released.
+        while let Some(session) = self.sessions.last() {
+            self.close_session(session.id, cx);
+        }
+        self.table_context_menu = None;
+        self.database_export_dialog = None;
+        self.confirmation_dialog = None;
+        self.mutation_error_dialog = None;
         self.settings_open = false;
+        self.toasts.clear();
+        self.test_generation = self.test_generation.saturating_add(1);
+        self.connection_test_abort.cancel();
+        self.testing_connection = false;
         self.cancel_credential_hydration();
         self.draft.password.update(cx, |value, cx| {
             value.zeroize();
@@ -372,6 +433,10 @@ impl DbxApp {
                 cx.notify();
             });
         }
+        self.draft.import_url.update(cx, |value, cx| {
+            value.zeroize();
+            cx.notify();
+        });
         self.clear_vault_inputs(cx);
         self.error = None;
         cx.notify();
@@ -525,6 +590,8 @@ impl DbxApp {
 
     pub(super) fn edit_tag(&mut self, tag: Option<ConnectionTag>, cx: &mut Context<Self>) {
         self.tag_editor.editing = tag.as_ref().map(|tag| tag.id);
+        self.tag_editor.creating = false;
+        self.tag_editor.deleting = None;
         self.tag_editor.name.update(cx, |value, cx| {
             *value = tag.as_ref().map(|tag| tag.name.clone()).unwrap_or_default();
             cx.notify();
@@ -536,6 +603,41 @@ impl DbxApp {
             );
             cx.notify();
         });
+        cx.notify();
+    }
+
+    pub(super) fn new_tag(&mut self, cx: &mut Context<Self>) {
+        self.edit_tag(None, cx);
+        self.tag_editor.creating = true;
+    }
+
+    /// Deleting a tag also untags every connection that used it.
+    pub(super) fn delete_connection_tag(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let Some(store) = self.profile_store.as_ref() else {
+            self.show_toast(
+                ToastKind::Error,
+                "Connection profile storage is unavailable",
+                cx,
+            );
+            return;
+        };
+        match store.delete_tag(id) {
+            Ok(tags) => {
+                self.connection_tags = tags;
+                let current = std::iter::once(&mut self.draft.tag)
+                    .chain(self.sessions.iter_mut().map(|session| &mut session.tag));
+                for existing in current {
+                    if existing.as_ref().is_some_and(|tag| tag.id == id) {
+                        *existing = None;
+                    }
+                }
+                if let Ok(profiles) = store.list() {
+                    self.saved_connections = profiles;
+                }
+                self.edit_tag(None, cx);
+            }
+            Err(error) => self.show_toast(ToastKind::Error, error.to_string(), cx),
+        }
         cx.notify();
     }
 
@@ -1014,18 +1116,19 @@ impl DbxApp {
         self.error = None;
         let runtime = self.runtime.clone();
         cx.notify();
+        let task = runtime.spawn(async move {
+            let engine = DatabaseEngine::connect(config).await?;
+            let tables = engine.list_tables().await?;
+            Ok::<usize, dbx_core::DbxError>(tables.len())
+        });
+        self.connection_test_abort.replace(task.abort_handle());
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move {
-                    let engine = DatabaseEngine::connect(config).await?;
-                    let tables = engine.list_tables().await?;
-                    Ok::<usize, dbx_core::DbxError>(tables.len())
-                })
-                .await?;
+            let result = task.await?;
             this.update(cx, |this, cx| {
                 if this.test_generation != generation {
                     return;
                 }
+                this.connection_test_abort.clear();
                 if this.draft_test_fingerprint(cx).ok().as_ref() != Some(&fingerprint) {
                     this.testing_connection = false;
                     this.show_toast(
@@ -1100,6 +1203,293 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn locking_with_open_connections_removes_workspace_and_cancels_requests(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        let vault = store.vault().unwrap();
+        vault.create("test vault passphrase").unwrap();
+        let session_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        let (runtime, request, connection_request, test_request, engine) =
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.profile_store = Some(store);
+                    app.vault_state = Some(VaultState::Unlocked);
+                    app.hydrate_connection_fields(
+                        DatabaseKind::SQLite,
+                        "sqlite::memory:".into(),
+                        cx,
+                    );
+                    app.draft.import_url.update(cx, |value, _| {
+                        *value = "postgres://user:secret@localhost/db".into()
+                    });
+                    let test_request = app.runtime.spawn(std::future::pending::<()>());
+                    app.connection_test_abort
+                        .replace(test_request.abort_handle());
+                    app.testing_connection = true;
+                    let engine = Arc::new(
+                        app.runtime
+                            .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                                DatabaseKind::SQLite,
+                                "sqlite::memory:",
+                            )))
+                            .unwrap(),
+                    );
+                    let mut session = ConnectionSession::new(
+                        session_id,
+                        None,
+                        "Lock test".into(),
+                        DatabaseKind::SQLite,
+                        None,
+                        window,
+                        cx,
+                    );
+                    session.engine = Some(engine.clone());
+                    let tab_id = Uuid::new_v4();
+                    let mut query =
+                        QueryTab::new(DatabaseKind::SQLite, session_id, tab_id, window, cx);
+                    let request = app.runtime.spawn(std::future::pending::<()>());
+                    query.abort_handle.replace(request.abort_handle());
+                    query.busy = true;
+                    session.secondary_tabs.push(SecondaryTab {
+                        id: tab_id,
+                        kind: SecondaryTabKind::Query(Box::new(query)),
+                    });
+                    session.active_secondary_tab = Some(tab_id);
+                    session.pane = Pane::Query;
+                    let mut connecting = ConnectionSession::new(
+                        Uuid::new_v4(),
+                        None,
+                        "Connecting".into(),
+                        DatabaseKind::SQLite,
+                        None,
+                        window,
+                        cx,
+                    );
+                    connecting.busy = true;
+                    let connection_request = app.runtime.spawn(std::future::pending::<()>());
+                    connecting.track_background_task(&connection_request);
+                    app.sessions = vec![session, connecting];
+                    app.active_session_id = Some(session_id);
+                    app.connection_picker_open = false;
+                    (
+                        app.runtime.clone(),
+                        request,
+                        connection_request,
+                        test_request,
+                        Arc::downgrade(&engine),
+                    )
+                })
+            });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("connection-tab").is_some());
+
+        for (settings_open, connection_picker_open) in
+            [(false, false), (false, true), (true, false)]
+        {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.settings_open = settings_open;
+                    app.connection_picker_open = connection_picker_open;
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            let lock = cx.debug_bounds("lock-vault").expect("Lock is visible");
+            cx.simulate_click(lock.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(vault.state(), VaultState::Unlocked);
+            assert!(cx.debug_bounds("confirmation-dialog").is_some());
+            assert!(!request.is_finished());
+            assert!(!connection_request.is_finished());
+            assert!(!test_request.is_finished());
+            if connection_picker_open {
+                cx.simulate_keystrokes("escape");
+            } else {
+                let cancel = cx.debug_bounds("cancel-confirmation").unwrap();
+                cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("confirmation-dialog").is_none());
+            assert_eq!(vault.state(), VaultState::Unlocked);
+            assert!(!request.is_finished());
+            assert!(!connection_request.is_finished());
+            assert!(!test_request.is_finished());
+            app.read_with(cx, |app, _| {
+                assert_eq!(app.sessions.len(), 2);
+                assert_eq!(app.active_session_id, Some(session_id));
+                assert!(app.confirmation_dialog.is_none());
+            });
+        }
+        cx.simulate_resize(gpui::size(px(720.), px(640.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let lock = cx.debug_bounds("lock-vault").expect("Lock is visible");
+        cx.simulate_click(lock.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let confirm = cx.debug_bounds("confirm-action").unwrap();
+        cx.simulate_click(confirm.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(vault.state(), VaultState::Locked);
+        assert!(
+            cx.debug_bounds("vault-gate").is_some(),
+            "Lock must show the unlock screen even with an open connection"
+        );
+        assert!(cx.debug_bounds("connection-tab").is_none());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(
+                    app.sessions.is_empty(),
+                    "Locked connections must be inaccessible"
+                );
+                assert!(app.active_session_id.is_none());
+                assert!(app.draft.import_url.read(cx).is_empty());
+                assert!(!app.testing_connection);
+                app.connect(window, cx);
+                app.test_connection(cx);
+                app.open_settings(cx);
+                assert!(
+                    app.sessions.is_empty(),
+                    "Connecting while locked must be rejected"
+                );
+                assert!(!app.testing_connection);
+                assert!(!app.settings_open);
+                assert_eq!(
+                    app.error.as_deref(),
+                    Some("Unlock the vault before connecting")
+                );
+                assert!(
+                    app.vault_editors
+                        .passphrase_editor
+                        .read(cx)
+                        .focus_handle()
+                        .is_focused(window)
+                );
+            });
+        });
+        assert!(
+            engine.upgrade().is_none(),
+            "Lock must release the database engine"
+        );
+        assert!(runtime.block_on(request).unwrap_err().is_cancelled());
+        assert!(
+            runtime
+                .block_on(connection_request)
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(runtime.block_on(test_request).unwrap_err().is_cancelled());
+    }
+
+    #[gpui::test]
+    fn inactive_query_work_warns_and_idle_connections_lock_without_warning(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        let vault = store.vault().unwrap();
+        vault.create("test vault passphrase").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.profile_store = Some(store);
+            app.vault_state = Some(VaultState::Unlocked);
+            let session_id = Uuid::new_v4();
+            app.sessions.push(ConnectionSession::new(
+                session_id,
+                None,
+                "Idle connection".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            ));
+            app.active_session_id = Some(session_id);
+            assert!(!app.has_pending_lock_work());
+            let tab_id = Uuid::new_v4();
+            let mut query = QueryTab::new(DatabaseKind::SQLite, session_id, tab_id, window, cx);
+            query.busy = true;
+            app.sessions[0].secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Query(Box::new(query)),
+            });
+            assert!(
+                app.has_pending_lock_work(),
+                "Work in an inactive tab must be detected"
+            );
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let lock = cx.debug_bounds("lock-vault").unwrap();
+        cx.simulate_click(lock.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(vault.state(), VaultState::Unlocked);
+        assert!(cx.debug_bounds("confirmation-dialog").is_some());
+        let cancel = cx.debug_bounds("cancel-confirmation").unwrap();
+        cx.simulate_click(cancel.center(), gpui::Modifiers::none());
+        app.update(cx, |app, _| {
+            let SecondaryTabKind::Query(query) = &mut app.sessions[0].secondary_tabs[0].kind else {
+                panic!("query tab");
+            };
+            query.busy = false;
+            let completed = app.runtime.spawn(async {});
+            app.sessions[0].track_background_task(&completed);
+            app.runtime.block_on(completed).unwrap();
+            assert!(
+                !app.has_pending_lock_work(),
+                "Completed background tasks must not warn"
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let lock = cx.debug_bounds("lock-vault").unwrap();
+        cx.simulate_click(lock.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(vault.state(), VaultState::Locked);
+        assert!(cx.debug_bounds("confirmation-dialog").is_none());
+        assert!(cx.debug_bounds("vault-gate").is_some());
+        assert!(app.read_with(cx, |app, _| app.sessions.is_empty()));
+    }
+
+    #[gpui::test]
+    fn locked_vault_takes_precedence_over_workspace_picker_and_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Locked);
+            let session_id = Uuid::new_v4();
+            app.sessions.push(ConnectionSession::new(
+                session_id,
+                None,
+                "Existing connection".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            ));
+            app.active_session_id = Some(session_id);
+            app
+        });
+        for (settings_open, connection_picker_open) in
+            [(false, false), (false, true), (true, false)]
+        {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.settings_open = settings_open;
+                    app.connection_picker_open = connection_picker_open;
+                    cx.notify();
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("vault-gate").is_some());
+            assert!(cx.debug_bounds("connection-tab").is_none());
+        }
+    }
+
+    #[gpui::test]
     fn provider_forms_preserve_tls_and_keep_api_tokens_in_masked_fields(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1107,6 +1497,7 @@ mod tests {
         let (app, cx) = cx.add_window_view(DbxApp::new);
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Unlocked);
                 for kind in DatabaseKind::ALL {
                     app.hydrate_connection_fields(kind, kind.default_url().into(), cx);
                     assert_eq!(app.connection_fields(cx).config().unwrap().kind, kind);

@@ -1,3 +1,4 @@
+mod agents;
 mod app;
 mod assets;
 mod connection_fields;
@@ -6,6 +7,7 @@ mod diagram;
 mod editor;
 #[allow(dead_code)]
 mod filters;
+mod popups;
 mod profiles;
 #[allow(dead_code)]
 mod query_history;
@@ -160,6 +162,11 @@ fn main() {
                 ),
                 KeyBinding::new("escape", app::CancelQuery, Some(editor::SQL_EDITOR_CONTEXT)),
                 KeyBinding::new("escape", app::CancelQuery, Some("QueryWorkbench")),
+                KeyBinding::new("cmd-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
+                KeyBinding::new("ctrl-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
+                KeyBinding::new("enter", app::SubmitQueryAgent, Some("DbxQueryAgent")),
+                KeyBinding::new("shift-enter", editor::Enter, Some("DbxQueryAgent")),
+                KeyBinding::new("escape", app::DismissQueryAgent, Some("DbxQueryAgent")),
                 KeyBinding::new("cmd-c", app::CopyQuerySelection, Some("QueryResult")),
                 KeyBinding::new("ctrl-c", app::CopyQuerySelection, Some("QueryResult")),
                 KeyBinding::new("left", app::DiagramPanLeft, Some("DbxDiagram")),

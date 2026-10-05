@@ -3228,7 +3228,7 @@ pub fn input_with_key_context(
     focus: FocusHandle,
     multiline: bool,
     key_context: &'static str,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     input_with_context(editor, focus, multiline, key_context, false)
 }
 

@@ -15,7 +15,10 @@ impl Render for DbxApp {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle, cx);
         }
-        let content = if self.settings_open {
+        let unlocked = self.vault_state == Some(VaultState::Unlocked);
+        let content = if !unlocked {
+            self.render_connection(cx).into_any_element()
+        } else if self.settings_open {
             self.render_settings(cx)
         } else if self.connection_picker_open || self.active_session().is_none() {
             self.render_connection(cx).into_any_element()
@@ -23,9 +26,10 @@ impl Render for DbxApp {
             self.render_workspace(window, cx).into_any_element()
         };
         // The pane rail only makes sense once a connection is live.
-        let connected = self
-            .active_session()
-            .is_some_and(|session| session.engine.is_some());
+        let connected = unlocked
+            && self
+                .active_session()
+                .is_some_and(|session| session.engine.is_some());
         div()
             .size_full()
             .relative()
@@ -57,6 +61,9 @@ impl Render for DbxApp {
                     .child(content),
             )
             .child(self.render_toasts(cx))
+            .when(unlocked, |view| {
+                view.child(self.render_confirmation_dialog(cx))
+            })
             .children(resize_edges(window))
     }
 }

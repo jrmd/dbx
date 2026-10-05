@@ -134,6 +134,8 @@ impl DbxApp {
         };
 
         let overlay = div()
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .absolute()
             .top(px(0.))
             .right(px(0.))
@@ -365,6 +367,11 @@ impl DbxApp {
         let detail = dialog.detail.clone();
         let confirm_label = dialog.confirm_label;
         let tone = dialog.tone;
+        let priority = if matches!(dialog.action, ConfirmationAction::LockVault) {
+            60
+        } else {
+            40
+        };
         let focus = dialog.focus.clone();
         let confirm_kind = match tone {
             ConfirmationTone::Warning => ButtonKind::Primary,
@@ -372,6 +379,9 @@ impl DbxApp {
         };
 
         let overlay = div()
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .id("confirmation-overlay")
             .absolute()
             .top(px(0.))
             .right(px(0.))
@@ -384,6 +394,7 @@ impl DbxApp {
             .child(
                 div()
                     .id("confirmation-dialog")
+                    .debug_selector(|| "confirmation-dialog".into())
                     .w(px(420.))
                     .rounded(px(RADIUS_GLASS))
                     .border_1()
@@ -443,6 +454,7 @@ impl DbxApp {
                             .gap(px(8.))
                             .child(
                                 button("cancel-confirmation", "Cancel", ButtonKind::Quiet)
+                                    .debug_selector(|| "cancel-confirmation".into())
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.cancel_confirmation(window, cx)
@@ -450,6 +462,7 @@ impl DbxApp {
                             )
                             .child(
                                 button("confirm-action", confirm_label, confirm_kind)
+                                    .debug_selector(|| "confirm-action".into())
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.confirm_pending_action(window, cx)
@@ -459,7 +472,7 @@ impl DbxApp {
                     .focus_trap("confirmation-focus-trap", &focus),
             );
 
-        deferred(overlay).with_priority(40).into_any_element()
+        deferred(overlay).with_priority(priority).into_any_element()
     }
 
     pub(super) fn render_mutation_error_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -471,6 +484,8 @@ impl DbxApp {
         let focus = dialog.focus.clone();
 
         let overlay = div()
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .absolute()
             .top(px(0.))
             .right(px(0.))
@@ -565,7 +580,11 @@ impl DbxApp {
         deferred(overlay).with_priority(50).into_any_element()
     }
 
-    pub(super) fn render_table_context_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_table_context_menu(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(menu) = self.table_context_menu.clone() else {
             return div().into_any_element();
         };
@@ -585,13 +604,14 @@ impl DbxApp {
         let drop_table = menu.table.clone();
         let session_id = menu.session_id;
 
-        deferred(
+        let menu_view = deferred(
             anchored()
                 .position(menu.position)
                 .snap_to_window_with_margin(px(8.))
                 .child(
                     div()
                         .id("table-context-menu")
+                        .occlude()
                         .w(px(220.))
                         .p(px(6.))
                         .rounded(px(RADIUS_PANEL))
@@ -775,7 +795,10 @@ impl DbxApp {
                         ),
                 ),
         )
-        .with_priority(10)
-        .into_any_element()
+        .with_priority(10);
+        div()
+            .child(crate::popups::scroll_shield(window, 9))
+            .child(menu_view)
+            .into_any_element()
     }
 }

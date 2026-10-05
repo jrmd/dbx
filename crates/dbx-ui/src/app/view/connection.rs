@@ -276,7 +276,7 @@ impl DbxApp {
                             .h(px(26.))
                             .text_size(px(11.))
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.open_tag_settings(cx))),
                     ),
             )
     }
@@ -570,7 +570,7 @@ impl DbxApp {
                 )
             },
         );
-        div().key_context("VaultGate")
+        div().debug_selector(|| "vault-gate".into()).key_context("VaultGate")
             .on_action(cx.listener(|_, _: &VaultFocusNext, window, cx| window.focus_next(cx)))
             .on_action(cx.listener(|_, _: &VaultFocusPrevious, window, cx| window.focus_prev(cx)))
             .on_action(cx.listener(move |this, _: &SubmitVault, _, cx| {
