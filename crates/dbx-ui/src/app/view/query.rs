@@ -1,5 +1,6 @@
 use super::super::*;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use crate::popups::DropdownMenu as _;
+use gpui_component::menu::PopupMenuItem;
 
 impl DbxApp {
     fn render_query_grid(
@@ -304,6 +305,8 @@ impl DbxApp {
         };
         let app = cx.entity().downgrade();
         let history = self.recent_query_history_limited(session_id, 10);
+        let agent_open = self.agent_panel_open(session_id, tab_id);
+        let agent_panel = self.render_agent_panel(session_id, tab_id, cx);
 
         div()
             .flex_1()
@@ -313,6 +316,10 @@ impl DbxApp {
             .key_context("QueryWorkbench")
             .on_action(cx.listener(move |this, _: &CancelQuery, _, cx| {
                 this.cancel_query_for(session_id, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(move |this, _: &ToggleQueryAgent, window, cx| {
+                this.toggle_agent_panel(session_id, tab_id, window, cx);
                 cx.stop_propagation();
             }))
             .child(
@@ -327,7 +334,44 @@ impl DbxApp {
                     .border_color(theme().border)
                     .bg(theme().panel)
                     // The tab already names the query; keep the actions right-aligned.
-                    .child(div())
+                    .child(
+                        div()
+                            .id("describe-query")
+                            .h(px(28.))
+                            .px(px(10.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .cursor_pointer()
+                            .when(agent_open, |toggle| {
+                                toggle
+                                    .bg(theme().glass_selected)
+                                    .border_1()
+                                    .border_color(theme().hairline)
+                                    .text_color(theme().text)
+                                    .font_weight(FontWeight::MEDIUM)
+                            })
+                            .when(!agent_open, |toggle| {
+                                toggle.text_color(theme().text_muted).hover(|style| {
+                                    style.bg(theme().glass_hover).text_color(theme().text)
+                                })
+                            })
+                            .tooltip(tip(format!("Query assistant ({})", shortcut("K", "K"))))
+                            .child(icon(
+                                Icon::Sparkles,
+                                if agent_open {
+                                    theme().accent
+                                } else {
+                                    theme().text_muted
+                                },
+                            ))
+                            .child("Ask AI")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.toggle_agent_panel(session_id, tab_id, window, cx);
+                            })),
+                    )
                     .child(
                         div()
                             .flex()
@@ -573,6 +617,7 @@ impl DbxApp {
                             ),
                     ),
             )
+            .when_some(agent_panel, |view, panel| view.child(panel))
             .child(
                 gpui_component::resizable::v_resizable(SharedString::from(format!(
                     "query-workbench-split-{session_id}-{tab_id}"

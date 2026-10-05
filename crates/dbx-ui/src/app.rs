@@ -7,6 +7,7 @@
 //! IMPLEMENTATION: `DbxApp` coordinates shared session state; focused workflows and rendering live in
 //! the private `app/` module tree documented in `docs/architecture.md`.
 
+mod agents;
 mod connection;
 mod redis_completion;
 mod result_table;
@@ -66,7 +67,8 @@ use crate::{
         RADIUS_PANEL, appearance, badge, button, connection_tab, database_logo, glass,
         glass_icon_button, glass_raised, glass_shadow, icon, panel_header, reduce_transparency,
         segment, segmented_track, set_appearance, set_reduce_transparency, set_system_appearance,
-        shortcut, sync_component_theme, theme, tip, window_background,
+        settings_group, settings_row, shortcut, sync_component_theme, theme, tip,
+        window_background,
     },
     vault::{VaultError, VaultState},
 };
@@ -113,7 +115,10 @@ gpui::actions!(
         ToggleSidebar,
         CheckForUpdates,
         SubmitVault,
-        ApplyFilters
+        ApplyFilters,
+        ToggleQueryAgent,
+        SubmitQueryAgent,
+        DismissQueryAgent
     ]
 );
 
@@ -293,6 +298,10 @@ impl ConnectionTransportDraft {
 /// The create/edit form for shared connection tags in Settings.
 struct TagEditor {
     editing: Option<Uuid>,
+    /// The new-tag row is open.
+    creating: bool,
+    /// The tag whose delete confirmation is showing.
+    deleting: Option<Uuid>,
     name: Entity<String>,
     name_editor: Entity<TextEditor>,
     color: Entity<String>,
@@ -307,6 +316,8 @@ impl TagEditor {
         let color_editor = cx.new(|cx| TextEditor::new(color.clone(), false, window, cx));
         Self {
             editing: None,
+            creating: false,
+            deleting: None,
             name,
             name_editor,
             color,
@@ -693,6 +704,10 @@ impl Drop for AbortOnDrop {
 struct BackgroundTaskSet(Vec<tokio::task::AbortHandle>);
 
 impl BackgroundTaskSet {
+    fn has_pending(&self) -> bool {
+        self.0.iter().any(|handle| !handle.is_finished())
+    }
+
     fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
         // Completed tasks no longer need an abort handle. Sweeping here keeps
         // this owner-scoped cancellation set bounded even when a connection
@@ -715,6 +730,7 @@ impl Drop for BackgroundTaskSet {
 }
 
 struct QueryTab {
+    agent: agents::AgentQuery,
     query_text: Entity<String>,
     query_editor: Entity<TextEditor>,
     result: Option<Arc<QueryResult>>,
@@ -759,8 +775,14 @@ impl QueryTab {
             }
         });
         let split_state = cx.new(|_| ResizableState::default());
+        let row_actions = ResultTableDelegate::with_row_actions(
+            cx.entity().downgrade(),
+            session_id,
+            tab_id,
+            false,
+        );
         let result_grid = cx.new(|cx| {
-            TableState::new(ResultTableDelegate::default(), window, cx)
+            TableState::new(row_actions, window, cx)
                 .col_resizable(true)
                 .col_movable(false)
                 .sortable(false)
@@ -792,6 +814,7 @@ impl QueryTab {
             });
 
         Self {
+            agent: agents::AgentQuery::new(window, cx),
             query_text,
             query_editor,
             result: None,
@@ -833,6 +856,8 @@ impl QueryTab {
         self.request_generation = self.request_generation.saturating_add(1);
         self.abort_handle.cancel();
         self.busy = false;
+        self.agent.cancel();
+        self.agent.result = None;
     }
 }
 
@@ -1037,8 +1062,10 @@ impl DataTab {
         window: &mut Window,
         cx: &mut Context<DbxApp>,
     ) -> Self {
+        let row_actions =
+            ResultTableDelegate::with_row_actions(cx.entity().downgrade(), session_id, id, true);
         let data_grid = cx.new(|cx| {
-            TableState::new(ResultTableDelegate::default(), window, cx)
+            TableState::new(row_actions, window, cx)
                 .col_resizable(true)
                 .col_movable(false)
                 .sortable(false)
@@ -1411,6 +1438,7 @@ enum ConfirmationTone {
 }
 
 enum ConfirmationAction {
+    LockVault,
     RunQuery {
         session_id: SessionId,
         run_all: bool,
@@ -1445,15 +1473,16 @@ enum ConfirmationAction {
 }
 
 impl ConfirmationAction {
-    fn session_id(&self) -> SessionId {
+    fn session_id(&self) -> Option<SessionId> {
         match self {
+            Self::LockVault => None,
             Self::RunQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
             | Self::ClearQueryHistory { session_id }
             | Self::Table { session_id, .. }
             | Self::DeleteRow { session_id, .. }
             | Self::DatabaseImport { session_id, .. }
-            | Self::TableImport { session_id, .. } => *session_id,
+            | Self::TableImport { session_id, .. } => Some(*session_id),
         }
     }
 }
@@ -1492,6 +1521,15 @@ fn compact_connection_picker_visible(
     compact_layout && !compact_connection_form_open && saved_connection_count > 0
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsSection {
+    #[default]
+    Appearance,
+    QueryAgent,
+    Tags,
+    Updates,
+}
+
 pub struct DbxApp {
     runtime: Arc<tokio::runtime::Runtime>,
     update_state: crate::updater::UpdateState,
@@ -1523,12 +1561,13 @@ pub struct DbxApp {
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
-    /// Focus target for the open Settings dialog; `None` while it is closed.
     settings_open: bool,
+    settings_section: SettingsSection,
     tag_editor: TagEditor,
     appearance: Appearance,
     reduce_transparency: bool,
     settings_store: Option<SettingsStore>,
+    agent_setup: agents::AgentSetup,
     compact_layout: bool,
     narrow_workspace: bool,
     sidebar_hidden: bool,
@@ -1540,6 +1579,7 @@ pub struct DbxApp {
     window_drag_armed: bool,
     test_generation: u64,
     testing_connection: bool,
+    connection_test_abort: AbortOnDrop,
     _subscriptions: Vec<Subscription>,
     error: Option<String>,
 }
@@ -1637,10 +1677,12 @@ impl DbxApp {
             confirmation_dialog: None,
             mutation_error_dialog: None,
             settings_open: false,
+            settings_section: SettingsSection::Appearance,
             tag_editor,
             appearance: appearance(),
             reduce_transparency: reduce_transparency(),
             settings_store: SettingsStore::new().ok(),
+            agent_setup: agents::AgentSetup::new(window, cx),
             compact_layout: false,
             narrow_workspace: false,
             sidebar_hidden: false,
@@ -1650,6 +1692,7 @@ impl DbxApp {
             window_drag_armed: false,
             test_generation: 0,
             testing_connection: false,
+            connection_test_abort: AbortOnDrop::default(),
             _subscriptions: subscriptions,
             error: profile_error,
         };
@@ -1717,7 +1760,11 @@ impl DbxApp {
     }
 
     pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.vault_state != Some(VaultState::Unlocked) {
+            return;
+        }
         self.settings_open = true;
+        self.check_agent_cli(cx);
         cx.notify();
     }
 
@@ -1948,9 +1995,10 @@ impl DbxApp {
     }
 
     fn persist_settings(&mut self, cx: &mut Context<Self>) {
-        let settings = Settings::new(self.appearance)
+        let mut settings = Settings::new(self.appearance)
             .with_reduce_transparency(self.reduce_transparency)
             .with_remember_device(self.remember_device);
+        settings.agents = self.agent_setup.preferences.clone();
         let failure = match &self.settings_store {
             Some(store) => store
                 .save(settings)
@@ -1959,7 +2007,10 @@ impl DbxApp {
             None => Some("Preference storage is unavailable".into()),
         };
         if let Some(message) = failure {
+            self.agent_setup.save_error = Some(message.clone());
             self.show_toast(ToastKind::Error, message, cx);
+        } else {
+            self.agent_setup.save_error = None;
         }
     }
 
@@ -2011,7 +2062,7 @@ impl DbxApp {
         if self
             .confirmation_dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.action.session_id() == session_id)
+            .is_some_and(|dialog| dialog.action.session_id() == Some(session_id))
         {
             self.confirmation_dialog = None;
         }
@@ -2058,11 +2109,12 @@ impl DbxApp {
             {
                 self.database_export_dialog = None;
             }
-            if self
-                .confirmation_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.action.session_id() != session_id)
-            {
+            if self.confirmation_dialog.as_ref().is_some_and(|dialog| {
+                dialog
+                    .action
+                    .session_id()
+                    .is_some_and(|id| id != session_id)
+            }) {
                 self.confirmation_dialog = None;
             }
             if self
@@ -5981,6 +6033,15 @@ impl DbxApp {
         let return_focus = dialog.return_focus.clone();
         let closes_query = matches!(dialog.action, ConfirmationAction::CloseQuery { .. });
         match dialog.action {
+            ConfirmationAction::LockVault => {
+                self.lock_vault(cx);
+                self.vault_editors
+                    .passphrase_editor
+                    .read(cx)
+                    .focus_handle()
+                    .focus(window, cx);
+                return;
+            }
             ConfirmationAction::RunQuery {
                 session_id,
                 run_all,
@@ -6684,6 +6745,12 @@ mod tests {
                 assert_eq!(store.tags().unwrap()[0].color, 0xb48ead);
                 app.select_tag(prod.clone(), cx);
                 assert!(app.draft.tag.is_none());
+                app.select_tag(prod.clone(), cx);
+                app.delete_connection_tag(prod.id, cx);
+                assert!(app.draft.tag.is_none());
+                assert!(app.sessions[0].tag.is_none());
+                assert!(app.connection_tags.iter().all(|tag| tag.id != prod.id));
+                assert_eq!(store.tags().unwrap(), app.connection_tags);
                 let _ = gpui::Render::render(app, window, cx);
                 app.compact_layout = true;
                 let _ = gpui::Render::render(app, window, cx);
@@ -6739,6 +6806,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
             let tab_id = Uuid::new_v4();
             let mut session = ConnectionSession::new(
                 session_id,

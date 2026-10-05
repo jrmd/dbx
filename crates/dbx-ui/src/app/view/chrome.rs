@@ -1,5 +1,6 @@
 use super::super::*;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use crate::popups::DropdownMenu as _;
+use gpui_component::menu::PopupMenuItem;
 
 impl DbxApp {
     pub(super) fn render_workspace(
@@ -45,9 +46,8 @@ impl DbxApp {
             .flex()
             .flex_col()
             .child(workspace)
-            .child(self.render_table_context_menu(cx))
+            .child(self.render_table_context_menu(window, cx))
             .child(self.render_database_export_dialog(window, cx))
-            .child(self.render_confirmation_dialog(cx))
             .child(self.render_mutation_error_dialog(cx))
     }
 
@@ -207,9 +207,11 @@ impl DbxApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_sessions = !self.sessions.is_empty();
-        let connected = self
-            .active_session()
-            .is_some_and(|session| session.engine.is_some());
+        let unlocked = self.vault_state == Some(VaultState::Unlocked);
+        let connected = unlocked
+            && self
+                .active_session()
+                .is_some_and(|session| session.engine.is_some());
         let show_sidebar_toggle = connected && !self.connection_picker_open;
         let identity = self
             .titlebar_drag(
@@ -250,7 +252,7 @@ impl DbxApp {
             .flex()
             .items_center()
             .child(identity)
-            .child(self.render_connection_tabs(cx))
+            .when(unlocked, |view| view.child(self.render_connection_tabs(cx)))
             .child(
                 self.titlebar_drag(
                     div()
@@ -271,15 +273,11 @@ impl DbxApp {
                     .when(self.vault_state == Some(VaultState::Unlocked), |view| {
                         view.child(
                             glass_icon_button("lock-vault", Icon::Lock, false)
+                                .debug_selector(|| "lock-vault".into())
                                 .tooltip(tip("Lock vault"))
                                 .when(!self.vault_busy && !self.saving_connection, |button| {
                                     button.on_click(cx.listener(|this, _, window, cx| {
-                                        this.lock_vault(cx);
-                                        this.vault_editors
-                                            .passphrase_editor
-                                            .read(cx)
-                                            .focus_handle()
-                                            .focus(window, cx);
+                                        this.request_lock_vault(window, cx);
                                     }))
                                 }),
                         )
@@ -379,6 +377,7 @@ impl DbxApp {
                     .map(|(session_id, label, busy, kind, _saved, tag)| {
                         let selected = active_session_id == Some(session_id);
                         connection_tab(kind, label, selected)
+                            .debug_selector(|| "connection-tab".into())
                             .id(SharedString::from(format!("connection-tab-{session_id}")))
                             .flex_none()
                             .cursor_pointer()

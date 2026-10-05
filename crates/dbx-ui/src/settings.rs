@@ -17,7 +17,7 @@ pub const SETTINGS_FILE_VERSION: u32 = 1;
 /// Settings file stored beneath DBX's platform config directory.
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct Settings {
     pub version: u32,
     #[serde(default)]
@@ -29,6 +29,8 @@ pub struct Settings {
     /// passphrase.
     #[serde(default = "remember_device_default")]
     pub remember_device: bool,
+    #[serde(default)]
+    pub agents: crate::agents::AgentPreferences,
 }
 
 fn remember_device_default() -> bool {
@@ -48,6 +50,7 @@ impl Settings {
             appearance,
             reduce_transparency: false,
             remember_device: true,
+            agents: crate::agents::AgentPreferences::default(),
         }
     }
 
@@ -203,6 +206,24 @@ mod tests {
     }
 
     #[test]
+    fn agent_models_providers_and_default_survive_restart() {
+        use crate::agents::{AgentCli, AgentConfig};
+        let (_directory, store) = test_store();
+        let mut settings = Settings::default();
+        settings.agents.default_cli = AgentCli::OpenCode;
+        settings.agents.configurations.insert(
+            AgentCli::OpenCode,
+            AgentConfig {
+                executable: "/opt/bin/opencode".into(),
+                model: "model".into(),
+                provider: "provider".into(),
+            },
+        );
+        store.save(settings.clone()).unwrap();
+        assert_eq!(store.load().unwrap(), settings);
+    }
+
+    #[test]
     fn earlier_documents_keep_their_explicit_appearance() {
         let (_directory, store) = test_store();
         fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#)
@@ -216,7 +237,7 @@ mod tests {
     fn saves_and_reloads_appearance_atomically() {
         let (_directory, store) = test_store();
         let settings = Settings::new(Appearance::Light);
-        store.save(settings).expect("save settings");
+        store.save(settings.clone()).expect("save settings");
 
         assert_eq!(store.load().expect("reload settings"), settings);
         let json = fs::read_to_string(&store.path).expect("read settings file");

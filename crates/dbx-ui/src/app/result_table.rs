@@ -11,9 +11,20 @@ use gpui_component::{
     table::{Column as DataColumn, TableDelegate, TableEvent, TableState},
 };
 
+use super::{DbxApp, SecondaryTabId, SessionId};
+use gpui::{ClipboardItem, WeakEntity};
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
+
 use crate::diagram::display_type;
 use crate::row_drafts::{FieldValueKind, field_value_kind};
 use crate::theme::{Icon, icon, theme};
+
+#[derive(Clone, Copy)]
+enum RowAction {
+    Inspect,
+    Edit,
+    Delete,
+}
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
@@ -59,6 +70,7 @@ pub(super) struct ResultTableDelegate {
     /// never re-formats or re-copies values that were already rendered.
     cell_text: Vec<Option<SharedString>>,
     foreign_keys: Vec<ForeignKeyInfo>,
+    row_actions: Option<(WeakEntity<DbxApp>, SessionId, SecondaryTabId, bool)>,
 }
 
 impl Default for ResultTableDelegate {
@@ -69,11 +81,58 @@ impl Default for ResultTableDelegate {
             numeric: Vec::new(),
             cell_text: Vec::new(),
             foreign_keys: Vec::new(),
+            row_actions: None,
         }
     }
 }
 
 impl ResultTableDelegate {
+    pub(super) fn with_row_actions(
+        app: WeakEntity<DbxApp>,
+        session: SessionId,
+        tab: SecondaryTabId,
+        is_data: bool,
+    ) -> Self {
+        Self {
+            row_actions: Some((app, session, tab, is_data)),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn row_as_json(&self, row_ix: usize) -> Option<String> {
+        let result = self.result.as_ref()?;
+        let row = result.rows.get(row_ix)?;
+        let mut names = std::collections::HashSet::new();
+        // Query aliases may repeat. Preserve all values in the existing
+        // positional envelope in that case instead of overwriting a field.
+        if result
+            .columns
+            .iter()
+            .any(|column| !names.insert(&column.name))
+        {
+            let single_row = QueryResult {
+                columns: result.columns.clone(),
+                rows: vec![row.clone()],
+                rows_affected: None,
+                truncated: false,
+                elapsed_ms: result.elapsed_ms,
+            };
+            return Some(json_result(&single_row));
+        }
+        let mut output = Vec::new();
+        output.push(b'{');
+        for (index, (column, value)) in result.columns.iter().zip(&row.values).enumerate() {
+            if index > 0 {
+                output.push(b',');
+            }
+            write_json_value(&mut output, &column.name);
+            output.push(b':');
+            write_json_cell_value(&mut output, value);
+        }
+        output.push(b'}');
+        String::from_utf8(output).ok()
+    }
+
     /// Return the underlying value for a data column (not the synthetic row-number column).
     ///
     /// Keeping this at the delegate boundary means callers can add selection, copy, or export
@@ -549,12 +608,121 @@ impl TableDelegate for ResultTableDelegate {
     ) -> Stateful<Div> {
         div()
             .id(("dbx-result-row", row_ix))
+            .debug_selector(move || format!("dbx-result-row-{row_ix}"))
             .border_color(theme().border)
             .bg(if row_ix.is_multiple_of(2) {
                 theme().canvas
             } else {
                 theme().grid_alternate
             })
+    }
+
+    fn context_menu(
+        &mut self,
+        row_ix: usize,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenu {
+        let mut menu = menu;
+        for (label, text) in [
+            ("Copy as JSON", self.row_as_json(row_ix)),
+            ("Copy as TSV", self.row_as_tsv(row_ix)),
+        ] {
+            menu = menu.item(PopupMenuItem::new(label).disabled(text.is_none()).on_click(
+                move |_, _, cx| {
+                    if let Some(text) = &text {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    }
+                },
+            ));
+        }
+        let Some((app, session_id, tab_id, is_data)) = self.row_actions.clone() else {
+            return menu;
+        };
+        if !is_data {
+            return menu;
+        }
+        let sql = app.upgrade().and_then(|app| {
+            let owner = app.read(cx);
+            let kind = owner.session(session_id)?.kind;
+            if !kind.is_sql() {
+                return None;
+            }
+            let table = &owner.data_tab(session_id, tab_id)?.table;
+            let result = self.result.as_ref()?;
+            let row = result.rows.get(row_ix)?;
+            let columns = result
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>();
+            dbx_core::render_sql_insert(kind, table, &columns, &row.values)
+                .ok()
+                .map(|sql| format!("{sql};"))
+        });
+        menu = menu
+            .item(
+                PopupMenuItem::new("Copy as SQL")
+                    .disabled(sql.is_none())
+                    .on_click(move |_, _, cx| {
+                        if let Some(sql) = &sql {
+                            cx.write_to_clipboard(ClipboardItem::new_string(sql.clone()));
+                        }
+                    }),
+            )
+            .separator();
+        let clicked_row = self
+            .result
+            .as_ref()
+            .and_then(|result| result.rows.get(row_ix))
+            .cloned();
+        let can_edit = app.upgrade().is_some_and(|app| {
+            let owner = app.read(cx);
+            owner.editable_table_for(session_id, tab_id).is_some()
+                && owner
+                    .data_tab(session_id, tab_id)
+                    .is_some_and(|data| !data.busy && data.row_draft.is_none())
+        });
+        for (label, action, enabled) in [
+            ("Inspect row", RowAction::Inspect, true),
+            ("Edit row", RowAction::Edit, can_edit),
+            ("Delete row…", RowAction::Delete, can_edit),
+        ] {
+            let app = app.clone();
+            let clicked_row = clicked_row.clone();
+            menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        if this
+                            .data_tab(session_id, tab_id)
+                            .and_then(|data| data.result.as_ref()?.rows.get(row_ix))
+                            != clicked_row.as_ref()
+                        {
+                            return;
+                        }
+                        this.select_row_for(session_id, tab_id, row_ix, cx);
+                        // A pending draft may reject selection. Never apply an
+                        // action to a different row than the one right-clicked.
+                        if this.data_tab(session_id, tab_id).is_none_or(|data| {
+                            data.selected_row != Some(row_ix) || data.row_draft.is_some()
+                        }) {
+                            return;
+                        }
+                        match action {
+                            RowAction::Edit => {
+                                this.begin_edit_selected_for(session_id, tab_id, window, cx)
+                            }
+                            RowAction::Delete => {
+                                this.request_delete_selected_for(session_id, tab_id, window, cx)
+                            }
+                            RowAction::Inspect => {}
+                        }
+                    });
+                },
+            ));
+        }
+        menu
     }
 
     fn render_td(
@@ -906,6 +1074,92 @@ mod tests {
         assert!(exported["rows"][0][1].is_null());
         assert_eq!(exported["rows"][0][2], "");
         assert_eq!(exported["rows"][1][2], "NULL");
+    }
+
+    struct RowMenuHarness {
+        grid: gpui::Entity<TableState<ResultTableDelegate>>,
+    }
+    impl gpui::Render for RowMenuHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            gpui_component::table::DataTable::new(&self.grid).with_size(px(30.))
+        }
+    }
+
+    #[gpui::test]
+    fn right_click_copies_the_clicked_row_instead_of_the_selected_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
+            grid: cx.new(|cx| {
+                let mut grid = TableState::new(delegate_with_export_result(), window, cx);
+                grid.set_selected_row(0, cx);
+                grid
+            }),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx
+            .debug_bounds("dbx-result-row-1")
+            .expect("second row must be visible");
+        cx.simulate_mouse_down(row.center(), gpui::MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(row.center(), gpui::MouseButton::Right, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("down enter");
+        let copied = cx
+            .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .expect("row menu must write the clipboard");
+        let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
+        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(value["rows"][0][0], 8);
+    }
+
+    #[test]
+    fn row_json_preserves_typed_values_and_full_text() {
+        let text = "line\nquoted\"".repeat(100);
+        let mut delegate = ResultTableDelegate::default();
+        delegate.set_result(
+            Some(Arc::new(QueryResult {
+                columns: vec![
+                    ColumnInfo::result("id", 0, "INTEGER"),
+                    ColumnInfo::result("note", 1, "TEXT"),
+                    ColumnInfo::result("empty", 2, "TEXT"),
+                    ColumnInfo::result("missing", 3, "TEXT"),
+                    ColumnInfo::result("payload", 4, "JSON"),
+                ],
+                rows: vec![RowData::new(vec![
+                    CellValue::Integer(7),
+                    CellValue::Text(text.clone()),
+                    CellValue::Text(String::new()),
+                    CellValue::Null,
+                    CellValue::Json(serde_json::json!({"ok": true})),
+                ])],
+                rows_affected: None,
+                truncated: false,
+                elapsed_ms: 0,
+            })),
+            &HashMap::new(),
+            &[],
+            &[],
+        );
+        let value: serde_json::Value =
+            serde_json::from_str(&delegate.row_as_json(0).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"id":7,"note":text,"empty":"","missing":null,"payload":{"ok":true}})
+        );
+        assert!(delegate.row_as_json(1).is_none());
+    }
+
+    #[test]
+    fn row_json_keeps_duplicate_query_aliases_and_only_the_clicked_row() {
+        let delegate = delegate_with_export_result();
+        let value: serde_json::Value =
+            serde_json::from_str(&delegate.row_as_json(1).unwrap()).unwrap();
+        assert_eq!(value["columns"][1]["name"], "note");
+        assert_eq!(value["columns"][2]["name"], "note");
+        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(value["rows"][0][0], 8);
+        assert_eq!(value["rows"][0][2], "NULL");
     }
 
     #[test]

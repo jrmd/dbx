@@ -178,7 +178,7 @@ impl DbxApp {
                     })
             });
 
-            Popover::new("diagram-schema-filter")
+            let popover = Popover::new("diagram-schema-filter")
                 .p_0()
                 .w(px(220.))
                 .trigger(
@@ -243,7 +243,8 @@ impl DbxApp {
                         .flex_col()
                         .gap(px(3.))
                         .children(schema_rows),
-                )
+                );
+            crate::popups::ScrollBlockingPopover::new("diagram-schema-filter", popover)
         });
         let toolbar = div()
             .h(px(48.))

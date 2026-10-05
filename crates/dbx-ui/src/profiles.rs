@@ -428,6 +428,20 @@ impl ProfileStore {
         Ok(document.tags)
     }
 
+    /// Remove a tag and untag every profile that used it.
+    pub fn delete_tag(&self, id: Uuid) -> ProfileResult<Vec<ConnectionTag>> {
+        let _lock = self.lock()?;
+        let mut document = self.read_document()?;
+        document.tags.retain(|tag| tag.id != id);
+        for profile in &mut document.connections {
+            if profile.tag.as_ref().is_some_and(|tag| tag.id == id) {
+                profile.tag = None;
+            }
+        }
+        self.write_document(&document)?;
+        Ok(document.tags)
+    }
+
     /// List profiles sorted by display name, without loading any secrets.
     pub fn list(&self) -> ProfileResult<Vec<SavedConnection>> {
         let _lock = self.lock()?;
@@ -1433,6 +1447,26 @@ mod tests {
             )
             .unwrap();
         assert!(store.list().unwrap()[0].tag.is_none());
+    }
+
+    #[test]
+    fn deleting_a_tag_untags_its_profiles() {
+        let (_directory, store, _) = test_store();
+        let prod = default_tags().remove(0);
+        let saved = store
+            .save(
+                ConnectionProfileDraft::new("DB", DatabaseKind::SQLite, "sqlite::memory:")
+                    .with_tag(Some(prod.clone())),
+            )
+            .unwrap();
+        let tags = store.delete_tag(prod.id).unwrap();
+        assert!(tags.iter().all(|tag| tag.id != prod.id));
+        assert_eq!(store.tags().unwrap(), tags);
+        assert!(store.get(saved.id).unwrap().unwrap().tag.is_none());
+        for tag in tags {
+            store.delete_tag(tag.id).unwrap();
+        }
+        assert!(store.tags().unwrap().is_empty());
     }
 
     #[test]

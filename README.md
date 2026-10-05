@@ -19,6 +19,7 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 - **Data you can work with:** virtualized grids over bounded row pages, structured filters, foreign-key navigation, and an all-field row inspector.
 - **Explicit edits:** typed insert/update drafts, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
 - **A query editor:** syntax highlighting, SQL completion, result grids, and per-connection query history.
+- **Bring your own query agent:** describe queries using Claude, Cursor, Codex, OpenCode or GitHub Copilot CLI, with saved agent/model defaults and schema context. See [agent setup](docs/query-agents.md).
 - **Import and export:** SQL, CSV, and TSV transfers; database exports with table selection, gzip, and schema-only SQL options.
 - **Saved connections:** named profiles, colour-coded tags managed in Settings, connection testing, and encrypted credentials in the DBX Vault.
 - **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
