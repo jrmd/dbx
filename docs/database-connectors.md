@@ -9,7 +9,7 @@ CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1 and Cl
 | CockroachDB | PostgreSQL URL supplied by CockroachDB, including its TLS options | SQL, schemas, tables, structure, primary keys and foreign keys |
 | DuckDB | `duckdb:///absolute/path.duckdb` or `duckdb::memory:`; native file chooser | Embedded DuckDB SQL, tables, views, structure and bound row mutations |
 | Elasticsearch | HTTP(S) endpoint; username/password for Basic authentication or `https://:API_KEY@host` | `METHOD /path` followed by an optional JSON body; indices and search hits |
-| BigQuery | `bigquery://project/dataset?location=US`, with an OAuth access token in the masked API-token field | GoogleSQL, datasets, tables, typed results, job polling and result pagination |
+| BigQuery | `bigquery://project/dataset?location=US`; leave the token field blank for Google Application Default Credentials, or supply an OAuth access token | GoogleSQL, datasets, tables, typed results, job polling and result pagination |
 | Kafka | `kafka://broker:9092`; optional `brokers=host:9092,other:9092` | Topics, JSON consume commands and acknowledged produce commands |
 | Turso | `libsql://database-organization.turso.io`, `turso://...` or HTTPS, with a database token in the masked field | SQL over HTTP, tables, views, SQLite structure and bound row mutations |
 | Cloudflare D1 | `d1://account-id/database-id`, with a Cloudflare API token in the masked field | REST SQL, tables, views, SQLite structure and bound row mutations |
@@ -98,13 +98,19 @@ docker compose -f docker-compose.test.yml stop clickhouse
 MongoDB and Elasticsearch collection schemas are sampled from documents;
 their grids are read-only. Use their native commands for writes. Kafka has a
 topic/message surface rather than relational row editing. BigQuery's grid is
-read-only, with writes available through SQL. BigQuery currently takes an
-OAuth access token; renew it when it expires. Service-account login and automatic
-OAuth refresh are not implemented.
+read-only, with writes available through SQL. BigQuery uses refreshing Google
+Application Default Credentials when its optional token field is blank. This
+includes service-account credentials via `GOOGLE_APPLICATION_CREDENTIALS` and
+local credentials created with `gcloud auth application-default login`. An
+explicit access token still requires manual renewal. See the
+[workbench guide](workbench-safety.md#bigquery-credentials) for setup and verification limits.
 
-SQL dump imports that require a transaction remain available on the original
-SQL engines and CockroachDB. The newer SQL connectors reject that operation
-rather than replaying a dump without the promised transaction.
+Atomic file imports are available on PostgreSQL, MySQL/InnoDB, SQLite and
+CockroachDB. MySQL SQL imports accept data statements and reject DDL/session
+commands that can commit implicitly. Other connectors reject atomic file imports.
+Native SQL exports use one data snapshot across pages and selected tables;
+MySQL non-InnoDB and other connectors report live reads. See
+[workbench safety and limits](workbench-safety.md) for the complete contract.
 
 Live disposable-server checks cover MongoDB 8, CockroachDB 25.1,
 Elasticsearch 8.17 and Kafka 3.9. Embedded DuckDB checks cover actual

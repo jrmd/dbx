@@ -17,6 +17,7 @@ mod settings;
 mod theme;
 mod updater;
 mod vault;
+mod workspace;
 
 use app::DbxApp;
 use gpui::{

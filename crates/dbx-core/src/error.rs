@@ -5,6 +5,14 @@ use thiserror::Error;
 /// Errors returned by DBX's connection and query layer.
 #[derive(Debug, Error)]
 pub enum DbxError {
+    #[error(
+        "row changed or was deleted since it was loaded; refresh the row and review your changes"
+    )]
+    Conflict,
+
+    #[error("{0}")]
+    Interrupted(String),
+
     #[error("invalid database configuration: {0}")]
     InvalidConfig(String),
 

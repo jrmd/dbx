@@ -222,6 +222,8 @@ impl fmt::Display for DatabaseKind {
 /// it is safe to log the rest of a connection configuration.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionConfig {
+    #[serde(default)]
+    pub read_only: bool,
     pub kind: DatabaseKind,
     pub url: String,
     #[serde(default = "default_max_connections")]
@@ -248,11 +250,17 @@ impl ConnectionConfig {
         Self {
             kind,
             url: url.into(),
+            read_only: false,
             max_connections: default_max_connections(),
             connect_timeout_ms: default_connect_timeout_ms(),
             socket: None,
             ssh: None,
         }
+    }
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     pub fn with_max_connections(mut self, max_connections: u32) -> Self {

@@ -55,6 +55,7 @@ impl DbxApp {
         let choosing = !editing && self.draft.choosing_kind;
         let kind_picker = choosing.then(|| self.render_kind_picker(cx));
         let transport = self.render_connection_transport(cx);
+        let protected = self.draft.read_only;
 
         if compact_connection_picker_visible(
             self.compact_layout,
@@ -118,7 +119,10 @@ impl DbxApp {
                                 .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::Redis { "Database index (optional)" } else { "Database" })).child(editor::input(self.draft.database_editor.clone(), database_focus, false))))
                             .when(!kind.connection_help().is_empty(), |view| view.child(div().text_size(px(11.)).text_color(theme().text_muted).child(kind.connection_help())))
                             .when(!details, |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child(if kind.is_file() { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false))).when(kind.is_file(), |view| view.child(button("choose-sqlite-file", "Choose file…", ButtonKind::Quiet).h(px(32.)).flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx))))))))
-                            .when(matches!(kind,DatabaseKind::BigQuery|DatabaseKind::Turso|DatabaseKind::CloudflareD1), |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child("API token")).child(editor::input(self.draft.password_editor.clone(),password_focus,false))))
+                            .when(matches!(kind,DatabaseKind::BigQuery|DatabaseKind::Turso|DatabaseKind::CloudflareD1), |view| view.child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::BigQuery { "OAuth token (optional; leave blank for Google credentials)" } else { "API token" })).child(editor::input(self.draft.password_editor.clone(),password_focus,false))))
+                             .child(Switch::new("connection-protected").label("Protected connection · disable writes").checked(protected).with_size(Size::Small)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| { this.draft.read_only = *checked; cx.notify(); })))
+                            .child(div().text_xs().text_color(theme().text_muted).child("Use a read-only database account to enforce permissions. Protected mode also blocks accidental writes in DBX."))
                             .when(kind.supports_transport(), |view| view.child(transport))))))
                 .when(!choosing, |view| view.child(div().flex_none().border_t_1().border_color(theme().border).follow_bottom_corners(RADIUS_PANEL).bg(theme().panel).px(if self.compact_layout { px(14.) } else { px(24.) }).py(px(12.)).flex().items_center().justify_between().gap(px(12.))
                     .child(div().min_w_0().flex_1().when_some(self.error.clone(), |view, error| view.child(div().id("connection-error").truncate().text_size(px(12.)).text_color(theme().danger).tooltip(tip(error.clone())).child(error))))

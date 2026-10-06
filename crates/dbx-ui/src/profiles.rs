@@ -163,6 +163,7 @@ pub struct SavedConnection {
     pub tag: Option<ConnectionTag>,
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
+    pub read_only: bool,
     pub socket: Option<PathBuf>,
     pub ssh: Option<dbx_core::SshConfig>,
     secret_key: Option<String>,
@@ -513,6 +514,7 @@ impl ProfileStore {
             tag: draft.tag.take(),
             max_connections: draft.config.max_connections,
             connect_timeout_ms: draft.config.connect_timeout_ms,
+            read_only: draft.config.read_only,
             socket: draft.config.socket.clone(),
             ssh: draft.config.ssh.clone(),
             secret_key: new_secret_key.clone(),
@@ -604,6 +606,7 @@ impl ProfileStore {
         let mut config = ConnectionConfig::new(stored.kind, url)
             .with_max_connections(stored.max_connections)
             .with_connect_timeout_ms(stored.connect_timeout_ms);
+        config.read_only = stored.read_only;
         config.socket = stored.socket;
         config.ssh = stored.ssh;
         Ok(LoadedConnection { profile, config })
@@ -798,6 +801,8 @@ struct StoredConnection {
     tag: Option<ConnectionTag>,
     max_connections: u32,
     connect_timeout_ms: u64,
+    #[serde(default)]
+    read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     socket: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -816,6 +821,7 @@ impl StoredConnection {
             tag: self.tag,
             max_connections: self.max_connections,
             connect_timeout_ms: self.connect_timeout_ms,
+            read_only: self.read_only,
             socket: self.socket,
             ssh: self.ssh,
             secret_key: self.secret_key,

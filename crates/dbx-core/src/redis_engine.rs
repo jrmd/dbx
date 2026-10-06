@@ -15,6 +15,7 @@ use crate::{
 /// `keys` collection with key/type/ttl columns while retaining a raw command
 /// editor for the full Redis command set.
 pub struct RedisEngine {
+    read_only: bool,
     client: Client,
     connection: MultiplexedConnection,
     /// Logical database currently selected. Clones of the multiplexed
@@ -62,6 +63,7 @@ impl RedisEngine {
                 DbxError::Connection(crate::error::connection_message(&config.url, error))
             })?;
         Ok(Self {
+            read_only: config.read_only,
             client,
             connection,
             database: AtomicUsize::new(database),
@@ -69,6 +71,9 @@ impl RedisEngine {
         })
     }
 
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
     pub fn kind(&self) -> DatabaseKind {
         DatabaseKind::Redis
     }
@@ -132,6 +137,9 @@ impl RedisEngine {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        if self.read_only {
+            crate::protected::ensure_query(DatabaseKind::Redis, &statement.sql)?;
+        }
         let started = Instant::now();
         let command = parse_command(&statement.sql)?;
         let command_name = command.first().map(String::as_str).unwrap_or_default();
@@ -194,6 +202,11 @@ impl RedisEngine {
     }
 
     async fn execute_command(&self, statement: &SqlStatement) -> Result<ExecResult> {
+        if self.read_only {
+            return Err(DbxError::Query(
+                "Protected connection: writes are disabled".into(),
+            ));
+        }
         let started = Instant::now();
         let value = self.send_command(&statement.sql, &statement.params).await?;
         let rows_affected = match value {

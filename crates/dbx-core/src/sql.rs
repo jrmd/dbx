@@ -202,6 +202,15 @@ pub fn build_multi_row_insert(
     columns: &[String],
     rows: &[Vec<CellValue>],
 ) -> Result<SqlStatement> {
+    build_multi_row_insert_with_columns(kind, table, columns, rows, &[])
+}
+pub(crate) fn build_multi_row_insert_with_columns(
+    kind: DatabaseKind,
+    table: &TableRef,
+    columns: &[String],
+    rows: &[Vec<CellValue>],
+    metadata: &[ColumnInfo],
+) -> Result<SqlStatement> {
     if rows.is_empty() {
         return Err(DbxError::Parse(
             "bulk insert requires at least one row".into(),
@@ -236,8 +245,13 @@ pub fn build_multi_row_insert(
             if column_index > 0 {
                 statement.push_str(", ");
             }
-            statement.push_str(&placeholder(kind, params.len() + 1));
-            params.push(value.clone());
+            append_column_value(
+                kind,
+                &mut statement,
+                &mut params,
+                &value.clone().into(),
+                column_metadata(metadata, &columns[column_index]),
+            )?;
         }
         statement.push(')');
     }
@@ -299,6 +313,51 @@ pub fn build_update_with_columns(
 
 fn column_metadata<'a>(columns: &'a [ColumnInfo], column: &str) -> Option<&'a ColumnInfo> {
     columns.iter().find(|metadata| metadata.name == column)
+}
+
+/// Extend an identity-guarded mutation with the values the user actually saw.
+/// NULL uses IS NULL; all other values remain bound, including rich SQL types.
+pub(crate) fn guard_original_values(
+    kind: DatabaseKind,
+    statement: &mut SqlStatement,
+    originals: &[(String, CellValue)],
+    columns: &[ColumnInfo],
+) -> Result<()> {
+    for (name, value) in originals {
+        let column = columns
+            .iter()
+            .find(|column| column.name == *name)
+            .ok_or_else(|| DbxError::Parse(format!("unknown original column `{name}`")))?;
+        statement.sql.push_str(" AND ");
+        let identifier = quote_identifier(kind, name)?;
+        if matches!(value, CellValue::Null) {
+            statement.sql.push_str(&format!("{identifier} IS NULL"));
+        } else if kind.dialect() == DatabaseKind::PostgreSQL
+            && column.data_type.eq_ignore_ascii_case("json")
+        {
+            // PostgreSQL json has no equality operator, but jsonb does.
+            statement
+                .sql
+                .push_str(&format!("CAST({identifier} AS jsonb) = CAST("));
+            append_mutation_value(
+                kind,
+                &mut statement.sql,
+                &mut statement.params,
+                &value.clone().into(),
+            )?;
+            statement.sql.push_str(" AS jsonb)");
+        } else {
+            statement.sql.push_str(&format!("{identifier} = "));
+            append_column_value(
+                kind,
+                &mut statement.sql,
+                &mut statement.params,
+                &value.clone().into(),
+                Some(column),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Append one assignment/insert value, casting text and NULL parameters to

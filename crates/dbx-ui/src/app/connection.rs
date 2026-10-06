@@ -108,6 +108,7 @@ impl DbxApp {
 
     fn connection_fields(&self, cx: &App) -> ConnectionFields {
         let mut fields = ConnectionFields::new(self.draft.kind);
+        fields.read_only = self.draft.read_only;
         fields.host = self.draft.host.read(cx).clone();
         fields.port = self.draft.port.read(cx).clone();
         fields.username = self.draft.username.read(cx).clone();
@@ -357,7 +358,9 @@ impl DbxApp {
                 session.busy
                     || session.background_tasks.has_pending()
                     || session.secondary_tabs.iter().any(|tab| match &tab.kind {
-                        SecondaryTabKind::Query(query) => query.busy || query.agent.is_busy(),
+                        SecondaryTabKind::Query(query) => {
+                            query.busy || query.in_transaction || query.agent.is_busy()
+                        }
                         SecondaryTabKind::Data(data) => data.busy,
                         SecondaryTabKind::Diagram(diagram) => diagram.busy,
                         SecondaryTabKind::Structure(structure) => structure.busy,
@@ -402,12 +405,14 @@ impl DbxApp {
         let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
             return;
         };
+        let recovery_error = self.flush_query_workspaces(cx);
         if vault.lock().is_err() {
             self.set_error("Couldn’t lock the vault".into());
             cx.notify();
             return;
         }
         self.vault_state = Some(VaultState::Locked);
+        self.workspace_documents.clear();
         // Use the normal teardown so queries, connection attempts, and tab
         // tasks are cancelled and their database engines are released.
         while let Some(session) = self.sessions.last() {
@@ -438,7 +443,7 @@ impl DbxApp {
             cx.notify();
         });
         self.clear_vault_inputs(cx);
-        self.error = None;
+        self.error = recovery_error;
         cx.notify();
     }
 
@@ -536,6 +541,7 @@ impl DbxApp {
     pub(super) fn select_kind(&mut self, kind: DatabaseKind, cx: &mut Context<Self>) {
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
+        self.draft.read_only = false;
         self.draft.choosing_kind = false;
         self.hydrate_connection_fields(kind, Self::default_url(kind).to_owned(), cx);
         self.error = None;
@@ -560,6 +566,7 @@ impl DbxApp {
         });
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
+        self.draft.read_only = false;
         self.draft.choosing_kind = false;
         self.hydrate_connection_fields(kind, url.trim().to_owned(), cx);
         self.error = None;
@@ -711,6 +718,7 @@ impl DbxApp {
             cx.notify();
         });
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
+        self.draft.read_only = profile.read_only;
         self.hydrate_transport(profile.socket, profile.ssh, cx);
         self.error = None;
         if has_saved_password {
@@ -1081,6 +1089,7 @@ impl DbxApp {
                 this.prefetch_completion_columns_for(session_id, cx);
                 if connected {
                     this.prefetch_redis_command_catalog_for(session_id, cx);
+                    this.restore_query_workspace_for(session_id, window, cx);
                 }
             })?;
             Ok::<(), anyhow::Error>(())
@@ -1168,6 +1177,7 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.compact_connection_form_open = true;
         self.draft.selected_profile = None;
+        self.draft.read_only = false;
         self.draft.tag = Some(default_tags().remove(3));
         self.draft.choosing_kind = true;
         self.settings_open = false;
@@ -1189,6 +1199,7 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.compact_connection_form_open = false;
         self.draft.selected_profile = None;
+        self.draft.read_only = false;
         self.draft.password.update(cx, |value, cx| {
             value.zeroize();
             cx.notify();
