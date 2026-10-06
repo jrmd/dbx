@@ -688,6 +688,7 @@ impl DbxApp {
                     .h_full(),
                 ),
             )
+            .child(self.render_schema_objects_for(session_id, None, cx))
             .into_any_element()
     }
 

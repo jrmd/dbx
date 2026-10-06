@@ -94,10 +94,13 @@ struct SessionState {
     in_transaction: bool,
     explicit_transaction: bool,
     savepoints: Vec<String>,
+    /// When the connection last finished a run, for idle health checks.
+    last_used: Option<Instant>,
 }
 impl SessionState {
     fn reset(&mut self) {
         self.connection.take();
+        self.last_used = None;
         self.in_transaction = false;
         self.explicit_transaction = false;
         self.savepoints.clear();
@@ -116,6 +119,7 @@ impl QuerySession {
                 in_transaction: false,
                 explicit_transaction: false,
                 savepoints: Vec::new(),
+                last_used: None,
             }),
         }
     }
@@ -128,48 +132,78 @@ impl QuerySession {
         timeout: Duration,
         cancellation: QueryCancellation,
     ) -> Result<ScriptResult> {
+        let statements = if self.engine.kind().is_sql() {
+            crate::transfer::checked_split_sql_for(Some(self.engine.kind()), sql)?
+        } else {
+            vec![sql.to_owned()]
+        }
+        .into_iter()
+        .map(|sql| SqlStatement::new(sql, Vec::new()))
+        .collect();
+        self.run_prepared(statements, options, timeout, cancellation)
+            .await
+    }
+
+    /// Execute driver-bound statements on the same tab-owned connection.
+    /// Values never become SQL text and are not included in statement history.
+    pub async fn run_prepared(
+        &self,
+        statements: Vec<SqlStatement>,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<ScriptResult> {
         let deadline = Instant::now() + timeout;
         let mut state = tokio::select! {
             state = tokio::time::timeout(timeout, self.state.lock()) => state.map_err(|_| DbxError::Interrupted("Query session was busy until the timeout".into()))?,
             _ = cancellation.cancelled() => return Err(DbxError::Interrupted("Query cancelled while waiting for its session".into())),
         };
-        let prepare = async {
-            Ok::<_, DbxError>(if let DatabaseEngine::Sql(engine) = self.engine.as_ref() {
-                if state.connection.is_none() {
-                    state.connection = Some(open_connection(engine.pool_snapshot().await).await?);
-                    if engine.is_read_only() {
-                        let protection = match engine.kind().dialect() {
-                            DatabaseKind::MySQL => "SET SESSION TRANSACTION READ ONLY",
-                            DatabaseKind::SQLite => "PRAGMA query_only=ON",
-                            _ => "SET default_transaction_read_only=on",
-                        };
-                        state
-                            .connection
-                            .as_mut()
-                            .unwrap()
-                            .query(
-                                &SqlStatement::new(protection, Vec::new()),
-                                QueryOptions::default(),
-                            )
-                            .await?;
+        // A server restart, proxy timeout, or sleeping laptop silently kills
+        // idle sockets. Check before reuse so a dead connection is replaced
+        // rather than failing this run.
+        if state
+            .last_used
+            .is_some_and(|used| used.elapsed() >= IDLE_HEALTH_CHECK)
+            && let Some(connection) = state.connection.as_mut()
+            && !connection.is_alive().await
+        {
+            let lost_transaction = state.in_transaction;
+            state.reset();
+            if lost_transaction {
+                return Err(DbxError::Connection(
+                    "the connection was lost while idle, and the server rolled back its open transaction; this tab reconnects on the next run".into(),
+                ));
+            }
+        }
+        // Preparing reads the backend id over the reused connection before
+        // any statement runs, so a connection lost there is retried once.
+        let mut retried = false;
+        let target = loop {
+            let reused = state.connection.is_some();
+            let lost_transaction = state.in_transaction;
+            let prepared = tokio::select! {
+                result = tokio::time::timeout(timeout, prepare_session(&self.engine, &mut state)) => match result {
+                    Ok(result) => result,
+                    Err(_) => { state.reset(); return Err(DbxError::Interrupted("Query session initialization timed out".into())); }
+                },
+                _ = cancellation.cancelled() => { state.reset(); return Err(DbxError::Interrupted("Query session initialization cancelled".into())); }
+            };
+            match prepared {
+                Ok(target) => break target,
+                Err(DbxError::Connection(_)) if reused && !retried => {
+                    state.reset();
+                    if lost_transaction {
+                        return Err(DbxError::Connection(
+                            "the connection was lost, and the server rolled back its open transaction; this tab reconnects on the next run".into(),
+                        ));
                     }
+                    retried = true;
                 }
-                cancel_target(
-                    state.connection.as_mut().unwrap(),
-                    engine.pool_snapshot().await,
-                )
-                .await?
-            } else {
-                CancelTarget::Local
-            })
-        };
-        let target = tokio::select! {
-            result = tokio::time::timeout(timeout, prepare) => match result {
-                Ok(Ok(target)) => target,
-                Ok(Err(error)) => { state.reset(); return Err(error); },
-                Err(_) => { state.reset(); return Err(DbxError::Interrupted("Query session initialization timed out".into())); }
-            },
-            _ = cancellation.cancelled() => { state.reset(); return Err(DbxError::Interrupted("Query session initialization cancelled".into())); }
+                Err(error) => {
+                    state.reset();
+                    return Err(error);
+                }
+            }
         };
         if let Some(connection) = state.connection.as_mut() {
             match connection {
@@ -189,7 +223,7 @@ impl QuerySession {
             let work = execute_script(
                 &self.engine,
                 &mut state,
-                sql,
+                statements,
                 options,
                 &cancellation,
                 deadline,
@@ -222,6 +256,7 @@ impl QuerySession {
             if result.is_err() {
                 state.reset();
             }
+            state.last_used = Some(Instant::now());
             if let Ok(script) = &mut result
                 && script
                     .statements
@@ -268,6 +303,41 @@ impl QuerySession {
             }
         )))
     }
+}
+
+/// Open or reuse the session connection and resolve how to cancel it.
+async fn prepare_session(
+    engine: &DatabaseEngine,
+    state: &mut SessionState,
+) -> Result<CancelTarget> {
+    Ok::<_, DbxError>(if let DatabaseEngine::Sql(engine) = engine {
+        if state.connection.is_none() {
+            state.connection = Some(open_connection(engine.pool_snapshot().await).await?);
+            if engine.is_read_only() {
+                let protection = match engine.kind().dialect() {
+                    DatabaseKind::MySQL => "SET SESSION TRANSACTION READ ONLY",
+                    DatabaseKind::SQLite => "PRAGMA query_only=ON",
+                    _ => "SET default_transaction_read_only=on",
+                };
+                state
+                    .connection
+                    .as_mut()
+                    .unwrap()
+                    .query(
+                        &SqlStatement::new(protection, Vec::new()),
+                        QueryOptions::default(),
+                    )
+                    .await?;
+            }
+        }
+        cancel_target(
+            state.connection.as_mut().unwrap(),
+            engine.pool_snapshot().await,
+        )
+        .await?
+    } else {
+        CancelTarget::Local
+    })
 }
 
 async fn open_connection(pool: SqlxPool) -> Result<SqlConnection> {
@@ -328,19 +398,15 @@ async fn install_progress(
 async fn execute_script(
     engine: &DatabaseEngine,
     state: &mut SessionState,
-    sql: &str,
+    statements: Vec<SqlStatement>,
     options: QueryOptions,
     cancellation: &QueryCancellation,
     deadline: Instant,
 ) -> Result<ScriptResult> {
-    let statements = if engine.kind().is_sql() {
-        crate::transfer::checked_split_sql_for(Some(engine.kind()), sql)?
-    } else {
-        vec![sql.to_owned()]
-    };
     let mut output = ScriptResult::default();
     let mut retained_bytes = 0usize;
-    for statement in statements {
+    for prepared in statements {
+        let statement = prepared.sql.clone();
         if engine.is_read_only()
             && let Err(error) = crate::protected::ensure_query(engine.kind(), &statement)
         {
@@ -432,12 +498,8 @@ async fn execute_script(
             Ok(QueryResult::empty(Some(0), 0))
         } else {
             match state.connection.as_mut() {
-                Some(connection) => {
-                    connection
-                        .query(&SqlStatement::new(&statement, Vec::new()), options)
-                        .await
-                }
-                None => engine.query(&statement, options).await,
+                Some(connection) => connection.query(&prepared, options).await,
+                None => engine.query_statement(&prepared, options).await,
             }
         };
         match outcome {
@@ -541,13 +603,26 @@ async fn execute_script(
                 }
             }
             Err(error) => {
-                if memory_savepoint {
+                let lost = matches!(error, DbxError::Connection(_));
+                let message = if lost {
+                    format!(
+                        "{error}. The connection was lost{}; this tab reconnects on the next run.",
+                        if state.in_transaction {
+                            " and its open transaction was rolled back"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    error.to_string()
+                };
+                if memory_savepoint || lost {
                     state.reset();
                 }
                 output.statements.push(StatementResult {
                     statement,
                     result: QueryResult::empty(None, started.elapsed().as_millis() as u64),
-                    error: Some(error.to_string()),
+                    error: Some(message),
                 });
                 break;
             }
@@ -595,7 +670,24 @@ fn control_name(statement: &str, operation: &str, kind: DatabaseKind) -> String 
     output.to_ascii_lowercase()
 }
 
+/// How long a query tab's connection may sit unused before it is pinged.
+const IDLE_HEALTH_CHECK: Duration = Duration::from_secs(30);
+
 impl SqlConnection {
+    /// Ping network connections; embedded SQLite handles cannot drop.
+    async fn is_alive(&mut self) -> bool {
+        let ping = async {
+            match self {
+                Self::Postgres(connection) => connection.ping().await.is_ok(),
+                Self::MySql(connection) => connection.ping().await.is_ok(),
+                _ => true,
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ping)
+            .await
+            .unwrap_or(false)
+    }
+
     async fn query(
         &mut self,
         statement: &SqlStatement,

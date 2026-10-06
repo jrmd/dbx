@@ -14,6 +14,8 @@ const KIND_GROUPS: [(&str, &[DatabaseKind]); 4] = [
             DatabaseKind::CockroachDB,
             DatabaseKind::DuckDB,
             DatabaseKind::ClickHouse,
+            DatabaseKind::SqlServer,
+            DatabaseKind::Snowflake,
         ],
     ),
     (
@@ -321,8 +323,19 @@ impl DbxApp {
             "Private key file (optional; leave blank to use SSH agent/config)",
             transport.ssh_key_editor.clone(),
         );
+        let password = input(
+            "SSH password (optional; stored in vault)",
+            transport.ssh_password_editor.clone(),
+        );
+        let jump = input(
+            "Jump hosts (optional; user@bastion:22, comma-separated)",
+            transport.ssh_jump_editor.clone(),
+        );
         div().debug_selector(|| "connection-transport-form".into()).border_t_1().border_color(theme().hairline).pt(px(12.))
             .flex().flex_col().gap(px(10.))
+            .when(matches!(self.draft.kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL), |view| view.child(div().flex().gap(px(8.))
+                .child(button("aws-rds-token", "Get AWS RDS IAM token", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| this.fetch_cloud_token(dbx_core::CloudAuthentication::AwsRdsIam, cx))))
+                .when(self.draft.kind == DatabaseKind::PostgreSQL, |view| view.child(button("azure-entra-token", "Get Azure Entra token", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| this.fetch_cloud_token(dbx_core::CloudAuthentication::AzureEntra, cx)))))))
             .child(Switch::new("connection-unix-socket").label("Use Unix socket")
                 .checked(socket_enabled).with_size(Size::Small)
                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -347,6 +360,7 @@ impl DbxApp {
                 .child(div().flex().items_end().gap(px(8.)).child(key)
                     .child(button("choose-ssh-key", "Choose key…", ButtonKind::Quiet)
                         .cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_ssh_key(cx)))))
+                .child(jump).child(password)
                 .child(div().text_size(px(11.)).text_color(theme().text_muted)
                     .child("Database host is resolved from the SSH server. Uses your SSH agent or key; load encrypted keys into the agent. Verify a new SSH host in a terminal first.")))
             .into_any_element()

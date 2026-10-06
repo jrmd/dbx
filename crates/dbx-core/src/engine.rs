@@ -64,7 +64,12 @@ pub trait Engine: Send + Sync {
         Ok(TableStructure {
             columns: self.describe_table(table).await?,
             foreign_keys: Vec::new(),
+            ..Default::default()
         })
+    }
+
+    async fn schema_objects(&self) -> Result<Vec<crate::SchemaObject>> {
+        crate::schema_objects::capture(self).await
     }
 
     /// Load a complete relational metadata snapshot for the active database.
@@ -90,6 +95,9 @@ pub trait Engine: Send + Sync {
         Ok(RelationalSchema {
             database: self.current_database().await?,
             tables,
+            objects: self.schema_objects().await?,
+            objects_captured: true,
+            details_captured: true,
         })
     }
 
@@ -219,6 +227,10 @@ impl DatabaseEngine {
 
     pub async fn table_structure(&self, table: &TableRef) -> Result<TableStructure> {
         Engine::table_structure(self, table).await
+    }
+
+    pub async fn schema_objects(&self) -> Result<Vec<crate::SchemaObject>> {
+        Engine::schema_objects(self).await
     }
 
     pub async fn relational_schema(&self) -> Result<RelationalSchema> {
@@ -382,6 +394,57 @@ impl DatabaseEngine {
             return Err(DbxError::Conflict);
         }
         Ok(result)
+    }
+
+    /// Apply several checked updates as one unit. Each must still match its
+    /// original values and affect exactly one row. Native SQL engines run them
+    /// in one transaction, so a conflict rolls every update back; other
+    /// writable engines apply them in order and stop at the first failure.
+    pub async fn update_checked_batch(
+        &self,
+        updates: &[(UpdateRequest, Vec<(String, CellValue)>)],
+    ) -> Result<u64> {
+        ensure_clickhouse_sql_writes(self.kind(), "update")?;
+        ensure_sql(self.kind(), "update")?;
+        if !matches!(self, Self::Sql(_)) {
+            for (applied, (request, originals)) in updates.iter().enumerate() {
+                self.update_checked(request, originals)
+                    .await
+                    .map_err(|error| match applied {
+                        0 => error,
+                        applied => DbxError::Query(format!(
+                            "{error}; {applied} earlier row update(s) were already applied"
+                        )),
+                    })?;
+            }
+            return Ok(updates.len() as u64);
+        }
+        let mut described: Vec<(TableRef, Vec<ColumnInfo>)> = Vec::new();
+        let mut statements = Vec::with_capacity(updates.len());
+        for (request, originals) in updates {
+            let columns = match described.iter().find(|(table, _)| *table == request.table) {
+                Some((_, columns)) => columns.clone(),
+                None => {
+                    let columns = self.describe_table(&request.table).await?;
+                    described.push((request.table.clone(), columns.clone()));
+                    columns
+                }
+            };
+            ensure_primary_key_filters(&columns, &request.filters)?;
+            let mut statement = build_update_with_columns(self.kind(), request, &columns)?;
+            crate::sql::guard_original_values(self.kind(), &mut statement, originals, &columns)?;
+            statements.push(statement);
+        }
+        let mut transaction = crate::console::SqlTransaction::begin(self, false).await?;
+        for statement in &statements {
+            let result = transaction.query(statement).await?;
+            if result.rows_affected != Some(1) {
+                // Dropping the transaction closes its connection and rolls back.
+                return Err(DbxError::Conflict);
+            }
+        }
+        transaction.commit().await?;
+        Ok(statements.len() as u64)
     }
 
     /// Delete exactly one unchanged, primary-key identified row.

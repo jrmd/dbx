@@ -4,7 +4,7 @@
 
 <h1 align="center">DBX</h1>
 <p align="center">A native database workbench. Built with Rust and GPUI.</p>
-<p align="center">PostgreSQL · MySQL · SQLite · Redis · MongoDB · CockroachDB · DuckDB · Elasticsearch · BigQuery · Kafka · Turso · Cloudflare D1 · ClickHouse</p>
+<p align="center">PostgreSQL · MySQL · SQLite · Redis · MongoDB · CockroachDB · DuckDB · Elasticsearch · BigQuery · Kafka · Turso · Cloudflare D1 · ClickHouse · SQL Server · Snowflake</p>
 
 Browse your data, follow relationships, edit rows, and run queries in a responsive desktop app. DBX uses [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for its window, input, and GPU rendering.
 
@@ -14,15 +14,17 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 
 ## Inside the workbench
 
-- **Thirteen database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
+- **Fourteen database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
 - **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
-- **Data you can work with:** virtualized grids over bounded row pages, structured filters, foreign-key navigation, and an all-field row inspector.
-- **Explicit edits:** typed insert/update drafts, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
-- **A query editor:** syntax highlighting, SQL completion, separate statement results, saved queries, encrypted draft recovery, and per-connection query history. Native SQL tabs retain their own transaction sessions.
+- **Data you can work with:** virtualized grids over bounded row pages, server-side header sorting, structured filters, foreign-key navigation, and an all-field row inspector with JSON and binary previews.
+- **Explicit edits:** typed insert/update drafts, inline cell editing with staged Save/Discard, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
+- **A query editor:** syntax highlighting, SQL completion, separate statement results, saved queries, find/replace, SQL parameter prompts, encrypted tab recovery, result-file exports, and per-connection query history. Native SQL tabs retain their own transaction sessions.
 - **Bring your own query agent:** describe queries using Claude, Cursor, Codex, OpenCode or GitHub Copilot CLI, with saved agent/model defaults and schema context. See [agent setup](docs/query-agents.md).
 - **Import and export:** streamed SQL, CSV, and TSV transfers with progress and cancellation; atomic imports and snapshot exports on supported engines. Database exports include table selection, gzip, and schema-only SQL options. See [workbench safety and limits](docs/workbench-safety.md).
 - **Database diagnostics:** execution-plan views and comparisons, PostgreSQL/MySQL session and lock queries, protected connection profiles, and reviewable schema comparison drafts.
 - **Saved connections:** named profiles, colour-coded tags managed in Settings, connection testing, and encrypted credentials in the DBX Vault.
+- **A visual table designer:** add, rename or drop columns and add or drop indexes through a reviewable SQL draft.
+- **Cloud authentication helpers:** fetch AWS RDS IAM or Azure PostgreSQL Entra tokens from an authenticated local CLI.
 - **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
 - **Native appearance:** light, dark, and system themes, with an option to reduce transparency.
 
@@ -40,7 +42,7 @@ Screenshots show the real Linux application with fictional SQLite demo data and 
 - **Git**, a native C/C++ build toolchain, and **CMake** for native dependencies.
 - **macOS:** Xcode and its command-line tools, including the Metal tooling required by GPUI. Open Xcode once to complete setup, then check `xcode-select -p`. See [GPUI/Zed's macOS build guide](https://zed.dev/docs/development/macos) for current platform requirements.
 - **Linux:** a Wayland or X11 desktop, a working Vulkan driver, `pkg-config`, and development libraries for XCB, xkbcommon, and fontconfig. Distribution package names vary; [Zed's Linux dependency guide](https://zed.dev/docs/development/linux) is a useful reference for GPUI's platform dependencies. A desktop file portal is needed for native file dialogs.
-- **Optional:** Docker Compose for the disposable PostgreSQL/MySQL/Redis/ClickHouse integration suite; Python 3 for the Linux UI fixtures.
+- **Optional:** Docker Compose for the disposable database integration suite; Python 3 for the Linux UI fixtures.
 
 ```bash
 git clone https://github.com/jrmd/dbx.git
@@ -109,8 +111,8 @@ is ignored in socket mode. SQLite continues to use a local database file.
 
 Enable **Connect through SSH tunnel** and enter the SSH host, port, and username.
 Leave the key field blank to use your existing OpenSSH agent/config, or choose
-a private key file. Load encrypted keys into your agent first. DBX uses key/agent
-authentication; SSH password prompts are not supported. Connect to a new SSH
+a private key file. Optional jump hosts accept comma-separated `[user@]host[:port]` hops. Load encrypted keys into your agent first. DBX uses key/agent
+authentication, or the masked SSH password field. Passwords are encrypted with the database credential. Forwarding reconnects after its SSH process exits; database writes are never replayed. Connect to a new SSH
 host from a terminal first to verify and save its host key. DBX refuses unknown
 or changed host keys and binds forwarding only on loopback. This follows
 [OpenSSH's forwarding and authentication behavior](https://man.openbsd.org/ssh).
@@ -232,7 +234,7 @@ python3 scripts/test-transports.py
 ./scripts/run-ui-test.sh
 ```
 
-The integration script starts PostgreSQL 16, MySQL 8.4, Redis 7, and ClickHouse 26.8 on loopback-only ports, uses temporary SQLite storage, runs connector tests serially, and tears down its containers. `DBX_TEST_POSTGRES_URL`, `DBX_TEST_MYSQL_URL`, `DBX_TEST_REDIS_URL`, and `DBX_TEST_SQLITE_URL` override its defaults; point them only at disposable databases because the tests perform writes. ClickHouse uses the fixed disposable endpoint on port 58123.
+The integration script starts PostgreSQL 16, MySQL 8.4, Redis 7, ClickHouse 26.8, MongoDB 8, CockroachDB 25.1, Elasticsearch 8.17, Kafka 3.9, and SQL Server 2022 on loopback-only ports, uses temporary SQLite storage, runs the integration, workbench-safety, and connector tests serially, and tears down its containers. The live-database workflow is configured to run the same suite on pull requests and nightly. `DBX_TEST_POSTGRES_URL`, `DBX_TEST_MYSQL_URL`, `DBX_TEST_REDIS_URL`, and `DBX_TEST_SQLITE_URL` override its defaults; point them only at disposable databases because the tests perform writes. Defaults use the loopback ports in `docker-compose.test.yml`. Set `DBX_TEST_<ENGINE>_PORT` and `DBX_TEST_COMPOSE_PROJECT` to run alongside another test stack; the script derives its disposable URLs from those ports. Connector URL overrides are also available for all server tests.
 
 The native UI launcher keeps its test vault, profiles, and database under `target/ui-test/`, separate from normal user configuration. See [desktop QA](docs/desktop-qa.md) for fixture credentials and platform checks, and [architecture](docs/architecture.md) for the core/UI boundaries.
 

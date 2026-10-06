@@ -1179,6 +1179,7 @@ mod tests {
             structure: TableStructure {
                 columns,
                 foreign_keys,
+                ..Default::default()
             },
         }
     }
@@ -1190,6 +1191,7 @@ mod tests {
             nullable: !primary_key,
             ordinal,
             primary_key,
+            default_value: None,
         }
     }
     fn foreign(columns: &[&str], target: &str, target_columns: &[&str]) -> ForeignKeyInfo {
@@ -1280,10 +1282,12 @@ mod tests {
         let forward = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables: vec![users.clone(), posts.clone()],
+            ..Default::default()
         });
         let reverse = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables: vec![posts, users],
+            ..Default::default()
         });
         assert_eq!(forward.svg(palette(), None), reverse.svg(palette(), None));
         for (index, left) in forward.nodes.iter().enumerate() {
@@ -1306,6 +1310,7 @@ mod tests {
                 table_in_schema("public", "users", vec![column("id", 0, true)], vec![]),
                 table_in_schema("audit", "events", vec![column("id", 0, true)], vec![]),
             ],
+            ..Default::default()
         };
 
         let full = DiagramDocument::from_schema(&schema);
@@ -1322,6 +1327,7 @@ mod tests {
                 table_in_schema("public", "users", vec![column("id", 0, true)], vec![]),
                 table_in_schema("audit", "events", vec![column("id", 0, true)], vec![]),
             ],
+            ..Default::default()
         };
         let selected = BTreeSet::from(["public".to_owned()]);
 
@@ -1345,6 +1351,7 @@ mod tests {
                     vec![foreign_in_schema("auth", &["author_id"], "users", &["id"])],
                 ),
             ],
+            ..Default::default()
         };
         let original = schema.clone();
         let selected = BTreeSet::from(["auth".to_owned(), "public".to_owned()]);
@@ -1371,6 +1378,7 @@ mod tests {
                     vec![foreign_in_schema("auth", &["author_id"], "users", &["id"])],
                 ),
             ],
+            ..Default::default()
         };
 
         for selected_schema in ["auth", "public"] {
@@ -1386,6 +1394,7 @@ mod tests {
         let schema = RelationalSchema {
             database: "db".into(),
             tables: vec![table("users", vec![column("id", 0, true)], vec![])],
+            ..Default::default()
         };
         let selected = BTreeSet::new();
 
@@ -1412,6 +1421,7 @@ mod tests {
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables,
+            ..Default::default()
         });
         let x_positions = document
             .nodes
@@ -1442,6 +1452,7 @@ mod tests {
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables: vec![child, parent],
+            ..Default::default()
         });
         let svg = document.svg(palette(), None);
         assert!(svg.contains("parent&lt;&amp;"));
@@ -1465,6 +1476,7 @@ mod tests {
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables: vec![parent, child],
+            ..Default::default()
         });
         let parent = document
             .nodes
@@ -1513,6 +1525,7 @@ mod tests {
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables: vec![parent, child],
+            ..Default::default()
         });
 
         for node in &document.nodes {
@@ -1627,6 +1640,7 @@ mod tests {
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables,
+            ..Default::default()
         });
         let corridors = document
             .edges
@@ -1653,6 +1667,7 @@ mod tests {
                     vec![foreign(&["parent_id"], "parent", &["id"])],
                 ),
             ],
+            ..Default::default()
         });
         let before = document.edges[0].points.clone();
         assert!(document.move_node("public.parent", 900.0, 700.0));
@@ -1682,6 +1697,7 @@ mod tests {
         let document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
             tables: vec![table("users", vec![column("id", 0, true)], vec![])],
+            ..Default::default()
         });
         let renderer = SvgRenderer::new(Arc::new(()));
         let png = document.png(&renderer, palette(), None, 1.0).unwrap();

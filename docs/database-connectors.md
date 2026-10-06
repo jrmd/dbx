@@ -1,7 +1,7 @@
 # Database connectors
 
 DBX provides native connections for PostgreSQL, MySQL, SQLite, Redis, MongoDB,
-CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1 and ClickHouse.
+CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1, ClickHouse, SQL Server and Snowflake.
 
 | Provider | Connection | Query editor and explorer |
 | --- | --- | --- |
@@ -14,6 +14,9 @@ CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1 and Cl
 | Turso | `libsql://database-organization.turso.io`, `turso://...` or HTTPS, with a database token in the masked field | SQL over HTTP, tables, views, SQLite structure and bound row mutations |
 | Cloudflare D1 | `d1://account-id/database-id`, with a Cloudflare API token in the masked field | REST SQL, tables, views, SQLite structure and bound row mutations |
 | ClickHouse | `clickhouse://default@localhost:8123/default` for HTTP; select ClickHouse and use `https://user:password@host:8443/default` for TLS/Cloud | SQL, database switching, tables/views, typed structure, bound filters, sorting and paged results; read-only row grid |
+| SQL Server | `sqlserver://user:password@host:1433/database` or `mssql://...` | SQL, database switching, tables/views, defaults, indexes, checks, bound filters and primary-key-checked row edits |
+
+| Snowflake | `snowflake://user:TOKEN@account.snowflakecomputing.com/database?warehouse=WH&schema=PUBLIC&auth=pat` | SQL API, bound parameters, polling and partitions, databases, tables, views and CREATE definitions; read-only row grid |
 
 API tokens can also be supplied as URL passwords by API callers. DBX stores
 passwords and tokens in its encrypted vault, removes them from profile JSON,
@@ -68,6 +71,17 @@ Supported certificate-file options are `ssl.ca.location`,
 `ssl.certificate.location` and `ssl.key.location`.
 
 ## Scope and verification
+
+SQL Server verifies TLS certificates by default. For a local self-signed test
+server, use `?trust_server_certificate=true`; `?encrypt=false` disables TLS
+for development. URL SQL authentication is supported; Entra and integrated
+authentication helpers are not provided. The connector has one shared connection,
+so SQL Server query tabs do not have independent transaction sessions. Staged
+row batches apply sequentially and can partially succeed. Atomic file imports
+and full-fidelity schema dumps are not supported. Disposable SQL Server 2022
+coverage exercises typed values, metadata, sorting, filtering, row conflicts,
+protected profiles, and database switching. Remote TLS/account verification
+remains outstanding.
 
 ClickHouse uses the [HTTP SQL interface](https://clickhouse.com/docs/interfaces/http),
 not native TCP ports 9000/9440. Choose ClickHouse before entering a generic HTTPS
@@ -129,3 +143,23 @@ HTTP implementations follow the provider references:
 [Turso SQL over HTTP](https://docs.turso.tech/sdk/http/reference),
 [Cloudflare D1 query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/),
 and [BigQuery jobs.query](https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query).
+
+## Snowflake and cloud verification
+
+Snowflake accepts PAT (`auth=pat`, default), OAuth (`auth=oauth`) or key-pair JWT
+(`auth=jwt`) in the masked token field. Optional URL fields are `warehouse`,
+`schema` and `role`. Queries use the [Snowflake SQL API](https://docs.snowflake.com/en/developer-guide/sql-api/reference).
+Connections validate with SELECT 1. Statements use separate typed bindings;
+async jobs are polled and result partitions are fetched with row and 64 MiB
+bounds. Cancel requests are sent after a statement handle is known. An interrupted
+submission whose handle was never received has an unknown outcome and is never
+replayed. Interactive transaction sessions and staged row mutations are disabled.
+Tokens are supplied by the user; DBX does not mint a Snowflake JWT.
+
+Live D1 and Turso contracts passed on October 6, 2026. Local HTTPS ClickHouse
+coverage verifies certificates and authentication; Snowflake protocol coverage
+verifies authentication headers, bound values, polling and partitions. These
+fixtures do not prove ClickHouse Cloud or Snowflake account access. Paid
+ClickHouse Cloud, BigQuery, Snowflake, AWS RDS and Azure accounts were not
+provisioned for this audit. AWS/Azure helper command construction is tested;
+actual token issuance requires those providers’ existing accounts and CLI logins.

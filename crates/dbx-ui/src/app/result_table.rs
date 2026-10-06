@@ -1,6 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
-use dbx_core::{CellValue, ColumnInfo, ForeignKeyInfo, QueryResult, TableInfo};
+use dbx_core::{
+    CellValue, ColumnInfo, ForeignKeyInfo, Order, OrderDirection, QueryResult, TableInfo,
+};
 use gpui::{
     App, Context, Div, FontWeight, IntoElement, Pixels, SharedString, Stateful, Window, div,
     prelude::*, px,
@@ -8,11 +10,12 @@ use gpui::{
 use gpui_component::{
     Sizable as _,
     button::{Button, ButtonVariants as _},
-    table::{Column as DataColumn, TableDelegate, TableEvent, TableState},
+    table::{Column as DataColumn, ColumnSort, TableDelegate, TableState},
 };
 
 use super::{DbxApp, SecondaryTabId, SessionId};
-use gpui::{ClipboardItem, WeakEntity};
+use crate::editor::TextEditor;
+use gpui::{ClipboardItem, Entity, WeakEntity};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use crate::diagram::display_type;
@@ -57,6 +60,40 @@ fn cell_display_text(value: &CellValue) -> String {
     }
 }
 
+/// Order cells for a local header sort: NULLs first, numbers numerically,
+/// then everything else by its display text.
+fn compare_cells(left: Option<&CellValue>, right: Option<&CellValue>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn number(value: &CellValue) -> Option<f64> {
+        match value {
+            CellValue::Integer(value) => Some(*value as f64),
+            CellValue::Unsigned(value) => Some(*value as f64),
+            CellValue::Real(value) => Some(*value),
+            CellValue::Text(text) => text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite()),
+            _ => None,
+        }
+    }
+    let left = left.unwrap_or(&CellValue::Null);
+    let right = right.unwrap_or(&CellValue::Null);
+    match (left, right) {
+        (CellValue::Null, CellValue::Null) => Ordering::Equal,
+        (CellValue::Null, _) => Ordering::Less,
+        (_, CellValue::Null) => Ordering::Greater,
+        (CellValue::Integer(left), CellValue::Integer(right)) => left.cmp(right),
+        (CellValue::Unsigned(left), CellValue::Unsigned(right)) => left.cmp(right),
+        (CellValue::Boolean(left), CellValue::Boolean(right)) => left.cmp(right),
+        (CellValue::Bytes(left), CellValue::Bytes(right)) => left.cmp(right),
+        _ => match (number(left), number(right)) {
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            _ => plain_cell_text(left).cmp(&plain_cell_text(right)),
+        },
+    }
+}
+
 /// Shared, virtualized backing model for both table browsing and ad-hoc query results.
 ///
 /// `QueryResult` stays owned by the session/tab through an `Arc`, while DataTable only
@@ -71,6 +108,28 @@ pub(super) struct ResultTableDelegate {
     cell_text: Vec<Option<SharedString>>,
     foreign_keys: Vec<ForeignKeyInfo>,
     row_actions: Option<(WeakEntity<DbxApp>, SessionId, SecondaryTabId, bool)>,
+    sorting: ResultSorting,
+    /// Unsorted rows behind a locally sorted result, restored when the sort
+    /// returns to its default state.
+    unsorted: Option<Arc<QueryResult>>,
+    /// The active header sort as (data column, direction).
+    sort: Option<(usize, OrderDirection)>,
+    /// The order a server-sorted data tab requested for its next result.
+    server_order: Option<Order>,
+    /// Inline values staged in a data tab, keyed by (row, data column).
+    pending: HashMap<(usize, usize), CellValue>,
+    /// The cell currently being edited inline, as (row, data column, editor).
+    editing: Option<(usize, usize, Entity<TextEditor>)>,
+}
+
+/// How a header click orders rows.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ResultSorting {
+    Disabled,
+    /// Reorder the rows already held by the grid.
+    Local,
+    /// Ask the owning data tab to reload with `ORDER BY`.
+    Server,
 }
 
 impl Default for ResultTableDelegate {
@@ -82,6 +141,12 @@ impl Default for ResultTableDelegate {
             cell_text: Vec::new(),
             foreign_keys: Vec::new(),
             row_actions: None,
+            sorting: ResultSorting::Disabled,
+            unsorted: None,
+            sort: None,
+            server_order: None,
+            pending: HashMap::new(),
+            editing: None,
         }
     }
 }
@@ -95,8 +160,72 @@ impl ResultTableDelegate {
     ) -> Self {
         Self {
             row_actions: Some((app, session, tab, is_data)),
+            sorting: if is_data {
+                ResultSorting::Disabled
+            } else {
+                ResultSorting::Local
+            },
             ..Self::default()
         }
+    }
+
+    /// Enable or disable server-side header sorting for a data tab and record
+    /// the order the next result was loaded with.
+    pub(super) fn set_server_sort(&mut self, enabled: bool, order: Option<&Order>) {
+        self.sorting = if enabled {
+            ResultSorting::Server
+        } else {
+            ResultSorting::Disabled
+        };
+        self.server_order = order.cloned();
+    }
+
+    pub(super) fn set_cell_edits(
+        &mut self,
+        pending: HashMap<(usize, usize), CellValue>,
+        editing: Option<(usize, usize, Entity<TextEditor>)>,
+    ) {
+        self.pending = pending;
+        self.editing = editing;
+    }
+
+    fn column_sort(&self, index: usize) -> Option<ColumnSort> {
+        if self.sorting == ResultSorting::Disabled {
+            return None;
+        }
+        Some(match self.sort {
+            Some((sorted, OrderDirection::Ascending)) if sorted == index => ColumnSort::Ascending,
+            Some((sorted, OrderDirection::Descending)) if sorted == index => ColumnSort::Descending,
+            _ => ColumnSort::Default,
+        })
+    }
+
+    fn sort_locally(&mut self, index: usize, direction: Option<OrderDirection>) {
+        let Some(source) = self.unsorted.clone().or_else(|| self.result.clone()) else {
+            return;
+        };
+        let Some(direction) = direction else {
+            self.sort = None;
+            self.unsorted = None;
+            self.replace_rows(source);
+            return;
+        };
+        let mut sorted = (*source).clone();
+        sorted.rows.sort_by(|left, right| {
+            let ordering = compare_cells(left.values.get(index), right.values.get(index));
+            match direction {
+                OrderDirection::Ascending => ordering,
+                OrderDirection::Descending => ordering.reverse(),
+            }
+        });
+        self.sort = Some((index, direction));
+        self.unsorted = Some(source);
+        self.replace_rows(Arc::new(sorted));
+    }
+
+    fn replace_rows(&mut self, result: Arc<QueryResult>) {
+        self.cell_text = vec![None; result.rows.len() * result.columns.len()];
+        self.result = Some(result);
     }
 
     pub(super) fn row_as_json(&self, row_ix: usize) -> Option<String> {
@@ -196,6 +325,50 @@ impl ResultTableDelegate {
     }
 
     /// Render the complete result as a headered TSV document.
+    pub(super) fn matching_cells(&self, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+        let Some(result) = &self.result else {
+            return Vec::new();
+        };
+        result
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row_index, row)| {
+                row.values
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(column_index, value)| {
+                        (!super::find::find_matches(&value.to_string(), needle, case_sensitive)
+                            .is_empty())
+                        .then_some((row_index, column_index + 1))
+                    })
+            })
+            .collect()
+    }
+
+    pub(super) fn result_as_insert(
+        &self,
+        kind: dbx_core::DatabaseKind,
+        target: &dbx_core::TableRef,
+    ) -> Option<String> {
+        let result = self.result.as_ref()?;
+        let columns = result
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        result
+            .rows
+            .iter()
+            .map(|row| {
+                dbx_core::render_sql_insert(kind, target, &columns, &row.values)
+                    .map(|sql| format!("{sql};"))
+            })
+            .collect::<dbx_core::Result<Vec<_>>>()
+            .ok()
+            .map(|sql| sql.join("\n"))
+    }
+
     pub(super) fn result_as_tsv(&self) -> Option<String> {
         self.result
             .as_deref()
@@ -260,6 +433,18 @@ impl ResultTableDelegate {
         tables: &[TableInfo],
     ) {
         let mut columns = vec![Self::row_number_column()];
+        self.unsorted = None;
+        self.sort = match self.sorting {
+            ResultSorting::Server => self.server_order.as_ref().and_then(|order| {
+                let index = result
+                    .as_deref()?
+                    .columns
+                    .iter()
+                    .position(|column| column.name == order.column)?;
+                Some((index, order.direction))
+            }),
+            _ => None,
+        };
 
         if let Some(result) = result.as_deref() {
             columns.extend(result.columns.iter().enumerate().map(|(index, column)| {
@@ -269,13 +454,16 @@ impl ResultTableDelegate {
                     .copied()
                     .unwrap_or_else(|| Self::auto_width(result, index, column));
 
-                DataColumn::new(key, format!("{}  {}", column.name, column.data_type))
-                    .width(width)
-                    .resizable(true)
-                    .movable(false)
-                    .min_width(80.)
-                    .max_width(600.)
-                    .p_0()
+                let mut data_column =
+                    DataColumn::new(key, format!("{}  {}", column.name, column.data_type))
+                        .width(width)
+                        .resizable(true)
+                        .movable(false)
+                        .min_width(80.)
+                        .max_width(600.)
+                        .p_0();
+                data_column.sort = self.column_sort(index);
+                data_column
             }));
         }
 
@@ -617,6 +805,59 @@ impl TableDelegate for ResultTableDelegate {
             })
     }
 
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let Some(index) = col_ix.checked_sub(1) else {
+            return;
+        };
+        let direction = match sort {
+            ColumnSort::Ascending => Some(OrderDirection::Ascending),
+            ColumnSort::Descending => Some(OrderDirection::Descending),
+            ColumnSort::Default => None,
+        };
+        match self.sorting {
+            ResultSorting::Disabled => {}
+            ResultSorting::Local => {
+                self.sort_locally(index, direction);
+                for (column_ix, column) in self.columns.iter_mut().enumerate().skip(1) {
+                    column.sort = Some(if column_ix == col_ix {
+                        sort
+                    } else {
+                        ColumnSort::Default
+                    });
+                }
+                cx.notify();
+            }
+            ResultSorting::Server => {
+                let Some((app, session_id, tab_id, _)) = self.row_actions.clone() else {
+                    return;
+                };
+                let Some(column) = self
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.columns.get(index))
+                else {
+                    return;
+                };
+                let order = direction.map(|direction| Order {
+                    column: column.name.clone(),
+                    direction,
+                });
+                // The app reloads through this grid, which is still borrowed here.
+                cx.defer(move |cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.set_table_sort_for(session_id, tab_id, order, cx);
+                    });
+                });
+            }
+        }
+    }
+
     fn context_menu(
         &mut self,
         row_ix: usize,
@@ -680,9 +921,9 @@ impl TableDelegate for ResultTableDelegate {
         let can_edit = app.upgrade().is_some_and(|app| {
             let owner = app.read(cx);
             owner.editable_table_for(session_id, tab_id).is_some()
-                && owner
-                    .data_tab(session_id, tab_id)
-                    .is_some_and(|data| !data.busy && data.row_draft.is_none())
+                && owner.data_tab(session_id, tab_id).is_some_and(|data| {
+                    !data.busy && data.row_draft.is_none() && !data.has_pending_edits()
+                })
         });
         for (label, action, enabled) in [
             ("Inspect row", RowAction::Inspect, true),
@@ -732,6 +973,51 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        if let Some((_, _, editor)) = self
+            .editing
+            .as_ref()
+            .filter(|(row, column, _)| *row == row_ix && Some(*column) == col_ix.checked_sub(1))
+        {
+            let focus = editor.read(cx).focus_handle();
+            return div()
+                .size_full()
+                .p(px(2.))
+                .child(
+                    crate::editor::input_with_key_context(
+                        editor.clone(),
+                        focus,
+                        false,
+                        super::cell_edits::CELL_EDITOR_CONTEXT,
+                    )
+                    .h_full()
+                    .py(px(0.))
+                    .px(px(6.))
+                    .text_size(px(11.)),
+                )
+                .into_any_element();
+        }
+        let staged = col_ix
+            .checked_sub(1)
+            .and_then(|column| self.pending.get(&(row_ix, column)))
+            .cloned();
+        if let Some(value) = staged {
+            let null = value == CellValue::Null;
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .px(px(8.))
+                .bg(theme().warning.alpha(0.16))
+                .text_size(px(11.))
+                .text_color(if null {
+                    theme().text_muted
+                } else {
+                    theme().text
+                })
+                .when(null, |cell| cell.italic())
+                .child(div().min_w_0().truncate().child(cell_display_text(&value)))
+                .into_any_element();
+        }
         let mut null = false;
         let (text, text_color): (SharedString, _) = if col_ix == 0 {
             ((row_ix + 1).to_string().into(), theme().text_muted)
@@ -806,9 +1092,21 @@ impl TableDelegate for ResultTableDelegate {
                     .tooltip("Open referenced row")
                     .text_color(theme().accent)
                     .child(icon(Icon::ArrowRight, theme().accent))
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .on_click(cx.listener(move |table, _, window, cx| {
                         cx.stop_propagation();
-                        cx.emit(TableEvent::DoubleClickedCell(row_ix, col_ix));
+                        let Some((app, session_id, tab_id, true)) =
+                            table.delegate().row_actions.clone()
+                        else {
+                            return;
+                        };
+                        // The app reloads through this grid, which is still borrowed here.
+                        window.defer(cx, move |window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.navigate_to_foreign_key_row_for(
+                                    session_id, tab_id, row_ix, col_ix, window, cx,
+                                );
+                            });
+                        });
                     })),
                 );
         } else {
@@ -821,7 +1119,7 @@ impl TableDelegate for ResultTableDelegate {
                     .child(text),
             );
         }
-        cell
+        cell.into_any_element()
     }
 
     fn render_empty(
@@ -896,6 +1194,67 @@ mod tests {
             truncated: false,
             elapsed_ms: 0,
         }
+    }
+
+    #[test]
+    fn local_sort_orders_numbers_and_nulls_then_restores_original_rows() {
+        let mut delegate = ResultTableDelegate {
+            sorting: ResultSorting::Local,
+            ..ResultTableDelegate::default()
+        };
+        let result = QueryResult {
+            columns: vec![ColumnInfo::result("n", 0, "TEXT")],
+            rows: ["10", "9", "", "b"]
+                .into_iter()
+                .map(|value| {
+                    RowData::new(vec![if value.is_empty() {
+                        CellValue::Null
+                    } else {
+                        CellValue::Text(value.into())
+                    }])
+                })
+                .chain([RowData::new(vec![CellValue::Integer(2)])])
+                .collect(),
+            rows_affected: None,
+            truncated: false,
+            elapsed_ms: 0,
+        };
+        delegate.set_result(Some(Arc::new(result)), &HashMap::new(), &[], &[]);
+        let column = |delegate: &ResultTableDelegate| {
+            delegate
+                .column_values(0)
+                .unwrap()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let original = column(&delegate);
+
+        delegate.sort_locally(0, Some(OrderDirection::Ascending));
+        assert_eq!(column(&delegate), ["NULL", "2", "9", "10", "b"]);
+        delegate.sort_locally(0, Some(OrderDirection::Descending));
+        assert_eq!(column(&delegate), ["b", "10", "9", "2", "NULL"]);
+        delegate.sort_locally(0, None);
+        assert_eq!(column(&delegate), original);
+        assert_eq!(delegate.column_sort(0), Some(ColumnSort::Default));
+    }
+
+    #[test]
+    fn server_sort_marks_the_requested_column() {
+        let mut delegate = delegate_with_export_result();
+        delegate.set_server_sort(
+            true,
+            Some(&Order {
+                column: "id".into(),
+                direction: OrderDirection::Descending,
+            }),
+        );
+        delegate.set_result(Some(Arc::new(export_result())), &HashMap::new(), &[], &[]);
+        assert_eq!(delegate.column_sort(0), Some(ColumnSort::Descending));
+        assert_eq!(delegate.column_sort(1), Some(ColumnSort::Default));
+        delegate.set_server_sort(false, None);
+        delegate.set_result(Some(Arc::new(export_result())), &HashMap::new(), &[], &[]);
+        assert_eq!(delegate.column_sort(0), None);
     }
 
     fn delegate_with_export_result() -> ResultTableDelegate {

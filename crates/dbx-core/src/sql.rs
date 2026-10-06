@@ -47,6 +47,23 @@ pub fn quote_identifier(kind: DatabaseKind, identifier: &str) -> Result<String> 
             identifier.replace('\\', "\\\\").replace('`', "\\`")
         ));
     }
+    if kind == DatabaseKind::SqlServer {
+        let mut output = String::new();
+        for (index, part) in identifier.split('.').enumerate() {
+            if part.is_empty() || part.contains('\0') {
+                return Err(DbxError::Parse(format!(
+                    "invalid identifier `{identifier}`"
+                )));
+            }
+            if index > 0 {
+                output.push('.');
+            }
+            output.push('[');
+            output.push_str(&part.replace(']', "]]"));
+            output.push(']');
+        }
+        return Ok(output);
+    }
     let quote = if kind == DatabaseKind::MySQL {
         '`'
     } else {
@@ -156,7 +173,8 @@ pub fn build_insert_with_columns(
             DatabaseKind::PostgreSQL
             | DatabaseKind::SQLite
             | DatabaseKind::DuckDB
-            | DatabaseKind::BigQuery => {
+            | DatabaseKind::BigQuery
+            | DatabaseKind::SqlServer => {
                 format!("INSERT INTO {table} DEFAULT VALUES")
             }
             _ => {
@@ -501,7 +519,8 @@ pub fn build_truncate_table(kind: DatabaseKind, table: &TableRef) -> Result<SqlS
         | DatabaseKind::MySQL
         | DatabaseKind::DuckDB
         | DatabaseKind::ClickHouse
-        | DatabaseKind::BigQuery => {
+        | DatabaseKind::BigQuery
+        | DatabaseKind::SqlServer => {
             format!("TRUNCATE TABLE {}", quote_table(kind, table)?)
         }
         // SQLite has no TRUNCATE statement. DELETE keeps the schema and
@@ -535,8 +554,16 @@ pub fn build_create_table(
     if request.columns.is_empty() {
         return Err(DbxError::Parse("table requires at least one column".into()));
     }
-    let mut statement = String::from("CREATE TABLE ");
-    if request.if_not_exists {
+    let mut statement = String::new();
+    if request.if_not_exists && kind == DatabaseKind::SqlServer {
+        // SQL Server has no CREATE TABLE IF NOT EXISTS.
+        statement.push_str(&format!(
+            "IF OBJECT_ID(N'{}', N'U') IS NULL ",
+            quote_table(kind, &request.table)?.replace('\'', "''")
+        ));
+    }
+    statement.push_str("CREATE TABLE ");
+    if request.if_not_exists && kind != DatabaseKind::SqlServer {
         statement.push_str("IF NOT EXISTS ");
     }
     statement.push_str(&quote_table(kind, &request.table)?);
@@ -800,10 +827,16 @@ fn push_like_predicate(
             .replace('_', "\\_")
     } else {
         statement.push_str(" ESCAPE '!'");
-        value
+        // SQL Server also treats `[` as the start of a character class.
+        let value = value
             .replace('!', "!!")
             .replace('%', "!%")
-            .replace('_', "!_")
+            .replace('_', "!_");
+        if kind == DatabaseKind::SqlServer {
+            value.replace('[', "![")
+        } else {
+            value
+        }
     };
     params.push(CellValue::Text(format!("{prefix}{escaped}{suffix}")));
     Ok(())
@@ -846,6 +879,21 @@ fn append_page(
             "page values exceed the SQL integer range".into(),
         ));
     }
+    if kind == DatabaseKind::SqlServer {
+        // OFFSET/FETCH requires an ORDER BY; keep the server's natural order
+        // when the caller did not choose one.
+        if !statement.contains(" ORDER BY ") {
+            statement.push_str(" ORDER BY (SELECT NULL)");
+        }
+        statement.push_str(" OFFSET ");
+        statement.push_str(&placeholder(kind, params.len() + 1));
+        params.push(CellValue::Unsigned(page.offset));
+        statement.push_str(" ROWS FETCH NEXT ");
+        statement.push_str(&placeholder(kind, params.len() + 1));
+        params.push(CellValue::Unsigned(u64::from(page.limit)));
+        statement.push_str(" ROWS ONLY");
+        return Ok(());
+    }
     statement.push_str(" LIMIT ");
     statement.push_str(&placeholder(kind, params.len() + 1));
     params.push(CellValue::Unsigned(u64::from(page.limit)));
@@ -858,6 +906,8 @@ fn append_page(
 fn placeholder(kind: DatabaseKind, position: usize) -> String {
     if kind.dialect() == DatabaseKind::PostgreSQL {
         format!("${position}")
+    } else if kind == DatabaseKind::SqlServer {
+        format!("@P{position}")
     } else {
         "?".to_owned()
     }

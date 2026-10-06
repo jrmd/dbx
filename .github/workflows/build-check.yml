@@ -11,6 +11,15 @@ on:
       - 'packaging/**'
       - '.github/actions/prepare-rust-build/**'
       - '.github/workflows/**'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - 'scripts/**'
+      - 'packaging/**'
+      - '.github/actions/prepare-rust-build/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:

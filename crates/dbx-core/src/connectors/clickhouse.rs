@@ -292,7 +292,7 @@ impl Engine for ClickHouseEngine {
             .clone()
             .unwrap_or(self.current_database().await?);
         let result = self.query_statement(&SqlStatement::new(
-            "SELECT name, type, position FROM system.columns WHERE database = ? AND table = ? ORDER BY position",
+            "SELECT name, type, position, default_expression FROM system.columns WHERE database = ? AND table = ? ORDER BY position",
             vec![CellValue::Text(database), CellValue::Text(table.name.clone())]), QueryOptions { max_rows: None }).await?;
         Ok(result
             .rows
@@ -302,9 +302,31 @@ impl Engine for ClickHouseEngine {
                 let data_type = super::text(r, 1);
                 let mut column = ColumnInfo::result(super::text(r, 0), i, &data_type);
                 column.nullable = data_type.contains("Nullable(");
+                column.default_value = (!super::text(r, 3).is_empty()).then(|| super::text(r, 3));
                 column
             })
             .collect())
+    }
+    async fn table_structure(&self, table: &TableRef) -> Result<crate::TableStructure> {
+        let columns = self.describe_table(table).await?;
+        let definition = self
+            .query(
+                &format!(
+                    "SHOW CREATE TABLE {}",
+                    crate::sql::quote_table(self.kind(), table)?
+                ),
+                QueryOptions::default(),
+            )
+            .await?
+            .rows
+            .first()
+            .and_then(|row| row.values.first())
+            .map(ToString::to_string);
+        Ok(crate::TableStructure {
+            columns,
+            definition,
+            ..Default::default()
+        })
     }
     async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
         self.query_statement(&SqlStatement::new(sql, vec![]), options)
@@ -569,5 +591,81 @@ mod tests {
                 .validate()
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn https_protocol_validates_certificate_and_sends_credentials_in_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::{
+            ServerConfig,
+            pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+        };
+        let cert = include_bytes!("../../tests/fixtures/tls/server.der").to_vec();
+        let key = include_bytes!("../../tests/fixtures/tls/server-key.der").to_vec();
+        let server = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = acceptor.accept(socket).await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            let (header_end, length) = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length: ")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            let header = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+            assert!(header.contains("authorization: basic zml4dhvyzs11c2vyomzpehr1cmutc2vjcmv0"));
+            assert!(!header.lines().next().unwrap().contains("fixture-secret"));
+            let sql = String::from_utf8_lossy(&bytes[header_end..]);
+            assert!(sql.contains("SELECT 42"));
+            let reply = r#"{"meta":[{"name":"n","type":"UInt64"}],"data":[["42"]],"rows":1}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let engine = ClickHouseEngine {
+            client: Client::builder()
+                .add_root_certificate(
+                    reqwest::Certificate::from_der(include_bytes!(
+                        "../../tests/fixtures/tls/ca.der"
+                    ))
+                    .unwrap(),
+                )
+                .build()
+                .unwrap(),
+            endpoint: Url::parse(&format!("https://localhost:{port}/")).unwrap(),
+            username: "fixture-user".into(),
+            password: "fixture-secret".into(),
+            database: RwLock::new("fixture".into()),
+        };
+        let result = engine
+            .query("SELECT 42", QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0].values[0], CellValue::Unsigned(42));
+        task.await.unwrap();
     }
 }

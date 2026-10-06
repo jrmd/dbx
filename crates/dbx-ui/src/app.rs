@@ -8,12 +8,22 @@
 //! the private `app/` module tree documented in `docs/architecture.md`.
 
 mod agents;
+mod cell_edits;
+mod designer;
+mod query_actions;
+mod schema_objects;
+mod session;
+mod tabs;
+use session::*;
 mod connection;
 mod diagnostics;
+mod find;
+mod query_parameters;
 mod redis_completion;
 mod result_table;
 mod sql_completion;
 mod transfer;
+mod value_view;
 mod view;
 mod workspace;
 
@@ -26,7 +36,7 @@ use std::{
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
-    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Page,
+    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Order, Page,
     QueryCancellation, QueryOptions, QueryResult, QuerySession, RedisCommandCatalog,
     ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo, TableRef,
     UpdateRequest, detect_file_format, export_database, export_table, import_database, import_file,
@@ -118,6 +128,18 @@ gpui::actions!(
         CheckForUpdates,
         SubmitVault,
         ApplyFilters,
+        CommitCellEdit,
+        CommitCellEditNext,
+        CommitCellEditPrevious,
+        CancelCellEdit,
+        SetCellNull,
+        SubmitQueryParameters,
+        CancelQueryParameters,
+        OpenFind,
+        OpenReplace,
+        FindNext,
+        FindPrevious,
+        CloseFind,
         ToggleQueryAgent,
         SubmitQueryAgent,
         DismissQueryAgent
@@ -150,6 +172,7 @@ pub(super) enum QueryResultExportFormat {
     Tsv,
     Csv,
     Json,
+    Insert,
 }
 
 /// The diagram renderer owns the actual SVG/PNG encoding; app state owns the
@@ -175,6 +198,7 @@ impl QueryResultExportFormat {
             Self::Tsv => "tsv",
             Self::Csv => "csv",
             Self::Json => "json",
+            Self::Insert => "sql",
         }
     }
 }
@@ -267,6 +291,10 @@ struct ConnectionTransportDraft {
     ssh_user_editor: Entity<TextEditor>,
     ssh_key: Entity<String>,
     ssh_key_editor: Entity<TextEditor>,
+    ssh_jump: Entity<String>,
+    ssh_jump_editor: Entity<TextEditor>,
+    ssh_password: Entity<String>,
+    ssh_password_editor: Entity<TextEditor>,
 }
 
 impl ConnectionTransportDraft {
@@ -281,6 +309,10 @@ impl ConnectionTransportDraft {
         let (ssh_port, ssh_port_editor) = field("22");
         let (ssh_user, ssh_user_editor) = field("");
         let (ssh_key, ssh_key_editor) = field("");
+        let (ssh_jump, ssh_jump_editor) = field("");
+        let ssh_password = cx.new(|_| String::new());
+        let ssh_password_editor =
+            cx.new(|cx| TextEditor::new(ssh_password.clone(), false, window, cx).password());
         Self {
             socket_enabled: false,
             ssh_enabled: false,
@@ -294,6 +326,10 @@ impl ConnectionTransportDraft {
             ssh_user_editor,
             ssh_key,
             ssh_key_editor,
+            ssh_jump,
+            ssh_jump_editor,
+            ssh_password,
+            ssh_password_editor,
         }
     }
 }
@@ -408,1043 +444,6 @@ impl ConnectionDraft {
     }
 }
 
-struct SessionEditors {
-    filter_text: Entity<String>,
-    filter_editor: Entity<TextEditor>,
-    /// Text typed into the sidebar's table search field.
-    sidebar_search: Entity<String>,
-    sidebar_search_editor: Entity<TextEditor>,
-    _subscriptions: Vec<Subscription>,
-}
-
-impl SessionEditors {
-    fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
-        let filter_text = cx.new(|_| String::new());
-        let filter_editor = cx.new(|cx| TextEditor::new(filter_text.clone(), false, window, cx));
-        let sidebar_search = cx.new(|_| String::new());
-        let sidebar_search_editor =
-            cx.new(|cx| TextEditor::new(sidebar_search.clone(), false, window, cx));
-        let subscriptions = vec![
-            cx.observe(&filter_text, |_, _, cx| cx.notify()),
-            cx.observe(&sidebar_search, |_, _, cx| cx.notify()),
-        ];
-
-        Self {
-            filter_text,
-            filter_editor,
-            sidebar_search,
-            sidebar_search_editor,
-            _subscriptions: subscriptions,
-        }
-    }
-}
-
-/// Height shared by every control at the top of the sidebar.
-const SIDEBAR_CONTROL_HEIGHT: f32 = 28.0;
-const ALL_SCHEMAS_LABEL: &str = "All schemas";
-
-type SidebarSelect = Entity<SelectState<SearchableVec<SharedString>>>;
-
-/// The sidebar's database and schema dropdowns plus the cached list of rows
-/// they and the search field produce.
-struct SidebarState {
-    database_select: SidebarSelect,
-    schema_select: SidebarSelect,
-    synced_databases: Vec<String>,
-    synced_schemas: Vec<Option<String>>,
-    list: SidebarList,
-    _subscriptions: Vec<Subscription>,
-}
-
-impl SidebarState {
-    fn new(
-        id: SessionId,
-        kind: DatabaseKind,
-        window: &mut Window,
-        cx: &mut Context<DbxApp>,
-    ) -> Self {
-        let make_select = |window: &mut Window, cx: &mut Context<DbxApp>| {
-            cx.new(|select_cx| {
-                SelectState::new(
-                    SearchableVec::new(Vec::<SharedString>::new()),
-                    None,
-                    window,
-                    select_cx,
-                )
-                .searchable(true)
-            })
-        };
-        let database_select = make_select(window, cx);
-        let schema_select = make_select(window, cx);
-        let database_subscription = cx.subscribe_in(
-            &database_select,
-            window,
-            move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
-                let SelectEvent::Confirm(Some(value)) = event else {
-                    return;
-                };
-                let database = this.session(id).and_then(|session| {
-                    session
-                        .databases
-                        .iter()
-                        .find(|database| database_label(kind, database) == value.as_ref())
-                        .cloned()
-                });
-                if let Some(database) = database {
-                    this.switch_database_for(id, database, cx);
-                }
-                // A refused switch (busy session) must snap the select back.
-                cx.notify();
-            },
-        );
-        let schema_subscription = cx.subscribe_in(
-            &schema_select,
-            window,
-            move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, _, cx| {
-                let SelectEvent::Confirm(Some(value)) = event else {
-                    return;
-                };
-                let schema = (value.as_ref() != ALL_SCHEMAS_LABEL).then(|| value.to_string());
-                this.select_schema_filter_for(id, schema, cx);
-                cx.notify();
-            },
-        );
-        Self {
-            database_select,
-            schema_select,
-            synced_databases: Vec::new(),
-            synced_schemas: Vec::new(),
-            list: SidebarList::default(),
-            _subscriptions: vec![database_subscription, schema_subscription],
-        }
-    }
-
-    /// Push changed items into the dropdowns and keep their selection equal to
-    /// the session's real state. Cheap when nothing changed.
-    fn sync_selectors(
-        &mut self,
-        kind: DatabaseKind,
-        databases: &[String],
-        current_database: Option<&str>,
-        schema_filter: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<DbxApp>,
-    ) {
-        let databases_changed = self.synced_databases != databases;
-        if databases_changed {
-            let labels = databases
-                .iter()
-                .map(|database| SharedString::from(database_label(kind, database)))
-                .collect::<Vec<_>>();
-            self.database_select.update(cx, |select, cx| {
-                select.set_items(SearchableVec::new(labels), window, cx)
-            });
-            self.synced_databases = databases.to_vec();
-        }
-        let database_index = current_database
-            .and_then(|current| databases.iter().position(|database| database == current))
-            .map(IndexPath::new);
-        sync_select_index(
-            &self.database_select,
-            database_index,
-            databases_changed,
-            window,
-            cx,
-        );
-
-        let schema_options = self.list.schema_options.clone();
-        let schemas_changed = *self.synced_schemas != *schema_options;
-        if schemas_changed {
-            let labels = schema_options
-                .iter()
-                .map(|schema| {
-                    SharedString::from(schema.clone().unwrap_or_else(|| ALL_SCHEMAS_LABEL.into()))
-                })
-                .collect::<Vec<_>>();
-            self.schema_select.update(cx, |select, cx| {
-                select.set_items(SearchableVec::new(labels), window, cx)
-            });
-            self.synced_schemas = schema_options.to_vec();
-        }
-        let schema_index = schema_options
-            .iter()
-            .position(|schema| schema.as_deref() == schema_filter)
-            .map(IndexPath::new);
-        sync_select_index(
-            &self.schema_select,
-            schema_index,
-            schemas_changed,
-            window,
-            cx,
-        );
-    }
-}
-
-fn sync_select_index(
-    select: &SidebarSelect,
-    index: Option<IndexPath>,
-    force: bool,
-    window: &mut Window,
-    cx: &mut Context<DbxApp>,
-) {
-    if force || select.read(cx).selected_index(cx) != index {
-        select.update(cx, |select, cx| {
-            select.set_selected_index(index, window, cx)
-        });
-    }
-}
-
-fn database_label(kind: DatabaseKind, database: &str) -> String {
-    if kind == DatabaseKind::Redis {
-        format!("db{database}")
-    } else {
-        database.to_owned()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SidebarListKey {
-    revision: u64,
-    schema_filter: Option<String>,
-    search: String,
-}
-
-/// The rows the sidebar shows, rebuilt only when the table list, the schema
-/// filter or the search text changes rather than on every frame.
-#[derive(Default)]
-struct SidebarList {
-    key: Option<SidebarListKey>,
-    visible: Arc<Vec<TableInfo>>,
-    schema_options: Arc<Vec<Option<String>>>,
-}
-
-impl SidebarList {
-    /// Returns whether the list was rebuilt.
-    fn refresh(
-        &mut self,
-        kind: DatabaseKind,
-        tables: &[TableInfo],
-        revision: u64,
-        schema_filter: Option<&str>,
-        search: &str,
-    ) -> bool {
-        let search = search.trim();
-        if self.key.as_ref().is_some_and(|key| {
-            key.revision == revision
-                && key.schema_filter.as_deref() == schema_filter
-                && key.search == search
-        }) {
-            return false;
-        }
-        if self.key.as_ref().is_none_or(|key| key.revision != revision) {
-            self.schema_options = Arc::new(schema_filter_options(kind, tables));
-        }
-        let needle = search.to_lowercase();
-        self.visible = Arc::new(
-            tables
-                .iter()
-                .filter(|table| {
-                    table_is_visible_in(kind, schema_filter, table.schema.as_deref())
-                        && (needle.is_empty() || table.name.to_lowercase().contains(&needle))
-                })
-                .cloned()
-                .collect(),
-        );
-        self.key = Some(SidebarListKey {
-            revision,
-            schema_filter: schema_filter.map(str::to_owned),
-            search: search.to_owned(),
-        });
-        true
-    }
-}
-
-type SecondaryTabId = Uuid;
-
-struct SqlCompletionMenu {
-    replacement_range: Range<usize>,
-    items: Vec<SqlCompletionItem>,
-    selected: usize,
-    signature: CompletionSignature,
-}
-
-/// A completion state identity without retaining a second copy of the query.
-/// The query entity increments its revision whenever its text changes; the
-/// caret offset distinguishes otherwise identical documents at different
-/// insertion points.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CompletionSignature {
-    text_revision: u64,
-    cursor: usize,
-}
-
-#[derive(Default)]
-struct AbortOnDrop(Option<tokio::task::AbortHandle>);
-
-impl AbortOnDrop {
-    fn replace(&mut self, handle: tokio::task::AbortHandle) {
-        self.cancel();
-        self.0 = Some(handle);
-    }
-
-    fn cancel(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
-        }
-    }
-
-    fn clear(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-#[derive(Default)]
-struct BackgroundTaskSet(Vec<tokio::task::AbortHandle>);
-
-impl BackgroundTaskSet {
-    fn has_pending(&self) -> bool {
-        self.0.iter().any(|handle| !handle.is_finished())
-    }
-
-    fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
-        // Completed tasks no longer need an abort handle. Sweeping here keeps
-        // this owner-scoped cancellation set bounded even when a connection
-        // performs many sequential refreshes or metadata requests.
-        self.0.retain(|handle| !handle.is_finished());
-        self.0.push(task.abort_handle());
-    }
-
-    fn cancel_all(&mut self) {
-        for handle in self.0.drain(..) {
-            handle.abort();
-        }
-    }
-}
-
-impl Drop for BackgroundTaskSet {
-    fn drop(&mut self) {
-        self.cancel_all();
-    }
-}
-
-struct QueryTab {
-    timeout_secs: u64,
-    plan_pending: bool,
-    plan: Option<QueryResult>,
-    plan_baseline: Option<QueryResult>,
-    name: Entity<String>,
-    name_editor: Entity<TextEditor>,
-    console: Option<Arc<QuerySession>>,
-    cancellation: Option<QueryCancellation>,
-    statement_results: Vec<StatementResult>,
-    active_result: usize,
-    in_transaction: bool,
-    execution_override: Option<String>,
-    agent: agents::AgentQuery,
-    query_text: Entity<String>,
-    query_editor: Entity<TextEditor>,
-    result: Option<Arc<QueryResult>>,
-    result_grid: Entity<TableState<ResultTableDelegate>>,
-    split_state: Entity<ResizableState>,
-    result_selection: QueryResultSelection,
-    result_column_widths: HashMap<String, Pixels>,
-    busy: bool,
-    /// The last result remains visible while a newer request is in flight or
-    /// has failed, but must not be mistaken for the newest execution.
-    results_stale: bool,
-    status: String,
-    error: Option<String>,
-    executed_database: Option<String>,
-    abort_handle: AbortOnDrop,
-    /// The byte range an error message points at. Query text edits increment
-    /// `query_revision` and clear this range before it can be painted again.
-    error_highlight: Option<Range<usize>>,
-    request_generation: u64,
-    query_revision: u64,
-    completion_signature: Option<CompletionSignature>,
-    completion_dismissed_signature: Option<CompletionSignature>,
-    completion_index: usize,
-    _subscriptions: Vec<Subscription>,
-}
-
-impl QueryTab {
-    fn new(
-        kind: DatabaseKind,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        window: &mut Window,
-        cx: &mut Context<DbxApp>,
-    ) -> Self {
-        let name = cx.new(|_| "Untitled".to_owned());
-        let name_editor = cx.new(|cx| TextEditor::new(name.clone(), false, window, cx));
-        let query_text = cx.new(|_| DbxApp::default_query(kind).to_owned());
-        let query_editor = cx.new(|cx| match query_editor_language(kind) {
-            editor::EditorLanguage::Sql => TextEditor::new_sql(query_text.clone(), window, cx),
-            editor::EditorLanguage::Redis => TextEditor::new_redis(query_text.clone(), window, cx),
-            editor::EditorLanguage::Json => TextEditor::new_json(query_text.clone(), window, cx),
-            editor::EditorLanguage::PlainText => {
-                TextEditor::new(query_text.clone(), true, window, cx)
-            }
-        });
-        let split_state = cx.new(|_| ResizableState::default());
-        let row_actions = ResultTableDelegate::with_row_actions(
-            cx.entity().downgrade(),
-            session_id,
-            tab_id,
-            false,
-        );
-        let result_grid = cx.new(|cx| {
-            TableState::new(row_actions, window, cx)
-                .col_resizable(true)
-                .col_movable(false)
-                .sortable(false)
-                .row_selectable(true)
-                .col_selectable(true)
-                .cell_selectable(true)
-                .row_header(false)
-        });
-        let text_subscription = cx.observe(&query_text, move |this, _, cx| {
-            if let Some(session) = this.session_mut(session_id)
-                && let Some(tab) = session
-                    .secondary_tabs
-                    .iter_mut()
-                    .find(|tab| tab.id == tab_id)
-                && let SecondaryTabKind::Query(query) = &mut tab.kind
-            {
-                query.query_revision = query.query_revision.wrapping_add(1);
-                query.results_stale = query.result.is_some();
-                query.error_highlight = None;
-                query.completion_signature = None;
-                query.completion_dismissed_signature = None;
-            }
-            this.persist_query_workspace_for(session_id, cx);
-            cx.notify();
-        });
-        let editor_subscription = cx.observe(&query_editor, |_, _, cx| cx.notify());
-        let name_subscription = cx.observe(&name, move |this, _, cx| {
-            this.persist_query_workspace_for(session_id, cx);
-            cx.notify();
-        });
-        let table_subscription =
-            cx.subscribe_in(&result_grid, window, move |this, _, event, _, cx| {
-                this.on_query_grid_event(session_id, tab_id, event, cx)
-            });
-
-        Self {
-            name,
-            timeout_secs: 60,
-            plan_pending: false,
-            plan: None,
-            plan_baseline: None,
-            name_editor,
-            console: None,
-            cancellation: None,
-            statement_results: Vec::new(),
-            active_result: 0,
-            in_transaction: false,
-            execution_override: None,
-            agent: agents::AgentQuery::new(window, cx),
-            query_text,
-            query_editor,
-            result: None,
-            result_grid,
-            split_state,
-            result_selection: QueryResultSelection::None,
-            result_column_widths: HashMap::new(),
-            busy: false,
-            results_stale: false,
-            status: String::new(),
-            error: None,
-            executed_database: None,
-            abort_handle: AbortOnDrop::default(),
-            error_highlight: None,
-            request_generation: 0,
-            query_revision: 0,
-            completion_signature: None,
-            completion_dismissed_signature: None,
-            completion_index: 0,
-            _subscriptions: vec![
-                text_subscription,
-                name_subscription,
-                editor_subscription,
-                table_subscription,
-            ],
-        }
-    }
-
-    fn set_result(&mut self, result: Option<QueryResult>, cx: &mut Context<DbxApp>) {
-        self.result = result.map(Arc::new);
-        self.result_selection = QueryResultSelection::None;
-        let result = self.result.clone();
-        let remembered_widths = self.result_column_widths.clone();
-        self.result_grid.update(cx, move |table, cx| {
-            table
-                .delegate_mut()
-                .set_result(result, &remembered_widths, &[], &[]);
-            table.clear_selection(cx);
-            table.refresh(cx);
-        });
-    }
-
-    fn invalidate_request(&mut self) {
-        self.request_generation = self.request_generation.saturating_add(1);
-        if let Some(cancellation) = self.cancellation.take() {
-            cancellation.cancel();
-        }
-        self.abort_handle.cancel();
-        self.console = None;
-        self.in_transaction = false;
-        self.busy = false;
-        self.agent.cancel();
-        self.agent.result = None;
-    }
-}
-
-fn query_editor_language(kind: DatabaseKind) -> editor::EditorLanguage {
-    if kind.is_sql() {
-        editor::EditorLanguage::Sql
-    } else {
-        match kind {
-            DatabaseKind::Redis => editor::EditorLanguage::Redis,
-            DatabaseKind::MongoDB | DatabaseKind::Kafka => editor::EditorLanguage::Json,
-            _ => editor::EditorLanguage::PlainText,
-        }
-    }
-}
-
-impl Drop for QueryTab {
-    fn drop(&mut self) {
-        if let Some(cancellation) = self.cancellation.take() {
-            cancellation.cancel();
-        }
-        self.abort_handle.cancel();
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum QueryResultSelection {
-    #[default]
-    None,
-    Cell,
-    Row,
-    Column,
-}
-
-fn query_result_status(result: &QueryResult) -> String {
-    let outcome = match (result.rows_affected, result.rows.is_empty()) {
-        (Some(affected), false) => format!(
-            "{} row{} returned · {affected} row{} affected",
-            result.rows.len(),
-            if result.rows.len() == 1 { "" } else { "s" },
-            if affected == 1 { "" } else { "s" }
-        ),
-        (Some(affected), true) => format!(
-            "{affected} row{} affected",
-            if affected == 1 { "" } else { "s" }
-        ),
-        (None, _) => format!(
-            "{} row{} returned",
-            result.rows.len(),
-            if result.rows.len() == 1 { "" } else { "s" }
-        ),
-    };
-    let truncation = if result.truncated {
-        " · results limited"
-    } else {
-        ""
-    };
-    format!("{outcome} · {} ms{truncation}", result.elapsed_ms)
-}
-
-fn query_history_connection(session: &ConnectionSession) -> Option<QueryHistoryConnection> {
-    session
-        .profile_id
-        .map(QueryHistoryConnection::profile)
-        .or_else(|| {
-            QueryHistoryConnection::session(
-                session.name.clone(),
-                session.kind,
-                session
-                    .current_database
-                    .clone()
-                    .unwrap_or_else(|| "default".into()),
-            )
-            .ok()
-        })
-}
-
-struct StructureTab {
-    table: TableRef,
-    columns: Vec<ColumnInfo>,
-    foreign_keys: Vec<ForeignKeyInfo>,
-    busy: bool,
-    error: Option<String>,
-}
-
-/// Per-tab state for a database-wide relationship diagram. The document is
-/// deliberately independent from GPUI so SVG and PNG exports share the exact
-/// same layout as the on-screen canvas.
-struct DiagramTab {
-    /// The complete metadata snapshot is retained so schema filters can
-    /// rebuild the scene without another database round-trip.
-    source_schema: Option<Arc<RelationalSchema>>,
-    document: Option<Arc<DiagramDocument>>,
-    available_schemas: Vec<String>,
-    /// PostgreSQL-only projection. `None` means every available schema.
-    selected_schemas: Option<BTreeSet<String>>,
-    busy: bool,
-    stale: bool,
-    error: Option<String>,
-    zoom: f32,
-    selected_node: Option<String>,
-    scroll_handle: ScrollHandle,
-    focus: FocusHandle,
-    drag_anchor: Option<DiagramDragAnchor>,
-    /// A card being rearranged by pointer drag.
-    node_drag: Option<DiagramNodeDrag>,
-    /// Card positions the user arranged by hand, keyed by node ID. They
-    /// survive refreshes and schema-filter rebuilds until the layout is reset.
-    arranged_positions: HashMap<String, (f32, f32)>,
-    request_generation: u64,
-    abort_handle: AbortOnDrop,
-}
-
-#[derive(Clone, Copy)]
-struct DiagramDragAnchor {
-    pointer: Point<Pixels>,
-    scroll_offset: Point<Pixels>,
-    /// Whether the press travelled far enough to count as a pan rather than
-    /// a click on empty canvas (which clears the selection).
-    moved: bool,
-}
-
-#[derive(Clone)]
-struct DiagramNodeDrag {
-    node_id: String,
-    pointer: Point<Pixels>,
-    origin: (f32, f32),
-}
-
-impl DiagramTab {
-    fn loading(
-        kind: DatabaseKind,
-        tables: &[TableInfo],
-        explorer_schema: Option<&str>,
-        cx: &mut Context<DbxApp>,
-    ) -> Self {
-        Self {
-            source_schema: None,
-            document: None,
-            available_schemas: diagram_schema_names(kind, tables),
-            selected_schemas: diagram_initial_schema_selection(kind, explorer_schema),
-            busy: true,
-            stale: false,
-            error: None,
-            zoom: 1.0,
-            selected_node: None,
-            scroll_handle: ScrollHandle::new(),
-            focus: cx.focus_handle(),
-            drag_anchor: None,
-            node_drag: None,
-            arranged_positions: HashMap::new(),
-            request_generation: 0,
-            abort_handle: AbortOnDrop::default(),
-        }
-    }
-
-    fn invalidate_request(&mut self) {
-        self.request_generation = self.request_generation.saturating_add(1);
-        self.abort_handle.cancel();
-        self.busy = false;
-    }
-}
-
-impl Drop for DiagramTab {
-    fn drop(&mut self) {
-        self.abort_handle.cancel();
-    }
-}
-
-/// One open table. Each tab owns its grid, filters, page, and row draft, so
-/// switching between tables keeps every view exactly where the user left it.
-struct DataTab {
-    table: TableRef,
-    data_grid: Entity<TableState<ResultTableDelegate>>,
-    result_column_widths: HashMap<String, Pixels>,
-    _data_grid_subscription: Subscription,
-    filters: FilterModel,
-    filter_subscriptions: Vec<Subscription>,
-    table_columns: Vec<ColumnInfo>,
-    foreign_keys: Vec<ForeignKeyInfo>,
-    result: Option<Arc<QueryResult>>,
-    /// The table that produced `result`, when it is safe to edit through the
-    /// grid. Cleared while a reload is in flight.
-    result_table: Option<TableRef>,
-    table_page: u64,
-    table_has_next_page: bool,
-    selected_row: Option<usize>,
-    selected_column: usize,
-    inspector_open: bool,
-    draft_mode: DraftMode,
-    row_draft: Option<RowDraftModel>,
-    row_draft_subscriptions: Vec<Subscription>,
-    suppress_next_grid_selection_event: bool,
-    busy: bool,
-    status: String,
-    error: Option<String>,
-    request_generation: u64,
-    abort_handle: AbortOnDrop,
-}
-
-impl DataTab {
-    fn new(
-        session_id: SessionId,
-        id: SecondaryTabId,
-        table: TableRef,
-        window: &mut Window,
-        cx: &mut Context<DbxApp>,
-    ) -> Self {
-        let row_actions =
-            ResultTableDelegate::with_row_actions(cx.entity().downgrade(), session_id, id, true);
-        let data_grid = cx.new(|cx| {
-            TableState::new(row_actions, window, cx)
-                .col_resizable(true)
-                .col_movable(false)
-                .sortable(false)
-                .row_selectable(true)
-                .col_selectable(true)
-                .cell_selectable(false)
-        });
-        let data_grid_subscription =
-            cx.subscribe_in(&data_grid, window, move |this, _, event, window, cx| {
-                this.on_data_grid_event(session_id, id, event, window, cx)
-            });
-        Self {
-            table,
-            data_grid,
-            result_column_widths: HashMap::new(),
-            _data_grid_subscription: data_grid_subscription,
-            filters: FilterModel::new(),
-            filter_subscriptions: Vec::new(),
-            table_columns: Vec::new(),
-            foreign_keys: Vec::new(),
-            result: None,
-            result_table: None,
-            table_page: 0,
-            table_has_next_page: false,
-            selected_row: None,
-            selected_column: 0,
-            inspector_open: false,
-            draft_mode: DraftMode::Update,
-            row_draft: None,
-            row_draft_subscriptions: Vec::new(),
-            suppress_next_grid_selection_event: false,
-            busy: false,
-            status: String::new(),
-            error: None,
-            request_generation: 0,
-            abort_handle: AbortOnDrop::default(),
-        }
-    }
-
-    fn set_result(
-        &mut self,
-        result: Option<QueryResult>,
-        tables: &[TableInfo],
-        cx: &mut Context<DbxApp>,
-    ) {
-        self.result = result.map(Arc::new);
-        self.sync_result_grid(true, tables, cx);
-    }
-
-    fn sync_result_grid(
-        &mut self,
-        clear_selection: bool,
-        tables: &[TableInfo],
-        cx: &mut Context<DbxApp>,
-    ) {
-        let result = self.result.clone();
-        let remembered_widths = self.result_column_widths.clone();
-        let foreign_keys = self.foreign_keys.clone();
-        let tables = tables.to_vec();
-        self.data_grid.update(cx, move |table, cx| {
-            table
-                .delegate_mut()
-                .set_result(result, &remembered_widths, &foreign_keys, &tables);
-            table.refresh(cx);
-            if clear_selection {
-                table.clear_selection(cx);
-            }
-        });
-    }
-
-    fn clear_grid_selection(&self, cx: &mut Context<DbxApp>) {
-        self.data_grid
-            .update(cx, |table, cx| table.clear_selection(cx));
-    }
-
-    /// Drop the row selection and any open draft ahead of a reload, whose
-    /// result replaces the snapshot they point into.
-    fn reset_row_state(&mut self, cx: &mut Context<DbxApp>) {
-        self.result_table = None;
-        self.selected_row = None;
-        self.row_draft = None;
-        self.row_draft_subscriptions.clear();
-        self.clear_grid_selection(cx);
-    }
-
-    fn invalidate_request(&mut self) {
-        self.request_generation = self.request_generation.saturating_add(1);
-        self.abort_handle.cancel();
-        self.busy = false;
-    }
-}
-
-impl Drop for DataTab {
-    fn drop(&mut self) {
-        self.abort_handle.cancel();
-    }
-}
-
-enum SecondaryTabKind {
-    Data(Box<DataTab>),
-    Query(Box<QueryTab>),
-    Structure(StructureTab),
-    Diagram(Box<DiagramTab>),
-}
-
-impl SecondaryTabKind {
-    fn pane(&self) -> Pane {
-        match self {
-            Self::Data(_) => Pane::Data,
-            Self::Query(_) => Pane::Query,
-            Self::Structure(_) => Pane::Structure,
-            Self::Diagram(_) => Pane::Diagram,
-        }
-    }
-}
-
-struct SecondaryTab {
-    id: SecondaryTabId,
-    kind: SecondaryTabKind,
-}
-
-/// Free functions rather than session methods so callers can hold a data tab
-/// and still update the session's other fields in the same scope.
-fn find_data_tab(tabs: &[SecondaryTab], id: SecondaryTabId) -> Option<&DataTab> {
-    tabs.iter().find_map(|tab| match &tab.kind {
-        SecondaryTabKind::Data(data) if tab.id == id => Some(data.as_ref()),
-        _ => None,
-    })
-}
-
-fn find_data_tab_mut(tabs: &mut [SecondaryTab], id: SecondaryTabId) -> Option<&mut DataTab> {
-    tabs.iter_mut().find_map(|tab| match &mut tab.kind {
-        SecondaryTabKind::Data(data) if tab.id == id => Some(data.as_mut()),
-        _ => None,
-    })
-}
-
-struct ConnectionSession {
-    schema_baseline: Option<RelationalSchema>,
-    transfer_control: Option<dbx_core::TransferControl>,
-    id: SessionId,
-    profile_id: Option<Uuid>,
-    name: String,
-    kind: DatabaseKind,
-    tag: Option<ConnectionTag>,
-    engine: Option<Arc<DatabaseEngine>>,
-    editors: SessionEditors,
-    pane: Pane,
-    secondary_tabs: Vec<SecondaryTab>,
-    active_secondary_tab: Option<SecondaryTabId>,
-    /// The data tab viewed most recently, even while another kind of tab is
-    /// in front. Query completion and the Data/Structure rail use it.
-    recent_data_tab: Option<SecondaryTabId>,
-    /// Recently closed query documents are retained for the current session
-    /// only. Persisted history remains the durable source for executed work.
-    closed_queries: Vec<String>,
-    tables: Vec<TableInfo>,
-    /// Bumped whenever `tables` is replaced so derived lists know to rebuild.
-    tables_revision: u64,
-    sidebar: SidebarState,
-    /// Schema metadata already fetched for completion. The navigator always
-    /// supplies table names; columns are added as tables are opened or their
-    /// structure is inspected, avoiding a metadata query for every keystroke.
-    completion_columns: HashMap<String, Vec<ColumnInfo>>,
-    /// Authoritative command grammar discovered once from the connected
-    /// Redis/Valkey server. Completion only reads this cache; it never performs
-    /// network I/O while the user is typing.
-    redis_command_catalog: Option<Arc<RedisCommandCatalog>>,
-    /// Databases reachable through this connection, for the sidebar switcher.
-    databases: Vec<String>,
-    /// Database the engine currently uses, if the backend reports one.
-    current_database: Option<String>,
-    /// PostgreSQL-only navigator filter. `None` means all schemas.
-    schema_filter: Option<String>,
-    /// Connection-wide work (connecting, switching databases, table actions,
-    /// transfers). Each data tab tracks its own loads and row mutations.
-    busy: bool,
-    status: String,
-    error: Option<String>,
-    request_generation: u64,
-    /// Tokio work captures an `Arc<DatabaseEngine>`. Keep abort handles here
-    /// so closing a connection cancels that work before dropping the session
-    /// instead of leaving closed pools alive until every query completes.
-    background_tasks: BackgroundTaskSet,
-}
-
-impl ConnectionSession {
-    fn new(
-        id: SessionId,
-        profile_id: Option<Uuid>,
-        name: String,
-        kind: DatabaseKind,
-        tag: Option<ConnectionTag>,
-        window: &mut Window,
-        cx: &mut Context<DbxApp>,
-    ) -> Self {
-        Self {
-            id,
-            profile_id,
-            name,
-            kind,
-            tag,
-            engine: None,
-            editors: SessionEditors::new(window, cx),
-            pane: Pane::Data,
-            secondary_tabs: Vec::new(),
-            active_secondary_tab: None,
-            recent_data_tab: None,
-            closed_queries: Vec::new(),
-            tables: Vec::new(),
-            tables_revision: 0,
-            sidebar: SidebarState::new(id, kind, window, cx),
-            completion_columns: HashMap::new(),
-            redis_command_catalog: None,
-            databases: Vec::new(),
-            current_database: None,
-            schema_filter: None,
-            busy: false,
-            status: "Connecting…".into(),
-            error: None,
-            request_generation: 0,
-            background_tasks: BackgroundTaskSet::default(),
-            transfer_control: None,
-            schema_baseline: None,
-        }
-    }
-
-    fn set_tables(&mut self, tables: Vec<TableInfo>) {
-        self.tables = tables;
-        self.tables_revision += 1;
-        // A dropped schema would otherwise leave an empty list behind a
-        // selector that hides itself when fewer than two schemas remain.
-        if let Some(schema) = self.schema_filter.as_deref()
-            && !self
-                .tables
-                .iter()
-                .any(|table| table.schema.as_deref() == Some(schema))
-        {
-            self.schema_filter = default_schema_filter(self.kind, &self.tables);
-        }
-    }
-
-    fn track_background_task<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
-        self.background_tasks.track(task);
-    }
-
-    fn cancel_background_tasks(&mut self) {
-        self.background_tasks.cancel_all();
-    }
-
-    fn data_tab(&self, id: SecondaryTabId) -> Option<&DataTab> {
-        find_data_tab(&self.secondary_tabs, id)
-    }
-
-    fn data_tab_mut(&mut self, id: SecondaryTabId) -> Option<&mut DataTab> {
-        find_data_tab_mut(&mut self.secondary_tabs, id)
-    }
-
-    /// The data tab in front, if the front tab is one.
-    fn active_data_tab_id(&self) -> Option<SecondaryTabId> {
-        self.active_secondary_tab
-            .filter(|id| self.data_tab(*id).is_some())
-    }
-
-    fn active_data_tab(&self) -> Option<&DataTab> {
-        self.active_data_tab_id().and_then(|id| self.data_tab(id))
-    }
-
-    /// The data tab in front, else the one viewed most recently.
-    fn recent_data(&self) -> Option<&DataTab> {
-        self.active_data_tab()
-            .or_else(|| self.recent_data_tab.and_then(|id| self.data_tab(id)))
-    }
-
-    fn data_tab_for_table(&self, table: &TableRef) -> Option<SecondaryTabId> {
-        self.secondary_tabs.iter().find_map(|tab| match &tab.kind {
-            SecondaryTabKind::Data(data) if data.table == *table => Some(tab.id),
-            _ => None,
-        })
-    }
-
-    /// Close every data tab matching `predicate`, moving the front tab to a
-    /// neighbour when it was one of them.
-    fn close_data_tabs_where(&mut self, predicate: impl Fn(&DataTab) -> bool) {
-        let active_index = self
-            .active_secondary_tab
-            .and_then(|id| self.secondary_tabs.iter().position(|tab| tab.id == id));
-        let mut kept_before_active = 0;
-        let mut active_closed = false;
-        let mut index = 0;
-        self.secondary_tabs.retain(|tab| {
-            let close = matches!(&tab.kind, SecondaryTabKind::Data(data) if predicate(data));
-            if Some(index) == active_index {
-                active_closed = close;
-            } else if !close && active_index.is_some_and(|active| index < active) {
-                kept_before_active += 1;
-            }
-            index += 1;
-            !close
-        });
-        if self
-            .recent_data_tab
-            .is_some_and(|id| self.data_tab(id).is_none())
-        {
-            self.recent_data_tab = None;
-        }
-        if active_closed {
-            let next = kept_before_active.min(self.secondary_tabs.len().saturating_sub(1));
-            self.active_secondary_tab = self.secondary_tabs.get(next).map(|tab| tab.id);
-            self.pane = self
-                .secondary_tabs
-                .get(next)
-                .map(|tab| tab.kind.pane())
-                .unwrap_or(Pane::Data);
-            if self.pane == Pane::Data {
-                self.recent_data_tab = self.active_secondary_tab;
-            }
-        }
-    }
-
-    fn close_data_tabs(&mut self) {
-        self.close_data_tabs_where(|_| true);
-    }
-}
-
-impl Drop for ConnectionSession {
-    fn drop(&mut self) {
-        self.cancel_background_tasks();
-    }
-}
-
 #[derive(Clone)]
 struct TableContextMenu {
     session_id: SessionId,
@@ -1493,7 +492,9 @@ enum ConfirmationAction {
     LockVault,
     RunQuery {
         session_id: SessionId,
+        tab_id: SecondaryTabId,
         run_all: bool,
+        query: String,
     },
     CloseQuery {
         session_id: SessionId,
@@ -1608,6 +609,7 @@ pub struct DbxApp {
     recent_query_history: Vec<QueryHistoryEntry>,
     workspace_store: Option<Arc<crate::workspace::WorkspaceStore>>,
     workspace_documents: HashMap<String, crate::workspace::WorkspaceDocument>,
+    startup_recovery_started: bool,
     sessions: Vec<ConnectionSession>,
     active_session_id: Option<SessionId>,
     connection_picker_open: bool,
@@ -1662,6 +664,7 @@ impl DbxApp {
             cx.observe(&draft.transport.ssh_port, |_, _, cx| cx.notify()),
             cx.observe(&draft.transport.ssh_user, |_, _, cx| cx.notify()),
             cx.observe(&draft.transport.ssh_key, |_, _, cx| cx.notify()),
+            cx.observe(&draft.transport.ssh_jump, |_, _, cx| cx.notify()),
             // Follow live OS light/dark changes when the preference is System.
             cx.observe_window_appearance(window, |this, window, cx| {
                 this.apply_material(window, cx);
@@ -1727,6 +730,7 @@ impl DbxApp {
                 .and_then(ProfileStore::vault)
                 .map(|vault| Arc::new(crate::workspace::WorkspaceStore::new(vault))),
             workspace_documents: HashMap::new(),
+            startup_recovery_started: cfg!(test),
             profile_store,
             saved_connections,
             connection_tags,
@@ -2109,6 +1113,20 @@ impl DbxApp {
     }
 
     fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        if self.vault_state == Some(VaultState::Unlocked)
+            && self.session(session_id).is_some_and(|session| {
+                session.secondary_tabs.iter().any(|tab| {
+                matches!(&tab.kind, SecondaryTabKind::Data(data) if data.has_unsaved_cell_work())
+            })
+            })
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Save or discard cell edits before closing this connection",
+                cx,
+            );
+            return;
+        }
         self.persist_query_workspace_for(session_id, cx);
         let Some(index) = self
             .sessions
@@ -2149,6 +1167,9 @@ impl DbxApp {
             }
         }
         self.sessions.remove(index);
+        if self.vault_state == Some(VaultState::Unlocked) {
+            self.persist_startup_workspace(cx);
+        }
         if self.active_session_id == Some(session_id) {
             self.active_session_id = self
                 .sessions
@@ -2192,6 +1213,7 @@ impl DbxApp {
             self.active_session_id = Some(session_id);
             self.connection_picker_open = false;
             self.settings_open = false;
+            self.persist_startup_workspace(cx);
             cx.notify();
         }
     }
@@ -2273,967 +1295,6 @@ impl DbxApp {
         }
     }
 
-    fn add_query_tab_for(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(kind) = self.session(session_id).map(|session| session.kind) else {
-            return;
-        };
-
-        let id = Uuid::new_v4();
-        let query_tab = QueryTab::new(kind, session_id, id, window, cx);
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.secondary_tabs.push(SecondaryTab {
-            id,
-            kind: SecondaryTabKind::Query(Box::new(query_tab)),
-        });
-        session.active_secondary_tab = Some(id);
-        session.pane = Pane::Query;
-        let focus = session
-            .secondary_tabs
-            .last()
-            .and_then(|tab| match &tab.kind {
-                SecondaryTabKind::Query(query) => Some(query.query_editor.read(cx).focus_handle()),
-                SecondaryTabKind::Data(_)
-                | SecondaryTabKind::Structure(_)
-                | SecondaryTabKind::Diagram(_) => None,
-            });
-        if let Some(focus) = focus {
-            focus.focus(window, cx);
-        }
-        cx.notify();
-    }
-
-    /// Load a persisted history item into the active query document, creating
-    /// one when the current document is Data or Structure. History never
-    /// executes implicitly; the user still chooses Run.
-    pub(super) fn load_query_history_entry_for(
-        &mut self,
-        session_id: SessionId,
-        entry: &QueryHistoryEntry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let query_is_active = self.session(session_id).is_some_and(|session| {
-            session.active_secondary_tab.is_some_and(|tab_id| {
-                session
-                    .secondary_tabs
-                    .iter()
-                    .any(|tab| tab.id == tab_id && matches!(&tab.kind, SecondaryTabKind::Query(_)))
-            })
-        });
-        if !query_is_active {
-            self.add_query_tab_for(session_id, window, cx);
-        }
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let Some(tab_id) = session.active_secondary_tab else {
-            return;
-        };
-        let Some(tab) = session
-            .secondary_tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)
-        else {
-            return;
-        };
-        let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
-            return;
-        };
-        let focus = query_tab.query_editor.read(cx).focus_handle();
-        query_tab.query_editor.update(cx, |editor, cx| {
-            editor.set_text(entry.sql.clone(), cx);
-        });
-        query_tab.error = None;
-        query_tab.error_highlight = None;
-        focus.focus(window, cx);
-        cx.notify();
-    }
-
-    fn open_structure_tab_for(
-        &mut self,
-        session_id: SessionId,
-        table: TableInfo,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((engine, table_ref)) = self.session(session_id).and_then(|session| {
-            session
-                .engine
-                .clone()
-                .map(|engine| (engine, table_ref(&table)))
-        }) else {
-            return;
-        };
-        let id = Uuid::new_v4();
-        if let Some(session) = self.session_mut(session_id) {
-            session.secondary_tabs.push(SecondaryTab {
-                id,
-                kind: SecondaryTabKind::Structure(StructureTab {
-                    table: table_ref.clone(),
-                    columns: Vec::new(),
-                    foreign_keys: Vec::new(),
-                    busy: true,
-                    error: None,
-                }),
-            });
-            session.active_secondary_tab = Some(id);
-            session.pane = Pane::Structure;
-        }
-        let runtime = self.runtime.clone();
-        let task = runtime.spawn(async move { engine.table_structure(&table_ref).await });
-        if let Some(session) = self.session_mut(session_id) {
-            session.track_background_task(&task);
-        }
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = task.await?;
-            this.update(cx, |this, cx| {
-                let Some(session) = this.session_mut(session_id) else {
-                    return;
-                };
-                let Some(tab) = session.secondary_tabs.iter_mut().find(|tab| tab.id == id) else {
-                    return;
-                };
-                let SecondaryTabKind::Structure(structure) = &mut tab.kind else {
-                    return;
-                };
-                structure.busy = false;
-                match result {
-                    Ok(table_structure) => {
-                        session.completion_columns.insert(
-                            completion_table_key(&structure.table),
-                            table_structure.columns.clone(),
-                        );
-                        structure.columns = table_structure.columns;
-                        structure.foreign_keys = table_structure.foreign_keys;
-                        structure.error = None;
-                    }
-                    Err(error) => structure.error = Some(error.to_string()),
-                }
-                cx.notify();
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-    }
-
-    /// Open the one relationship diagram for this connection, or return to it
-    /// when it is already open. Redis deliberately has no relational surface.
-    pub(super) fn open_diagram_for(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((kind, existing, tables, explorer_schema)) =
-            self.session(session_id).map(|session| {
-                (
-                    session.kind,
-                    session.secondary_tabs.iter().find_map(|tab| {
-                        matches!(&tab.kind, SecondaryTabKind::Diagram(_)).then_some(tab.id)
-                    }),
-                    session.tables.clone(),
-                    session.schema_filter.clone(),
-                )
-            })
-        else {
-            return;
-        };
-        if !kind.is_sql() {
-            if let Some(session) = self.session_mut(session_id) {
-                session.error =
-                    Some("Database diagrams are available for relational connections".into());
-            }
-            cx.notify();
-            return;
-        }
-        if let Some(tab_id) = existing {
-            self.activate_secondary_tab_for(session_id, tab_id, window, cx);
-            return;
-        }
-
-        let id = Uuid::new_v4();
-        let diagram = DiagramTab::loading(kind, &tables, explorer_schema.as_deref(), cx);
-        let focus = diagram.focus.clone();
-        if let Some(session) = self.session_mut(session_id) {
-            session.secondary_tabs.push(SecondaryTab {
-                id,
-                kind: SecondaryTabKind::Diagram(Box::new(diagram)),
-            });
-            session.active_secondary_tab = Some(id);
-            session.pane = Pane::Diagram;
-        }
-        focus.focus(window, cx);
-        self.load_diagram_for(session_id, id, false, cx);
-    }
-
-    /// Reload the active diagram while retaining its last successful scene as
-    /// a visible, explicitly stale snapshot.
-    pub(super) fn refresh_diagram_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.session(session_id).and_then(|session| {
-            session
-                .secondary_tabs
-                .iter()
-                .find(|tab| matches!(&tab.kind, SecondaryTabKind::Diagram(_)))
-                .map(|tab| tab.id)
-        }) else {
-            return;
-        };
-        self.load_diagram_for(session_id, tab_id, true, cx);
-    }
-
-    fn load_diagram_for(
-        &mut self,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        retain_document: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(engine) = self
-            .session(session_id)
-            .and_then(|session| session.engine.clone())
-        else {
-            return;
-        };
-        let runtime = self.runtime.clone();
-        let Some(tab) = self.session_mut(session_id).and_then(|session| {
-            session
-                .secondary_tabs
-                .iter_mut()
-                .find(|tab| tab.id == tab_id)
-        }) else {
-            return;
-        };
-        let SecondaryTabKind::Diagram(diagram) = &mut tab.kind else {
-            return;
-        };
-        diagram.invalidate_request();
-        diagram.busy = true;
-        diagram.stale = retain_document && diagram.document.is_some();
-        diagram.error = None;
-        diagram.request_generation = diagram.request_generation.saturating_add(1);
-        let generation = diagram.request_generation;
-        let task = runtime.spawn(async move { engine.relational_schema().await });
-        diagram.abort_handle.replace(task.abort_handle());
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                let Some(tab) = this.session_mut(session_id).and_then(|session| {
-                    session
-                        .secondary_tabs
-                        .iter_mut()
-                        .find(|tab| tab.id == tab_id)
-                }) else {
-                    return;
-                };
-                let SecondaryTabKind::Diagram(diagram) = &mut tab.kind else {
-                    return;
-                };
-                if generation != diagram.request_generation {
-                    return;
-                }
-                diagram.busy = false;
-                diagram.abort_handle.clear();
-                match result {
-                    Ok(Ok(schema)) => {
-                        let source_schema = Arc::new(schema);
-                        diagram.available_schemas = relational_schema_names(&source_schema);
-                        normalize_diagram_schema_selection(
-                            &mut diagram.selected_schemas,
-                            &diagram.available_schemas,
-                        );
-                        let mut document = diagram_document_for_selection(
-                            &source_schema,
-                            diagram.selected_schemas.as_ref(),
-                        );
-                        document.place_nodes(&diagram.arranged_positions);
-                        diagram.document = Some(Arc::new(document));
-                        diagram.source_schema = Some(source_schema);
-                        diagram.stale = false;
-                        diagram.error = None;
-                    }
-                    Ok(Err(error)) => {
-                        diagram.stale = diagram.document.is_some();
-                        diagram.error = Some(error.to_string());
-                    }
-                    Err(error) => {
-                        diagram.stale = diagram.document.is_some();
-                        diagram.error =
-                            Some(format!("Diagram request stopped unexpectedly: {error}"));
-                    }
-                }
-                cx.notify();
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-    }
-
-    pub(super) fn set_diagram_zoom_for(
-        &mut self,
-        session_id: SessionId,
-        zoom: f32,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        let next_zoom = zoom.clamp(0.35, 2.0);
-        if let Some(document) = diagram.document.as_ref() {
-            let old_scene = point(
-                px(document.width * diagram.zoom + DIAGRAM_SCENE_PADDING * 2.0),
-                px(document.height * diagram.zoom + DIAGRAM_SCENE_PADDING * 2.0),
-            );
-            let next_scene = point(
-                px(document.width * next_zoom + DIAGRAM_SCENE_PADDING * 2.0),
-                px(document.height * next_zoom + DIAGRAM_SCENE_PADDING * 2.0),
-            );
-            let offset = diagram.scroll_handle.offset();
-            let max_offset = diagram.scroll_handle.max_offset();
-            diagram.scroll_handle.set_offset(point(
-                remap_diagram_scroll_axis(offset.x, max_offset.x, old_scene.x, next_scene.x),
-                remap_diagram_scroll_axis(offset.y, max_offset.y, old_scene.y, next_scene.y),
-            ));
-        }
-        diagram.zoom = next_zoom;
-        cx.notify();
-    }
-
-    pub(super) fn reset_diagram_view_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        diagram.zoom = 1.0;
-        diagram.scroll_handle.set_offset(point(px(0.), px(0.)));
-        diagram.drag_anchor = None;
-        cx.notify();
-    }
-
-    pub(super) fn fit_diagram_for(
-        &mut self,
-        session_id: SessionId,
-        zoom: f32,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        diagram.zoom = zoom.clamp(0.35, 2.0);
-        diagram.scroll_handle.set_offset(point(px(0.), px(0.)));
-        diagram.drag_anchor = None;
-        cx.notify();
-    }
-
-    pub(super) fn begin_diagram_pan_for(
-        &mut self,
-        session_id: SessionId,
-        pointer: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        diagram.drag_anchor = Some(DiagramDragAnchor {
-            pointer,
-            scroll_offset: diagram.scroll_handle.offset(),
-            moved: false,
-        });
-        cx.notify();
-    }
-
-    pub(super) fn pan_diagram_to_for(
-        &mut self,
-        session_id: SessionId,
-        pointer: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        let Some(anchor) = diagram.drag_anchor.as_mut() else {
-            return;
-        };
-        let travel = (pointer.x - anchor.pointer.x)
-            .abs()
-            .max((pointer.y - anchor.pointer.y).abs());
-        anchor.moved |= travel > px(3.);
-        let anchor = *anchor;
-        let offset = point(
-            anchor.scroll_offset.x + (pointer.x - anchor.pointer.x),
-            anchor.scroll_offset.y + (pointer.y - anchor.pointer.y),
-        );
-        diagram
-            .scroll_handle
-            .set_offset(clamp_diagram_scroll_offset(
-                offset,
-                diagram.scroll_handle.max_offset(),
-            ));
-        cx.notify();
-    }
-
-    pub(super) fn pan_diagram_by_for(
-        &mut self,
-        session_id: SessionId,
-        horizontal: f32,
-        vertical: f32,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        let offset = diagram.scroll_handle.offset();
-        let requested = point(offset.x - px(horizontal), offset.y - px(vertical));
-        diagram
-            .scroll_handle
-            .set_offset(clamp_diagram_scroll_offset(
-                requested,
-                diagram.scroll_handle.max_offset(),
-            ));
-        cx.notify();
-    }
-
-    pub(super) fn end_diagram_pan_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        if let Some(diagram) = self.active_diagram_tab_mut(session_id)
-            && (diagram.drag_anchor.is_some() || diagram.node_drag.is_some())
-        {
-            if diagram.drag_anchor.is_some_and(|anchor| !anchor.moved) {
-                diagram.selected_node = None;
-            }
-            diagram.drag_anchor = None;
-            diagram.node_drag = None;
-            cx.notify();
-        }
-    }
-
-    pub(super) fn begin_diagram_node_drag_for(
-        &mut self,
-        session_id: SessionId,
-        node_id: String,
-        pointer: Point<Pixels>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        let Some(origin) = diagram
-            .document
-            .as_ref()
-            .and_then(|document| document.node_position(&node_id))
-        else {
-            return;
-        };
-        diagram.drag_anchor = None;
-        diagram.node_drag = Some(DiagramNodeDrag {
-            node_id,
-            pointer,
-            origin,
-        });
-    }
-
-    /// Move the dragged card with the pointer. Returns whether a drag is in
-    /// progress so the caller can skip canvas panning.
-    pub(super) fn drag_diagram_node_to_for(
-        &mut self,
-        session_id: SessionId,
-        pointer: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return false;
-        };
-        let Some(drag) = diagram.node_drag.clone() else {
-            return false;
-        };
-        let zoom = diagram.zoom.max(0.01);
-        let x = drag.origin.0 + f32::from(pointer.x - drag.pointer.x) / zoom;
-        let y = drag.origin.1 + f32::from(pointer.y - drag.pointer.y) / zoom;
-        if let Some(document) = diagram.document.as_mut()
-            && Arc::make_mut(document).move_node(&drag.node_id, x, y)
-            && let Some(position) = document.node_position(&drag.node_id)
-        {
-            diagram
-                .arranged_positions
-                .insert(drag.node_id.clone(), position);
-            cx.notify();
-        }
-        true
-    }
-
-    /// Discard hand-arranged card positions and return to the automatic
-    /// layout.
-    pub(super) fn reset_diagram_layout_for(
-        &mut self,
-        session_id: SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        diagram.arranged_positions.clear();
-        rebuild_diagram_document(diagram);
-        cx.notify();
-    }
-
-    /// Zoom while keeping the document point under `anchor` (window
-    /// coordinates) fixed, as pinch and Ctrl+wheel zoom do in native canvases.
-    pub(super) fn zoom_diagram_at_for(
-        &mut self,
-        session_id: SessionId,
-        zoom: f32,
-        anchor: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        let Some(document) = diagram.document.as_ref() else {
-            return;
-        };
-        let next_zoom = zoom.clamp(0.35, 2.0);
-        if (next_zoom - diagram.zoom).abs() < f32::EPSILON {
-            return;
-        }
-        let viewport = diagram.scroll_handle.bounds();
-        let offset = diagram.scroll_handle.offset();
-        let local = point(
-            f32::from(anchor.x - viewport.origin.x),
-            f32::from(anchor.y - viewport.origin.y),
-        );
-        let document_point = (
-            (local.x - f32::from(offset.x) - DIAGRAM_SCENE_PADDING) / diagram.zoom,
-            (local.y - f32::from(offset.y) - DIAGRAM_SCENE_PADDING) / diagram.zoom,
-        );
-        let scene = (
-            document.width * next_zoom + DIAGRAM_SCENE_PADDING * 2.0,
-            document.height * next_zoom + DIAGRAM_SCENE_PADDING * 2.0,
-        );
-        let max_offset = point(
-            px((scene.0 - f32::from(viewport.size.width)).max(0.0)),
-            px((scene.1 - f32::from(viewport.size.height)).max(0.0)),
-        );
-        let next_offset = point(
-            px(local.x - (document_point.0 * next_zoom + DIAGRAM_SCENE_PADDING)),
-            px(local.y - (document_point.1 * next_zoom + DIAGRAM_SCENE_PADDING)),
-        );
-        diagram
-            .scroll_handle
-            .set_offset(clamp_diagram_scroll_offset(next_offset, max_offset));
-        diagram.zoom = next_zoom;
-        cx.notify();
-    }
-
-    pub(super) fn active_diagram_zoom(&self, session_id: SessionId) -> Option<f32> {
-        let session = self.session(session_id)?;
-        let tab_id = session.active_secondary_tab?;
-        session
-            .secondary_tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)
-            .and_then(|tab| match &tab.kind {
-                SecondaryTabKind::Diagram(diagram) => Some(diagram.zoom),
-                _ => None,
-            })
-    }
-
-    /// Window-space bounds of the minimap's drawing area. The minimap is
-    /// pinned to the viewport's bottom-right corner, so its geometry follows
-    /// from the tracked scroll bounds and the document's aspect ratio.
-    pub(super) fn diagram_minimap_bounds(
-        &self,
-        session_id: SessionId,
-    ) -> Option<gpui::Bounds<Pixels>> {
-        let session = self.session(session_id)?;
-        let tab_id = session.active_secondary_tab?;
-        let SecondaryTabKind::Diagram(diagram) = &session
-            .secondary_tabs
-            .iter()
-            .find(|tab| tab.id == tab_id)?
-            .kind
-        else {
-            return None;
-        };
-        let document = diagram.document.as_ref()?;
-        let (width, height) = diagram_minimap_size(document);
-        let viewport = diagram.scroll_handle.bounds();
-        let inset = px(DIAGRAM_MINIMAP_MARGIN + DIAGRAM_MINIMAP_PADDING);
-        Some(gpui::Bounds::new(
-            point(
-                viewport.origin.x + viewport.size.width - inset - px(width),
-                viewport.origin.y + viewport.size.height - inset - px(height),
-            ),
-            gpui::size(px(width), px(height)),
-        ))
-    }
-
-    /// Scroll so a document point sits in the centre of the viewport; used by
-    /// the minimap.
-    pub(super) fn center_diagram_on_for(
-        &mut self,
-        session_id: SessionId,
-        document_point: (f32, f32),
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        let viewport = diagram.scroll_handle.bounds().size;
-        let target = point(
-            px(f32::from(viewport.width) / 2.0
-                - (document_point.0 * diagram.zoom + DIAGRAM_SCENE_PADDING)),
-            px(f32::from(viewport.height) / 2.0
-                - (document_point.1 * diagram.zoom + DIAGRAM_SCENE_PADDING)),
-        );
-        diagram
-            .scroll_handle
-            .set_offset(clamp_diagram_scroll_offset(
-                target,
-                diagram.scroll_handle.max_offset(),
-            ));
-        cx.notify();
-    }
-
-    pub(super) fn set_all_diagram_schemas_for(
-        &mut self,
-        session_id: SessionId,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        diagram.selected_schemas = if enabled { None } else { Some(BTreeSet::new()) };
-        rebuild_diagram_document(diagram);
-        cx.notify();
-    }
-
-    pub(super) fn set_diagram_schema_enabled_for(
-        &mut self,
-        session_id: SessionId,
-        schema: String,
-        enabled: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        if diagram.available_schemas.binary_search(&schema).is_err() {
-            return;
-        }
-
-        let mut selected = diagram
-            .selected_schemas
-            .clone()
-            .unwrap_or_else(|| diagram.available_schemas.iter().cloned().collect());
-        if enabled {
-            selected.insert(schema);
-        } else {
-            selected.remove(&schema);
-        }
-        diagram.selected_schemas = Some(selected);
-        normalize_diagram_schema_selection(
-            &mut diagram.selected_schemas,
-            &diagram.available_schemas,
-        );
-        rebuild_diagram_document(diagram);
-        cx.notify();
-    }
-
-    pub(super) fn select_diagram_node_for(
-        &mut self,
-        session_id: SessionId,
-        node_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
-            return;
-        };
-        diagram.selected_node = node_id;
-        cx.notify();
-    }
-
-    /// Drill into a table from the diagram using the same data-loading path as
-    /// the explorer, keeping filters, paging, and mutation safety consistent.
-    pub(super) fn open_diagram_table_for(
-        &mut self,
-        session_id: SessionId,
-        table: TableInfo,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_table_for(session_id, table, window, cx);
-    }
-
-    /// Save pre-rendered diagram bytes through the native file picker. The
-    /// renderer supplies bytes so app state remains presentation agnostic.
-    pub(super) fn export_diagram_for(
-        &mut self,
-        session_id: SessionId,
-        format: DiagramExportFormat,
-        bytes: Vec<u8>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(database) = self.session(session_id).map(|session| {
-            session
-                .current_database
-                .clone()
-                .unwrap_or_else(|| session.name.clone())
-        }) else {
-            return;
-        };
-        let directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let stem = database
-            .chars()
-            .map(|character| match character {
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
-                _ => '-',
-            })
-            .collect::<String>();
-        let suggested = format!("{}-diagram.{}", stem.trim_matches('-'), format.extension());
-        let receiver = cx.prompt_for_new_path(&directory, Some(suggested.as_str()));
-        let runtime = self.runtime.clone();
-        cx.spawn(async move |this, cx| {
-            match receiver.await {
-                Ok(Ok(Some(path))) => {
-                    let destination = path.display().to_string();
-                    let result = runtime
-                        .spawn_blocking(move || std::fs::write(path, bytes))
-                        .await;
-                    this.update(cx, |this, cx| {
-                        let (kind, message) = match result {
-                            Ok(Ok(())) => (
-                                ToastKind::Success,
-                                format!("Exported diagram to {destination}"),
-                            ),
-                            Ok(Err(error)) => (
-                                ToastKind::Error,
-                                format!("Could not export diagram: {error}"),
-                            ),
-                            Err(error) => (
-                                ToastKind::Error,
-                                format!("Diagram export task stopped: {error}"),
-                            ),
-                        };
-                        this.show_toast(kind, message, cx);
-                    })?;
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    this.update(cx, |this, cx| {
-                        this.show_toast(
-                            ToastKind::Error,
-                            format!("Could not open the save dialog: {error}"),
-                            cx,
-                        );
-                    })?;
-                }
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.show_toast(
-                            ToastKind::Error,
-                            format!("Save dialog closed unexpectedly: {error}"),
-                            cx,
-                        );
-                    })?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-    }
-
-    fn active_diagram_tab_mut(&mut self, session_id: SessionId) -> Option<&mut DiagramTab> {
-        let session = self.session_mut(session_id)?;
-        let tab_id = session.active_secondary_tab?;
-        let tab = session
-            .secondary_tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)?;
-        let SecondaryTabKind::Diagram(diagram) = &mut tab.kind else {
-            return None;
-        };
-        Some(diagram)
-    }
-
-    fn activate_secondary_tab_for(
-        &mut self,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let Some(tab) = session.secondary_tabs.iter().find(|tab| tab.id == tab_id) else {
-            return;
-        };
-        session.active_secondary_tab = Some(tab_id);
-        let tab_focus = match &tab.kind {
-            SecondaryTabKind::Data(_) => {
-                session.pane = Pane::Data;
-                session.recent_data_tab = Some(tab_id);
-                None
-            }
-            SecondaryTabKind::Query(query) => {
-                session.pane = Pane::Query;
-                Some(query.query_editor.read(cx).focus_handle())
-            }
-            SecondaryTabKind::Structure(_) => {
-                session.pane = Pane::Structure;
-                None
-            }
-            SecondaryTabKind::Diagram(diagram) => {
-                session.pane = Pane::Diagram;
-                Some(diagram.focus.clone())
-            }
-        };
-        if let Some(focus) = tab_focus {
-            focus.focus(window, cx);
-        }
-        cx.notify();
-    }
-
-    /// Ask before discarding an edited query document. The confirmation keeps
-    /// accidental tab closes from silently losing work.
-    pub(super) fn request_close_secondary_tab_for(
-        &mut self,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((kind, text, return_focus)) = self.session(session_id).and_then(|session| {
-            session
-                .secondary_tabs
-                .iter()
-                .find(|tab| tab.id == tab_id)
-                .and_then(|tab| {
-                    let SecondaryTabKind::Query(query) = &tab.kind else {
-                        return None;
-                    };
-                    let editor = query.query_editor.read(cx);
-                    Some((session.kind, editor.text(cx), editor.focus_handle()))
-                })
-        }) else {
-            self.close_secondary_tab_for(session_id, tab_id, cx);
-            return;
-        };
-        if text.trim().is_empty() || text == Self::default_query(kind) {
-            self.close_secondary_tab_for(session_id, tab_id, cx);
-            return;
-        }
-        let focus = cx.focus_handle();
-        self.confirmation_dialog = Some(ConfirmationDialog {
-            title: "Close query?".into(),
-            detail: "You can reopen it from Query options until you disconnect.".into(),
-            confirm_label: "Close query",
-            tone: ConfirmationTone::Warning,
-            action: ConfirmationAction::CloseQuery { session_id, tab_id },
-            focus: focus.clone(),
-            return_focus: Some(return_focus),
-        });
-        focus.focus(window, cx);
-        cx.notify();
-    }
-
-    fn close_secondary_tab_for(
-        &mut self,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let Some(index) = session
-            .secondary_tabs
-            .iter()
-            .position(|tab| tab.id == tab_id)
-        else {
-            return;
-        };
-        let tab = session.secondary_tabs.remove(index);
-        match tab.kind {
-            SecondaryTabKind::Query(mut query) => {
-                query.invalidate_request();
-                let text = query.query_editor.read(cx).text(cx);
-                if !text.trim().is_empty() && text != Self::default_query(session.kind) {
-                    session.closed_queries.push(text);
-                    const MAX_CLOSED_QUERIES: usize = 10;
-                    let overflow = session
-                        .closed_queries
-                        .len()
-                        .saturating_sub(MAX_CLOSED_QUERIES);
-                    if overflow > 0 {
-                        session.closed_queries.drain(..overflow);
-                    }
-                }
-            }
-            SecondaryTabKind::Diagram(mut diagram) => diagram.invalidate_request(),
-            SecondaryTabKind::Data(mut data) => data.invalidate_request(),
-            SecondaryTabKind::Structure(_) => {}
-        }
-        if session.recent_data_tab == Some(tab_id) {
-            session.recent_data_tab = None;
-        }
-        if session.active_secondary_tab == Some(tab_id) {
-            let next = index.min(session.secondary_tabs.len().saturating_sub(1));
-            session.active_secondary_tab = session.secondary_tabs.get(next).map(|tab| tab.id);
-            session.pane = session
-                .secondary_tabs
-                .get(next)
-                .map(|tab| tab.kind.pane())
-                .unwrap_or(Pane::Data);
-            if session.pane == Pane::Data {
-                session.recent_data_tab = session.active_secondary_tab;
-            }
-        }
-        self.persist_query_workspace_for(session_id, cx);
-        cx.notify();
-    }
-
-    /// Reopen the most recently closed query document in this connection.
-    pub(super) fn reopen_last_closed_query_for(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let text = self
-            .session_mut(session_id)
-            .and_then(|session| session.closed_queries.pop());
-        let Some(text) = text else { return };
-        self.add_query_tab_for(session_id, window, cx);
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let Some(tab_id) = session.active_secondary_tab else {
-            return;
-        };
-        let Some(SecondaryTab {
-            kind: SecondaryTabKind::Query(query),
-            ..
-        }) = session
-            .secondary_tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)
-        else {
-            return;
-        };
-        query
-            .query_editor
-            .update(cx, |editor, cx| editor.set_text(text, cx));
-        cx.notify();
-    }
-
     fn select_schema_filter_for(
         &mut self,
         session_id: SessionId,
@@ -3295,7 +1356,14 @@ impl DbxApp {
         }
 
         let tab_id = Uuid::new_v4();
-        let data = DataTab::new(session_id, tab_id, table_ref, window, cx);
+        let data = DataTab::new(
+            session_id,
+            tab_id,
+            table_ref,
+            session.kind.is_sql(),
+            window,
+            cx,
+        );
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
@@ -3305,6 +1373,7 @@ impl DbxApp {
         });
         self.activate_secondary_tab_for(session_id, tab_id, window, cx);
         self.load_data_tab_for(session_id, tab_id, filters, window, cx);
+        self.persist_query_workspace_for(session_id, cx);
     }
 
     /// Load a data tab's structure and first page together, starting from
@@ -3317,6 +1386,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_edits_block(session_id, tab_id, cx) {
+            return;
+        }
         let Some((engine, kind, table_ref, filter_columns)) =
             self.session(session_id).and_then(|session| {
                 let data = session.data_tab(tab_id)?;
@@ -3374,6 +1446,7 @@ impl DbxApp {
         data.reset_row_state(cx);
         data.filters = filter_model;
         data.filter_subscriptions.clear();
+        let order = data.sort.clone().into_iter().collect::<Vec<_>>();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading {}…", table_ref.name);
@@ -3394,7 +1467,7 @@ impl DbxApp {
                             &table_ref,
                             &[],
                             &filters,
-                            &[],
+                            &order,
                             Some(table_browse_page(0)),
                             QueryOptions::default(),
                         )
@@ -3737,6 +1810,31 @@ impl DbxApp {
         self.load_table_page_for(session_id, tab_id, 0, cx);
     }
 
+    /// Apply a header sort to a data tab and reload its first page.
+    pub(super) fn set_table_sort_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        order: Option<Order>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let tables = session.tables.clone();
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        if data.busy || data.row_draft.is_some() || data.has_unsaved_cell_work() {
+            // Restore the indicator the grid already advanced.
+            data.sync_result_grid(false, &tables, cx);
+            cx.notify();
+            return;
+        }
+        data.sort = order;
+        self.load_table_page_for(session_id, tab_id, 0, cx);
+    }
+
     fn set_table_page(
         &mut self,
         session_id: SessionId,
@@ -3763,6 +1861,9 @@ impl DbxApp {
         page: u64,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_edits_block(session_id, tab_id, cx) {
+            return;
+        }
         let Some((engine, table, kind, busy, known_columns)) =
             self.session(session_id).and_then(|session| {
                 let data = session.data_tab(tab_id)?;
@@ -3797,6 +1898,7 @@ impl DbxApp {
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
+        let order = data.sort.clone().into_iter().collect::<Vec<_>>();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading page {}…", page + 1);
@@ -3813,7 +1915,7 @@ impl DbxApp {
                         &table,
                         &[],
                         &filters,
-                        &[],
+                        &order,
                         Some(table_browse_page(page)),
                         QueryOptions::default(),
                         Some(&known_columns),
@@ -4278,651 +2380,6 @@ impl DbxApp {
         cx.notify();
     }
 
-    pub(super) fn request_run_query_for(
-        &mut self,
-        session_id: SessionId,
-        run_all: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((kind, query_editor)) = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            Some((session.kind, query.query_editor.clone()))
-        }) else {
-            return;
-        };
-        if !kind.is_sql() {
-            // Redis is intentionally line-oriented: a multiline document is
-            // not a Redis pipeline, and flattening it into one command would
-            // silently change its meaning. The only execution unit is the
-            // selection or current line.
-            self.run_query_for_execution(session_id, false, cx);
-            return;
-        }
-        let text = query_editor.read(cx).text(cx);
-        let scope = if run_all {
-            editor::QueryExecutionScope::Document
-        } else {
-            editor::QueryExecutionScope::SelectionOrStatement
-        };
-        let range = if run_all {
-            0..text.len()
-        } else {
-            query_editor.read(cx).execution_range(scope, cx)
-        };
-        let query = text[range].trim();
-        if query.is_empty() {
-            return;
-        }
-        let (title, detail, confirm_label, tone) = match editor::sql_execution_kind(query) {
-            editor::SqlExecutionKind::Destructive => (
-                "Run destructive query?",
-                "This statement can permanently change or delete data.",
-                "Run query",
-                ConfirmationTone::Danger,
-            ),
-            _ if editor::sql_statement_count(query) > 1 => (
-                "Run multiple statements?",
-                "Statements run in order without a transaction. If one fails, earlier changes stay.",
-                "Run statements",
-                ConfirmationTone::Warning,
-            ),
-            _ => {
-                self.run_query_for_execution(session_id, run_all, cx);
-                return;
-            }
-        };
-        let return_focus = Some(query_editor.read(cx).focus_handle());
-        let focus = cx.focus_handle();
-        self.confirmation_dialog = Some(ConfirmationDialog {
-            title: title.into(),
-            detail: detail.into(),
-            confirm_label,
-            tone,
-            action: ConfirmationAction::RunQuery {
-                session_id,
-                run_all,
-            },
-            focus: focus.clone(),
-            return_focus,
-        });
-        focus.focus(window, cx);
-        cx.notify();
-    }
-
-    /// Execute the selected text or current statement. `run_all` is reserved
-    /// for the explicit whole-document action; it intentionally ignores an
-    /// editor selection.
-    fn run_query_for_execution(
-        &mut self,
-        session_id: SessionId,
-        run_all: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((engine, tab_id, kind, database, history_connection, query_editor, busy)) =
-            self.session(session_id).and_then(|session| {
-                let tab_id = session.active_secondary_tab?;
-                let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-                let SecondaryTabKind::Query(query_tab) = &tab.kind else {
-                    return None;
-                };
-                Some((
-                    session.engine.clone(),
-                    tab_id,
-                    session.kind,
-                    session.current_database.clone(),
-                    query_history_connection(session),
-                    query_tab.query_editor.clone(),
-                    query_tab.busy,
-                ))
-            })
-        else {
-            return;
-        };
-        let Some(engine) = engine else {
-            return;
-        };
-        if busy {
-            return;
-        }
-        let override_query = self
-            .session_mut(session_id)
-            .and_then(|session| {
-                session
-                    .secondary_tabs
-                    .iter_mut()
-                    .find(|tab| tab.id == tab_id)
-            })
-            .and_then(|tab| match &mut tab.kind {
-                SecondaryTabKind::Query(query) => query.execution_override.take(),
-                _ => None,
-            });
-        let full_query = override_query
-            .clone()
-            .unwrap_or_else(|| query_editor.read(cx).text(cx));
-        let scope = if run_all {
-            editor::QueryExecutionScope::Document
-        } else if kind.is_sql() {
-            editor::QueryExecutionScope::SelectionOrStatement
-        } else if kind == DatabaseKind::Redis {
-            editor::QueryExecutionScope::SelectionOrCurrentLine
-        } else {
-            editor::QueryExecutionScope::Document
-        };
-        let range = if run_all || override_query.is_some() {
-            0..full_query.len()
-        } else {
-            query_editor.read(cx).execution_range(scope, cx)
-        };
-        let selected_query = &full_query[range.clone()];
-        let executed_leading_whitespace = selected_query.len() - selected_query.trim_start().len();
-        let query = selected_query.trim().to_owned();
-        if query.is_empty() {
-            return;
-        }
-        let may_change_schema = kind.is_sql() && editor::sql_may_change_schema(&query);
-        let runtime = self.runtime.clone();
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let Some(tab) = session
-            .secondary_tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)
-        else {
-            return;
-        };
-        let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
-            return;
-        };
-        query_tab.busy = true;
-        query_tab.results_stale = query_tab.result.is_some();
-        query_tab.error = None;
-        query_tab.status = "Running query…".into();
-        query_tab.request_generation = query_tab.request_generation.saturating_add(1);
-        let generation = query_tab.request_generation;
-        let query_revision = query_tab.query_revision;
-        query_tab.executed_database = database.clone();
-        cx.notify();
-        // The executed statement moves into the blocking task; the original
-        // stays behind so failures can locate the offending token in it.
-        let executed_query = query.clone();
-        let console = query_tab
-            .console
-            .get_or_insert_with(|| Arc::new(QuerySession::new(engine)))
-            .clone();
-        let cancellation = QueryCancellation::default();
-        query_tab.cancellation = Some(cancellation.clone());
-        let timeout_secs = query_tab.timeout_secs;
-        let task = runtime.spawn(async move {
-            console
-                .run(
-                    &executed_query,
-                    QueryOptions::default(),
-                    std::time::Duration::from_secs(timeout_secs),
-                    cancellation,
-                )
-                .await
-        });
-        query_tab.abort_handle.replace(task.abort_handle());
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            this.update(cx, |this, cx| {
-                let (history_outcome, refresh_schema) = {
-                    let Some(session) = this.session_mut(session_id) else {
-                        return;
-                    };
-                    let Some(tab) = session
-                        .secondary_tabs
-                        .iter_mut()
-                        .find(|tab| tab.id == tab_id)
-                    else {
-                        return;
-                    };
-                    let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
-                        return;
-                    };
-                    if generation != query_tab.request_generation {
-                        return;
-                    }
-                    query_tab.busy = false;
-                    query_tab.abort_handle.clear();
-                    query_tab.cancellation = None;
-                    match result {
-                        Ok(Ok(script)) => {
-                            query_tab.in_transaction = script.in_transaction;
-                            query_tab.statement_results = script.statements;
-                            query_tab.active_result =
-                                query_tab.statement_results.len().saturating_sub(1);
-                            let mut result = query_tab
-                                .statement_results
-                                .last()
-                                .map(|item| item.result.clone());
-                            let error = query_tab
-                                .statement_results
-                                .last()
-                                .and_then(|item| item.error.clone());
-                            if std::mem::take(&mut query_tab.plan_pending)
-                                && error.is_none()
-                                && let Some(raw) = &result
-                            {
-                                let plan = dbx_core::format_execution_plan(kind, raw);
-                                query_tab.plan = Some(plan.clone());
-                                result = Some(plan);
-                            }
-                            query_tab.status =
-                                result.as_ref().map(query_result_status).unwrap_or_default();
-                            let outcome = if let Some(error) = &error {
-                                QueryHistoryOutcome::failure(error.clone())
-                            } else {
-                                QueryHistoryOutcome::success(query_tab.status.clone())
-                            };
-                            query_tab.set_result(result, cx);
-                            query_tab.results_stale = false;
-                            query_tab.error = error;
-                            query_tab.error_highlight = None;
-                            (outcome, may_change_schema && !query_tab.in_transaction)
-                        }
-                        Ok(Err(error)) => {
-                            query_tab.plan_pending = false;
-                            query_tab.in_transaction = false;
-                            let message = error.to_string();
-                            // Positions reported against the trimmed statement
-                            // shift by the trimmed leading whitespace.
-                            let lead = range.start + executed_leading_whitespace;
-                            query_tab.error_highlight =
-                                if query_tab.query_revision == query_revision {
-                                    editor::sql_error_range(&message, &query)
-                                        .map(|range| range.start + lead..range.end + lead)
-                                } else {
-                                    None
-                                };
-                            query_tab.error = Some(message.clone());
-                            query_tab.results_stale = query_tab.result.is_some();
-                            (QueryHistoryOutcome::failure(message), false)
-                        }
-                        Err(error) => {
-                            let message = format!("Query task stopped unexpectedly: {error}");
-                            query_tab.error = Some(message.clone());
-                            query_tab.results_stale = query_tab.result.is_some();
-                            (QueryHistoryOutcome::failure(message), false)
-                        }
-                    }
-                };
-                this.record_query_history(
-                    history_connection.clone(),
-                    query.clone(),
-                    history_outcome,
-                    cx,
-                );
-                if refresh_schema {
-                    if let Some(session) = this.session_mut(session_id) {
-                        for tab in &mut session.secondary_tabs {
-                            if let SecondaryTabKind::Diagram(diagram) = &mut tab.kind {
-                                diagram.stale = diagram.document.is_some();
-                            }
-                        }
-                    }
-                    // Refresh Explorer first; its guarded completion then
-                    // rebuilds any open diagram from the same catalogue.
-                    this.refresh_tables_for(session_id, cx);
-                }
-                cx.notify();
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-    }
-
-    pub(super) fn run_console_command_for(
-        &mut self,
-        session_id: SessionId,
-        command: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session) = self.session_mut(session_id)
-            && let Some(tab_id) = session.active_secondary_tab
-            && let Some(tab) = session
-                .secondary_tabs
-                .iter_mut()
-                .find(|tab| tab.id == tab_id)
-            && let SecondaryTabKind::Query(query) = &mut tab.kind
-            && !query.busy
-        {
-            query.execution_override = Some(command.to_owned());
-            self.run_query_for_execution(session_id, true, cx);
-        }
-    }
-
-    pub(super) fn select_statement_result_for(
-        &mut self,
-        session_id: SessionId,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session) = self.session_mut(session_id)
-            && let Some(tab_id) = session.active_secondary_tab
-            && let Some(tab) = session
-                .secondary_tabs
-                .iter_mut()
-                .find(|tab| tab.id == tab_id)
-            && let SecondaryTabKind::Query(query) = &mut tab.kind
-            && let Some(item) = query.statement_results.get(index).cloned()
-        {
-            query.active_result = index;
-            query.status = query_result_status(&item.result);
-            query.error = item.error;
-            query.set_result(Some(item.result), cx);
-            cx.notify();
-        }
-    }
-
-    fn copy_query_selection_action(
-        &mut self,
-        _: &CopyQuerySelection,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(session_id) = self.active_session_id() {
-            self.copy_query_selection_for(session_id, cx);
-        }
-    }
-
-    fn cancel_query_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        // Escape belongs to an open completion menu first; the keybinding
-        // reaches here before the menu's own key handler can dismiss it.
-        if let Some(menu) = self.query_completion_for(session_id, cx) {
-            if let Some(session) = self.session_mut(session_id)
-                && let Some(tab_id) = session.active_secondary_tab
-                && let Some(tab) = session
-                    .secondary_tabs
-                    .iter_mut()
-                    .find(|tab| tab.id == tab_id)
-                && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
-            {
-                query_tab.completion_dismissed_signature = Some(menu.signature);
-            }
-            cx.notify();
-            return;
-        }
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        let Some(tab_id) = session.active_secondary_tab else {
-            return;
-        };
-        let Some(tab) = session
-            .secondary_tabs
-            .iter_mut()
-            .find(|tab| tab.id == tab_id)
-        else {
-            return;
-        };
-        let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
-            return;
-        };
-        if !query_tab.busy {
-            return;
-        }
-        if let Some(cancellation) = &query_tab.cancellation {
-            cancellation.cancel();
-        }
-        query_tab.status = "Stopping query; verifying server cancellation…".into();
-        cx.notify();
-    }
-
-    fn query_result_text_for(
-        &self,
-        session_id: SessionId,
-        format: QueryResultExportFormat,
-        cx: &App,
-    ) -> Option<String> {
-        let query = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            Some(query)
-        })?;
-        let delegate = query.result_grid.read(cx).delegate();
-        match format {
-            QueryResultExportFormat::Tsv => delegate.result_as_tsv(),
-            QueryResultExportFormat::Csv => delegate.result_as_csv(),
-            QueryResultExportFormat::Json => delegate.result_as_json(),
-        }
-    }
-
-    /// Copy the most specific active selection: cell, then row, then column.
-    /// Column zero is DBX's synthetic row-number column and has no database value.
-    pub(super) fn copy_query_selection_for(
-        &mut self,
-        session_id: SessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((text, label)) = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            let grid = query.result_grid.read(cx);
-            let delegate = grid.delegate();
-            match query.result_selection {
-                QueryResultSelection::Cell => {
-                    let (row, column) = grid.selected_cell()?;
-                    let text = if column == 0 {
-                        Some((row + 1).to_string())
-                    } else {
-                        delegate.cell_as_plain_text(row, column - 1)
-                    }?;
-                    Some((text, "cell"))
-                }
-                QueryResultSelection::Row => grid
-                    .selected_row()
-                    .and_then(|row| delegate.row_as_tsv(row))
-                    .map(|text| (text, "row")),
-                QueryResultSelection::Column => grid.selected_col().and_then(|column| {
-                    (column > 0)
-                        .then(|| delegate.column_as_tsv(column - 1))
-                        .flatten()
-                        .map(|text| (text, "column"))
-                }),
-                QueryResultSelection::None => None,
-            }
-        }) else {
-            self.show_toast(
-                ToastKind::Info,
-                "Select a result cell, row, or column to copy",
-                cx,
-            );
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.show_toast(ToastKind::Success, format!("Copied {label}"), cx);
-    }
-
-    pub(super) fn copy_query_result_for(
-        &mut self,
-        session_id: SessionId,
-        format: QueryResultExportFormat,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(text) = self.query_result_text_for(session_id, format, cx) else {
-            return;
-        };
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.show_toast(
-            ToastKind::Success,
-            format!(
-                "Copied result as {}",
-                format.extension().to_ascii_uppercase()
-            ),
-            cx,
-        );
-    }
-
-    pub(super) fn export_query_result_for(
-        &mut self,
-        session_id: SessionId,
-        format: QueryResultExportFormat,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(text) = self.query_result_text_for(session_id, format, cx) else {
-            return;
-        };
-        let directory = dirs::download_dir()
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let suggested = format!("query-result.{}", format.extension());
-        let receiver = cx.prompt_for_new_path(&directory, Some(suggested.as_str()));
-        let runtime = self.runtime.clone();
-        cx.spawn(async move |this, cx| {
-            match receiver.await {
-                Ok(Ok(Some(path))) => {
-                    let destination = path.display().to_string();
-                    let result = runtime
-                        .spawn_blocking(move || std::fs::write(path, text))
-                        .await;
-                    this.update(cx, |this, cx| {
-                        let (kind, message) = match result {
-                            Ok(Ok(())) => (
-                                ToastKind::Success,
-                                format!("Exported result to {destination}"),
-                            ),
-                            Ok(Err(error)) => (
-                                ToastKind::Error,
-                                format!("Could not export result: {error}"),
-                            ),
-                            Err(error) => (
-                                ToastKind::Error,
-                                format!("Result export task stopped: {error}"),
-                            ),
-                        };
-                        this.show_toast(kind, message, cx);
-                    })?;
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => {
-                    this.update(cx, |this, cx| {
-                        this.show_toast(
-                            ToastKind::Error,
-                            format!("Could not open the save dialog: {error}"),
-                            cx,
-                        );
-                    })?;
-                }
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.show_toast(
-                            ToastKind::Error,
-                            format!("Save dialog closed unexpectedly: {error}"),
-                            cx,
-                        );
-                    })?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-    }
-
-    pub(super) fn copy_query_error_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
-        let error = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            query.error.clone()
-        });
-        if let Some(error) = error {
-            cx.write_to_clipboard(ClipboardItem::new_string(error));
-            self.show_toast(ToastKind::Success, "Copied query error", cx);
-        }
-    }
-
-    pub(super) fn focus_query_error_for(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let editor = self.session(session_id).and_then(|session| {
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            query
-                .error_highlight
-                .as_ref()
-                .map(|range| (query.query_editor.clone(), range.start))
-        });
-        if let Some((editor, offset)) = editor {
-            let focus = editor.read(cx).focus_handle();
-            editor.update(cx, |editor, cx| editor.move_cursor_to(offset, cx));
-            focus.focus(window, cx);
-        }
-    }
-
-    /// Pretty-print the active query tab's SQL in place, keeping the caret
-    /// anchored to the token it sat on. Redis tabs have nothing to format.
-    fn format_query_for(
-        &mut self,
-        session_id: SessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(query_editor) = self.session(session_id).and_then(|session| {
-            if !session.kind.is_sql() {
-                return None;
-            }
-            let tab_id = session.active_secondary_tab?;
-            let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-            let SecondaryTabKind::Query(query) = &tab.kind else {
-                return None;
-            };
-            Some(query.query_editor.clone())
-        }) else {
-            return;
-        };
-
-        let (text, cursor, focus_handle) = query_editor.update(cx, |editor, cx| {
-            (
-                editor.text(cx),
-                editor.cursor_offset(),
-                editor.focus_handle(),
-            )
-        });
-        let (formatted, mapped_cursor) = editor::format_sql_at_cursor(&text, cursor);
-        if formatted != text {
-            let length = text.len();
-            query_editor.update(cx, |editor, cx| {
-                editor.replace_range(0..length, formatted.as_str(), cx);
-                editor.move_cursor_to(mapped_cursor, cx);
-            });
-        }
-        if let Some(session) = self.session_mut(session_id)
-            && let Some(tab_id) = session.active_secondary_tab
-            && let Some(tab) = session
-                .secondary_tabs
-                .iter_mut()
-                .find(|tab| tab.id == tab_id)
-            && let SecondaryTabKind::Query(query_tab) = &mut tab.kind
-        {
-            query_tab.completion_signature = None;
-            query_tab.completion_dismissed_signature = None;
-            query_tab.completion_index = 0;
-        }
-        focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
     fn refresh_tables_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
         let Some(session) = self.session(session_id) else {
             return;
@@ -4974,6 +2431,7 @@ impl DbxApp {
                 };
 
                 cx.notify();
+                this.load_schema_objects_for(session_id, cx);
                 this.prefetch_completion_columns_for(session_id, cx);
                 if diagram_open {
                     this.refresh_diagram_for(session_id, cx);
@@ -5261,6 +2719,11 @@ impl DbxApp {
         if session.current_database.as_deref() == Some(database.as_str()) || session.busy {
             return;
         }
+        if session.secondary_tabs.iter().any(|tab| matches!(&tab.kind, SecondaryTabKind::Data(data) if data.has_unsaved_cell_work() || data.busy)) {
+            session.error = Some("Finish running table work and save or discard cell edits before switching databases".into());
+            cx.notify();
+            return;
+        }
         if session.secondary_tabs.iter().any(|tab| matches!(&tab.kind, SecondaryTabKind::Query(query) if query.in_transaction || query.busy)) {
             session.error = Some("Finish or roll back open query transactions before switching databases".into());
             return;
@@ -5311,10 +2774,13 @@ impl DbxApp {
                     .iter()
                     .any(|tab| matches!(&tab.kind, SecondaryTabKind::Diagram(_)));
                 let mut diagram_needs_reload = false;
+                let switched = matches!(&result, Ok(Ok(_)));
                 match result {
                     Ok(Ok(tables)) => {
                         session.set_tables(tables);
                         session.current_database = Some(database.clone());
+                        session.schema_objects.clear();
+                        session.schema_objects_error = None;
                         // Open tables belong to the previous database.
                         session.close_data_tabs();
                         session.completion_columns.clear();
@@ -5361,6 +2827,11 @@ impl DbxApp {
                 }
                 cx.notify();
                 this.prefetch_completion_columns_for(session_id, cx);
+                if switched {
+                    this.load_schema_objects_for(session_id, cx);
+                    this.persist_query_workspace_for(session_id, cx);
+                    this.persist_startup_workspace(cx);
+                }
                 if diagram_needs_reload {
                     this.refresh_diagram_for(session_id, cx);
                 }
@@ -5377,6 +2848,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_edits_block(session_id, tab_id, cx) {
+            return;
+        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
@@ -5523,18 +2997,17 @@ impl DbxApp {
             TableEvent::SelectRow(row_index) => {
                 self.select_row_for(session_id, tab_id, *row_index, cx);
             }
-            // The inline foreign-key action uses the table component's
-            // existing cell event channel so the virtualized grid remains
-            // responsible for rendering and hit testing its cells.
+            // Selecting a cell also selects its row for the inspector.
+            TableEvent::SelectCell(row_index, column_index) => {
+                self.select_row_for(session_id, tab_id, *row_index, cx);
+                if let Some(column) = column_index.checked_sub(1) {
+                    self.select_column_for(session_id, tab_id, column, cx);
+                }
+            }
             TableEvent::DoubleClickedCell(row_index, column_index) => {
-                self.navigate_to_foreign_key_row_for(
-                    session_id,
-                    tab_id,
-                    *row_index,
-                    *column_index,
-                    window,
-                    cx,
-                );
+                if let Some(column) = column_index.checked_sub(1) {
+                    self.begin_cell_edit_for(session_id, tab_id, *row_index, column, window, cx);
+                }
             }
             TableEvent::SelectColumn(column_index) if *column_index > 0 => {
                 self.select_column_for(session_id, tab_id, *column_index - 1, cx);
@@ -5575,6 +3048,14 @@ impl DbxApp {
         };
 
         match event {
+            TableEvent::DoubleClickedCell(row, column) if *column > 0 => {
+                query_tab.inspected_value = query_tab
+                    .result_grid
+                    .read(cx)
+                    .delegate()
+                    .cell_value(*row, *column - 1)
+                    .cloned();
+            }
             TableEvent::ColumnWidthsChanged(widths) => {
                 query_tab.result_column_widths =
                     ResultTableDelegate::widths_by_key(query_tab.result.as_deref(), widths);
@@ -5654,6 +3135,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_edits_block(session_id, tab_id, cx) {
+            return;
+        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
@@ -5971,6 +3455,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pending_edits_block(session_id, tab_id, cx) {
+            return;
+        }
         let Some((table, selected_row, row)) = self.data_tab(session_id, tab_id).and_then(|data| {
             let selected_row = data.selected_row?;
             let row = data.result.as_ref()?.rows.get(selected_row)?.clone();
@@ -6169,6 +3656,13 @@ impl DbxApp {
         let Some(dialog) = self.confirmation_dialog.take() else {
             return;
         };
+        // A declined run must ask for its parameters again next time.
+        if let ConfirmationAction::RunQuery { session_id, .. } = dialog.action
+            && let Some(query) = self.active_query_tab_mut(session_id)
+        {
+            query.parameters_ready = false;
+            query.prepared_parameters = None;
+        }
         if let Some(return_focus) = dialog.return_focus {
             return_focus.focus(window, cx);
         }
@@ -6249,8 +3743,25 @@ impl DbxApp {
             }
             ConfirmationAction::RunQuery {
                 session_id,
+                tab_id,
                 run_all,
+                query,
             } => {
+                if self
+                    .session(session_id)
+                    .and_then(|session| session.active_secondary_tab)
+                    != Some(tab_id)
+                {
+                    self.show_toast(
+                        ToastKind::Info,
+                        "Return to the query tab and run it again",
+                        cx,
+                    );
+                    return;
+                }
+                if let Some(tab) = self.active_query_tab_mut(session_id) {
+                    tab.execution_override = Some(query);
+                }
                 self.run_query_for_execution(session_id, run_all, cx);
             }
             ConfirmationAction::CloseQuery { session_id, tab_id } => {
@@ -6459,6 +3970,9 @@ impl DbxApp {
             DatabaseKind::BigQuery => "CREATE TABLE new_table (id INT64, name STRING);",
             DatabaseKind::ClickHouse => {
                 "CREATE TABLE new_table (\n    id UInt64,\n    name String\n) ENGINE = MergeTree ORDER BY id;"
+            }
+            DatabaseKind::SqlServer => {
+                "CREATE TABLE dbo.new_table (\n    id INT IDENTITY(1,1) PRIMARY KEY,\n    name NVARCHAR(200) NOT NULL\n);"
             }
             _ => kind.default_query(),
         };

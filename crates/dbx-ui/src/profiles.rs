@@ -254,6 +254,7 @@ impl ConnectionProfileDraft {
         self
     }
 
+    #[cfg(test)]
     pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
         self.secret = Some(secret.into());
         self
@@ -482,7 +483,7 @@ impl ProfileStore {
             .validate()
             .map_err(|error| ProfileError::Invalid(error.to_string()))?;
         let (url, embedded_secret) = scrub_url(&draft.config.url)?;
-        let secret = draft.secret.take().or(embedded_secret).map(Zeroizing::new);
+        let mut secret = draft.secret.take().or(embedded_secret).map(Zeroizing::new);
         let id = draft.id.unwrap_or_else(Uuid::new_v4);
         let mut document = self.read_document()?;
         let existing = document
@@ -490,6 +491,36 @@ impl ProfileStore {
             .iter()
             .find(|profile| profile.id == id)
             .cloned();
+        if draft.config.ssh_password.is_some() {
+            let prior = existing
+                .as_ref()
+                .and_then(|profile| profile.secret_key.as_ref())
+                .map(|key| self.secrets.get(key))
+                .transpose()?
+                .flatten()
+                .map(Zeroizing::new);
+            let prior = prior
+                .as_deref()
+                .map(|value| decode_credentials(value))
+                .transpose()?;
+            let password = secret
+                .take()
+                .map(|value| value.to_string())
+                .or_else(|| prior.as_ref().and_then(|(password, _)| password.clone()));
+            let encoded = serde_json::to_string(&(password, draft.config.ssh_password.clone()))?;
+            secret = Some(Zeroizing::new(format!("dbx-secret-v2:{encoded}")));
+        } else if let Some(existing) = &existing
+            && let Some(key) = &existing.secret_key
+            && let Some(prior) = self.secrets.get(key)?
+            && prior.starts_with("dbx-secret-v2:")
+            && let Some(replacement) = secret.take()
+        {
+            let (_, ssh_password) = decode_credentials(&prior)?;
+            secret = Some(Zeroizing::new(format!(
+                "dbx-secret-v2:{}",
+                serde_json::to_string(&(Some(replacement.to_string()), ssh_password))?
+            )));
+        }
         // The connection screen deliberately displays the password-free URL.
         // Saving edits to that selected profile must retain its existing
         // credential unless a replacement password is explicitly supplied.
@@ -593,13 +624,19 @@ impl ProfileStore {
             .find(|profile| profile.id == id)
             .ok_or(ProfileError::NotFound(id))?;
         let profile = stored.clone().into_public();
+        let mut ssh_password = None;
         let url = if let Some(secret_key) = stored.secret_key {
             let secret = Zeroizing::new(
                 self.secrets
                     .get(&secret_key)?
                     .ok_or(ProfileError::MissingSecret(id))?,
             );
-            add_password(&stored.url, &secret)?
+            let (password, ssh) = decode_credentials(&secret)?;
+            ssh_password = ssh;
+            match password {
+                Some(password) => add_password(&stored.url, &password)?,
+                None => stored.url.clone(),
+            }
         } else {
             stored.url
         };
@@ -609,6 +646,7 @@ impl ProfileStore {
         config.read_only = stored.read_only;
         config.socket = stored.socket;
         config.ssh = stored.ssh;
+        config.ssh_password = ssh_password;
         Ok(LoadedConnection { profile, config })
     }
 
@@ -957,6 +995,13 @@ mod provider_credential_tests {
     }
 }
 
+fn decode_credentials(value: &str) -> ProfileResult<(Option<String>, Option<String>)> {
+    match value.strip_prefix("dbx-secret-v2:") {
+        Some(json) => Ok(serde_json::from_str(json)?),
+        None => Ok((Some(value.to_owned()), None)),
+    }
+}
+
 fn add_password(raw: &str, secret: &str) -> ProfileResult<String> {
     let normalized = normalize_connection_string(raw)
         .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
@@ -1092,6 +1137,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ssh_passwords_are_encrypted_and_survive_profile_edits_and_relaunch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PROFILE_FILE_NAME);
+        let store = ProfileStore::at(&path);
+        let vault = store.vault().unwrap();
+        vault.create("fixture passphrase").unwrap();
+        let mut config = ConnectionConfig::new(
+            DatabaseKind::PostgreSQL,
+            "postgres://alice:database-secret@database.test/app",
+        );
+        config.ssh = Some(dbx_core::SshConfig {
+            host: "bastion.test".into(),
+            port: 22,
+            username: "ops".into(),
+            identity_file: None,
+            jump_host: Some("jump.test".into()),
+        });
+        config.ssh_password = Some("ssh-secret".into());
+        let saved = store
+            .save(ConnectionProfileDraft::from_config(
+                "SSH password",
+                config.clone(),
+            ))
+            .unwrap();
+        for file in [&path, vault.path()] {
+            let bytes = fs::read(file).unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(!text.contains("database-secret"));
+            assert!(!text.contains("ssh-secret"));
+        }
+        assert!(!format!("{config:?}").contains("ssh-secret"));
+        let mut edited = config.clone();
+        edited.url = "postgres://alice@database.test/app".into();
+        edited.ssh_password = None;
+        store
+            .save(ConnectionProfileDraft::from_config("Renamed", edited).with_id(saved.id))
+            .unwrap();
+        vault.lock().unwrap();
+        let reopened = ProfileStore::at(&path);
+        reopened
+            .vault()
+            .unwrap()
+            .unlock("fixture passphrase")
+            .unwrap();
+        assert_eq!(reopened.load(saved.id).unwrap().config, config);
+    }
+
+    #[test]
     fn transport_profiles_round_trip_without_exposing_database_passwords() {
         let (_directory, store, _) = test_store();
         let mut config = ConnectionConfig::new(
@@ -1104,6 +1197,7 @@ mod tests {
             port: 2222,
             username: "alice".into(),
             identity_file: Some("/home/alice/.ssh/id_ed25519".into()),
+            jump_host: Some("ops@jump.example:2200".into()),
         });
         let saved = store
             .save(ConnectionProfileDraft::from_config(

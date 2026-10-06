@@ -13,6 +13,15 @@ pub struct SavedQuery {
     pub name: String,
     pub sql: String,
 }
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", content = "document")]
+pub enum SavedTab {
+    Query(SavedQuery),
+    Data(dbx_core::TableRef),
+    Structure(dbx_core::TableRef),
+    Diagram,
+}
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct WorkspaceDocument {
     #[serde(default)]
@@ -20,6 +29,30 @@ pub struct WorkspaceDocument {
     pub drafts: Vec<SavedQuery>,
     pub saved: Vec<SavedQuery>,
     pub closed: Vec<String>,
+    /// Tables open in data tabs, reopened on the next connection.
+    #[serde(default)]
+    pub open_tables: Vec<dbx_core::TableRef>,
+    /// Ordered documents and the selected document within this connection.
+    #[serde(default)]
+    pub tabs: Vec<SavedTab>,
+    #[serde(default)]
+    pub active_tab: Option<usize>,
+    #[serde(default)]
+    pub current_database: Option<String>,
+}
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct StartupWorkspace {
+    pub connections: Vec<StartupConnection>,
+    pub active: Option<usize>,
+}
+#[derive(Clone, Deserialize, Serialize)]
+pub struct StartupConnection {
+    pub profile_id: uuid::Uuid,
+    pub database: Option<String>,
+    #[serde(default)]
+    pub tabs: Option<Vec<SavedTab>>,
+    #[serde(default)]
+    pub active_tab: Option<usize>,
 }
 pub fn connection_key(connection: &QueryHistoryConnection) -> String {
     let identity = serde_json::to_vec(connection).unwrap_or_default();
@@ -38,6 +71,25 @@ impl WorkspaceStore {
     }
     pub fn matches_vault(&self, vault: &Arc<CredentialVault>) -> bool {
         Arc::ptr_eq(&self.vault, vault)
+    }
+    pub fn load_startup(&self) -> Result<StartupWorkspace, String> {
+        match self
+            .vault
+            .get("workspace-startup-v1")
+            .map_err(|error| error.to_string())?
+        {
+            None => Ok(StartupWorkspace::default()),
+            Some(secret) => serde_json::from_str(secret.expose_secret())
+                .map_err(|_| "Saved connections could not be decoded".into()),
+        }
+    }
+    pub fn save_startup(&self, document: &StartupWorkspace) -> Result<(), String> {
+        self.vault
+            .set(
+                "workspace-startup-v1",
+                serde_json::to_string(document).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())
     }
     pub fn load(&self, key: &str) -> Result<WorkspaceDocument, String> {
         match self.vault.get(key).map_err(|error| error.to_string())? {
@@ -82,6 +134,56 @@ impl WorkspaceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_preserves_separate_layouts_for_instances_of_the_same_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Arc::new(CredentialVault::at(directory.path().join("vault")));
+        vault.create("fixture passphrase").unwrap();
+        let store = WorkspaceStore::new(vault.clone());
+        let profile_id = uuid::Uuid::new_v4();
+        let connection = |name: &str| StartupConnection {
+            profile_id,
+            database: Some("app".into()),
+            tabs: Some(vec![
+                SavedTab::Query(SavedQuery {
+                    name: name.into(),
+                    sql: format!("SELECT '{name}'"),
+                }),
+                SavedTab::Data(dbx_core::TableRef::new("items")),
+            ]),
+            active_tab: Some(1),
+        };
+        store
+            .save_startup(&StartupWorkspace {
+                connections: vec![
+                    connection("first private draft"),
+                    connection("second private draft"),
+                ],
+                active: Some(1),
+            })
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(vault.path()).unwrap())
+                .contains("private draft")
+        );
+        vault.lock().unwrap();
+        vault.unlock("fixture passphrase").unwrap();
+        let reopened = WorkspaceStore::new(vault).load_startup().unwrap();
+        assert_eq!(reopened.active, Some(1));
+        assert_eq!(reopened.connections.len(), 2);
+        for (index, expected) in ["first private draft", "second private draft"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(reopened.connections[index].active_tab, Some(1));
+            let SavedTab::Query(query) = &reopened.connections[index].tabs.as_ref().unwrap()[0]
+            else {
+                panic!("query layout lost")
+            };
+            assert_eq!(&query.name, expected);
+        }
+    }
+
     #[test]
     fn drafts_are_encrypted_recoverable_and_old_saves_cannot_overwrite_new_work() {
         let directory = tempfile::tempdir().unwrap();

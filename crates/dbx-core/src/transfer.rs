@@ -15,7 +15,7 @@
 //!   nor TSV has a binary convention.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -402,9 +402,11 @@ async fn export_table_with_reader(
         });
     }
     let file_format = detect_file_format(path)?;
-    if kind == DatabaseKind::ClickHouse && file_format.format == DumpFormat::Sql {
+    if matches!(kind, DatabaseKind::ClickHouse | DatabaseKind::SqlServer)
+        && file_format.format == DumpFormat::Sql
+    {
         return Err(DbxError::Unsupported {
-            operation: "ClickHouse SQL dump export; use CSV or TSV".into(),
+            operation: format!("{kind} SQL dump export; use CSV or TSV"),
             kind,
         });
     }
@@ -490,9 +492,11 @@ pub async fn export_database(
             "database export requires at least one table".into(),
         ));
     }
-    if kind == DatabaseKind::ClickHouse && request.format == DumpFormat::Sql {
+    if matches!(kind, DatabaseKind::ClickHouse | DatabaseKind::SqlServer)
+        && request.format == DumpFormat::Sql
+    {
         return Err(DbxError::Unsupported {
-            operation: "ClickHouse SQL dump export; use CSV or TSV".into(),
+            operation: format!("{kind} SQL dump export; use CSV or TSV"),
             kind,
         });
     }
@@ -505,6 +509,57 @@ pub async fn export_database(
     validate_output_directory(&request.output_directory)?;
     let stem = normalize_output_stem(&request.output_name)?;
 
+    let schema_objects = if request.format == DumpFormat::Sql {
+        engine.schema_objects().await?
+    } else {
+        Vec::new()
+    };
+    let schema_objects = schema_objects
+        .into_iter()
+        .filter(|object| {
+            request
+                .tables
+                .iter()
+                .any(|table| table.schema == object.schema || object.schema.is_none())
+                && object
+                    .table
+                    .as_ref()
+                    .is_none_or(|name| request.tables.iter().any(|table| table.name == *name))
+        })
+        .collect::<Vec<_>>();
+    let mut view_definitions = Vec::new();
+    if request.format == DumpFormat::Sql {
+        for view in engine.list_tables().await?.iter().filter(|table| {
+            table.kind == crate::EntityKind::View
+                && request
+                    .tables
+                    .iter()
+                    .any(|selected| selected.schema == table.schema)
+        }) {
+            let table = TableRef {
+                schema: view.schema.clone(),
+                name: view.name.clone(),
+            };
+            let structure = engine.table_structure(&table).await?;
+            let definition = structure.definition.ok_or_else(|| {
+                DbxError::Query(format!(
+                    "Cannot export the definition of view {}",
+                    view.name
+                ))
+            })?;
+            let definition = if definition
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CREATE ")
+            {
+                definition
+            } else {
+                format!("CREATE VIEW {} AS {definition}", quote_table(kind, &table)?)
+            };
+            view_definitions.push((table, definition));
+        }
+    }
+    let view_definitions = order_export_views(engine, view_definitions, &request.tables).await?;
     let mut reader = ExportReader::new(engine, &request.tables).await?;
     let consistent_snapshot = reader.snapshot.is_some();
     if request.format == DumpFormat::Sql {
@@ -541,6 +596,21 @@ pub async fn export_database(
             )
             .map_err(io_error)?;
         append_database_prelude(kind, &request.tables, &table_order, &mut output)?;
+        if kind == DatabaseKind::PostgreSQL {
+            output
+                .write_all(b"SET check_function_bodies = false;\n")
+                .map_err(io_error)?;
+        }
+        for object in schema_objects.iter().filter(|object| {
+            matches!(
+                object.kind,
+                crate::SchemaObjectKind::Sequence
+                    | crate::SchemaObjectKind::Function
+                    | crate::SchemaObjectKind::Procedure
+            )
+        }) {
+            append_schema_object(kind, object, &mut output)?;
+        }
         output.write_all(b"\n-- Schema\n").map_err(io_error)?;
         for &index in &table_order {
             let export_table = &export_tables[index];
@@ -570,6 +640,14 @@ pub async fn export_database(
             };
             output.write_all(schema.as_bytes()).map_err(io_error)?;
             output.write_all(b";\n").map_err(io_error)?;
+            for statement in render_sql_indexes(kind, &export_table.table, &export_table.structure)?
+            {
+                output.write_all(statement.as_bytes()).map_err(io_error)?;
+                if !statement.starts_with("--") {
+                    output.write_all(b";").map_err(io_error)?;
+                }
+                output.write_all(b"\n").map_err(io_error)?;
+            }
             output.write_all(b"\n").map_err(io_error)?;
         }
 
@@ -586,6 +664,12 @@ pub async fn export_database(
                     &mut output,
                 )
                 .await?;
+                for statement in
+                    render_sql_sequence_resets(kind, &export_table.table, &export_table.structure)?
+                {
+                    output.write_all(statement.as_bytes()).map_err(io_error)?;
+                    output.write_all(b";\n").map_err(io_error)?;
+                }
                 output.write_all(b"\n").map_err(io_error)?;
             }
         }
@@ -610,6 +694,18 @@ pub async fn export_database(
             output.write_all(b"\n").map_err(io_error)?;
         }
 
+        // Install triggers after copying data so restore does not fire them.
+        for object in schema_objects
+            .iter()
+            .filter(|object| object.kind == crate::SchemaObjectKind::Trigger)
+        {
+            append_schema_object(kind, object, &mut output)?;
+        }
+        for (_, definition) in view_definitions {
+            output
+                .write_all(format!("\n{definition};\n").as_bytes())
+                .map_err(io_error)?;
+        }
         reader.finish().await?;
         output.finish()?;
         return Ok(DatabaseExportSummary {
@@ -717,9 +813,10 @@ pub async fn import_database(engine: &DatabaseEngine, path: &Path) -> Result<Imp
 
 /// Render a portable `CREATE TABLE` statement from DBX's normalized metadata.
 ///
-/// Defaults, generated expressions, and indexes are not currently part of
-/// [`TableStructure`], so the output intentionally includes only columns,
-/// primary keys, and foreign keys that DBX can verify from metadata.
+/// The statement includes columns, defaults, primary keys, check constraints,
+/// and foreign keys. Indexes are separate statements from
+/// [`render_sql_indexes`]. Generated expressions, triggers, and grants are not
+/// part of [`TableStructure`].
 pub fn render_sql_schema(
     kind: DatabaseKind,
     table: &TableRef,
@@ -760,11 +857,18 @@ fn render_sql_schema_with_foreign_keys(
 
     let mut definitions = Vec::new();
     for column in &structure.columns {
-        let mut definition = format!(
-            "{} {}",
-            quote_identifier(kind, &column.name)?,
-            safe_schema_type(&column.data_type)?
-        );
+        let (data_type, default) = match postgres_serial_type(kind, column) {
+            Some(serial) => (serial.to_owned(), None),
+            None => (
+                safe_schema_type(&column.data_type)?,
+                column.default_value.as_deref(),
+            ),
+        };
+        let mut definition = format!("{} {}", quote_identifier(kind, &column.name)?, data_type);
+        if let Some(default) = default {
+            definition.push_str(" DEFAULT ");
+            definition.push_str(safe_schema_expression(default)?);
+        }
         if !column.nullable {
             definition.push_str(" NOT NULL");
         }
@@ -779,6 +883,19 @@ fn render_sql_schema_with_foreign_keys(
         .collect::<Result<Vec<_>>>()?;
     if !primary_keys.is_empty() {
         definitions.push(format!("PRIMARY KEY ({})", primary_keys.join(", ")));
+    }
+
+    for check in &structure.checks {
+        let mut definition = String::new();
+        if let Some(name) = &check.name {
+            definition.push_str("CONSTRAINT ");
+            definition.push_str(&quote_identifier(kind, name)?);
+            definition.push(' ');
+        }
+        definition.push_str("CHECK (");
+        definition.push_str(safe_schema_expression(&check.expression)?);
+        definition.push(')');
+        definitions.push(definition);
     }
 
     for foreign_key in &structure.foreign_keys {
@@ -805,6 +922,181 @@ fn render_sql_schema_with_foreign_keys(
     }
     statement.push_str("\n)");
     Ok(statement)
+}
+
+/// PostgreSQL `nextval(...)` defaults point at sequences owned by the column,
+/// which a dump's `DROP TABLE` removes. Recreate them as serial types.
+fn postgres_serial_type(kind: DatabaseKind, column: &ColumnInfo) -> Option<&'static str> {
+    if kind != DatabaseKind::PostgreSQL
+        || !column
+            .default_value
+            .as_deref()
+            .is_some_and(|default| default.trim_start().starts_with("nextval("))
+    {
+        return None;
+    }
+    match column.data_type.trim().to_ascii_lowercase().as_str() {
+        "integer" | "int" | "int4" => Some("serial"),
+        "bigint" | "int8" => Some("bigserial"),
+        "smallint" | "int2" => Some("smallserial"),
+        _ => None,
+    }
+}
+
+/// Statements that move recreated serial sequences past the imported rows.
+pub(crate) fn render_sql_sequence_resets(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+) -> Result<Vec<String>> {
+    let quoted_table = quote_table(kind, table)?;
+    let literal_table = quoted_table.replace('\'', "''");
+    structure
+        .columns
+        .iter()
+        .filter(|column| postgres_serial_type(kind, column).is_some())
+        .map(|column| {
+            let column_name = quote_identifier(kind, &column.name)?;
+            Ok(format!(
+                "SELECT setval(pg_get_serial_sequence('{literal_table}', '{}'), COALESCE((SELECT MAX({column_name}) FROM {quoted_table}), 0) + 1, false)",
+                column.name.replace('\'', "''")
+            ))
+        })
+        .collect()
+}
+
+/// Render `CREATE INDEX` statements for a table's secondary indexes. Primary
+/// keys are part of `CREATE TABLE`. MySQL functional indexes cannot be
+/// reconstructed from its catalog and are emitted as comments.
+pub fn render_sql_indexes(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+) -> Result<Vec<String>> {
+    let mut statements = Vec::new();
+    for index in structure.indexes.iter().filter(|index| !index.primary) {
+        if let Some(definition) = index.definition.as_deref() {
+            let definition = safe_schema_expression(definition)?;
+            if kind.dialect() == DatabaseKind::MySQL {
+                statements.push(definition.to_owned());
+                continue;
+            }
+            let statement = ["CREATE UNIQUE INDEX ", "CREATE INDEX "]
+                .into_iter()
+                .find_map(|prefix| {
+                    let rest = definition.strip_prefix(prefix)?;
+                    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+                    Some(format!("{prefix}IF NOT EXISTS {rest}"))
+                })
+                .ok_or_else(|| {
+                    DbxError::Parse(format!("unexpected index definition for `{}`", index.name))
+                })?;
+            statements.push(statement);
+            continue;
+        }
+        let mut parts = Vec::with_capacity(index.columns.len());
+        for part in &index.columns {
+            let (column, descending) = match part.strip_suffix(" DESC") {
+                Some(column) => (column, true),
+                None => (part.as_str(), false),
+            };
+            let (column, length) = match column
+                .strip_suffix(')')
+                .and_then(|rest| rest.rsplit_once('('))
+                .filter(|(_, length)| {
+                    !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit())
+                }) {
+                Some((column, length)) => (column, Some(length)),
+                None => (column, None),
+            };
+            if column == "(expression)" {
+                parts.clear();
+                break;
+            }
+            let mut rendered = quote_identifier(kind, column)?;
+            if let Some(length) = length {
+                rendered.push_str(&format!("({length})"));
+            }
+            if descending {
+                rendered.push_str(" DESC");
+            }
+            parts.push(rendered);
+        }
+        if parts.is_empty() {
+            statements.push(format!(
+                "-- Index {} uses expressions; recreate it manually",
+                comment_label(&index.name)
+            ));
+            continue;
+        }
+        // SQLite reserves `sqlite_` names for its automatic UNIQUE indexes.
+        let name = match index.name.strip_prefix("sqlite_autoindex_") {
+            Some(_) => format!(
+                "{}_{}_key",
+                table.name,
+                index.columns.join("_").replace(" DESC", "")
+            ),
+            None => index.name.clone(),
+        };
+        let kind_prefix = match index.method.as_deref() {
+            Some("FULLTEXT") if kind.dialect() == DatabaseKind::MySQL => "FULLTEXT ",
+            Some("SPATIAL") if kind.dialect() == DatabaseKind::MySQL => "SPATIAL ",
+            _ if index.unique => "UNIQUE ",
+            _ => "",
+        };
+        // MySQL has no `IF NOT EXISTS` for indexes; the table is new anyway.
+        let if_not_exists = if kind.dialect() == DatabaseKind::MySQL {
+            ""
+        } else {
+            "IF NOT EXISTS "
+        };
+        statements.push(format!(
+            "CREATE {kind_prefix}INDEX {if_not_exists}{} ON {} ({})",
+            quote_identifier(kind, &name)?,
+            quote_table(kind, table)?,
+            parts.join(", ")
+        ));
+    }
+    Ok(statements)
+}
+
+/// Accept a catalog-produced SQL expression only when it is one statement
+/// fragment: balanced quotes and parentheses, with no terminator or comment
+/// outside a literal.
+pub(crate) fn safe_schema_expression(expression: &str) -> Result<&str> {
+    let expression = expression.trim();
+    let invalid = || DbxError::Parse(format!("invalid metadata expression `{expression}`"));
+    if expression.is_empty() || expression.contains('\0') {
+        return Err(invalid());
+    }
+    let mut quote = None;
+    let mut depth = 0i32;
+    let mut previous = '\0';
+    for character in expression.chars() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None => match character {
+                '\'' | '"' | '`' => quote = Some(character),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(invalid());
+                    }
+                }
+                ';' => return Err(invalid()),
+                '-' if previous == '-' => return Err(invalid()),
+                '*' if previous == '/' => return Err(invalid()),
+                _ => {}
+            },
+        }
+        previous = character;
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(invalid());
+    }
+    Ok(expression)
 }
 
 fn render_sql_foreign_key_definition(
@@ -1153,6 +1445,117 @@ pub fn render_sql_insert(
     Ok(statement)
 }
 
+async fn order_export_views(
+    engine: &DatabaseEngine,
+    mut views: Vec<(TableRef, String)>,
+    selected: &[TableRef],
+) -> Result<Vec<(TableRef, String)>> {
+    if views.is_empty() {
+        return Ok(views);
+    }
+    let sql = match engine.kind() {
+        DatabaseKind::PostgreSQL => {
+            "SELECT vn.nspname, v.relname, rn.nspname, r.relname FROM pg_rewrite rw JOIN pg_class v ON v.oid=rw.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_depend d ON d.objid=rw.oid AND d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass JOIN pg_class r ON r.oid=d.refobjid JOIN pg_namespace rn ON rn.oid=r.relnamespace WHERE v.relkind='v' AND r.oid<>v.oid AND r.relkind IN ('r','p','v','m') AND vn.nspname NOT IN ('pg_catalog','information_schema')"
+        }
+        DatabaseKind::MySQL => {
+            "SELECT VIEW_SCHEMA, VIEW_NAME, TABLE_SCHEMA, TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE WHERE VIEW_SCHEMA=DATABASE()"
+        }
+        _ => return Ok(views),
+    };
+    let result = engine.query(sql, QueryOptions { max_rows: None }).await?;
+    let mut dependencies: HashMap<TableRef, Vec<TableRef>> = HashMap::new();
+    for row in result.rows {
+        if row.values.len() != 4 {
+            return Err(DbxError::Decode("Invalid view dependency metadata".into()));
+        }
+        dependencies
+            .entry(TableRef::in_schema(
+                row.values[0].to_string(),
+                row.values[1].to_string(),
+            ))
+            .or_default()
+            .push(TableRef::in_schema(
+                row.values[2].to_string(),
+                row.values[3].to_string(),
+            ));
+    }
+    let included = views
+        .iter()
+        .map(|(view, _)| view.clone())
+        .collect::<Vec<_>>();
+    // A table-scoped dump cannot recreate views referring to omitted tables.
+    // Full database selections retain every view with captured dependencies.
+    loop {
+        let previous = views.len();
+        let current = views
+            .iter()
+            .map(|(view, _)| view.clone())
+            .collect::<Vec<_>>();
+        views.retain(|(view, _)| {
+            dependencies.get(view).is_none_or(|references| {
+                references.iter().all(|reference| {
+                    selected.contains(reference)
+                        || current.contains(reference)
+                        || reference.schema.as_deref() == Some("pg_catalog")
+                })
+            })
+        });
+        if views.len() == previous {
+            break;
+        }
+    }
+    let mut ordered = Vec::new();
+    while !views.is_empty() {
+        let ready = views.iter().position(|(view, _)| {
+            dependencies.get(view).is_none_or(|references| {
+                references.iter().all(|reference| {
+                    !included.contains(reference)
+                        || ordered.iter().any(|(ready, _)| ready == reference)
+                })
+            })
+        });
+        let Some(index) = ready else {
+            return Err(DbxError::Query(
+                "View dependencies cannot be ordered; export the views separately".into(),
+            ));
+        };
+        ordered.push(views.remove(index));
+    }
+    Ok(ordered)
+}
+
+fn append_schema_object(
+    kind: DatabaseKind,
+    object: &crate::SchemaObject,
+    output: &mut ExportFile,
+) -> Result<()> {
+    let definition = object.definition.as_ref().ok_or_else(|| {
+        DbxError::Query(format!("Cannot export the definition of {}", object.name))
+    })?;
+    if kind == DatabaseKind::MySQL {
+        let delimiter = "__DBX_ROUTINE_END__";
+        if definition.contains(delimiter) {
+            return Err(DbxError::Parse(
+                "Routine contains the dump delimiter".into(),
+            ));
+        }
+        output
+            .write_all(
+                format!(
+                    "\nDELIMITER {delimiter}\n{}{delimiter}\nDELIMITER ;\n",
+                    definition.trim_end_matches(';')
+                )
+                .as_bytes(),
+            )
+            .map_err(io_error)?;
+    } else {
+        output
+            .write_all(format!("\n{};\n", definition.trim_end_matches(';')).as_bytes())
+            .map_err(io_error)?;
+    }
+    Ok(())
+}
+
 fn render_sql_literal(kind: DatabaseKind, value: &CellValue) -> Result<String> {
     match value {
         CellValue::Null => Ok("NULL".into()),
@@ -1270,7 +1673,14 @@ pub async fn import_file(
             let mut reader = SqlScriptReader::with_kind(input, Some(kind));
             let mut transaction = SqlTransaction::begin(engine, false).await?;
             let mut statements_executed = 0;
-            while let Some(statement) = reader.next_statement().map_err(io_error)? {
+            while let Some(mut statement) = reader.next_statement().map_err(io_error)? {
+                let function_check_setting = kind == DatabaseKind::PostgreSQL
+                    && statement
+                        .trim()
+                        .eq_ignore_ascii_case("SET check_function_bodies = false");
+                if function_check_setting {
+                    statement = "SET LOCAL check_function_bodies = false".into();
+                }
                 let keyword = crate::sqlx_engine::top_level_operation_keyword(&statement)
                     .unwrap_or_default()
                     .to_ascii_uppercase();
@@ -1280,10 +1690,12 @@ pub async fn import_file(
                 ) {
                     return Err(DbxError::Parse("dump contains transaction controls; remove them so DBX can own the import transaction".into()));
                 }
-                if matches!(
-                    keyword.as_str(),
-                    "ATTACH" | "DETACH" | "VACUUM" | "PRAGMA" | "SET" | "RESET"
-                ) {
+                if !function_check_setting
+                    && matches!(
+                        keyword.as_str(),
+                        "ATTACH" | "DETACH" | "VACUUM" | "PRAGMA" | "SET" | "RESET"
+                    )
+                {
                     return Err(DbxError::Parse("dump changes session or transaction settings; remove those statements so DBX can preserve atomic rollback".into()));
                 }
                 if engine.kind() == DatabaseKind::MySQL
@@ -1800,16 +2212,82 @@ pub fn split_sql_statements(script: &str) -> Vec<String> {
 pub(crate) fn checked_split_sql_statements(script: &str) -> Result<Vec<String>> {
     checked_split_sql_for(None, script)
 }
-pub(crate) fn checked_split_sql_for(
-    kind: Option<DatabaseKind>,
-    script: &str,
-) -> Result<Vec<String>> {
+pub fn checked_split_sql_for(kind: Option<DatabaseKind>, script: &str) -> Result<Vec<String>> {
+    if kind == Some(DatabaseKind::SqlServer) {
+        return split_sql_server_script(script);
+    }
     let mut reader = SqlScriptReader::with_kind(script.as_bytes(), kind);
     let mut statements = Vec::new();
     while let Some(statement) = reader.next_statement().map_err(io_error)? {
         statements.push(statement);
     }
     Ok(statements)
+}
+
+/// T-SQL module bodies (procedures, functions, triggers, views) contain
+/// semicolons but must reach the server as one batch, ended by `GO`.
+fn split_sql_server_script(script: &str) -> Result<Vec<String>> {
+    let mut batches = vec![String::new()];
+    for line in script.split_inclusive('\n') {
+        if line.trim().eq_ignore_ascii_case("go") {
+            batches.push(String::new());
+        } else if let Some(batch) = batches.last_mut() {
+            batch.push_str(line);
+        }
+    }
+    let mut statements = Vec::new();
+    for batch in batches {
+        let words = sql_words_for(&batch);
+        let module = matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER"))
+            && words
+                .iter()
+                .skip(1)
+                .find(|word| !matches!(word.as_str(), "OR" | "ALTER"))
+                .is_some_and(|word| {
+                    matches!(
+                        word.as_str(),
+                        "PROCEDURE" | "PROC" | "FUNCTION" | "TRIGGER" | "VIEW"
+                    )
+                });
+        if module {
+            let trimmed = batch.trim();
+            if !trimmed.is_empty() {
+                statements.push(trimmed.to_owned());
+            }
+            continue;
+        }
+        let mut reader =
+            SqlScriptReader::with_kind(batch.as_bytes(), Some(DatabaseKind::SqlServer));
+        while let Some(statement) = reader.next_statement().map_err(io_error)? {
+            statements.push(statement);
+        }
+    }
+    Ok(statements)
+}
+
+/// The first few upper-cased words of a batch, skipping leading comments.
+fn sql_words_for(batch: &str) -> Vec<String> {
+    let mut text = batch.trim_start();
+    loop {
+        if let Some(rest) = text.strip_prefix("--") {
+            text = rest
+                .split_once('\n')
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
+        } else if let Some(rest) = text.strip_prefix("/*") {
+            text = rest
+                .split_once("*/")
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
+        } else {
+            break;
+        }
+    }
+    text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .take(4)
+        .map(str::to_ascii_uppercase)
+        .collect()
 }
 
 #[derive(Clone)]
@@ -1829,6 +2307,8 @@ struct SqlScriptReader<R> {
     input: R,
     state: ScriptState,
     delimiter: String,
+    trigger: bool,
+    trigger_depth: usize,
     current: String,
     ready: VecDeque<String>,
     at_line_start: bool,
@@ -1842,6 +2322,8 @@ impl<R: BufRead> SqlScriptReader<R> {
             input,
             state: ScriptState::Normal,
             delimiter: ";".into(),
+            trigger: false,
+            trigger_depth: 0,
             current: String::new(),
             ready: VecDeque::new(),
             at_line_start: true,
@@ -1925,12 +2407,29 @@ impl<R: BufRead> SqlScriptReader<R> {
                         }
                         continue;
                     }
+                    // T-SQL clients separate batches with a line holding
+                    // only GO; it is not SQL the server understands.
+                    if self.kind == Some(DatabaseKind::SqlServer)
+                        && matches_here_ci(&characters, index, "go")
+                        && characters[..index].iter().all(|c| c.is_whitespace())
+                        && characters[index + 2..].iter().all(|c| c.is_whitespace())
+                    {
+                        let trimmed = current.trim();
+                        if !trimmed.is_empty() {
+                            statements.push(trimmed.to_owned());
+                        }
+                        current.clear();
+                        at_line_start = true;
+                        index = characters.len();
+                        continue;
+                    }
                     if character == '-' && matches_here("--", index) {
                         state = ScriptState::LineComment;
                         index += 2;
                         continue;
                     }
-                    if character == '#' {
+                    // `#name` is a temporary table in T-SQL, not a comment.
+                    if character == '#' && self.kind != Some(DatabaseKind::SqlServer) {
                         state = ScriptState::LineComment;
                         index += 1;
                         continue;
@@ -1952,12 +2451,49 @@ impl<R: BufRead> SqlScriptReader<R> {
                         index += 2;
                         continue;
                     }
-                    if matches_here(&delimiter, index) {
+                    if delimiter == ";"
+                        && character.is_ascii_alphabetic()
+                        && self
+                            .kind
+                            .is_none_or(|kind| kind.dialect() == DatabaseKind::SQLite)
+                    {
+                        let start = index;
+                        while characters.get(index).is_some_and(|character| {
+                            character.is_ascii_alphanumeric() || *character == '_'
+                        }) {
+                            index += 1;
+                        }
+                        let word = characters[start..index].iter().collect::<String>();
+                        if word.eq_ignore_ascii_case("TRIGGER") {
+                            let prefix = sql_words_for(&current);
+                            if prefix.first().is_some_and(|word| word == "CREATE")
+                                && prefix.iter().all(|word| {
+                                    matches!(word.as_str(), "CREATE" | "TEMP" | "TEMPORARY")
+                                })
+                            {
+                                self.trigger = true;
+                            }
+                        }
+                        if self.trigger {
+                            match word.to_ascii_uppercase().as_str() {
+                                "BEGIN" | "CASE" => self.trigger_depth += 1,
+                                "END" => self.trigger_depth = self.trigger_depth.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
+                        current.push_str(&word);
+                        at_line_start = false;
+                        continue;
+                    }
+                    if matches_here(&delimiter, index) && (!self.trigger || self.trigger_depth == 0)
+                    {
                         let trimmed = current.trim();
                         if !trimmed.is_empty() {
                             statements.push(trimmed.to_owned());
                         }
                         current.clear();
+                        self.trigger = false;
+                        self.trigger_depth = 0;
                         at_line_start = true;
                         index += delimiter.chars().count();
                         continue;
@@ -2440,6 +2976,7 @@ mod tests {
                     nullable: false,
                     ordinal: 1,
                     primary_key: true,
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "account_id".into(),
@@ -2448,6 +2985,7 @@ mod tests {
                     nullable: false,
                     ordinal: 2,
                     primary_key: false,
+                    default_value: None,
                 },
             ],
             foreign_keys: vec![crate::ForeignKeyInfo {
@@ -2459,6 +2997,7 @@ mod tests {
                 on_update: Some(crate::ReferentialAction::Cascade),
                 on_delete: Some(crate::ReferentialAction::SetNull),
             }],
+            ..Default::default()
         };
 
         let sql =
@@ -2467,6 +3006,218 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (\"id\")"));
         assert!(sql.contains("CONSTRAINT \"events_account_id_fkey\""));
         assert!(sql.contains("ON UPDATE CASCADE ON DELETE SET NULL"));
+    }
+
+    #[test]
+    fn schema_expressions_reject_terminators_and_comments_outside_literals() {
+        assert_eq!(
+            safe_schema_expression(" 'a;b'::text ").unwrap(),
+            "'a;b'::text"
+        );
+        assert!(safe_schema_expression("now()").is_ok());
+        assert!(safe_schema_expression("-1").is_ok());
+        for bad in [
+            "1); DROP TABLE x",
+            "1 -- x",
+            "1 /* x */",
+            "(1",
+            "'open",
+            "1)",
+        ] {
+            assert!(safe_schema_expression(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn schema_rendering_includes_defaults_checks_serials_and_indexes() {
+        let table = TableRef::in_schema("public", "items");
+        let column = |name: &str, data_type: &str, default: Option<&str>| ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            enum_values: Vec::new(),
+            nullable: false,
+            ordinal: 1,
+            primary_key: name == "id",
+            default_value: default.map(str::to_owned),
+        };
+        let structure = TableStructure {
+            columns: vec![
+                column("id", "integer", Some("nextval('items_id_seq'::regclass)")),
+                column("code", "text", Some("'new'::text")),
+            ],
+            checks: vec![crate::CheckConstraintInfo {
+                name: Some("code_length".into()),
+                expression: "length(code) > 0".into(),
+            }],
+            indexes: vec![
+                crate::IndexInfo {
+                    name: "items_pkey".into(),
+                    columns: vec!["id".into()],
+                    unique: true,
+                    primary: true,
+                    method: None,
+                    predicate: None,
+                    definition: Some(
+                        "CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)".into(),
+                    ),
+                },
+                crate::IndexInfo {
+                    name: "items_code".into(),
+                    columns: vec!["code".into()],
+                    unique: true,
+                    primary: false,
+                    method: Some("btree".into()),
+                    predicate: None,
+                    definition: Some(
+                        "CREATE UNIQUE INDEX items_code ON public.items USING btree (code)".into(),
+                    ),
+                },
+            ],
+            ..Default::default()
+        };
+        let sql = render_sql_schema(DatabaseKind::PostgreSQL, &table, &structure, &[]).unwrap();
+        assert!(sql.contains("\"id\" serial NOT NULL"), "{sql}");
+        assert!(
+            sql.contains("\"code\" text DEFAULT 'new'::text NOT NULL"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("CONSTRAINT \"code_length\" CHECK (length(code) > 0)"),
+            "{sql}"
+        );
+        assert_eq!(
+            render_sql_indexes(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
+            ["CREATE UNIQUE INDEX IF NOT EXISTS items_code ON public.items USING btree (code)"]
+        );
+        assert_eq!(
+            render_sql_sequence_resets(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
+            [
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"items\"', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"public\".\"items\"), 0) + 1, false)"
+            ]
+        );
+
+        let mysql = TableStructure {
+            indexes: vec![
+                crate::IndexInfo {
+                    name: "by_name".into(),
+                    columns: vec!["name(10)".into(), "created DESC".into()],
+                    unique: false,
+                    primary: false,
+                    method: Some("BTREE".into()),
+                    predicate: None,
+                    definition: None,
+                },
+                crate::IndexInfo {
+                    name: "by_expression".into(),
+                    columns: vec!["(expression)".into()],
+                    unique: false,
+                    primary: false,
+                    method: Some("BTREE".into()),
+                    predicate: None,
+                    definition: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            render_sql_indexes(DatabaseKind::MySQL, &TableRef::new("people"), &mysql).unwrap(),
+            [
+                "CREATE INDEX `by_name` ON `people` (`name`(10), `created` DESC)",
+                "-- Index by_expression uses expressions; recreate it manually",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_dump_round_trips_defaults_and_indexes() {
+        let connect = || {
+            DatabaseEngine::connect(crate::ConnectionConfig::new(
+                crate::DatabaseKind::SQLite,
+                "sqlite::memory:",
+            ))
+        };
+        let source = connect().await.unwrap();
+        source
+            .execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, qty INTEGER NOT NULL DEFAULT 1 CHECK (qty >= 0))")
+            .await
+            .unwrap();
+        source
+            .execute_sql("CREATE INDEX items_qty ON items (qty DESC)")
+            .await
+            .unwrap();
+        source
+            .execute_sql("INSERT INTO items (id, code) VALUES (1, 'a')")
+            .await
+            .unwrap();
+        source.execute_sql("CREATE TRIGGER items_insert AFTER INSERT ON items BEGIN UPDATE items SET qty=qty+1 WHERE id=NEW.id; END").await.unwrap();
+        source
+            .execute_sql("CREATE VIEW items_view AS SELECT code, qty FROM items")
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let request = DatabaseExportRequest {
+            tables: vec![TableRef::new("items")],
+            output_directory: directory.path().to_owned(),
+            output_name: "items.sql".into(),
+            format: DumpFormat::Sql,
+            schema_only: false,
+            gzipped: false,
+        };
+        export_database(&source, &request).await.unwrap();
+
+        let target = connect().await.unwrap();
+        import_database(&target, &directory.path().join("items.sql"))
+            .await
+            .unwrap();
+        let structure = target
+            .table_structure(&TableRef::new("items"))
+            .await
+            .unwrap();
+        assert_eq!(structure.checks.len(), 1);
+        assert!(
+            target
+                .execute_sql("INSERT INTO items(id, code, qty) VALUES (2,'invalid',-1)")
+                .await
+                .is_err()
+        );
+        target
+            .execute_sql("INSERT INTO items(id, code) VALUES (2,'trigger')")
+            .await
+            .unwrap();
+        let view = target
+            .query(
+                "SELECT qty FROM items_view WHERE code='trigger'",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(view.rows[0].values[0], CellValue::Integer(2));
+        assert!(
+            target
+                .schema_objects()
+                .await
+                .unwrap()
+                .iter()
+                .any(|object| object.name == "items_insert")
+        );
+        let qty = structure
+            .columns
+            .iter()
+            .find(|column| column.name == "qty")
+            .unwrap();
+        assert_eq!(qty.default_value.as_deref(), Some("1"));
+        assert!(
+            structure
+                .indexes
+                .iter()
+                .any(|index| index.name == "items_qty" && index.columns == ["qty DESC"])
+        );
+        assert!(
+            structure
+                .indexes
+                .iter()
+                .any(|index| index.unique && index.columns == ["code"])
+        );
     }
 
     #[test]
@@ -2482,6 +3233,7 @@ mod tests {
                     nullable: false,
                     ordinal: 1,
                     primary_key: true,
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "account_id".into(),
@@ -2490,6 +3242,7 @@ mod tests {
                     nullable: false,
                     ordinal: 2,
                     primary_key: false,
+                    default_value: None,
                 },
             ],
             foreign_keys: vec![crate::ForeignKeyInfo {
@@ -2501,6 +3254,7 @@ mod tests {
                 on_update: Some(crate::ReferentialAction::Cascade),
                 on_delete: Some(crate::ReferentialAction::SetNull),
             }],
+            ..Default::default()
         };
         let selected = [parent];
 

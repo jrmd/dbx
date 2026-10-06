@@ -58,6 +58,109 @@ async fn changed_and_deleted_rows_are_conflicts_without_overwriting_data() {
     ));
 }
 
+/// A query tab whose connection the server closed reconnects on its next run.
+async fn assert_query_tab_recovers_from_a_lost_connection(
+    engine: &Arc<DatabaseEngine>,
+    kind: DatabaseKind,
+) {
+    let session = QuerySession::new(engine.clone());
+    let run = |sql: String| {
+        let session = &session;
+        async move {
+            session
+                .run(
+                    &sql,
+                    QueryOptions::default(),
+                    Duration::from_secs(10),
+                    QueryCancellation::default(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let pid = run(if kind == DatabaseKind::PostgreSQL {
+        "SELECT pg_backend_pid()".into()
+    } else {
+        "SELECT CONNECTION_ID()".into()
+    })
+    .await
+    .statements[0]
+        .result
+        .rows[0]
+        .values[0]
+        .to_string();
+    engine
+        .execute_sql(&if kind == DatabaseKind::PostgreSQL {
+            format!("SELECT pg_terminate_backend({pid})")
+        } else {
+            format!("KILL {pid}")
+        })
+        .await
+        .unwrap();
+    // Nothing ran on the dead connection, so the tab reconnects silently.
+    let recovered = run("SELECT 1".into()).await;
+    assert!(
+        recovered.statements[0].error.is_none(),
+        "{:?}",
+        recovered.statements[0].error
+    );
+}
+
+/// A staged batch commits together, and one conflict rolls back every update.
+async fn assert_batch_updates_are_atomic(engine: &DatabaseEngine, table: &str, current: &str) {
+    let update = |value: &str, original: &str| {
+        (
+            UpdateRequest::for_primary_key(
+                TableRef::new(table),
+                vec![("value".into(), CellValue::Text(value.into()))],
+                vec![("id".into(), CellValue::Integer(1))],
+            ),
+            vec![("value".to_owned(), CellValue::Text(original.into()))],
+        )
+    };
+    let value = || async {
+        engine
+            .query(
+                &format!("SELECT value FROM {table} WHERE id = 1"),
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap()
+            .rows[0]
+            .values[0]
+            .clone()
+    };
+    assert_eq!(
+        engine
+            .update_checked_batch(&[update("batched", current)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(value().await, CellValue::Text("batched".into()));
+    assert!(matches!(
+        engine
+            .update_checked_batch(&[update("first", "batched"), update("second", "stale")])
+            .await,
+        Err(DbxError::Conflict)
+    ));
+    assert_eq!(value().await, CellValue::Text("batched".into()));
+}
+
+#[tokio::test]
+async fn staged_row_updates_commit_or_roll_back_together() {
+    let (_directory, engine) = database().await;
+    engine
+        .execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)")
+        .await
+        .unwrap();
+    engine
+        .execute_sql("INSERT INTO items VALUES (1, 'original')")
+        .await
+        .unwrap();
+    assert_batch_updates_are_atomic(&engine, "items", "original").await;
+}
+
 #[tokio::test]
 async fn query_documents_keep_transactions_and_separate_result_shapes() {
     let (_directory, engine) = database().await;
@@ -514,6 +617,8 @@ async fn native_safety(kind: DatabaseKind, variable: &str, sleep: &str) {
         engine.update_checked(&request, &originals).await,
         Err(DbxError::Conflict)
     ));
+    assert_batch_updates_are_atomic(&engine, "dbx_workbench_safety", "changed").await;
+    assert_query_tab_recovers_from_a_lost_connection(&engine, kind).await;
     let explained = run(if kind == DatabaseKind::PostgreSQL {
         "EXPLAIN (FORMAT JSON) SELECT * FROM dbx_workbench_safety"
     } else {
@@ -716,4 +821,174 @@ async fn mysql_workbench_safety() {
         "SELECT SLEEP(30)",
     )
     .await;
+}
+
+#[tokio::test]
+async fn prepared_query_session_keeps_values_out_of_sql_and_preserves_transactions() {
+    let engine = Arc::new(
+        DatabaseEngine::connect(ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap(),
+    );
+    engine
+        .execute_sql("CREATE TABLE bound_values (value TEXT)")
+        .await
+        .unwrap();
+    let session = QuerySession::new(engine.clone());
+    let injected = "'); DROP TABLE bound_values; --";
+    let result = session
+        .run_prepared(
+            vec![
+                SqlStatement::new("BEGIN", vec![]),
+                SqlStatement::new(
+                    "INSERT INTO bound_values VALUES (?)",
+                    vec![CellValue::Text(injected.into())],
+                ),
+                SqlStatement::new(
+                    "SELECT value FROM bound_values WHERE value=?",
+                    vec![CellValue::Text(injected.into())],
+                ),
+                SqlStatement::new("COMMIT", vec![]),
+            ],
+            QueryOptions::default(),
+            Duration::from_secs(5),
+            QueryCancellation::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        result
+            .statements
+            .iter()
+            .all(|statement| statement.error.is_none())
+    );
+    assert_eq!(
+        result.statements[2].result.rows[0].values[0],
+        CellValue::Text(injected.into())
+    );
+    let persisted = engine
+        .query("SELECT value FROM bound_values", QueryOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted.rows[0].values[0],
+        CellValue::Text(injected.into())
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL from scripts/test-integration.sh"]
+async fn postgres_schema_objects_dump_restore_round_trip() {
+    let url = std::env::var("DBX_TEST_POSTGRES_URL").unwrap();
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::PostgreSQL, url))
+        .await
+        .unwrap();
+    let schema = format!(
+        "dbx_audit_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    engine
+        .execute_sql(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    engine.execute_sql(&format!("CREATE FUNCTION {schema}.twice(n integer) RETURNS integer LANGUAGE SQL AS $$ SELECT n * 2 $$")).await.unwrap();
+    engine
+        .execute_sql(&format!(
+            "CREATE SEQUENCE {schema}.standalone START WITH 23"
+        ))
+        .await
+        .unwrap();
+    engine.execute_sql(&format!("CREATE TABLE {schema}.items (id serial PRIMARY KEY, code text UNIQUE NOT NULL, qty integer DEFAULT {schema}.twice(2) CHECK(qty>=0))")).await.unwrap();
+    engine.execute_sql(&format!("CREATE FUNCTION {schema}.bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.qty := NEW.qty + 1; RETURN NEW; END $$")).await.unwrap();
+    engine.execute_sql(&format!("CREATE TRIGGER bump BEFORE INSERT ON {schema}.items FOR EACH ROW EXECUTE FUNCTION {schema}.bump()")).await.unwrap();
+    engine
+        .execute_sql(&format!(
+            "CREATE VIEW {schema}.items_view AS SELECT code,qty FROM {schema}.items"
+        ))
+        .await
+        .unwrap();
+    engine
+        .execute_sql(&format!(
+            "INSERT INTO {schema}.items(code) VALUES ('initial')"
+        ))
+        .await
+        .unwrap();
+    engine
+        .execute_sql(&format!(
+            "CREATE VIEW {schema}.a_dependent AS SELECT * FROM {schema}.items_view"
+        ))
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    export_database(
+        &engine,
+        &DatabaseExportRequest {
+            tables: vec![TableRef::in_schema(&schema, "items")],
+            output_directory: directory.path().to_owned(),
+            output_name: "objects".into(),
+            format: DumpFormat::Sql,
+            schema_only: false,
+            gzipped: false,
+        },
+    )
+    .await
+    .unwrap();
+    engine
+        .execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    import_database(&engine, &directory.path().join("objects.sql"))
+        .await
+        .unwrap();
+    engine
+        .execute_sql(&format!(
+            "INSERT INTO {schema}.items(code) VALUES ('restored')"
+        ))
+        .await
+        .unwrap();
+    let result = engine
+        .query(
+            &format!("SELECT qty FROM {schema}.a_dependent WHERE code='restored'"),
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows[0].values[0], CellValue::Integer(5));
+    let sequence = engine
+        .query(
+            &format!("SELECT nextval('{schema}.standalone')"),
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sequence.rows[0].values[0], CellValue::Integer(23));
+    assert!(
+        engine
+            .execute_sql(&format!(
+                "INSERT INTO {schema}.items(code,qty) VALUES ('bad',-2)"
+            ))
+            .await
+            .is_err()
+    );
+    let structure = engine
+        .table_structure(&TableRef::in_schema(&schema, "items"))
+        .await
+        .unwrap();
+    assert_eq!(structure.checks.len(), 1);
+    assert!(
+        structure
+            .indexes
+            .iter()
+            .any(|index| index.unique && !index.primary)
+    );
+    engine
+        .execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }
