@@ -616,7 +616,7 @@ impl FieldRow {
     }
 }
 
-fn field_editor_text(value: &CellValue) -> String {
+pub(crate) fn field_editor_text(value: &CellValue) -> String {
     match value {
         CellValue::Json(value) => {
             serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
@@ -1126,6 +1126,7 @@ mod tests {
             nullable,
             ordinal: 0,
             primary_key: false,
+            default_value: None,
         }
     }
 

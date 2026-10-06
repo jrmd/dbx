@@ -341,6 +341,12 @@ fn persist_unlocked(path: &Path, unlocked: &UnlockedVault) -> VaultResult<()> {
 fn write_vault(path: &Path, unlocked: &UnlockedVault, nonce: [u8; NONCE_LEN]) -> VaultResult<()> {
     let header = Header::bytes(unlocked.salt, nonce);
     let mut plaintext = encode_entries(&unlocked.entries)?;
+    if plaintext.len() as u64 + HEADER_LEN as u64 + 16 > MAX_VAULT_FILE_BYTES {
+        plaintext.zeroize();
+        return Err(VaultError::Io(
+            "Vault storage limit reached; remove saved queries before adding more data".into(),
+        ));
+    }
     let cipher = XChaCha20Poly1305::new_from_slice(unlocked.key.expose_secret())
         .map_err(|_| VaultError::Invalid)?;
     let nonce = XNonce::try_from(&nonce[..]).map_err(|_| VaultError::Invalid)?;

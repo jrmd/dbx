@@ -1,6 +1,72 @@
 use super::*;
 
 impl DbxApp {
+    fn can_import_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) -> bool {
+        let supported = self
+            .session(session_id)
+            .and_then(|session| session.engine.as_ref())
+            .is_some_and(|engine| {
+                !engine.is_read_only() && matches!(engine.as_ref(), DatabaseEngine::Sql(_))
+            });
+        if !supported {
+            self.show_toast(ToastKind::Info, "Atomic imports require a writable PostgreSQL, MySQL, SQLite or CockroachDB connection", cx);
+        }
+        supported
+    }
+    fn start_transfer_progress(
+        &mut self,
+        session_id: SessionId,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) -> dbx_core::TransferControl {
+        let control = dbx_core::TransferControl::default();
+        let label = self
+            .session(session_id)
+            .map(|session| session.status.clone())
+            .unwrap_or_default();
+        if let Some(session) = self.session_mut(session_id) {
+            session.transfer_control = Some(control.clone());
+        }
+        let progress = control.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let keep_going = this.update(cx, |this, cx| {
+                    let Some(session) = this.session_mut(session_id) else {
+                        return false;
+                    };
+                    if generation != session.request_generation
+                        || session.transfer_control.is_none()
+                    {
+                        return false;
+                    }
+                    let (rows, statements) = progress.progress();
+                    session.status =
+                        format!("{label} · {rows} rows · {statements} statements processed");
+                    cx.notify();
+                    true
+                })?;
+                if !keep_going {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+        control
+    }
+    pub(super) fn cancel_transfer_for(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        if let Some(session) = self.session_mut(session_id)
+            && let Some(control) = &session.transfer_control
+        {
+            control.cancel();
+            session.status = "Cancelling transfer and rolling back uncommitted work…".into();
+            cx.notify();
+        }
+    }
+
     pub(super) fn begin_database_export(
         &mut self,
         session_id: SessionId,
@@ -215,9 +281,15 @@ impl DbxApp {
         let generation = session.request_generation;
         cx.notify();
 
+        let control = self.start_transfer_progress(session_id, generation, cx);
+        let task = runtime.spawn(async move {
+            dbx_core::with_transfer_control(control, export_database(&engine, &request)).await
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { export_database(&engine, &request).await })
+            let result = task
                 .await
                 .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
             this.update(cx, |this, cx| {
@@ -228,6 +300,7 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
+                session.transfer_control = None;
                 match result {
                     Ok(summary) => {
                         session.error = None;
@@ -237,7 +310,7 @@ impl DbxApp {
                             "data"
                         };
                         let message = format!(
-                            "Exported {} · {} · {} {}",
+                            "Exported {} · {} · {} {} · {}",
                             counted(summary.tables_exported, "table", "tables"),
                             counted(summary.rows_exported, "row", "rows"),
                             mode,
@@ -245,6 +318,11 @@ impl DbxApp {
                                 "file"
                             } else {
                                 "files"
+                            },
+                            if summary.consistent_snapshot {
+                                "consistent data snapshot"
+                            } else {
+                                "live data; snapshot unsupported"
                             }
                         );
                         this.show_toast(ToastKind::Success, message, cx);
@@ -266,6 +344,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_import_for(session_id, cx) {
+            return;
+        }
         let available = self.session(session_id).is_some_and(|session| {
             session.kind.is_sql() && !session.busy && session.engine.is_some()
         });
@@ -384,9 +465,15 @@ impl DbxApp {
         let generation = session.request_generation;
         cx.notify();
 
+        let control = self.start_transfer_progress(session_id, generation, cx);
+        let task = runtime.spawn(async move {
+            dbx_core::with_transfer_control(control, import_database(&engine, &path)).await
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { import_database(&engine, &path).await })
+            let result = task
                 .await
                 .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
             this.update(cx, |this, cx| {
@@ -397,6 +484,7 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
+                session.transfer_control = None;
                 match result {
                     Ok(report) => {
                         session.error = None;
@@ -502,9 +590,15 @@ impl DbxApp {
         let generation = session.request_generation;
         cx.notify();
 
+        let control = self.start_transfer_progress(session_id, generation, cx);
+        let task = runtime.spawn(async move {
+            dbx_core::with_transfer_control(control, export_table(&engine, &target, &path)).await
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { export_table(&engine, &target, &path).await })
+            let result = task
                 .await
                 .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
             this.update(cx, |this, cx| {
@@ -515,13 +609,19 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
+                session.transfer_control = None;
                 match result {
                     Ok(summary) => {
                         session.error = None;
                         let message = format!(
-                            "Exported {} to {}",
+                            "Exported {} to {} · {}",
                             counted(summary.rows_exported, "row", "rows"),
-                            destination
+                            destination,
+                            if summary.consistent_snapshot {
+                                "consistent data snapshot"
+                            } else {
+                                "live data; snapshot unsupported"
+                            }
                         );
                         this.show_toast(ToastKind::Success, message, cx);
                     }
@@ -545,6 +645,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_import_for(session_id, cx) {
+            return;
+        }
         if !self.transfer_available_for(session_id, &table) {
             return;
         }
@@ -678,9 +781,16 @@ impl DbxApp {
         let generation = session.request_generation;
         cx.notify();
 
+        let control = self.start_transfer_progress(session_id, generation, cx);
+        let task = runtime.spawn(async move {
+            dbx_core::with_transfer_control(control, import_file(&engine, Some(&target), &path))
+                .await
+        });
+        if let Some(session) = self.session_mut(session_id) {
+            session.track_background_task(&task);
+        }
         cx.spawn(async move |this, cx| {
-            let result = runtime
-                .spawn(async move { import_file(&engine, Some(&target), &path).await })
+            let result = task
                 .await
                 .unwrap_or_else(|error| Err(dbx_core::DbxError::Io(error.to_string())));
             this.update(cx, |this, cx| {
@@ -691,6 +801,7 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
+                session.transfer_control = None;
                 match result {
                     Ok(report) => {
                         session.error = None;

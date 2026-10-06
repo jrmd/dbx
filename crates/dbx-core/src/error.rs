@@ -5,6 +5,14 @@ use thiserror::Error;
 /// Errors returned by DBX's connection and query layer.
 #[derive(Debug, Error)]
 pub enum DbxError {
+    #[error(
+        "row changed or was deleted since it was loaded; refresh the row and review your changes"
+    )]
+    Conflict,
+
+    #[error("{0}")]
+    Interrupted(String),
+
     #[error("invalid database configuration: {0}")]
     InvalidConfig(String),
 
@@ -40,6 +48,15 @@ impl From<sqlx::Error> for DbxError {
             | sqlx::Error::PoolClosed
             | sqlx::Error::Io(_)
             | sqlx::Error::Tls(_) => Self::Connection(error.to_string()),
+            // SQLSTATE class 08 and PostgreSQL's admin/crash shutdown codes
+            // mean the server closed this session.
+            sqlx::Error::Database(ref database)
+                if database.code().is_some_and(|code| {
+                    code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+                }) =>
+            {
+                Self::Connection(error.to_string())
+            }
             other => Self::Query(other.to_string()),
         }
     }

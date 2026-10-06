@@ -190,6 +190,42 @@ impl DbxApp {
         else {
             return div().into_any_element();
         };
+        let (in_transaction, active_result, statement_labels, transactions_supported) = self
+            .session(session_id)
+            .and_then(|session| {
+                let query = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+                let SecondaryTabKind::Query(query) = &query.kind else {
+                    return None;
+                };
+                Some((
+                    query.in_transaction,
+                    query.active_result,
+                    query
+                        .statement_results
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            format!(
+                                "{} · {}",
+                                index + 1,
+                                if item.error.is_some() {
+                                    "Failed"
+                                } else {
+                                    "Result"
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                    matches!(
+                        session.kind,
+                        DatabaseKind::PostgreSQL
+                            | DatabaseKind::CockroachDB
+                            | DatabaseKind::MySQL
+                            | DatabaseKind::SQLite
+                    ),
+                ))
+            })
+            .unwrap_or_default();
         // Paint failed-query underlines only while the query revision still
         // matches the run that produced them; text edits clear the range.
         if sql_dialect {
@@ -304,9 +340,37 @@ impl DbxApp {
             theme().text_muted
         };
         let app = cx.entity().downgrade();
+        let saved_queries = self.saved_queries_for(session_id);
+        let timeout_secs = self
+            .session(session_id)
+            .and_then(|session| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
+            .and_then(|tab| match &tab.kind {
+                SecondaryTabKind::Query(query) => Some(query.timeout_secs),
+                _ => None,
+            })
+            .unwrap_or(60);
+        let name_editor = self
+            .session(session_id)
+            .and_then(|session| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
+            .and_then(|tab| match &tab.kind {
+                SecondaryTabKind::Query(query) => Some(query.name_editor.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let name_focus = name_editor.read(cx).focus_handle();
         let history = self.recent_query_history_limited(session_id, 10);
         let agent_open = self.agent_panel_open(session_id, tab_id);
         let agent_panel = self.render_agent_panel(session_id, tab_id, cx);
+        let parameter_prompt = self.render_parameter_prompt(session_id, cx);
+        let find_bar = self.render_find_bar(session_id, cx);
+        let export_target = self
+            .active_query_tab(session_id)
+            .unwrap()
+            .export_target
+            .clone();
+        let inspected_value = self
+            .active_query_tab(session_id)
+            .and_then(|query| query.inspected_value.clone());
 
         div()
             .flex_1()
@@ -322,6 +386,14 @@ impl DbxApp {
                 this.toggle_agent_panel(session_id, tab_id, window, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(move |this, _: &OpenFind, window, cx| {
+                this.open_find_for(session_id, false, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(move |this, _: &OpenReplace, window, cx| {
+                this.open_find_for(session_id, true, window, cx);
+                cx.stop_propagation();
+            }))
             .child(
                 div()
                     .h(px(38.))
@@ -331,6 +403,9 @@ impl DbxApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
+                    .child(div().w(px(150.)).child(editor::input(name_editor, name_focus, false)))
+                    .child(Button::new("save-named-query").debug_selector(|| "save-named-query".into()).label("Save").ghost().with_size(Size::XSmall)
+                        .on_click(cx.listener(move |this, _, _, cx| this.save_named_query_for(session_id, cx))))
                     .border_color(theme().border)
                     .bg(theme().panel)
                     // The tab already names the query; keep the actions right-aligned.
@@ -377,6 +452,21 @@ impl DbxApp {
                             .flex()
                             .items_center()
                             .gap(px(7.))
+                            .when(transactions_supported && !busy, |actions| {
+                                if in_transaction {
+                                    actions
+                                        .child(button("commit-query", "Commit", ButtonKind::Primary)
+                                            .debug_selector(|| "commit-query".into())
+                                            .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "COMMIT", cx))))
+                                        .child(button("rollback-query", "Rollback", ButtonKind::Quiet)
+                                            .debug_selector(|| "rollback-query".into())
+                                            .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "ROLLBACK", cx))))
+                                } else {
+                                    actions.child(button("begin-query", "Begin", ButtonKind::Quiet)
+                                        .tooltip("Begin a transaction in this query tab")
+                                        .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "BEGIN", cx))))
+                                }
+                            })
                             .when(!busy, |actions| {
                                 actions.child(
                                     button("run-query", "Run", ButtonKind::Primary)
@@ -404,6 +494,7 @@ impl DbxApp {
                             })
                             .child(
                                 Button::new("query-workbench-more")
+                                    .debug_selector(|| "query-workbench-more".into())
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
@@ -416,12 +507,47 @@ impl DbxApp {
                                         let copy_tsv = app.clone();
                                         let copy_csv = app.clone();
                                         let copy_json = app.clone();
+                                        let copy_insert = app.clone();
+                                        let export_insert = app.clone();
                                         let export_tsv = app.clone();
                                         let export_csv = app.clone();
                                         let export_json = app.clone();
                                         let reopen_last = app.clone();
                                         let clear_history = app.clone();
                                         let mut menu = menu;
+                                        if sql_dialect {
+                                            for (index, label) in ["Explain query", "Capture plan", "Compare plans", "Server sessions", "Lock waits", "Capture schema baseline", "Compare schema / draft migration"].into_iter().enumerate() {
+                                                let action = app.clone();
+                                                menu = menu.item(PopupMenuItem::new(label).disabled(busy).on_click(move |_, window, cx| {
+                                                    let _ = action.update(cx, |this, cx| match index {
+                                                        0 => this.explain_query_for(session_id, cx),
+                                                        1 => this.pin_plan_for(session_id, cx),
+                                                        2 => this.compare_plan_for(session_id, cx),
+                                                        3 => this.open_monitor_for(session_id, dbx_core::Monitor::Sessions, window, cx),
+                                                        4 => this.open_monitor_for(session_id, dbx_core::Monitor::Locks, window, cx),
+                                                        5 => this.inspect_schema_for(session_id, true, window, cx),
+                                                        _ => this.inspect_schema_for(session_id, false, window, cx),
+                                                    });
+                                                }));
+                                            }
+                                        }
+                                        for seconds in [5, 30, 60, 300] {
+                                            let action = app.clone();
+                                            menu = menu.item(PopupMenuItem::new(format!("{}Query timeout: {seconds}s", if seconds == timeout_secs { "✓ " } else { "" })).on_click(move |_, _, cx| {
+                                                let _ = action.update(cx, |this, cx| this.set_query_timeout_for(session_id, seconds, cx));
+                                            }));
+                                        }
+                                        for saved in &saved_queries {
+                                            let saved = saved.clone();
+                                            let open = app.clone();
+                                            let remove = app.clone();
+                                            let name = saved.name.clone();
+                                            menu = menu.item(PopupMenuItem::new(format!("Open saved: {}", saved.name)).on_click(move |_, window, cx| {
+                                                let _ = open.update(cx, |this, cx| this.open_saved_query_for(session_id, saved.clone(), window, cx));
+                                            })).item(PopupMenuItem::new(format!("Delete saved: {name}")).on_click(move |_, _, cx| {
+                                                let _ = remove.update(cx, |this, cx| this.delete_saved_query_for(session_id, &name, cx));
+                                            }));
+                                        }
                                         if sql_dialect {
                                             menu = menu
                                                 .item(
@@ -504,6 +630,14 @@ impl DbxApp {
                                                         });
                                                     }),
                                             )
+                                            .item(PopupMenuItem::new("Copy result as INSERT statements")
+                                                .disabled(!has_rowset).on_click(move |_, _, cx| {
+                                                    let _ = copy_insert.update(cx, |this, cx| this.copy_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
+                                                }))
+                                            .item(PopupMenuItem::new("Export INSERT statements…")
+                                                .disabled(!has_rowset).on_click(move |_, _, cx| {
+                                                    let _ = export_insert.update(cx, |this, cx| this.export_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
+                                                }))
                                             .separator()
                                             .item(
                                                 PopupMenuItem::new("Export TSV…")
@@ -617,7 +751,34 @@ impl DbxApp {
                             ),
                     ),
             )
+            .when(in_transaction, |view| view.child(div().px(px(10.)).py(px(4.)).text_xs().text_color(theme().warning)
+                .child("Transaction open in this tab · Commit to save or Rollback to discard. Closing the tab rolls it back.")))
+            .when(statement_labels.len() > 1, |view| view.child(div().flex().gap(px(4.)).px(px(8.)).py(px(4.))
+                .children(statement_labels.into_iter().enumerate().map(|(index, label)| {
+                    button(SharedString::from(format!("statement-result-{index}")), label,
+                        if index == active_result { ButtonKind::Primary } else { ButtonKind::Quiet })
+                    .debug_selector(move || format!("statement-result-{index}"))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_statement_result_for(session_id, index, cx)))
+                }))))
             .when_some(agent_panel, |view, panel| view.child(panel))
+            .when_some(parameter_prompt, |view, prompt| view.child(prompt))
+            .when_some(find_bar, |view, bar| view.child(bar))
+            .when(has_rowset, |view| view.child(div().flex().items_center().gap(px(8.)).px(px(10.)).py(px(4.))
+                .child(div().text_size(px(11.)).child("INSERT export target table:"))
+                .child(div().w(px(220.)).child(export_target))))
+            .when_some(inspected_value, |view, value| view.child(
+                div().id("query-value-viewer").max_h(px(300.)).overflow_y_scroll().p(px(10.))
+                    .child(div().flex().justify_between().child("Value")
+                        .child(button("copy-query-value", "Copy full value", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(value) = this.active_query_tab(session_id).and_then(|query| query.inspected_value.as_ref()) {
+                                cx.write_to_clipboard(ClipboardItem::new_string(value_view::value_clipboard_text(value)));
+                            }
+                        })))
+                        .child(button("close-query-value", "Close", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(query) = this.active_query_tab_mut(session_id) { query.inspected_value = None; }
+                            cx.notify();
+                        }))))
+                    .child(crate::app::value_view::value_view(Some(&value)))))
             .child(
                 gpui_component::resizable::v_resizable(SharedString::from(format!(
                     "query-workbench-split-{session_id}-{tab_id}"

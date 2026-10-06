@@ -5,26 +5,40 @@
 //! manager) and exposes database-agnostic metadata, query, and mutation
 //! operations for the GPUI client.
 
+mod cloud_auth;
+pub use cloud_auth::{CloudAuthentication, cloud_database_password};
+mod schema_objects;
+pub use model::{SchemaObject, SchemaObjectKind};
+mod designer;
+pub use designer::{TableAlteration, draft_table_alteration};
 mod connectors;
+mod console;
+mod diagnostics;
 mod engine;
 mod error;
 mod model;
+mod protected;
 mod redis_catalog;
 mod redis_engine;
 mod sql;
 mod sqlx_engine;
 mod transfer;
+pub use diagnostics::{
+    MigrationDraft, Monitor, compare_execution_plans, execution_plan_query, format_execution_plan,
+    monitor_query, schema_migration,
+};
 mod transport;
 
 pub use transport::SshConfig;
 
+pub use console::{QueryCancellation, QuerySession, ScriptResult, StatementResult};
 pub use engine::{DatabaseEngine, Engine, QueryOptions};
 pub use error::{DbxError, Result};
 pub use model::{
-    CellValue, ColumnInfo, ConnectionConfig, CreateColumn, CreateTableRequest, DatabaseKind,
-    EntityKind, ExecResult, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, MutationValue,
-    Order, OrderDirection, Page, QueryResult, ReferentialAction, RelationalSchema, RelationalTable,
-    RowData, TableInfo, TableRef, TableStructure, UpdateRequest,
+    CellValue, CheckConstraintInfo, ColumnInfo, ConnectionConfig, CreateColumn, CreateTableRequest,
+    DatabaseKind, EntityKind, ExecResult, Filter, FilterOperator, ForeignKeyInfo, IndexInfo,
+    InsertRequest, MutationValue, Order, OrderDirection, Page, QueryResult, ReferentialAction,
+    RelationalSchema, RelationalTable, RowData, TableInfo, TableRef, TableStructure, UpdateRequest,
 };
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
@@ -35,10 +49,12 @@ pub use sql::{
     quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
+pub use transfer::checked_split_sql_for;
 pub use transfer::{
     DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
-    FileFormat, ImportReport, detect_file_format, export_database, export_table, import_database,
-    import_file, render_sql_insert, render_sql_schema, split_sql_statements,
+    FileFormat, ImportReport, TransferControl, detect_file_format, export_database, export_table,
+    import_database, import_file, render_sql_indexes, render_sql_insert, render_sql_schema,
+    split_sql_statements, with_transfer_control,
 };
 
 #[cfg(test)]
@@ -231,6 +247,7 @@ mod tests {
             nullable: true,
             ordinal: 1,
             primary_key: false,
+            default_value: None,
         }
     }
 
@@ -313,6 +330,7 @@ mod tests {
             nullable: false,
             ordinal: 1,
             primary_key: false,
+            default_value: None,
         }];
 
         let statement =
@@ -460,6 +478,7 @@ mod tests {
                 nullable: false,
                 ordinal: 1,
                 primary_key: true,
+                default_value: None,
             },
             ColumnInfo {
                 name: "name".into(),
@@ -468,6 +487,7 @@ mod tests {
                 nullable: true,
                 ordinal: 2,
                 primary_key: false,
+                default_value: None,
             },
             ColumnInfo {
                 name: "seen_at".into(),
@@ -476,6 +496,7 @@ mod tests {
                 nullable: true,
                 ordinal: 3,
                 primary_key: false,
+                default_value: None,
             },
         ];
         let text = |value: &str| Some(CellValue::Text(value.into()));

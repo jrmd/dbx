@@ -349,11 +349,23 @@ impl DbxApp {
             .map(|(index, session)| {
                 (
                     session.id,
-                    if session.name.trim().is_empty() {
-                        format!("{} {}", session.kind, index + 1)
-                    } else {
-                        session.name.clone()
-                    },
+                    format!(
+                        "{}{}",
+                        if session.name.trim().is_empty() {
+                            format!("{} {}", session.kind, index + 1)
+                        } else {
+                            session.name.clone()
+                        },
+                        if session
+                            .engine
+                            .as_ref()
+                            .is_some_and(|engine| engine.is_read_only())
+                        {
+                            " · protected"
+                        } else {
+                            ""
+                        }
+                    ),
                     session.busy,
                     session.kind,
                     session.profile_id.is_some(),
@@ -676,6 +688,7 @@ impl DbxApp {
                     .h_full(),
                 ),
             )
+            .child(self.render_schema_objects_for(session_id, None, cx))
             .into_any_element()
     }
 
@@ -713,9 +726,17 @@ impl DbxApp {
                     .map(|tab| {
                         let (label, kind) = match &tab.kind {
                             SecondaryTabKind::Data(data) => (data.table.name.clone(), Icon::Table),
-                            SecondaryTabKind::Query(_) => {
+                            SecondaryTabKind::Query(query) => {
                                 query_number += 1;
-                                (format!("Query {query_number}"), Icon::Query)
+                                let name = query.name.read(cx);
+                                (
+                                    if name.as_str() == "Untitled" {
+                                        format!("Query {query_number}")
+                                    } else {
+                                        name.clone()
+                                    },
+                                    Icon::Query,
+                                )
                             }
                             SecondaryTabKind::Structure(structure) => (
                                 format!("{} structure", structure.table.name),
@@ -828,7 +849,17 @@ impl DbxApp {
                         }
                         // Query tabs show their outcome and errors inline.
                         SecondaryTabKind::Query(_) => {
-                            return (None, String::new(), None, None, String::new());
+                            return (
+                                session.error.clone(),
+                                if session.busy {
+                                    session.status.clone()
+                                } else {
+                                    String::new()
+                                },
+                                None,
+                                None,
+                                String::new(),
+                            );
                         }
                         SecondaryTabKind::Diagram(diagram) => {
                             let status = match (diagram.busy, &diagram.document) {
@@ -963,6 +994,23 @@ impl DbxApp {
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .when_some(
+                        self.active_session_id.filter(|id| {
+                            self.session(*id)
+                                .is_some_and(|session| session.transfer_control.is_some())
+                        }),
+                        |view, session_id| {
+                            view.child(
+                                Button::new("cancel-transfer")
+                                    .label("Cancel transfer")
+                                    .ghost()
+                                    .with_size(Size::XSmall)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.cancel_transfer_for(session_id, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .child(result_summary)
                     .when_some(pagination_controls, |view, controls| view.child(controls)),
             )

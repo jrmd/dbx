@@ -2,7 +2,7 @@
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, process::Child};
+use tokio::net::TcpListener;
 use url::Url;
 
 use crate::{ConnectionConfig, DatabaseKind, DbxError, Result};
@@ -16,6 +16,40 @@ pub struct SshConfig {
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_file: Option<PathBuf>,
+    /// OpenSSH `ProxyJump` hops: comma-separated `[user@]host[:port]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
+}
+
+/// Accept only `[user@]host[:port]` hops, so a jump specification can never
+/// become another OpenSSH option.
+fn valid_jump_hosts(value: &str) -> bool {
+    !value.is_empty()
+        && value.split(',').all(|hop| {
+            let (user, address) = match hop.split_once('@') {
+                Some((user, address)) => (Some(user), address),
+                None => (None, hop),
+            };
+            let user_ok = user.is_none_or(|user| {
+                !user.is_empty()
+                    && !user.starts_with('-')
+                    && user
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            });
+            let (host, port) = match address.strip_prefix('[') {
+                Some(rest) => match rest.split_once(']') {
+                    Some((host, port)) => (host, port.strip_prefix(':')),
+                    None => return false,
+                },
+                None => match address.rsplit_once(':') {
+                    Some((host, port)) => (host, Some(port)),
+                    None => (address, None),
+                },
+            };
+            let port_ok = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0));
+            user_ok && port_ok && safe_host(host)
+        })
 }
 
 fn invalid(message: &str) -> DbxError {
@@ -62,6 +96,13 @@ pub(crate) fn validate(config: &ConnectionConfig) -> Result<()> {
         {
             return Err(invalid("SSH private key path must be absolute."));
         }
+        if let Some(jump) = &ssh.jump_host
+            && !valid_jump_hosts(jump)
+        {
+            return Err(invalid(
+                "Enter jump hosts as user@host:port, separated by commas.",
+            ));
+        }
         let url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL."))?;
         if config.socket.is_none()
             && !safe_host(url.host_str().unwrap_or("").trim_matches(['[', ']']))
@@ -91,15 +132,15 @@ pub(crate) fn validate(config: &ConnectionConfig) -> Result<()> {
 }
 
 pub(crate) struct Tunnel {
-    child: Child,
-    // Private control socket/log directory remains until the child is stopped.
-    _directory: tempfile::TempDir,
+    supervisor: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
+    initial_pid: u32,
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
-        // Tokio reaps dropped children; kill_on_drop also covers cancellation.
+        self.supervisor.abort();
+        // The supervised child uses kill_on_drop, including during reconnect.
     }
 }
 
@@ -143,6 +184,7 @@ pub(crate) async fn prepare(
     config.url = url.into();
     config.socket = None;
     config.ssh = None;
+    config.ssh_password = None;
     Ok((config, Some(tunnel)))
 }
 
@@ -178,7 +220,11 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
         .arg(&control)
         .args([
             "-o",
-            "BatchMode=yes",
+            if config.ssh_password.is_some() {
+                "BatchMode=no"
+            } else {
+                "BatchMode=yes"
+            },
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
@@ -207,11 +253,50 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
         .arg(&ssh.username)
         .arg("-L")
         .arg(format!("127.0.0.1:{local_port}:{endpoint}"));
+    if let Some(password) = &config.ssh_password {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+            let secret_path = directory.path().join("password");
+            let askpass_path = directory.path().join("askpass");
+            let mut secret = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&secret_path)
+                .map_err(|_| invalid("Cannot create SSH authentication file"))?;
+            std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|_| invalid("Cannot protect SSH authentication file"))?;
+            secret
+                .write_all(password.as_bytes())
+                .map_err(|_| invalid("Cannot prepare SSH authentication"))?;
+            std::fs::write(
+                &askpass_path,
+                "#!/bin/sh\nexec cat -- \"$DBX_SSH_PASSWORD_FILE\"\n",
+            )
+            .map_err(|_| invalid("Cannot prepare SSH password helper"))?;
+            std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| invalid("Cannot protect SSH password helper"))?;
+            command
+                .env("SSH_ASKPASS", askpass_path)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env("DISPLAY", "dbx")
+                .env("DBX_SSH_PASSWORD_FILE", secret_path)
+                .args(["-o", "NumberOfPasswordPrompts=1"]);
+        }
+        #[cfg(not(unix))]
+        return Err(invalid(
+            "SSH password authentication currently requires Unix",
+        ));
+    }
     if let Some(identity) = &ssh.identity_file {
         command
             .arg("-i")
             .arg(identity)
             .args(["-o", "IdentitiesOnly=yes"]);
+    }
+    if let Some(jump) = &ssh.jump_host {
+        command.arg("-J").arg(jump);
     }
     command
         .arg("--")
@@ -223,19 +308,14 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
     // OpenSSH owns the actual listener. ExitOnForwardFailure prevents a stolen
     // port from being mistaken for a tunnel established by this process.
     drop(listener);
-    let child = command.spawn().map_err(|_| {
+    let mut child = command.spawn().map_err(|_| {
         DbxError::Connection(
             "Could not start OpenSSH. Install the ssh client and try again.".into(),
         )
     })?;
-    let mut tunnel = Tunnel {
-        child,
-        _directory: directory,
-    };
     let deadline = tokio::time::Instant::now() + Duration::from_millis(config.connect_timeout_ms);
     loop {
-        if tunnel
-            .child
+        if child
             .try_wait()
             .map_err(|_| invalid("Cannot inspect SSH process."))?
             .is_some()
@@ -262,7 +342,35 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
                 .await
                 .is_ok_and(|result| result.is_ok_and(|status| status.success()))
             {
-                return Ok((tunnel, local_port));
+                #[cfg(test)]
+                let initial_pid = child.id().unwrap();
+                let supervisor = tokio::spawn(async move {
+                    let _directory = directory;
+                    loop {
+                        let _ = child.wait().await;
+                        // Re-establish only the transport, on the same forwarding
+                        // port. Database statements are never replayed here.
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let _ = std::fs::remove_file(&control);
+                            match command.spawn() {
+                                Ok(replacement) => {
+                                    child = replacement;
+                                    break;
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                    }
+                });
+                return Ok((
+                    Tunnel {
+                        supervisor,
+                        #[cfg(test)]
+                        initial_pid,
+                    },
+                    local_port,
+                ));
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -296,6 +404,7 @@ mod tests {
             port: std::env::var("DBX_TEST_SSH_PORT").unwrap().parse().unwrap(),
             username: std::env::var("DBX_TEST_SSH_USER").unwrap(),
             identity_file: Some(root.join("identity")),
+            jump_host: None,
         });
         let (forwarded, tunnel) = prepare(config).await.unwrap();
         assert!(forwarded.ssh.is_none());
@@ -311,6 +420,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&response, b"+PONG\r\n");
+        let pid = tunnel.as_ref().unwrap().initial_pid;
+        assert!(
+            tokio::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Ok(mut recovered) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
+                && recovered.write_all(b"*1\r\n$4\r\nPING\r\n").await.is_ok()
+                && tokio::time::timeout(
+                    Duration::from_millis(500),
+                    recovered.read_exact(&mut response),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                assert_eq!(&response, b"+PONG\r\n");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "SSH tunnel did not reconnect on its original port"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         drop(tunnel);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
@@ -326,6 +464,29 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "run scripts/test-transports.py for disposable password-authenticated SSH"]
+    async fn ssh_password_integration() {
+        let mut config = ConnectionConfig::new(DatabaseKind::Redis, "redis://127.0.0.1:6379/0");
+        config.ssh = Some(SshConfig {
+            host: "127.0.0.1".into(),
+            port: std::env::var("DBX_TEST_SSH_PASSWORD_PORT")
+                .unwrap()
+                .parse()
+                .unwrap(),
+            username: "dbx_password".into(),
+            identity_file: None,
+            jump_host: None,
+        });
+        config.ssh_password = Some("disposable-fixture-password".into());
+        let engine = crate::DatabaseEngine::connect(config).await.unwrap();
+        let result = engine
+            .query("PING", crate::QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.rows[0].values[0].to_string(), "PONG");
     }
 
     #[test]
@@ -348,6 +509,7 @@ mod tests {
             port: 22,
             username: "alice".into(),
             identity_file: None,
+            jump_host: None,
         });
         config
     }
@@ -367,6 +529,32 @@ mod tests {
         assert!(config.validate().is_err());
         config.socket = Some("/tmp".into());
         config.kind = DatabaseKind::SQLite;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn jump_hosts_accept_only_user_host_port_hops() {
+        for valid in [
+            "bastion",
+            "ops@bastion:2222,jump.internal",
+            "[::1]:22",
+            "a@[fe80::1]",
+        ] {
+            assert!(valid_jump_hosts(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "-oProxyCommand=x",
+            "a@-b",
+            "host:0",
+            "host:port",
+            "a b",
+            "[::1",
+        ] {
+            assert!(!valid_jump_hosts(invalid), "{invalid}");
+        }
+        let mut config = config();
+        config.ssh.as_mut().unwrap().jump_host = Some("-J evil".into());
         assert!(config.validate().is_err());
     }
 

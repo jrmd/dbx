@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::HashMap, time::Instant};
 
 use futures_util::TryStreamExt;
 use sqlx::{
-    Column, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
+    Column, Connection, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
     mysql::{MySqlArguments, MySqlConnectOptions, MySqlRow},
     postgres::{
         PgArguments, PgConnectOptions, PgPool, PgRow,
@@ -15,10 +15,10 @@ use tokio::sync::RwLock;
 
 use crate::engine::{exec_result, query_result, row_limit};
 use crate::{
-    CellValue, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError, EntityKind, ExecResult,
-    ForeignKeyInfo, QueryOptions, QueryResult, ReferentialAction, RelationalSchema,
-    RelationalTable, Result, RowData, SqlStatement, TableInfo, TableRef, TableStructure,
-    split_sql_statements,
+    CellValue, CheckConstraintInfo, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError,
+    EntityKind, ExecResult, ForeignKeyInfo, IndexInfo, QueryOptions, QueryResult,
+    ReferentialAction, RelationalSchema, RelationalTable, Result, RowData, SqlStatement, TableInfo,
+    TableRef, TableStructure, split_sql_statements,
 };
 use async_trait::async_trait;
 
@@ -33,6 +33,9 @@ fn postgres_options(
     let mut options = url.parse::<PgConnectOptions>()?;
     if let Some(socket) = &config.socket {
         options = options.socket(socket);
+    }
+    if config.read_only {
+        options = options.options([("default_transaction_read_only", "on")]);
     }
     Ok(options)
 }
@@ -49,6 +52,10 @@ fn mysql_options(
 
 /// Maps `pg_constraint` action codes to the rule names `information_schema`
 /// used, as the last two columns of a foreign-key row.
+/// MySQL reports literal defaults unquoted and expression defaults bare.
+/// Normalize both to an SQL expression that can be replayed in DDL.
+const MYSQL_DEFAULT_SQL: &str = "CASE WHEN COLUMN_DEFAULT IS NULL THEN NULL WHEN EXTRA LIKE '%DEFAULT_GENERATED%' THEN CASE WHEN UPPER(COLUMN_DEFAULT) LIKE 'CURRENT_TIMESTAMP%' THEN CAST(COLUMN_DEFAULT AS CHAR) ELSE CONCAT('(', CAST(COLUMN_DEFAULT AS CHAR), ')') END ELSE QUOTE(CAST(COLUMN_DEFAULT AS CHAR)) END AS column_default";
+
 const PG_FK_RULE_SQL: &str = "CASE con.confupdtype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END, CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END";
 
 /// `(schema, name)` identity used to join bulk catalog rows to tables.
@@ -65,6 +72,14 @@ fn pool_options<DB: sqlx::Database>(
         .max_connections(max_connections)
         .acquire_timeout(acquire_timeout)
         .test_before_acquire(false)
+        .before_acquire(|connection, metadata| {
+            Box::pin(async move {
+                if metadata.idle_for >= std::time::Duration::from_secs(30) {
+                    connection.ping().await?;
+                }
+                Ok(true)
+            })
+        })
         .idle_timeout(idle_timeout)
 }
 
@@ -145,6 +160,7 @@ impl SqlxEngine {
         let connect_error = |error: sqlx::Error| {
             DbxError::Connection(crate::error::connection_message(&config.url, error))
         };
+        let read_only = config.read_only;
         let pool = match config.kind.dialect() {
             DatabaseKind::PostgreSQL => SqlxPool::Postgres(
                 pool_options::<Postgres>(max_connections, timeout, idle_timeout)
@@ -154,12 +170,32 @@ impl SqlxEngine {
             ),
             DatabaseKind::MySQL => SqlxPool::MySql(
                 pool_options::<MySql>(max_connections, timeout, idle_timeout)
+                    .after_connect(move |connection, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("SET SESSION TRANSACTION READ ONLY")
+                                    .execute(connection)
+                                    .await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect_with(mysql_options(&config).map_err(connect_error)?)
                     .await
                     .map_err(connect_error)?,
             ),
             DatabaseKind::SQLite => SqlxPool::SQLite(
                 pool_options::<Sqlite>(max_connections, timeout, idle_timeout)
+                    .after_connect(move |connection, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("PRAGMA query_only=ON")
+                                    .execute(connection)
+                                    .await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect(&config.url)
                     .await
                     .map_err(connect_error)?,
@@ -177,6 +213,9 @@ impl SqlxEngine {
     pub fn kind(&self) -> DatabaseKind {
         self.kind
     }
+    pub fn is_read_only(&self) -> bool {
+        self.config.read_only
+    }
 
     pub fn pool(&self) -> &RwLock<SqlxPool> {
         &self.pool
@@ -184,7 +223,7 @@ impl SqlxEngine {
 
     /// Snapshot the current pool handle. `SqlxPool` clones are cheap and stay
     /// valid even if a later `use_database` swaps the pool underneath.
-    async fn pool_snapshot(&self) -> SqlxPool {
+    pub(crate) async fn pool_snapshot(&self) -> SqlxPool {
         self.pool.read().await.clone()
     }
 
@@ -193,6 +232,9 @@ impl SqlxEngine {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        if self.config.read_only {
+            crate::protected::ensure_query(self.kind, &statement.sql)?;
+        }
         self.query_statement_impl(statement, options, true).await
     }
 
@@ -214,6 +256,9 @@ impl SqlxEngine {
         options: QueryOptions,
         describe_empty: bool,
     ) -> Result<QueryResult> {
+        if self.config.read_only {
+            crate::protected::ensure_query(self.kind, &statement.sql)?;
+        }
         let started = Instant::now();
         let limit = row_limit(options);
         let mut columns = Vec::new();
@@ -275,6 +320,9 @@ impl SqlxEngine {
     /// statements continue through `query_with_statement` so parameters remain
     /// safely bound.
     async fn query_raw(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
+        if self.config.read_only {
+            crate::protected::ensure_query(self.kind, sql)?;
+        }
         let started = Instant::now();
         let limit = row_limit(options);
         let mut columns = Vec::new();
@@ -417,6 +465,11 @@ impl SqlxEngine {
     }
 
     async fn execute_statement(&self, statement: &SqlStatement) -> Result<ExecResult> {
+        if self.config.read_only {
+            return Err(DbxError::Query(
+                "Protected connection: writes are disabled".into(),
+            ));
+        }
         let started = Instant::now();
         let (rows_affected, last_insert_id) = match &self.pool_snapshot().await {
             SqlxPool::Postgres(pool) => {
@@ -559,7 +612,7 @@ impl SqlxEngine {
                     // accepts it (length, precision, arrays, and qualified
                     // user-defined types), so mutations can cast text
                     // parameters to it.
-                    "SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    "SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
                     &[CellValue::Text(schema), CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -568,7 +621,7 @@ impl SqlxEngine {
                 self.metadata_query(
                     // COLUMN_TYPE keeps `tinyint(1)`, `unsigned`, and enum
                     // labels, which DATA_TYPE drops.
-                    "SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    &format!("SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {MYSQL_DEFAULT_SQL} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"),
                     &[CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -607,6 +660,11 @@ impl SqlxEngine {
             ),
             _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
+        let default_value = match self.kind.dialect() {
+            DatabaseKind::SQLite => optional_text_value(row, offset + 4)?,
+            _ => optional_text_value(row, offset + 6)?,
+        }
+        .filter(|value| !value.trim().is_empty());
         let enum_values = match self.kind.dialect() {
             DatabaseKind::PostgreSQL => enum_values_from_postgres_metadata(row, offset + 5)?,
             DatabaseKind::MySQL => parse_mysql_enum_definition(&text_value(row, offset + 5)?),
@@ -619,6 +677,7 @@ impl SqlxEngine {
             nullable,
             ordinal: if ordinal == 0 { index + 1 } else { ordinal },
             primary_key,
+            default_value,
         })
     }
 
@@ -653,28 +712,342 @@ impl SqlxEngine {
     }
 
     async fn table_structure_sql(&self, table: &TableRef) -> Result<TableStructure> {
-        let (columns, foreign_keys) =
-            tokio::try_join!(self.describe_sql_table(table), self.foreign_keys(table),)?;
+        let ((columns, foreign_keys), (mut indexes, mut checks, mut definitions)) = tokio::try_join!(
+            async { tokio::try_join!(self.describe_sql_table(table), self.foreign_keys(table)) },
+            self.supplementary_metadata(Some(table)),
+        )?;
+        // A single-table request returns at most one table's entries.
         Ok(TableStructure {
             columns,
             foreign_keys,
+            indexes: indexes
+                .drain()
+                .next()
+                .map(|(_, value)| value)
+                .unwrap_or_default(),
+            checks: checks
+                .drain()
+                .next()
+                .map(|(_, value)| value)
+                .unwrap_or_default(),
+            definition: definitions.drain().next().map(|(_, value)| value),
         })
+    }
+
+    /// Indexes, check constraints, and object definitions for one table or
+    /// for every table. An unavailable catalog must not look like an empty
+    /// catalog to schema comparison or exports.
+    async fn supplementary_metadata(
+        &self,
+        table: Option<&TableRef>,
+    ) -> Result<(
+        HashMap<TableKey, Vec<IndexInfo>>,
+        HashMap<TableKey, Vec<CheckConstraintInfo>>,
+        HashMap<TableKey, String>,
+    )> {
+        let (indexes, checks, definitions) = tokio::join!(
+            self.table_indexes(table),
+            self.table_checks(table),
+            self.table_definitions(table),
+        );
+        Ok((indexes?, checks?, definitions?))
+    }
+
+    /// The SQL fragment and parameters restricting a catalog query to one
+    /// table. `schema` and `name` are the catalog's column expressions.
+    fn table_filter(
+        &self,
+        table: Option<&TableRef>,
+        schema: &str,
+        name: &str,
+    ) -> (String, Vec<CellValue>) {
+        let Some(table) = table else {
+            return (String::new(), Vec::new());
+        };
+        match self.kind.dialect() {
+            DatabaseKind::PostgreSQL => (
+                format!(" AND {schema} = $1 AND {name} = $2"),
+                vec![
+                    CellValue::Text(table.schema.clone().unwrap_or_else(|| "public".to_owned())),
+                    CellValue::Text(table.name.clone()),
+                ],
+            ),
+            _ => (
+                format!(" AND {name} = ?"),
+                vec![CellValue::Text(table.name.clone())],
+            ),
+        }
+    }
+
+    async fn table_indexes(
+        &self,
+        table: Option<&TableRef>,
+    ) -> Result<HashMap<TableKey, Vec<IndexInfo>>> {
+        let (sql, params) = match self.kind.dialect() {
+            DatabaseKind::PostgreSQL => {
+                let (filter, params) = self.table_filter(table, "n.nspname", "c.relname");
+                (
+                    format!(
+                        "SELECT n.nspname, c.relname, i.relname, ix.indisunique, ix.indisprimary, am.amname, pg_get_expr(ix.indpred, ix.indrelid), pg_get_indexdef(ix.indexrelid), array_to_string(ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k, true) FROM generate_series(1, ix.indnkeyatts::INT) AS k ORDER BY k), chr(31)) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class c ON c.oid = ix.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'{filter} ORDER BY n.nspname, c.relname, ix.indisprimary DESC, i.relname"
+                    ),
+                    params,
+                )
+            }
+            DatabaseKind::MySQL => {
+                let (filter, params) = self.table_filter(table, "TABLE_SCHEMA", "TABLE_NAME");
+                (
+                    format!(
+                        "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), NON_UNIQUE, CAST(INDEX_TYPE AS CHAR), CAST(COLUMN_NAME AS CHAR), SUB_PART, CAST(COLLATION AS CHAR), CAST(EXPRESSION AS CHAR) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE(){filter} ORDER BY TABLE_NAME, INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX"
+                    ),
+                    params,
+                )
+            }
+            DatabaseKind::SQLite => {
+                let (filter, params) = self.table_filter(table, "", "m.name");
+                (
+                    format!(
+                        "SELECT NULL, m.name, il.name, il.\"unique\", il.origin, ii.name, ii.\"desc\", s.sql FROM sqlite_master m JOIN pragma_index_list(m.name) il JOIN pragma_index_xinfo(il.name) ii LEFT JOIN sqlite_master s ON s.type = 'index' AND s.name = il.name WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND ii.key = 1{filter} ORDER BY m.name, il.origin = 'pk' DESC, il.name, ii.seqno"
+                    ),
+                    params,
+                )
+            }
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
+        };
+        let result = self.metadata_query(&sql, &params).await?;
+        let mut tables: HashMap<TableKey, Vec<IndexInfo>> = HashMap::new();
+        let mut native_parts: HashMap<(TableKey, String), Vec<String>> = HashMap::new();
+        for row in &result.rows {
+            let key = (optional_text_value(row, 0)?, text_value(row, 1)?);
+            let name = text_value(row, 2)?;
+            let indexes = tables.entry(key.clone()).or_default();
+            match self.kind.dialect() {
+                DatabaseKind::PostgreSQL => indexes.push(IndexInfo {
+                    name,
+                    unique: boolish_value(row, 3)?,
+                    primary: boolish_value(row, 4)?,
+                    method: optional_text_value(row, 5)?,
+                    predicate: optional_text_value(row, 6)?,
+                    definition: optional_text_value(row, 7)?,
+                    columns: text_value(row, 8)?
+                        .split('\u{1f}')
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                }),
+                DatabaseKind::MySQL | DatabaseKind::SQLite => {
+                    let part = if self.kind.dialect() == DatabaseKind::MySQL {
+                        let expression = optional_text_value(row, 8)?;
+                        let column = optional_text_value(row, 5)?;
+                        let mut native = if let Some(expression) = &expression {
+                            format!("({})", crate::transfer::safe_schema_expression(expression)?)
+                        } else {
+                            crate::quote_identifier(self.kind, column.as_deref().unwrap_or(""))?
+                        };
+                        let mut part = column.unwrap_or_else(|| {
+                            format!("({})", expression.as_deref().unwrap_or("expression"))
+                        });
+                        if let Some(length) = optional_text_value(row, 6)? {
+                            part.push_str(&format!("({length})"));
+                            native.push_str(&format!("({length})"));
+                        }
+                        if optional_text_value(row, 7)?.as_deref() == Some("D") {
+                            part.push_str(" DESC");
+                            native.push_str(" DESC");
+                        }
+                        native_parts
+                            .entry((key.clone(), name.clone()))
+                            .or_default()
+                            .push(native);
+                        part
+                    } else {
+                        let mut part = optional_text_value(row, 5)?
+                            .unwrap_or_else(|| "(expression)".to_owned());
+                        if boolish_value(row, 6)? {
+                            part.push_str(" DESC");
+                        }
+                        part
+                    };
+                    if let Some(index) = indexes.last_mut().filter(|index| index.name == name) {
+                        index.columns.push(part);
+                        continue;
+                    }
+                    let index = if self.kind.dialect() == DatabaseKind::MySQL {
+                        IndexInfo {
+                            primary: name == "PRIMARY",
+                            unique: !boolish_value(row, 3)?,
+                            method: optional_text_value(row, 4)?,
+                            predicate: None,
+                            definition: None,
+                            name,
+                            columns: vec![part],
+                        }
+                    } else {
+                        let origin = text_value(row, 4)?;
+                        IndexInfo {
+                            primary: origin == "pk",
+                            unique: boolish_value(row, 3)?,
+                            method: None,
+                            predicate: None,
+                            definition: optional_text_value(row, 7)?,
+                            name,
+                            columns: vec![part],
+                        }
+                    };
+                    indexes.push(index);
+                }
+                _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
+            }
+        }
+        if self.kind.dialect() == DatabaseKind::MySQL {
+            for (key, indexes) in &mut tables {
+                for index in indexes.iter_mut().filter(|index| !index.primary) {
+                    let parts = native_parts
+                        .get(&(key.clone(), index.name.clone()))
+                        .ok_or_else(|| DbxError::Decode("Missing index parts".into()))?;
+                    let method = match index.method.as_deref() {
+                        Some("FULLTEXT") => "FULLTEXT ",
+                        Some("SPATIAL") => "SPATIAL ",
+                        _ => "",
+                    };
+                    let access = match index.method.as_deref() {
+                        Some("BTREE") => " USING BTREE",
+                        Some("HASH") => " USING HASH",
+                        _ => "",
+                    };
+                    index.definition = Some(format!(
+                        "CREATE {}{method}INDEX {} ON {} ({}){access}",
+                        if index.unique { "UNIQUE " } else { "" },
+                        crate::quote_identifier(self.kind, &index.name)?,
+                        crate::sql::quote_table(
+                            self.kind,
+                            &TableRef {
+                                schema: key.0.clone(),
+                                name: key.1.clone()
+                            }
+                        )?,
+                        parts.join(", ")
+                    ));
+                }
+            }
+        }
+        Ok(tables)
+    }
+
+    async fn table_checks(
+        &self,
+        table: Option<&TableRef>,
+    ) -> Result<HashMap<TableKey, Vec<CheckConstraintInfo>>> {
+        let (sql, params) = match self.kind.dialect() {
+            DatabaseKind::PostgreSQL => {
+                let (filter, params) = self.table_filter(table, "n.nspname", "c.relname");
+                (
+                    format!(
+                        "SELECT n.nspname, c.relname, con.conname, pg_get_constraintdef(con.oid) FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE con.contype = 'c' AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'{filter} ORDER BY n.nspname, c.relname, con.conname"
+                    ),
+                    params,
+                )
+            }
+            DatabaseKind::MySQL => {
+                let (filter, params) = self.table_filter(table, "tc.TABLE_SCHEMA", "tc.TABLE_NAME");
+                (
+                    format!(
+                        "SELECT CAST(tc.TABLE_SCHEMA AS CHAR), CAST(tc.TABLE_NAME AS CHAR), CAST(tc.CONSTRAINT_NAME AS CHAR), CAST(cc.CHECK_CLAUSE AS CHAR) FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME WHERE tc.CONSTRAINT_TYPE = 'CHECK' AND tc.TABLE_SCHEMA = DATABASE(){filter} ORDER BY tc.TABLE_NAME, tc.CONSTRAINT_NAME"
+                    ),
+                    params,
+                )
+            }
+            DatabaseKind::SQLite => {
+                return Ok(self
+                    .table_definitions(table)
+                    .await?
+                    .into_iter()
+                    .map(|(key, definition)| {
+                        (key, crate::schema_objects::sqlite_checks(&definition))
+                    })
+                    .collect());
+            }
+            _ => return Ok(HashMap::new()),
+        };
+        let result = self.metadata_query(&sql, &params).await?;
+        let mut tables: HashMap<TableKey, Vec<CheckConstraintInfo>> = HashMap::new();
+        for row in &result.rows {
+            let key = (optional_text_value(row, 0)?, text_value(row, 1)?);
+            let clause = text_value(row, 3)?;
+            let expression = match self.kind.dialect() {
+                DatabaseKind::PostgreSQL => check_expression_from_definition(&clause),
+                _ => strip_outer_parentheses(clause.trim()).to_owned(),
+            };
+            tables.entry(key).or_default().push(CheckConstraintInfo {
+                name: optional_text_value(row, 2)?,
+                expression,
+            });
+        }
+        Ok(tables)
+    }
+
+    async fn table_definitions(
+        &self,
+        table: Option<&TableRef>,
+    ) -> Result<HashMap<TableKey, String>> {
+        let (sql, params) = match self.kind.dialect() {
+            DatabaseKind::PostgreSQL => {
+                let (filter, params) = self.table_filter(table, "n.nspname", "c.relname");
+                (
+                    format!(
+                        "SELECT n.nspname, c.relname, pg_get_viewdef(c.oid, true) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'{filter}"
+                    ),
+                    params,
+                )
+            }
+            DatabaseKind::MySQL => {
+                let (filter, params) = self.table_filter(table, "TABLE_SCHEMA", "TABLE_NAME");
+                (
+                    format!(
+                        "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(VIEW_DEFINITION AS CHAR) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE(){filter}"
+                    ),
+                    params,
+                )
+            }
+            DatabaseKind::SQLite => {
+                let (filter, params) = self.table_filter(table, "", "name");
+                (
+                    format!(
+                        "SELECT NULL, name, sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL{filter}"
+                    ),
+                    params,
+                )
+            }
+            _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
+        };
+        let result = self.metadata_query(&sql, &params).await?;
+        let mut definitions = HashMap::new();
+        for row in &result.rows {
+            if let Some(definition) =
+                optional_text_value(row, 2)?.filter(|value| !value.trim().is_empty())
+            {
+                definitions.insert(
+                    (optional_text_value(row, 0)?, text_value(row, 1)?),
+                    definition,
+                );
+            }
+        }
+        Ok(definitions)
     }
 
     /// Every column of every table in the active database, in one query.
     async fn bulk_columns(&self) -> Result<HashMap<TableKey, Vec<ColumnInfo>>> {
         // Each query prefixes the owning table's (schema, name) and then
         // repeats the per-table column layout, so `column_from_row` is shared.
-        let sql = match self.kind.dialect() {
+        let sql: &str = match self.kind.dialect() {
             DatabaseKind::SQLite => {
                 "SELECT NULL, m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, p.cid"
             }
             DatabaseKind::PostgreSQL => {
-                "SELECT n.nspname, c.relname, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY n.nspname, c.relname, a.attnum"
+                "SELECT n.nspname, c.relname, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY n.nspname, c.relname, a.attnum"
             }
-            DatabaseKind::MySQL => {
-                "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
-            }
+            DatabaseKind::MySQL => &format!(
+                "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {MYSQL_DEFAULT_SQL} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
+            ),
             _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };
         let result = self.metadata_query(sql, &[]).await?;
@@ -724,11 +1097,19 @@ impl SqlxEngine {
 
     async fn relational_schema_sql(&self) -> Result<RelationalSchema> {
         // Four catalog queries in parallel replace two per table.
-        let (database, tables, mut columns, mut foreign_keys) = tokio::try_join!(
-            self.current_sql_database(),
-            self.list_sql_tables(),
-            self.bulk_columns(),
-            self.bulk_foreign_keys(),
+        let (
+            (database, tables, mut columns, mut foreign_keys),
+            (mut indexes, mut checks, mut definitions),
+        ) = tokio::try_join!(
+            async {
+                tokio::try_join!(
+                    self.current_sql_database(),
+                    self.list_sql_tables(),
+                    self.bulk_columns(),
+                    self.bulk_foreign_keys(),
+                )
+            },
+            self.supplementary_metadata(None),
         )?;
         let mut tables: Vec<RelationalTable> = tables
             .into_iter()
@@ -737,6 +1118,9 @@ impl SqlxEngine {
                 let structure = TableStructure {
                     columns: columns.remove(&key).unwrap_or_default(),
                     foreign_keys: foreign_keys.remove(&key).unwrap_or_default(),
+                    indexes: indexes.remove(&key).unwrap_or_default(),
+                    checks: checks.remove(&key).unwrap_or_default(),
+                    definition: definitions.remove(&key),
                 };
                 RelationalTable { table, structure }
             })
@@ -747,7 +1131,13 @@ impl SqlxEngine {
                 .cmp(&right.table.schema)
                 .then_with(|| left.table.name.cmp(&right.table.name))
         });
-        Ok(RelationalSchema { database, tables })
+        Ok(RelationalSchema {
+            database,
+            tables,
+            details_captured: true,
+            objects: crate::schema_objects::capture(self).await?,
+            objects_captured: true,
+        })
     }
 
     async fn list_sql_databases(&self) -> Result<Vec<String>> {
@@ -871,7 +1261,7 @@ impl SqlxEngine {
     }
 }
 
-fn statement_likely_returns_rows(statement: &str) -> bool {
+pub(crate) fn statement_likely_returns_rows(statement: &str) -> bool {
     top_level_operation_keyword(statement).is_some_and(|keyword| {
         [
             "SELECT", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "PRAGMA",
@@ -881,7 +1271,7 @@ fn statement_likely_returns_rows(statement: &str) -> bool {
     })
 }
 
-fn top_level_operation_keyword(statement: &str) -> Option<&str> {
+pub(crate) fn top_level_operation_keyword(statement: &str) -> Option<&str> {
     let words = top_level_sql_words(statement);
     let first = *words.first()?;
     if !first.eq_ignore_ascii_case("WITH") {
@@ -1139,7 +1529,7 @@ fn push_bounded_row(
     Ok(())
 }
 
-fn refine_dynamic_column_types(columns: &mut [ColumnInfo], values: &[CellValue]) {
+pub(crate) fn refine_dynamic_column_types(columns: &mut [ColumnInfo], values: &[CellValue]) {
     for (column, value) in columns.iter_mut().zip(values) {
         let data_type = column.data_type.trim();
         if !(data_type.is_empty()
@@ -1227,7 +1617,7 @@ fn with_database_path(base: &str, database: &str) -> Result<String> {
 }
 
 fn foreign_keys_from_rows(kind: DatabaseKind, rows: Vec<RowData>) -> Result<Vec<ForeignKeyInfo>> {
-    match kind {
+    match kind.dialect() {
         DatabaseKind::SQLite => {
             let mut foreign_keys: Vec<(i64, ForeignKeyInfo)> = Vec::new();
             for row in rows {
@@ -1296,7 +1686,7 @@ fn foreign_keys_from_rows(kind: DatabaseKind, rows: Vec<RowData>) -> Result<Vec<
     }
 }
 
-fn result_columns<C>(columns: &[C]) -> Vec<ColumnInfo>
+pub(crate) fn result_columns<C>(columns: &[C]) -> Vec<ColumnInfo>
 where
     C: Column,
 {
@@ -1309,7 +1699,7 @@ where
         .collect()
 }
 
-fn bind_postgres_query<'q>(
+pub(crate) fn bind_postgres_query<'q>(
     statement: &'q SqlStatement,
 ) -> sqlx::query::Query<'q, Postgres, PgArguments> {
     let mut query = sqlx::query::<Postgres>(statement.sql.as_str());
@@ -1337,7 +1727,7 @@ fn bind_postgres_query<'q>(
     query
 }
 
-fn bind_mysql_query<'q>(
+pub(crate) fn bind_mysql_query<'q>(
     statement: &'q SqlStatement,
 ) -> sqlx::query::Query<'q, MySql, MySqlArguments> {
     let mut query = sqlx::query::<MySql>(statement.sql.as_str());
@@ -1357,7 +1747,7 @@ fn bind_mysql_query<'q>(
     query
 }
 
-fn bind_sqlite_query<'q>(
+pub(crate) fn bind_sqlite_query<'q>(
     statement: &'q SqlStatement,
 ) -> sqlx::query::Query<'q, Sqlite, SqliteArguments<'q>> {
     let mut query = sqlx::query::<Sqlite>(statement.sql.as_str());
@@ -1382,7 +1772,7 @@ fn bind_sqlite_query<'q>(
     query
 }
 
-fn decode_postgres_row(row: &PgRow) -> Result<Vec<CellValue>> {
+pub(crate) fn decode_postgres_row(row: &PgRow) -> Result<Vec<CellValue>> {
     row.columns()
         .iter()
         .enumerate()
@@ -1390,7 +1780,7 @@ fn decode_postgres_row(row: &PgRow) -> Result<Vec<CellValue>> {
         .collect()
 }
 
-fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<CellValue>> {
+pub(crate) fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<CellValue>> {
     row.columns()
         .iter()
         .enumerate()
@@ -1398,7 +1788,7 @@ fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<CellValue>> {
         .collect()
 }
 
-fn decode_sqlite_row(row: &SqliteRow) -> Result<Vec<CellValue>> {
+pub(crate) fn decode_sqlite_row(row: &SqliteRow) -> Result<Vec<CellValue>> {
     row.columns()
         .iter()
         .enumerate()
@@ -1929,6 +2319,43 @@ fn text_value(row: &RowData, index: usize) -> Result<String> {
     }
 }
 
+/// `CHECK ((price > 0)) NOT VALID` → `price > 0`.
+fn check_expression_from_definition(definition: &str) -> String {
+    let body = definition.trim();
+    let body = body.strip_prefix("CHECK").unwrap_or(body).trim();
+    let body = body.strip_suffix("NOT VALID").unwrap_or(body).trim();
+    let body = body.strip_suffix("NO INHERIT").unwrap_or(body).trim();
+    strip_outer_parentheses(strip_outer_parentheses(body)).to_owned()
+}
+
+/// Remove one pair of parentheses that encloses the whole expression.
+fn strip_outer_parentheses(expression: &str) -> &str {
+    let Some(inner) = expression
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return expression;
+    };
+    let mut depth = 0i32;
+    let mut quote = None;
+    for character in inner.chars() {
+        match (quote, character) {
+            (Some(open), current) if current == open => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(character),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth < 0 {
+                    return expression;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 { inner.trim() } else { expression }
+}
+
 fn optional_text_value(row: &RowData, index: usize) -> Result<Option<String>> {
     match row.values.get(index) {
         Some(CellValue::Null) => Ok(None),
@@ -2044,6 +2471,22 @@ fn boolish_value(row: &RowData, index: usize) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_schema_catalogs_are_errors_not_empty_metadata() {
+        let engine = SqlxEngine::connect(ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        let SqlxPool::SQLite(pool) = engine.pool_snapshot().await else {
+            unreachable!()
+        };
+        pool.close().await;
+        assert!(engine.table_indexes(None).await.is_err());
+        assert!(engine.supplementary_metadata(None).await.is_err());
+    }
 
     #[test]
     fn mysql_byte_fallback_decodes_metadata_text_and_preserves_binary() {

@@ -70,7 +70,8 @@ def main():
                 container = f"dbx-transports-{os.getpid()}-{name}"
                 names.append(container)
                 container_port = port.split(":")[1]
-                run("docker", "run", "-d", "--name", container, "-p", f"127.0.0.1::{container_port}", "-v", f"{sockets}:/sockets", *environment, image, *command, stdout=subprocess.DEVNULL)
+                ssh_binding = ["-p", "127.0.0.1::2222"] if name == "redis" else []
+                run("docker", "run", "-d", "--name", container, "-p", f"127.0.0.1::{container_port}", "-v", f"{sockets}:/sockets", *ssh_binding, *environment, image, *command, stdout=subprocess.DEVNULL)
             for _ in range(120):
                 for name in names:
                     state = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture_output=True, text=True, check=True)
@@ -95,8 +96,22 @@ def main():
             for index, (name, _, port, _, _) in enumerate(services):
                 binding = subprocess.run(["docker", "port", names[index], port.split(":")[1]], capture_output=True, text=True, check=True)
                 environment[f"DBX_TEST_TRANSPORT_{name.upper()}_PORT"] = binding.stdout.strip().rsplit(":", 1)[1]
+            # Password authentication belongs to this disposable Redis container,
+            # never to an account on the developer's machine.
+            run("docker", "exec", names[2], "apk", "add", "--no-cache", "openssh", stdout=subprocess.DEVNULL)
+            run("docker", "exec", names[2], "sh", "-c", "adduser -D dbx_password && printf '%s\\n' 'dbx_password:disposable-fixture-password' | chpasswd && ssh-keygen -A", stdout=subprocess.DEVNULL)
+            password_config = "Port 2222\nListenAddress 0.0.0.0\nPasswordAuthentication yes\nPubkeyAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nAllowUsers dbx_password\nAllowTcpForwarding yes\n"
+            run("docker", "exec", "-i", names[2], "sh", "-c", "cat > /tmp/dbx-sshd.conf", input=password_config, text=True)
+            run("docker", "exec", "-d", names[2], "/usr/sbin/sshd", "-D", "-e", "-f", "/tmp/dbx-sshd.conf")
+            binding = subprocess.run(["docker", "port", names[2], "2222"], capture_output=True, text=True, check=True)
+            password_port = binding.stdout.strip().rsplit(":",1)[1]
+            host_key = subprocess.run(["docker", "exec", names[2], "cat", "/etc/ssh/ssh_host_ed25519_key.pub"], capture_output=True, text=True, check=True).stdout.split()
+            with (root / "known_hosts").open("a") as known_hosts:
+                known_hosts.write(f"[127.0.0.1]:{password_port} {host_key[0]} {host_key[1]}\n")
+            environment["DBX_TEST_SSH_PASSWORD_PORT"] = password_port
             run("cargo", "test", "--locked", "-p", "dbx-core", "socket_and_ssh_connections_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
             run("cargo", "test", "--locked", "-p", "dbx-core", "ssh_tunnel_lifetime_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
+            run("cargo", "test", "--locked", "-p", "dbx-core", "ssh_password_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
         finally:
             for name in names:
                 subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

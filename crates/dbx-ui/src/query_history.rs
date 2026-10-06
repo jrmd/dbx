@@ -889,16 +889,30 @@ mod tests {
     #[test]
     fn bounds_total_entries_across_unique_connections() {
         let (_directory, store) = store();
-        for index in 0..=MAX_QUERY_HISTORY_ENTRIES {
-            store
-                .record_at(
-                    QueryHistoryConnection::profile(Uuid::from_u128(index as u128 + 1)),
-                    "select 1",
-                    index as u64,
-                    QueryHistoryOutcome::success("ok"),
-                )
-                .unwrap();
-        }
+        // Seed the full on-disk document once. The next real record exercises
+        // overflow, eviction and persistence without 5,000 setup rewrites.
+        let document = QueryHistoryDocument {
+            version: QUERY_HISTORY_FILE_VERSION,
+            entries: (0..MAX_QUERY_HISTORY_ENTRIES)
+                .map(|index| QueryHistoryEntry {
+                    connection: QueryHistoryConnection::profile(Uuid::from_u128(index as u128 + 1)),
+                    sql: "select 1".into(),
+                    executed_at_ms: index as u64,
+                    outcome: QueryHistoryOutcome::success("ok"),
+                })
+                .collect(),
+        };
+        store.write_document(&document).unwrap();
+        store
+            .record_at(
+                QueryHistoryConnection::profile(Uuid::from_u128(
+                    MAX_QUERY_HISTORY_ENTRIES as u128 + 1,
+                )),
+                "select 1",
+                MAX_QUERY_HISTORY_ENTRIES as u64,
+                QueryHistoryOutcome::success("ok"),
+            )
+            .unwrap();
 
         let entries = store.load().unwrap();
         assert_eq!(entries.len(), MAX_QUERY_HISTORY_ENTRIES);

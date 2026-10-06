@@ -332,7 +332,7 @@ impl DbxApp {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.render_grid(session_id, tab_id))
+                    .child(self.render_grid(session_id, tab_id, cx))
                     .when(!self.narrow_workspace && inspector_open, |view| {
                         view.child(self.render_inspector(session_id, tab_id, cx))
                     }),
@@ -340,10 +340,27 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_grid(&self, session_id: SessionId, tab_id: SecondaryTabId) -> AnyElement {
-        let Some((result_grid, has_result, busy)) = self
-            .data_tab(session_id, tab_id)
-            .map(|data| (data.data_grid.clone(), data.result.is_some(), data.busy))
+    fn render_grid(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((result_grid, has_result, busy, pending)) =
+            self.data_tab(session_id, tab_id).map(|data| {
+                let rows = data
+                    .pending_edits
+                    .keys()
+                    .map(|(row, _)| *row)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                (
+                    data.data_grid.clone(),
+                    data.result.is_some(),
+                    data.busy,
+                    (data.pending_edits.len(), rows),
+                )
+            })
         else {
             return div().into_any_element();
         };
@@ -363,17 +380,139 @@ impl DbxApp {
                 .into_any_element();
         }
 
+        let (pending_cells, pending_rows) = pending;
         div()
             .id("grid")
             .flex_1()
             .min_w_0()
             .min_h_0()
+            .flex()
+            .flex_col()
+            .on_action(cx.listener(move |this, _: &CommitCellEdit, window, cx| {
+                this.commit_cell_edit_for(session_id, tab_id, None, window, cx)
+            }))
+            .on_action(
+                cx.listener(move |this, _: &CommitCellEditNext, window, cx| {
+                    this.commit_cell_edit_for(session_id, tab_id, Some(true), window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(move |this, _: &CommitCellEditPrevious, window, cx| {
+                    this.commit_cell_edit_for(session_id, tab_id, Some(false), window, cx)
+                }),
+            )
+            .on_action(cx.listener(move |this, _: &CancelCellEdit, window, cx| {
+                this.cancel_cell_edit_for(session_id, tab_id, window, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &SetCellNull, window, cx| {
+                this.set_cell_null_for(session_id, tab_id, window, cx)
+            }))
+            .when_some(
+                self.data_tab(session_id, tab_id)
+                    .and_then(|data| data.cell_editor.as_ref())
+                    .filter(|cell| cell.structured)
+                    .map(|cell| cell.editor.clone()),
+                |view, editor| {
+                    view.child(
+                        div()
+                            .flex_none()
+                            .h(px(260.))
+                            .p(px(10.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div().flex().justify_between().child("JSON editor").child(
+                                    div()
+                                        .flex()
+                                        .gap(px(6.))
+                                        .child(
+                                            button("cancel-json-edit", "Cancel", ButtonKind::Quiet)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.cancel_cell_edit_for(
+                                                            session_id, tab_id, window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            button(
+                                                "stage-json-edit",
+                                                "Stage change",
+                                                ButtonKind::Primary,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.commit_cell_edit_for(
+                                                        session_id, tab_id, None, window, cx,
+                                                    )
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                            )
+                            .child(div().flex_1().min_h_0().child(editor)),
+                    )
+                },
+            )
+            .when(pending_cells > 0, |view| {
+                view.child(
+                    div()
+                        .flex_none()
+                        .px(px(8.))
+                        .py(px(5.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .border_b_1()
+                        .border_color(theme().border)
+                        .bg(theme().panel)
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme().text)
+                                .child(format!(
+                                    "{} in {}",
+                                    counted(pending_cells, "staged change", "staged changes"),
+                                    counted(pending_rows, "row", "rows")
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    button("discard-cell-edits", "Discard", ButtonKind::Quiet)
+                                        .cursor_pointer()
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.discard_pending_edits_for(session_id, tab_id, cx)
+                                        })),
+                                )
+                                .child(
+                                    button("save-cell-edits", "Save changes", ButtonKind::Primary)
+                                        .cursor_pointer()
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.save_pending_edits_for(
+                                                session_id, tab_id, window, cx,
+                                            )
+                                        })),
+                                ),
+                        ),
+                )
+            })
             .child(
-                DataTable::new(&result_grid)
-                    .with_size(px(30.))
-                    .stripe(false)
-                    .bordered(false)
-                    .scrollbar_visible(true, true),
+                div().flex_1().min_h_0().child(
+                    DataTable::new(&result_grid)
+                        .with_size(px(30.))
+                        .stripe(false)
+                        .bordered(false)
+                        .scrollbar_visible(true, true),
+                ),
             )
             .into_any_element()
     }
@@ -430,12 +569,10 @@ impl DbxApp {
                             .iter()
                             .enumerate()
                             .map(|(index, column)| {
-                                let value = row.values.get(index);
                                 (
                                     column.name.clone(),
                                     column.data_type.clone(),
-                                    value.map(ToString::to_string).unwrap_or_else(|| "—".into()),
-                                    value.is_some_and(|value| matches!(value, CellValue::Null)),
+                                    row.values.get(index).cloned(),
                                 )
                             })
                             .collect::<Vec<_>>()
@@ -652,8 +789,11 @@ impl DbxApp {
                         },
                     ))
                     .when(!has_draft, |view| {
-                        view.children(static_fields.into_iter().map(
-                            |(name, data_type, value, is_null)| {
+                        view.children(static_fields.into_iter().enumerate().map(
+                            |(index, (name, data_type, value))| {
+                                let copy_text = value
+                                    .as_ref()
+                                    .map(crate::app::value_view::value_clipboard_text);
                                 div()
                                     .px(px(9.))
                                     .py(px(9.))
@@ -670,21 +810,36 @@ impl DbxApp {
                                             .child(div().text_size(px(11.)).child(name))
                                             .child(
                                                 div()
-                                                    .text_size(px(9.))
-                                                    .text_color(theme().text_muted)
-                                                    .child(display_type(&data_type)),
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(4.))
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(9.))
+                                                            .text_color(theme().text_muted)
+                                                            .child(display_type(&data_type)),
+                                                    )
+                                                    .when_some(copy_text, |view, text| {
+                                                        view.child(
+                                                            Button::new(SharedString::from(
+                                                                format!("inspector-copy-{index}"),
+                                                            ))
+                                                            .label("Copy")
+                                                            .with_size(Size::XSmall)
+                                                            .compact()
+                                                            .ghost()
+                                                            .on_click(move |_, _, cx| {
+                                                                cx.write_to_clipboard(
+                                                                    ClipboardItem::new_string(
+                                                                        text.clone(),
+                                                                    ),
+                                                                );
+                                                            }),
+                                                        )
+                                                    }),
                                             ),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(if is_null {
-                                                theme().text_muted
-                                            } else {
-                                                theme().text
-                                            })
-                                            .child(value),
-                                    )
+                                    .child(crate::app::value_view::value_view(value.as_ref()))
                             },
                         ))
                     }),
@@ -772,6 +927,21 @@ impl DbxApp {
     }
 
     pub(super) fn render_structure(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (indexes, checks, definition) = self
+            .active_session()
+            .and_then(|session| {
+                let tab_id = session.active_secondary_tab?;
+                let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+                let SecondaryTabKind::Structure(structure) = &tab.kind else {
+                    return None;
+                };
+                Some((
+                    structure.indexes.clone(),
+                    structure.checks.clone(),
+                    structure.definition.clone(),
+                ))
+            })
+            .unwrap_or_default();
         let (session_id, table_name, table_columns, foreign_keys, tables, busy, error) = self
             .active_session()
             .and_then(|session| {
@@ -801,6 +971,20 @@ impl DbxApp {
                     None,
                 )
             });
+        let object_table = self
+            .session(session_id)
+            .and_then(|session| {
+                session
+                    .secondary_tabs
+                    .iter()
+                    .find(|tab| Some(tab.id) == session.active_secondary_tab)
+            })
+            .and_then(|tab| match &tab.kind {
+                SecondaryTabKind::Structure(structure) => Some(structure.table.clone()),
+                _ => None,
+            });
+        let objects = self.render_schema_objects_for(session_id, object_table.as_ref(), cx);
+        let designer = self.render_designer_for(session_id, cx);
         div()
             .id("structure-scroll")
             .flex_1()
@@ -816,6 +1000,15 @@ impl DbxApp {
                     String::new()
                 },
             ))
+            .child(
+                button("open-table-designer", "Design table…", ButtonKind::Quiet).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_designer_for(session_id, window, cx)
+                    }),
+                ),
+            )
+            .when_some(designer, |view, designer| view.child(designer))
+            .child(objects)
             .when(error.is_some(), |view| {
                 view.child(
                     div()
@@ -846,6 +1039,7 @@ impl DbxApp {
                             .child(div().flex_1().min_w_0().child("Column"))
                             .child(div().flex_1().min_w_0().child("Type"))
                             .child(structure_cell(STRUCTURE_NULL_WIDTH).child("Nullable"))
+                            .child(div().flex_1().min_w_0().child("Default"))
                             .child(div().flex_1().min_w_0().child("References")),
                     )
                     .children(table_columns.iter().enumerate().map(|(index, column)| {
@@ -924,6 +1118,18 @@ impl DbxApp {
                                         theme().text
                                     })
                                     .child(if column.nullable { "NULL" } else { "NOT NULL" }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family("monospace")
+                                    .text_size(px(11.))
+                                    .text_color(theme().text_muted)
+                                    .when_some(column.default_value.clone(), |cell, default| {
+                                        cell.child(default)
+                                    }),
                             )
                             .child(
                                 div()
@@ -1056,7 +1262,118 @@ impl DbxApp {
                             }),
                     )
             }))
+            .when(!indexes.is_empty(), |view| {
+                view.child(div().mt(px(18.)).child(panel_header("Indexes", "")))
+                    .children(indexes.into_iter().map(|index| {
+                        let mut traits = Vec::new();
+                        if index.primary {
+                            traits.push("PRIMARY".to_owned());
+                        } else if index.unique {
+                            traits.push("UNIQUE".to_owned());
+                        }
+                        if let Some(method) = index.method {
+                            traits.push(method.to_ascii_uppercase());
+                        }
+                        structure_detail_row(
+                            index.name,
+                            index.columns.join(", "),
+                            traits.join(" · "),
+                            index
+                                .predicate
+                                .map(|predicate| format!("WHERE {predicate}")),
+                        )
+                    }))
+            })
+            .when(!checks.is_empty(), |view| {
+                view.child(
+                    div()
+                        .mt(px(18.))
+                        .child(panel_header("Check constraints", "")),
+                )
+                .children(checks.into_iter().map(|check| {
+                    structure_detail_row(
+                        check.name.unwrap_or_else(|| "Unnamed constraint".into()),
+                        format!("CHECK ({})", check.expression),
+                        String::new(),
+                        None,
+                    )
+                }))
+            })
+            .when_some(definition, |view, definition| {
+                view.child(div().mt(px(18.)).child(panel_header("Definition", "")))
+                    .child(
+                        div()
+                            .mt(px(8.))
+                            .p(px(10.))
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme().border)
+                            .bg(theme().panel_raised)
+                            .font_family("monospace")
+                            .text_size(px(11.))
+                            .text_color(theme().text)
+                            .whitespace_normal()
+                            .child(definition),
+                    )
+            })
     }
+}
+
+/// One named index or constraint: its name and traits on top, the indexed
+/// parts or expression below.
+fn structure_detail_row(
+    name: String,
+    body: String,
+    traits: String,
+    predicate: Option<String>,
+) -> Div {
+    div()
+        .min_h(px(44.))
+        .px(px(10.))
+        .py(px(7.))
+        .flex()
+        .flex_col()
+        .gap(px(3.))
+        .border_b_1()
+        .border_color(theme().border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(9.))
+                        .text_color(theme().text_muted)
+                        .child(traits),
+                ),
+        )
+        .child(
+            div()
+                .font_family("monospace")
+                .text_size(px(10.))
+                .text_color(theme().text_muted)
+                .child(body),
+        )
+        .when_some(predicate, |row, predicate| {
+            row.child(
+                div()
+                    .font_family("monospace")
+                    .text_size(px(10.))
+                    .text_color(theme().text_muted)
+                    .child(predicate),
+            )
+        })
 }
 
 /// Every control in a filter row matches the single-line editor height.

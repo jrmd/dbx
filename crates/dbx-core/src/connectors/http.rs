@@ -15,6 +15,7 @@ pub(super) struct HttpEngine {
     client: Client,
     endpoint: Url,
     token: String,
+    google_auth: Option<std::sync::Arc<dyn gcp_auth::TokenProvider>>,
     username: String,
     database: RwLock<String>,
     location: Option<String>,
@@ -65,11 +66,6 @@ impl HttpEngine {
                 endpoint
             }
             DatabaseKind::BigQuery => {
-                if token.is_empty() {
-                    return Err(invalid(
-                        "BigQuery requires a Google OAuth access token in the URL password",
-                    ));
-                }
                 let mut endpoint =
                     Url::parse("https://bigquery.googleapis.com/bigquery/v2/").unwrap();
                 endpoint
@@ -106,6 +102,13 @@ impl HttpEngine {
             return Err(invalid("Use HTTPS when sending database credentials"));
         }
         let timeout = Duration::from_millis(config.connect_timeout_ms);
+        let google_auth = if config.kind == DatabaseKind::BigQuery && token.is_empty() {
+            Some(tokio::time::timeout(timeout, gcp_auth::provider()).await
+                .map_err(|_| invalid("Google credentials discovery timed out"))?
+                .map_err(|_| invalid("Configure Google Application Default Credentials or provide an OAuth access token"))?)
+        } else {
+            None
+        };
         let client = Client::builder()
             .connect_timeout(timeout)
             .timeout(timeout)
@@ -117,6 +120,7 @@ impl HttpEngine {
             client,
             endpoint,
             token,
+            google_auth,
             username,
             database: RwLock::new(database),
             location,
@@ -155,6 +159,19 @@ impl HttpEngine {
             } else if !self.token.is_empty() {
                 request = request.header("Authorization", format!("ApiKey {}", self.token));
             }
+        } else if let Some(provider) = &self.google_auth {
+            let token = tokio::time::timeout(
+                self.timeout,
+                provider.token(&["https://www.googleapis.com/auth/cloud-platform"]),
+            )
+            .await
+            .map_err(|_| DbxError::Connection("Google token refresh timed out".into()))?
+            .map_err(|_| {
+                DbxError::Connection(
+                    "Google token refresh failed; check ADC credentials and permissions".into(),
+                )
+            })?;
+            request = request.bearer_auth(token.as_str());
         } else if !self.token.is_empty() {
             request = request.bearer_auth(&self.token);
         }
@@ -642,6 +659,7 @@ impl Engine for HttpEngine {
                         i,
                     );
                     c.nullable = f["mode"] != "REQUIRED";
+                    c.default_value = f["defaultValueExpression"].as_str().map(str::to_owned);
                     Ok(c)
                 })
                 .collect();
@@ -676,6 +694,7 @@ impl Engine for HttpEngine {
                 .position(|c| c.name == name)
                 .ok_or_else(decode_error)
         };
+        let default = index("dflt_value")?;
         let (name, ty, notnull, pk) = (
             index("name")?,
             index("type")?,
@@ -690,6 +709,11 @@ impl Engine for HttpEngine {
                 let mut c = super::column(super::text(r, name), super::text(r, ty), i);
                 c.primary_key = super::text(r, pk) != "0";
                 c.nullable = super::text(r, notnull) == "0" && !c.primary_key;
+                c.default_value = r
+                    .values
+                    .get(default)
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string);
                 c
             })
             .collect())
@@ -753,13 +777,98 @@ impl Engine for HttpEngine {
             return Ok(crate::TableStructure {
                 columns,
                 foreign_keys,
+                definition: metadata["view"]["query"].as_str().map(str::to_owned),
+                ..Default::default()
             });
         }
         if !matches!(self.kind, DatabaseKind::Turso | DatabaseKind::CloudflareD1) {
             return Ok(crate::TableStructure {
                 columns,
                 foreign_keys: Vec::new(),
+                ..Default::default()
             });
+        }
+        let definition_result = self
+            .query_statement(
+                &SqlStatement::new(
+                    "SELECT sql FROM sqlite_master WHERE name=? AND type IN ('table','view')",
+                    vec![CellValue::Text(table.name.clone())],
+                ),
+                QueryOptions::default(),
+            )
+            .await?;
+        let definition = definition_result
+            .rows
+            .first()
+            .and_then(|row| row.values.first())
+            .filter(|value| !matches!(value, CellValue::Null))
+            .map(ToString::to_string);
+        let index_result = self
+            .query(
+                &format!("PRAGMA index_list('{}')", table.name.replace('\'', "''")),
+                QueryOptions { max_rows: None },
+            )
+            .await?;
+        let column_index = |name: &str| {
+            index_result
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+                .ok_or_else(decode_error)
+        };
+        let checks = definition
+            .as_deref()
+            .map(crate::schema_objects::sqlite_checks)
+            .unwrap_or_default();
+        let mut indexes = Vec::new();
+        if !index_result.rows.is_empty() {
+            let name_index = column_index("name")?;
+            let unique_index = column_index("unique")?;
+            let origin_index = column_index("origin")?;
+            for row in &index_result.rows {
+                let name = super::text(row, name_index);
+                let parts = self
+                    .query(
+                        &format!("PRAGMA index_info('{}')", name.replace('\'', "''")),
+                        QueryOptions { max_rows: None },
+                    )
+                    .await?;
+                let part_index = parts
+                    .columns
+                    .iter()
+                    .position(|column| column.name == "name");
+                let columns = parts
+                    .rows
+                    .iter()
+                    .filter_map(|row| part_index.and_then(|index| row.values.get(index)))
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string)
+                    .collect();
+                let source = self
+                    .query_statement(
+                        &SqlStatement::new(
+                            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                            vec![CellValue::Text(name.clone())],
+                        ),
+                        QueryOptions::default(),
+                    )
+                    .await?;
+                let definition = source
+                    .rows
+                    .first()
+                    .and_then(|row| row.values.first())
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string);
+                indexes.push(crate::IndexInfo {
+                    name,
+                    columns,
+                    unique: super::text(row, unique_index) == "1",
+                    primary: super::text(row, origin_index) == "pk",
+                    method: None,
+                    predicate: None,
+                    definition,
+                });
+            }
         }
         let result = self
             .query(
@@ -773,6 +882,9 @@ impl Engine for HttpEngine {
         if result.rows.is_empty() {
             return Ok(crate::TableStructure {
                 columns,
+                indexes,
+                definition,
+                checks,
                 foreign_keys: Vec::new(),
             });
         }
@@ -820,6 +932,9 @@ impl Engine for HttpEngine {
         Ok(crate::TableStructure {
             columns,
             foreign_keys: groups.into_values().collect(),
+            indexes,
+            checks,
+            definition,
         })
     }
     async fn query(&self, command: &str, options: QueryOptions) -> Result<QueryResult> {
@@ -962,6 +1077,7 @@ mod tests {
                 .unwrap(),
             endpoint: Url::parse(&format!("http://127.0.0.1:{port}/projects/project")).unwrap(),
             token: "fixture-secret".into(),
+            google_auth: None,
             username: String::new(),
             database: RwLock::new("dataset".into()),
             location: Some("EU".into()),
@@ -999,6 +1115,51 @@ mod tests {
             json!({"type":"text","value":"O'Reilly"})
         );
         assert_eq!(requests[0].1["requests"][1]["type"], "close");
+    }
+    #[tokio::test]
+    async fn bigquery_requests_a_current_google_token_for_each_api_call() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Provider(AtomicUsize);
+        #[async_trait]
+        impl gcp_auth::TokenProvider for Provider {
+            async fn token(
+                &self,
+                scopes: &[&str],
+            ) -> std::result::Result<Arc<gcp_auth::Token>, gcp_auth::Error> {
+                assert_eq!(scopes, ["https://www.googleapis.com/auth/cloud-platform"]);
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::new(
+                    serde_json::from_value(
+                        json!({"access_token":"fixture-secret", "expires_in":3600}),
+                    )
+                    .unwrap(),
+                ))
+            }
+            async fn project_id(&self) -> std::result::Result<Arc<str>, gcp_auth::Error> {
+                Ok(Arc::from("project"))
+            }
+        }
+        let (mut engine, server) = fixture(
+            DatabaseKind::BigQuery,
+            vec![json!({"datasets":[]}), json!({"datasets":[]})],
+        )
+        .await;
+        let provider = Arc::new(Provider(AtomicUsize::new(0)));
+        engine.token.clear();
+        engine.google_auth = Some(provider.clone());
+        engine
+            .request(Method::GET, engine.url(&["datasets"]), None)
+            .await
+            .unwrap();
+        engine
+            .request(Method::GET, engine.url(&["datasets"]), None)
+            .await
+            .unwrap();
+        assert_eq!(provider.0.load(Ordering::Relaxed), 2);
+        assert_eq!(server.await.unwrap().len(), 2);
     }
     #[tokio::test]
     async fn d1_uses_database_endpoint_and_bound_parameters() {

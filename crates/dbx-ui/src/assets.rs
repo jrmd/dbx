@@ -27,6 +27,8 @@ pub const ICON_TRASH: &str = "icons/trash.svg";
 pub const ICON_PENCIL: &str = "icons/pencil.svg";
 pub const ICON_TAG: &str = "icons/tag.svg";
 pub const ICON_DOWNLOAD: &str = "icons/download.svg";
+pub const ICON_CHEVRON_UP: &str = "icons/chevron-up.svg";
+pub const ICON_CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 pub const LOGO_POSTGRESQL: &str = "icons/postgresql.svg";
 pub const LOGO_MYSQL: &str = "icons/mysql.svg";
 pub const LOGO_SQLITE: &str = "icons/sqlite.svg";
@@ -40,6 +42,8 @@ pub const LOGO_KAFKA: &str = "icons/kafka.svg";
 pub const LOGO_TURSO: &str = "icons/turso.svg";
 pub const LOGO_CLOUDFLARE_D1: &str = "icons/cloudflare-d1.svg";
 pub const LOGO_CLICKHOUSE: &str = "icons/clickhouse.svg";
+pub const LOGO_SNOWFLAKE: &str = "icons/snowflake.svg";
+pub const LOGO_SQLSERVER: &str = "icons/sqlserver.svg";
 pub const LOGO: &str = "logo.svg";
 pub const LOGO_BYTES: &[u8] = include_bytes!("../../../logo.svg");
 
@@ -75,6 +79,8 @@ impl AssetSource for Assets {
             ICON_PENCIL => include_bytes!("../assets/icons/pencil.svg").as_slice(),
             ICON_TAG => include_bytes!("../assets/icons/tag.svg").as_slice(),
             ICON_DOWNLOAD => include_bytes!("../assets/icons/download.svg").as_slice(),
+            ICON_CHEVRON_UP => include_bytes!("../assets/icons/chevron-up.svg").as_slice(),
+            ICON_CHEVRON_DOWN => include_bytes!("../assets/icons/chevron-down.svg").as_slice(),
             LOGO_POSTGRESQL => include_bytes!("../assets/icons/postgresql.svg").as_slice(),
             LOGO_MYSQL => include_bytes!("../assets/icons/mysql.svg").as_slice(),
             LOGO_SQLITE => include_bytes!("../assets/icons/sqlite.svg").as_slice(),
@@ -88,6 +94,8 @@ impl AssetSource for Assets {
             LOGO_TURSO => include_bytes!("../assets/icons/turso.svg").as_slice(),
             LOGO_CLOUDFLARE_D1 => include_bytes!("../assets/icons/cloudflare-d1.svg").as_slice(),
             LOGO_CLICKHOUSE => include_bytes!("../assets/icons/clickhouse.svg").as_slice(),
+            LOGO_SNOWFLAKE => include_bytes!("../assets/icons/snowflake.svg").as_slice(),
+            LOGO_SQLSERVER => include_bytes!("../assets/icons/sqlserver.svg").as_slice(),
             LOGO => LOGO_BYTES,
             // gpui-component draws its own glyphs (menu checkmarks, select
             // carets, dialog closes) from its bundled icon set.
@@ -116,6 +124,8 @@ impl AssetSource for Assets {
                 "close.svg",
                 "more.svg",
                 "arrow-right.svg",
+                "chevron-up.svg",
+                "chevron-down.svg",
                 "minimize.svg",
                 "maximize.svg",
                 "restore.svg",
@@ -135,6 +145,7 @@ impl AssetSource for Assets {
                 "turso.svg",
                 "cloudflare-d1.svg",
                 "clickhouse.svg",
+                "sqlserver.svg",
             ]
             .into_iter()
             .map(SharedString::from)
