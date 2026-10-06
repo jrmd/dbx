@@ -22,7 +22,7 @@ impl DbxApp {
         let socket = socket
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let (host, port, user, key) = ssh
+        let (host, port, user, key, jump) = ssh
             .map(|ssh| {
                 (
                     ssh.host,
@@ -31,15 +31,26 @@ impl DbxApp {
                     ssh.identity_file
                         .map(|path| path.to_string_lossy().into_owned())
                         .unwrap_or_default(),
+                    ssh.jump_host.unwrap_or_default(),
                 )
             })
-            .unwrap_or_else(|| (String::new(), "22".into(), String::new(), String::new()));
+            .unwrap_or_else(|| {
+                (
+                    String::new(),
+                    "22".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
+            });
         for (entity, text) in [
             (&self.draft.transport.socket, socket),
             (&self.draft.transport.ssh_host, host),
             (&self.draft.transport.ssh_port, port),
             (&self.draft.transport.ssh_user, user),
             (&self.draft.transport.ssh_key, key),
+            (&self.draft.transport.ssh_jump, jump),
+            (&self.draft.transport.ssh_password, String::new()),
         ] {
             entity.update(cx, |value, cx| {
                 *value = text;
@@ -117,12 +128,17 @@ impl DbxApp {
         let transport = &self.draft.transport;
         fields.socket_enabled = transport.socket_enabled;
         fields.socket = transport.socket.read(cx).clone();
+        fields.ssh_password = (transport.ssh_enabled
+            && !transport.ssh_password.read(cx).is_empty())
+        .then(|| transport.ssh_password.read(cx).clone());
         fields.ssh = transport.ssh_enabled.then(|| dbx_core::SshConfig {
             host: transport.ssh_host.read(cx).trim().to_owned(),
             port: transport.ssh_port.read(cx).trim().parse().unwrap_or(0),
             username: transport.ssh_user.read(cx).trim().to_owned(),
             identity_file: (!transport.ssh_key.read(cx).trim().is_empty())
                 .then(|| transport.ssh_key.read(cx).trim().into()),
+            jump_host: (!transport.ssh_jump.read(cx).trim().is_empty())
+                .then(|| transport.ssh_jump.read(cx).trim().to_owned()),
         });
         if self.draft.mode == ConnectionFormMode::ConnectionString
             || !self.draft.kind.supports_details()
@@ -178,6 +194,51 @@ impl DbxApp {
         let (kind, visible_url) = self.draft_connection(cx)?;
         let config = self.connection_fields(cx).config()?;
         Ok((kind, visible_url, config))
+    }
+
+    pub(super) fn fetch_cloud_token(
+        &mut self,
+        provider: dbx_core::CloudAuthentication,
+        cx: &mut Context<Self>,
+    ) {
+        let config = match self.connection_fields(cx).config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.show_toast(ToastKind::Error, error, cx);
+                return;
+            }
+        };
+        let requested = self.connection_fields(cx);
+        let runtime = self.runtime.clone();
+        let task = runtime
+            .spawn(async move { dbx_core::cloud_database_password(&config, provider).await });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.vault_state != Some(VaultState::Unlocked)
+                    || this.connection_fields(cx) != requested
+                {
+                    return;
+                }
+                match result {
+                    Ok(Ok(token)) => {
+                        this.draft.password.update(cx, |password, cx| {
+                            password.zeroize();
+                            *password = token;
+                            cx.notify();
+                        });
+                        this.show_toast(
+                            ToastKind::Success,
+                            "Cloud token ready. Connect now; fetch a new token after it expires.",
+                            cx,
+                        );
+                    }
+                    Ok(Err(error)) => this.show_toast(ToastKind::Error, error.to_string(), cx),
+                    Err(_) => this.show_toast(ToastKind::Error, "Cloud token request failed", cx),
+                }
+            });
+        })
+        .detach();
     }
 
     fn clear_vault_inputs(&mut self, cx: &mut Context<Self>) {
@@ -351,7 +412,7 @@ impl DbxApp {
         .detach();
     }
 
-    fn has_pending_lock_work(&self) -> bool {
+    pub(super) fn has_pending_lock_work(&self) -> bool {
         self.testing_connection
             || self.credential_hydrating
             || self.sessions.iter().any(|session| {
@@ -361,7 +422,7 @@ impl DbxApp {
                         SecondaryTabKind::Query(query) => {
                             query.busy || query.in_transaction || query.agent.is_busy()
                         }
-                        SecondaryTabKind::Data(data) => data.busy,
+                        SecondaryTabKind::Data(data) => data.busy || data.has_unsaved_cell_work(),
                         SecondaryTabKind::Diagram(diagram) => diagram.busy,
                         SecondaryTabKind::Structure(structure) => structure.busy,
                     })
@@ -379,7 +440,7 @@ impl DbxApp {
             let focus = cx.focus_handle();
             self.confirmation_dialog = Some(ConfirmationDialog {
                 title: "Cancel work and lock?".into(),
-                detail: "Work is still in progress. Locking will cancel what you’re doing and close all connections.".into(),
+                detail: "Locking will cancel running work, discard unsaved cell edits, and close all connections.".into(),
                 confirm_label: "Cancel work and lock",
                 tone: ConfirmationTone::Warning,
                 action: ConfirmationAction::LockVault,
@@ -466,7 +527,14 @@ impl DbxApp {
 
         match mode {
             ConnectionFormMode::Details if self.draft.kind.supports_details() => {
-                let connection_string = self.draft.connection_url.read(cx).trim().to_owned();
+                let connection_string = match self.connection_fields(cx).url() {
+                    Ok(url) => url,
+                    Err(error) => {
+                        self.set_error(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
                 if connection_string.starts_with("mongodb+srv:") {
                     self.set_error("SRV connections use DNS rather than a fixed host/port; edit this URI in Connection string mode".into());
                     cx.notify();
@@ -813,6 +881,11 @@ impl DbxApp {
                 }
                 match result {
                     Ok(loaded) => {
+                        this.draft.transport.ssh_password.update(cx, |value, cx| {
+                            value.zeroize();
+                            *value = loaded.config.ssh_password.clone().unwrap_or_default();
+                            cx.notify();
+                        });
                         let mut fields = ConnectionFields::from_url(loaded.config.url)
                             .unwrap_or_else(|_| ConnectionFields::new(loaded.config.kind));
                         this.draft.password.update(cx, |value, cx| {
@@ -843,6 +916,24 @@ impl DbxApp {
         .detach();
     }
 
+    fn connection_profile_draft(
+        &self,
+        fields: &ConnectionFields,
+        cx: &App,
+    ) -> Result<ConnectionProfileDraft, String> {
+        // Resolve the effective credential before the store extracts it. A
+        // hidden Details field must not override a newly pasted URL password.
+        let mut draft = ConnectionProfileDraft::from_config(
+            self.draft.connection_name.read(cx).trim().to_owned(),
+            fields.config()?,
+        )
+        .with_tag(self.draft.tag.clone());
+        if let Some(id) = self.draft.selected_profile {
+            draft = draft.with_id(id);
+        }
+        Ok(draft)
+    }
+
     pub(super) fn save_connection(&mut self, cx: &mut Context<Self>) {
         if self.saving_connection || self.vault_busy {
             return;
@@ -852,25 +943,16 @@ impl DbxApp {
             cx.notify();
             return;
         };
-        let name = self.draft.connection_name.read(cx).trim().to_owned();
-        let mut fields = self.connection_fields(cx);
+        let fields = self.connection_fields(cx);
         let mut requested_fields = fields.clone();
-        let config = match fields.config() {
-            Ok(config) => config,
+        let draft = match self.connection_profile_draft(&fields, cx) {
+            Ok(draft) => draft,
             Err(error) => {
                 self.set_error(error.to_string());
                 cx.notify();
                 return;
             }
         };
-        let mut draft =
-            ConnectionProfileDraft::from_config(name, config).with_tag(self.draft.tag.clone());
-        if !fields.password.is_empty() {
-            draft = draft.with_secret(std::mem::take(&mut fields.password));
-        }
-        if let Some(id) = self.draft.selected_profile {
-            draft = draft.with_id(id);
-        }
         let selected_profile = self.draft.selected_profile;
         let runtime = self.runtime.clone();
         self.saving_connection = true;
@@ -1082,12 +1164,11 @@ impl DbxApp {
                 }
                 // Open the first table the same way a navigator click would,
                 // so it arrives in its own data tab.
-                if let Some(table) = initial_table {
-                    this.select_table_for(session_id, table, window, cx);
-                }
+                let _ = initial_table;
                 cx.notify();
                 this.prefetch_completion_columns_for(session_id, cx);
                 if connected {
+                    this.load_schema_objects_for(session_id, cx);
                     this.prefetch_redis_command_catalog_for(session_id, cx);
                     this.restore_query_workspace_for(session_id, window, cx);
                 }
@@ -1501,6 +1582,96 @@ mod tests {
     }
 
     #[gpui::test]
+    fn saved_postgres_connection_string_uses_restored_vault_password(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        store
+            .vault()
+            .unwrap()
+            .create("test vault passphrase")
+            .unwrap();
+        let original = "postgresql://alice:fixture%25password@localhost:5432/app?sslmode=require";
+        let profile = store
+            .save(ConnectionProfileDraft::new(
+                "Postgres",
+                DatabaseKind::PostgreSQL,
+                original,
+            ))
+            .unwrap();
+        let loaded = store.load(profile.id).unwrap();
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        app.update(cx, |app, cx| {
+            app.vault_state = Some(VaultState::Unlocked);
+            app.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
+            assert_eq!(app.draft.mode, ConnectionFormMode::ConnectionString);
+            let mut restored = ConnectionFields::from_url(loaded.config.url).unwrap();
+            app.draft.password.update(cx, |value, cx| {
+                *value = std::mem::take(&mut restored.password);
+                cx.notify();
+            });
+            let config = app.resolve_draft(cx).unwrap().2;
+            let resolved = ConnectionFields::from_url(config.url).unwrap();
+            assert_eq!(resolved.password, "fixture%password");
+            assert!(resolved.connection_string.contains("sslmode=require"));
+            app.set_connection_form_mode(ConnectionFormMode::Details, cx);
+            assert_eq!(app.draft.password.read(cx), "fixture%password");
+            app.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx);
+            assert_eq!(
+                ConnectionFields::from_url(app.resolve_draft(cx).unwrap().2.url)
+                    .unwrap()
+                    .password,
+                "fixture%password"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn saving_pasted_postgres_url_preserves_its_password_over_old_details(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        store
+            .vault()
+            .unwrap()
+            .create("test vault passphrase")
+            .unwrap();
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        app.update(cx, |app, cx| {
+            app.draft.connection_name.update(cx, |value, cx| {
+                *value = "Postgres".into();
+                cx.notify();
+            });
+            app.hydrate_connection_fields(
+                DatabaseKind::PostgreSQL,
+                "postgres://alice:old-password@localhost/app".into(),
+                cx,
+            );
+            app.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx);
+            app.draft.connection_url.update(cx, |value, cx| {
+                *value = "postgresql://alice:new%25password@localhost/app?sslmode=require".into();
+                cx.notify();
+            });
+            let draft = app
+                .connection_profile_draft(&app.connection_fields(cx), cx)
+                .unwrap();
+            let profile = store.save(draft).unwrap();
+            let loaded = store.load(profile.id).unwrap();
+            assert_eq!(
+                ConnectionFields::from_url(loaded.config.url)
+                    .unwrap()
+                    .password,
+                "new%password"
+            );
+            assert!(!profile.url.contains("password"));
+        });
+    }
+
+    #[gpui::test]
     fn provider_forms_preserve_tls_and_keep_api_tokens_in_masked_fields(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -1564,6 +1735,7 @@ mod tests {
             port: 2222,
             username: "developer".into(),
             identity_file: None,
+            jump_host: None,
         });
         let profile = store
             .save(ConnectionProfileDraft::from_config(

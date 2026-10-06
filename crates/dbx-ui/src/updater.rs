@@ -757,8 +757,15 @@ mod tests {
                         Err(error) => panic!("{error}"),
                     }
                 };
-                let mut request = [0; 4096];
-                assert!(stream.read(&mut request).unwrap() > 0);
+                // Consume the whole request before closing the socket. Leaving
+                // headers unread can reset the connection and discard our body.
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    assert_eq!(stream.read(&mut byte).unwrap(), 1);
+                    request.push(byte[0]);
+                    assert!(request.len() <= 4096);
+                }
                 let size = if index == 0 { body.len() } else { size };
                 write!(
                     stream,

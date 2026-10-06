@@ -16,6 +16,8 @@ pub fn monitor_query(kind: DatabaseKind, monitor: Monitor) -> Result<String> {
         (DatabaseKind::PostgreSQL, Monitor::Locks) => "SELECT l.pid, a.usename, l.locktype, l.mode, l.granted, l.relation::regclass::text AS relation, pg_blocking_pids(l.pid)::text AS blocking_pids, a.query FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.datname=current_database() ORDER BY l.granted, l.pid".into(),
         (DatabaseKind::MySQL, Monitor::Sessions) => "SHOW FULL PROCESSLIST".into(),
         (DatabaseKind::MySQL, Monitor::Locks) => "SELECT * FROM performance_schema.data_lock_waits".into(),
+        (DatabaseKind::SqlServer, Monitor::Sessions) => "SELECT s.session_id, s.login_name, s.host_name, s.program_name, s.status, DB_NAME(s.database_id) AS database_name, s.cpu_time, s.memory_usage, s.last_request_start_time, t.text AS current_sql FROM sys.dm_exec_sessions s LEFT JOIN sys.dm_exec_requests r ON r.session_id = s.session_id OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE s.is_user_process = 1 ORDER BY s.session_id".into(),
+        (DatabaseKind::SqlServer, Monitor::Locks) => "SELECT r.session_id, r.blocking_session_id, r.wait_type, r.wait_time, r.wait_resource, r.status, DB_NAME(r.database_id) AS database_name, t.text AS current_sql FROM sys.dm_exec_requests r OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t WHERE r.blocking_session_id <> 0 OR r.wait_type LIKE 'LCK%' ORDER BY r.wait_time DESC".into(),
         _ => return Err(DbxError::Unsupported { operation: "server session/lock monitoring".into(), kind }),
     })
 }
@@ -184,7 +186,11 @@ pub fn schema_migration(
     before: &RelationalSchema,
     after: &RelationalSchema,
 ) -> Result<MigrationDraft> {
-    let mut draft = MigrationDraft { sql: "-- Migration from captured schema to current schema. Review before running.\n-- Scope: columns, primary keys and foreign keys. Defaults, indexes, triggers, grants and views are not captured.\n".into(), changes: Vec::new(), warnings: Vec::new() };
+    let details = before.details_captured && after.details_captured;
+    let mut draft = MigrationDraft { sql: "-- Migration from captured schema to current schema. Review before running.\n-- Scope: columns, defaults, primary keys, check constraints, indexes and foreign keys. Views, triggers, sequences and routines are compared when captured; grants are not captured.\n".into(), changes: Vec::new(), warnings: Vec::new() };
+    if !details {
+        draft.warnings.push("The captured baseline predates default, index and check capture; recapture it to compare them".into());
+    }
     fn comment(value: &str) -> String {
         value
             .chars()
@@ -196,6 +202,92 @@ pub fn schema_migration(
                 }
             })
             .collect()
+    }
+    if before.objects_captured && after.objects_captured {
+        for object in &after.objects {
+            let old = before.objects.iter().find(|old| {
+                old.kind == object.kind && old.schema == object.schema && old.name == object.name
+            });
+            if old == Some(object) {
+                continue;
+            }
+            draft.changes.push(format!(
+                "{} {:?} {}",
+                if old.is_some() { "Changed" } else { "Added" },
+                object.kind,
+                object.name
+            ));
+            draft.sql.push_str(&format!(
+                "-- Review {:?} {} and its dependencies:\n",
+                object.kind,
+                comment(&object.name)
+            ));
+            if let Some(definition) = &object.definition {
+                for line in definition.lines() {
+                    draft.sql.push_str(&format!("-- {line}\n"));
+                }
+            } else {
+                draft
+                    .warnings
+                    .push(format!("Definition unavailable for {}", object.name));
+            }
+        }
+        for object in &before.objects {
+            if !after.objects.iter().any(|new| {
+                new.kind == object.kind && new.schema == object.schema && new.name == object.name
+            }) {
+                draft
+                    .changes
+                    .push(format!("Removed {:?} {}", object.kind, object.name));
+                draft.sql.push_str(&format!(
+                    "-- Removed {:?} {}. Review dependencies before dropping.\n",
+                    object.kind,
+                    comment(&object.name)
+                ));
+            }
+        }
+    }
+    for table in after
+        .tables
+        .iter()
+        .filter(|table| table.table.kind == EntityKind::View)
+    {
+        let old = before.tables.iter().find(|old| old.table == table.table);
+        if old.is_some_and(|old| old.structure.definition == table.structure.definition) {
+            continue;
+        }
+        draft
+            .changes
+            .push(format!("View definition changed: {}", table.table.name));
+        if let Some(definition) = &table.structure.definition {
+            draft
+                .sql
+                .push_str(&format!("-- Review view {}:\n", comment(&table.table.name)));
+            for line in definition.lines() {
+                draft.sql.push_str(&format!("-- {line}\n"));
+            }
+        }
+    }
+    for table in before
+        .tables
+        .iter()
+        .filter(|table| table.table.kind == EntityKind::View)
+    {
+        if !after.tables.iter().any(|new| new.table == table.table) {
+            draft
+                .changes
+                .push(format!("Removed view: {}", table.table.name));
+            draft.sql.push_str(&format!(
+                "-- DROP VIEW {}; -- Review dependencies before dropping.\n",
+                quote_table(
+                    kind,
+                    &TableRef {
+                        name: table.table.name.clone(),
+                        schema: table.table.schema.clone()
+                    }
+                )?
+            ));
+        }
     }
     let mut added = Vec::new();
     let refs: Vec<_> = after
@@ -233,6 +325,13 @@ pub fn schema_migration(
                 crate::render_sql_schema(kind, &reference, &table.structure, &refs)?
             };
             draft.sql.push_str(&format!("{definition};\n"));
+            for statement in crate::render_sql_indexes(kind, &reference, &table.structure)? {
+                if statement.starts_with("--") {
+                    draft.sql.push_str(&format!("{statement}\n"));
+                } else {
+                    draft.sql.push_str(&format!("{statement};\n"));
+                }
+            }
             added.push((reference, &table.structure));
             continue;
         };
@@ -248,12 +347,21 @@ pub fn schema_migration(
                     draft
                         .changes
                         .push(format!("Added {quoted}.{quoted_column}"));
+                    let default = match column.default_value.as_deref() {
+                        Some(default) => format!(
+                            " DEFAULT {}",
+                            crate::transfer::safe_schema_expression(default)?
+                        ),
+                        None => String::new(),
+                    };
                     let statement = format!(
-                        "ALTER TABLE {quoted} ADD COLUMN {quoted_column} {}{};",
+                        "ALTER TABLE {quoted} ADD COLUMN {quoted_column} {}{default}{};",
                         crate::transfer::safe_schema_type(&column.data_type)?,
                         if column.nullable { "" } else { " NOT NULL" }
                     );
-                    if column.primary_key || !column.nullable {
+                    // A default backfills existing rows, so a required column
+                    // with one needs no manual strategy.
+                    if column.primary_key || (!column.nullable && default.is_empty()) {
                         draft.warnings.push(format!(
                             "{quoted}.{quoted_column} requires a key/backfill strategy"
                         ));
@@ -262,6 +370,38 @@ pub fn schema_migration(
                             .push_str(&format!("-- MANUAL: {}\n", comment(&statement)));
                     } else {
                         draft.sql.push_str(&format!("{statement}\n"));
+                    }
+                }
+                Some(previous)
+                    if previous.data_type == column.data_type
+                        && previous.nullable == column.nullable
+                        && previous.primary_key == column.primary_key
+                        && previous.enum_values == column.enum_values
+                        && previous.ordinal == column.ordinal =>
+                {
+                    if details && previous.default_value != column.default_value {
+                        draft
+                            .changes
+                            .push(format!("Changed default of {quoted}.{quoted_column}"));
+                        let action = match column.default_value.as_deref() {
+                            Some(default) => format!(
+                                "SET DEFAULT {}",
+                                crate::transfer::safe_schema_expression(default)?
+                            ),
+                            None => "DROP DEFAULT".into(),
+                        };
+                        let statement =
+                            format!("ALTER TABLE {quoted} ALTER COLUMN {quoted_column} {action};");
+                        if kind.dialect() == DatabaseKind::SQLite {
+                            draft.warnings.push(format!(
+                                "SQLite cannot alter the default of {quoted}.{quoted_column}; rebuild the table"
+                            ));
+                            draft
+                                .sql
+                                .push_str(&format!("-- MANUAL: {}\n", comment(&statement)));
+                        } else {
+                            draft.sql.push_str(&format!("{statement}\n"));
+                        }
                     }
                 }
                 Some(previous) if previous != column => {
@@ -291,6 +431,16 @@ pub fn schema_migration(
                     comment(&format!("ALTER TABLE {quoted} DROP COLUMN {column};"))
                 ));
             }
+        }
+        if details {
+            migrate_indexes(
+                kind,
+                &reference,
+                &old.structure,
+                &table.structure,
+                &mut draft,
+            )?;
+            migrate_checks(kind, &quoted, &old.structure, &table.structure, &mut draft)?;
         }
         if old.structure.foreign_keys != table.structure.foreign_keys {
             draft
@@ -348,6 +498,118 @@ pub fn schema_migration(
     Ok(draft)
 }
 
+fn migrate_indexes(
+    kind: DatabaseKind,
+    table: &TableRef,
+    before: &crate::TableStructure,
+    after: &crate::TableStructure,
+    draft: &mut MigrationDraft,
+) -> Result<()> {
+    let secondary = |structure: &crate::TableStructure| {
+        structure
+            .indexes
+            .iter()
+            .filter(|index| !index.primary)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let (old, new) = (secondary(before), secondary(after));
+    let quoted = quote_table(kind, table)?;
+    for index in &old {
+        if new.iter().any(|current| current == index) {
+            continue;
+        }
+        let name = quote_identifier(kind, &index.name)?;
+        draft
+            .changes
+            .push(format!("Removed or changed index {name} on {quoted}"));
+        let statement = match kind.dialect() {
+            DatabaseKind::MySQL => format!("DROP INDEX {name} ON {quoted};"),
+            DatabaseKind::PostgreSQL => match &table.schema {
+                Some(schema) => format!("DROP INDEX {}.{name};", quote_identifier(kind, schema)?),
+                None => format!("DROP INDEX {name};"),
+            },
+            _ => format!("DROP INDEX {name};"),
+        };
+        draft.sql.push_str(&format!("{statement}\n"));
+    }
+    let added = new
+        .into_iter()
+        .filter(|index| !old.contains(index))
+        .collect::<Vec<_>>();
+    if added.is_empty() {
+        return Ok(());
+    }
+    for index in &added {
+        draft.changes.push(format!(
+            "Added or changed index {} on {quoted}",
+            quote_identifier(kind, &index.name)?
+        ));
+        if index.unique {
+            draft.warnings.push(format!(
+                "Unique index {} fails if {quoted} already holds duplicates",
+                quote_identifier(kind, &index.name)?
+            ));
+        }
+    }
+    let structure = crate::TableStructure {
+        indexes: added,
+        ..Default::default()
+    };
+    for statement in crate::render_sql_indexes(kind, table, &structure)? {
+        if statement.starts_with("--") {
+            draft.sql.push_str(&format!("{statement}\n"));
+        } else {
+            draft.sql.push_str(&format!("{statement};\n"));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_checks(
+    kind: DatabaseKind,
+    quoted: &str,
+    before: &crate::TableStructure,
+    after: &crate::TableStructure,
+    draft: &mut MigrationDraft,
+) -> Result<()> {
+    for check in &before.checks {
+        if after.checks.contains(check) {
+            continue;
+        }
+        let Some(name) = &check.name else {
+            continue;
+        };
+        let name = quote_identifier(kind, name)?;
+        draft
+            .changes
+            .push(format!("Removed or changed check {name} on {quoted}"));
+        draft
+            .sql
+            .push_str(&format!("ALTER TABLE {quoted} DROP CONSTRAINT {name};\n"));
+    }
+    for check in &after.checks {
+        if before.checks.contains(check) {
+            continue;
+        }
+        let constraint = match &check.name {
+            Some(name) => format!("CONSTRAINT {} ", quote_identifier(kind, name)?),
+            None => String::new(),
+        };
+        draft
+            .changes
+            .push(format!("Added or changed check {constraint}on {quoted}"));
+        draft.warnings.push(format!(
+            "New check constraints on {quoted} fail if existing rows violate them"
+        ));
+        draft.sql.push_str(&format!(
+            "ALTER TABLE {quoted} ADD {constraint}CHECK ({});\n",
+            crate::transfer::safe_schema_expression(&check.expression)?
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +650,7 @@ mod tests {
             structure: crate::TableStructure {
                 columns,
                 foreign_keys: Vec::new(),
+                ..Default::default()
             },
         };
         let before = RelationalSchema {
@@ -396,10 +659,16 @@ mod tests {
                 table("old\nSELECT 1;", vec![column("value")]),
                 table("kept", vec![column("old\nSELECT 2;")]),
             ],
+            details_captured: true,
+            objects: Vec::new(),
+            objects_captured: false,
         };
         let after = RelationalSchema {
             database: "db".into(),
             tables: vec![table("kept", vec![column("new")])],
+            details_captured: true,
+            objects: Vec::new(),
+            objects_captured: false,
         };
         let draft = schema_migration(DatabaseKind::SQLite, &before, &after).unwrap();
         let statements = crate::split_sql_statements(&draft.sql);
@@ -408,6 +677,70 @@ mod tests {
         assert!(statements[0].contains("ADD COLUMN"));
         assert_eq!(draft.changes.len(), 3);
         assert_eq!(draft.warnings.len(), 2);
+    }
+
+    #[test]
+    fn schema_drafts_cover_defaults_indexes_and_checks_only_for_detailed_baselines() {
+        let mut code = ColumnInfo::result("code", 1, "text");
+        code.nullable = false;
+        let index = |name: &str, unique: bool| crate::IndexInfo {
+            name: name.into(),
+            columns: vec!["code".into()],
+            unique,
+            primary: false,
+            method: Some("btree".into()),
+            predicate: None,
+            definition: Some(format!(
+                "CREATE {}INDEX {name} ON public.items USING btree (code)",
+                if unique { "UNIQUE " } else { "" }
+            )),
+        };
+        let schema = |code: ColumnInfo, indexes, checks, details_captured| RelationalSchema {
+            database: "db".into(),
+            tables: vec![crate::RelationalTable {
+                table: crate::TableInfo::table("items", Some("public".into())),
+                structure: crate::TableStructure {
+                    columns: vec![code],
+                    indexes,
+                    checks,
+                    ..Default::default()
+                },
+            }],
+            details_captured,
+            objects: Vec::new(),
+            objects_captured: false,
+        };
+        let mut defaulted = code.clone();
+        defaulted.default_value = Some("'new'::text".into());
+        let check = crate::CheckConstraintInfo {
+            name: Some("code_length".into()),
+            expression: "length(code) > 0".into(),
+        };
+        let before = schema(code.clone(), vec![index("items_old", false)], vec![], true);
+        let after = schema(
+            defaulted.clone(),
+            vec![index("items_code", true)],
+            vec![check.clone()],
+            true,
+        );
+        let draft = schema_migration(DatabaseKind::PostgreSQL, &before, &after).unwrap();
+        assert!(draft.sql.contains(
+            "ALTER TABLE \"public\".\"items\" ALTER COLUMN \"code\" SET DEFAULT 'new'::text;"
+        ));
+        assert!(draft.sql.contains("DROP INDEX \"public\".\"items_old\";"));
+        assert!(draft.sql.contains(
+            "CREATE UNIQUE INDEX IF NOT EXISTS items_code ON public.items USING btree (code);"
+        ));
+        assert!(draft.sql.contains(
+            "ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"code_length\" CHECK (length(code) > 0);"
+        ));
+        assert!(!draft.sql.contains("MANUAL"), "{}", draft.sql);
+
+        // A baseline from an earlier version has no defaults or indexes.
+        let legacy = schema(code, vec![], vec![], false);
+        let draft = schema_migration(DatabaseKind::PostgreSQL, &legacy, &after).unwrap();
+        assert!(draft.changes.is_empty(), "{:?}", draft.changes);
+        assert_eq!(draft.warnings.len(), 1);
     }
 
     #[test]
@@ -431,6 +764,7 @@ mod tests {
                             on_update: None,
                             on_delete: None,
                         }],
+                        ..Default::default()
                     },
                 },
                 crate::RelationalTable {
@@ -438,14 +772,17 @@ mod tests {
                     structure: crate::TableStructure {
                         columns: vec![key],
                         foreign_keys: Vec::new(),
+                        ..Default::default()
                     },
                 },
             ],
+            ..Default::default()
         };
         for kind in [DatabaseKind::PostgreSQL, DatabaseKind::MySQL] {
             let before = RelationalSchema {
                 database: "db".into(),
                 tables: Vec::new(),
+                ..Default::default()
             };
             let draft = schema_migration(kind, &before, &schema).unwrap();
             let statements = crate::split_sql_statements(&draft.sql);

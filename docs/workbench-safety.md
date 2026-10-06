@@ -28,6 +28,27 @@ locally and report that server execution may continue.
 
 ## Row edits and protected profiles
 
+Double-click a table cell to edit it. Enter or leaving the cell stages the
+typed value; Escape cancels the current editor. Staged cells are highlighted.
+Save changes applies checked updates, and Discard removes pending changes.
+Sorting, paging, refreshing, closing a table/connection and switching databases
+are blocked while cell edits remain. Vault locking asks before discarding edits.
+PostgreSQL, MySQL/InnoDB, SQLite and CockroachDB batches use a transaction;
+other writable connectors apply rows sequentially and report partial success.
+
+Query tabs prompt for `:name` and `$1` placeholders outside strings/comments.
+Values are bound separately through the driver/API: text, numbers, booleans,
+null and JSON are supported. Quotes are literal text, not SQL quoting syntax.
+Confirmations retain the exact statement and bound-value snapshot. Find and
+replace works in the editor; Results mode finds matching cells in displayed order.
+Results can be saved as CSV, TSV, JSON or INSERT statements with a chosen target table.
+
+The encrypted workspace recovers query, data, structure and diagram tabs in
+their saved order after reconnecting, retaining the selected tab. Missing tables
+are skipped. After vault unlock, recovery reopens saved connections and their selected databases.
+Each connection instance retains its own tab layout. Recovery never executes saved queries.
+Pending cell edits, query results and transactions are not persisted.
+
 Grid updates and deletes match the primary key plus the original displayed
 values. A changed or deleted row reports a conflict rather than overwriting the
 newer values. Exactly one affected row is required. Nullable primary-key values
@@ -52,9 +73,14 @@ selected tables in one transaction snapshot. Rows use stable key ordering, or
 all-column ordering when there is no key. MySQL non-InnoDB tables and other
 connectors are explicitly reported as live reads. Schema metadata is gathered
 before the data snapshot; concurrent DDL is not a full schema-and-data backup
-guarantee. SQL dumps include only the columns, primary keys and foreign keys
-represented by DBX metadata, not defaults, indexes, generated expressions,
-triggers, views or grants. Use native backup tools for full-fidelity backups.
+guarantee. SQL dumps include the columns, defaults, primary keys, check
+constraints, secondary indexes and foreign keys represented by DBX metadata.
+PostgreSQL serial columns are recreated as serial types and their sequences are
+advanced past the imported rows. Available standalone sequences, routines,
+triggers and view definitions are also dumped. SQLite CHECK expressions are
+captured from its CREATE statement. MySQL 8 functional index expressions are captured and rendered. Generated
+column expressions and grants require native tools. Use native backup tools for
+full-fidelity backups.
 
 File imports stream records/statements and insert bounded batches inside one
 transaction on PostgreSQL, CockroachDB, SQLite and MySQL/InnoDB. Parse failures,
@@ -96,13 +122,22 @@ Visibility depends on the account's server permissions. References:
 [PostgreSQL EXPLAIN](https://www.postgresql.org/docs/current/sql-explain.html),
 and [SQLite query plans](https://www.sqlite.org/eqp.html).
 
-Capture schema baseline stores normalized columns, primary keys and foreign
-keys. Compare schema opens a migration draft in a new editor tab without running
-it. New tables and nullable column additions can be generated. Drops remain
-commented; changed types, required/key columns and changed foreign keys require
-manual review. Defaults, indexes, generated columns, triggers, views and grants
-are outside this comparison. This is a conservative drafting workflow, not a
+Capture schema baseline stores normalized columns, defaults, primary keys,
+check constraints, indexes and foreign keys. Compare schema opens a migration
+draft in a new editor tab without running it. New tables, nullable or defaulted
+column additions, default changes, index additions/removals and check
+constraint additions/removals can be generated. Column drops remain commented;
+changed types, required/key columns and changed foreign keys require manual
+review. Baselines captured by earlier DBX versions lack defaults, indexes and
+checks, so those are not compared until the baseline is recaptured. When both
+snapshots capture ancillary objects, changes to views, triggers, routines and
+sequences appear as commented review drafts. Generated columns and grants
+remain outside automatic migration generation. This is a conservative drafting workflow, not a
 complete schema synchronization or migration-history system.
+
+Catalog read failures abort schema capture, structure loading and export rather
+than treating unavailable indexes or constraints as absent. Unsupported server
+catalog versions therefore produce an error requiring review.
 
 ## BigQuery credentials
 
@@ -128,8 +163,13 @@ authenticated BigQuery or service-account access.
 Disposable PostgreSQL 16 and MySQL 8.4 tests cover native transactions,
 transaction chaining, protection, plans, cancellation acknowledgment, exports
 and import rollback. Existing connector regressions also run against disposable
-Redis 7 and ClickHouse 26.8. Physical macOS behavior, release builds and live
-cloud accounts remain separate verification boundaries.
+Redis 7 and ClickHouse 26.8. Live D1 and Turso checks passed on October 6, 2026, covering bound values,
+defaults, unique indexes, checked updates, stale conflicts and persisted readback.
+ClickHouse HTTPS certificate/authentication and Snowflake polling, bindings and
+partitioning have local protocol coverage. Paid ClickHouse Cloud, BigQuery,
+Snowflake, RDS IAM and Azure Entra accounts were not provisioned; local tests
+do not establish account permissions or provider authentication. Physical macOS
+behavior and hosted CI remain separate verification boundaries.
 
 ```sh
 env CARGO_BUILD_JOBS=4 CXXFLAGS=-g0 cargo test --locked -p dbx-core
@@ -142,3 +182,26 @@ DBX_TEST_MYSQL_URL=mysql://dbx_test:dbx_test_password@127.0.0.1:53306/dbx_test \
   cargo test --locked -p dbx-core --test workbench_safety -- --ignored --test-threads=1
 docker compose -f docker-compose.test.yml -p dbx-workbench-audit down --remove-orphans
 ```
+
+## Table designer and value viewers
+
+Structure → Design table generates quoted, reviewable ALTER or index SQL in a
+query tab. Creating a draft never executes it. JSON cells open a multiline
+syntax-highlighted editor; Stage validates JSON before marking the cell pending.
+Query cells open a dedicated pretty JSON/text, hex or image viewer on double-click.
+Previews are bounded; Copy full value preserves the complete value.
+
+## Connection recovery and cloud tokens
+
+Native SQL sessions health-check idle connections and reconnect before running a
+statement. Losing an open transaction fails it rather than replaying it. SQL Server
+and Redis probe connections before commands. HTTP connectors issue independent
+requests; MongoDB and Kafka retain their driver reconnection behavior. SSH
+supervision re-establishes the same local forwarding port after process exit.
+No submitted database write is automatically replayed.
+
+AWS RDS IAM uses the existing `aws` CLI login, default profile and region. Azure
+PostgreSQL Entra uses the existing `az` login and the `oss-rdbms` audience. Token
+buttons populate the masked password field; fetch a new token when it expires.
+See [AWS token command](https://docs.aws.amazon.com/cli/latest/reference/rds/generate-db-auth-token.html)
+and [Azure PostgreSQL Entra authentication](https://learn.microsoft.com/en-us/azure/postgresql/security/security-entra-configure).

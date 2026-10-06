@@ -5,6 +5,8 @@ mod duck;
 mod http;
 mod kafka;
 mod mongo;
+mod snowflake;
+mod sqlserver;
 
 use crate::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError, Engine, Page, QueryOptions,
@@ -21,6 +23,8 @@ pub(crate) async fn connect(config: ConnectionConfig) -> Result<Box<dyn Engine>>
         DatabaseKind::DuckDB => Ok(Box::new(duck::DuckEngine::connect(config).await?)),
         DatabaseKind::MongoDB => Ok(Box::new(mongo::MongoEngine::connect(config).await?)),
         DatabaseKind::Kafka => Ok(Box::new(kafka::KafkaEngine::connect(config).await?)),
+        DatabaseKind::Snowflake => Ok(Box::new(snowflake::SnowflakeEngine::connect(config).await?)),
+        DatabaseKind::SqlServer => Ok(Box::new(sqlserver::SqlServerEngine::connect(config).await?)),
         DatabaseKind::Elasticsearch
         | DatabaseKind::BigQuery
         | DatabaseKind::Turso
@@ -63,6 +67,7 @@ pub(super) fn column(
         nullable: true,
         ordinal,
         primary_key: false,
+        default_value: None,
     }
 }
 pub(super) fn cell(value: &Value) -> CellValue {

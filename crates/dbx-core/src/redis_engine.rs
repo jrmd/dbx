@@ -17,7 +17,7 @@ use crate::{
 pub struct RedisEngine {
     read_only: bool,
     client: Client,
-    connection: MultiplexedConnection,
+    connection: tokio::sync::Mutex<MultiplexedConnection>,
     /// Logical database currently selected. Clones of the multiplexed
     /// connection share one socket, so `SELECT` through any clone moves every
     /// subsequent command to that index.
@@ -65,7 +65,7 @@ impl RedisEngine {
         Ok(Self {
             read_only: config.read_only,
             client,
-            connection,
+            connection: tokio::sync::Mutex::new(connection),
             database: AtomicUsize::new(database),
             _tunnel: tunnel,
         })
@@ -116,20 +116,57 @@ impl RedisEngine {
         Ok(16)
     }
 
+    /// Probe before sending a command. Only this harmless probe is retried;
+    /// a failed user command is never replayed because it may have committed.
+    async fn live_connection(&self) -> Result<tokio::sync::MutexGuard<'_, MultiplexedConnection>> {
+        let mut connection = self.connection.lock().await;
+        let alive = tokio::time::timeout(
+            Duration::from_secs(5),
+            redis::cmd("PING").query_async::<Value>(&mut *connection),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        if !alive {
+            let mut replacement = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.client.get_multiplexed_async_connection(),
+            )
+            .await
+            .map_err(|_| DbxError::Connection("Redis reconnect timed out".into()))??;
+            redis::cmd("SELECT")
+                .arg(self.database.load(Ordering::SeqCst))
+                .query_async::<()>(&mut replacement)
+                .await?;
+            *connection = replacement;
+        }
+        Ok(connection)
+    }
+
     async fn send_command(&self, command: &str, params: &[CellValue]) -> Result<Value> {
         let words = parse_command(command)?;
         if words.is_empty() {
             return Err(DbxError::Parse("Redis command cannot be empty".into()));
         }
         let mut cmd = Cmd::new();
-        for word in words {
+        for word in &words {
             cmd.arg(word);
         }
         for value in params {
             cmd.arg(redis_argument(value)?);
         }
-        let mut connection = self.connection.clone();
-        Ok(cmd.query_async(&mut connection).await?)
+        let mut connection = self.live_connection().await?;
+        let result = cmd.query_async(&mut *connection).await?;
+        if words[0].eq_ignore_ascii_case("SELECT") {
+            let database = words
+                .get(1)
+                .cloned()
+                .or_else(|| params.first().map(ToString::to_string))
+                .and_then(|value| value.parse().ok());
+            if let Some(database) = database {
+                self.database.store(database, Ordering::SeqCst);
+            }
+        }
+        Ok(result)
     }
 
     async fn query_command(
@@ -173,8 +210,8 @@ impl RedisEngine {
                 pipeline.cmd("TYPE").arg(&argument);
                 pipeline.cmd("TTL").arg(&argument);
             }
-            let mut connection = self.connection.clone();
-            let metadata: Vec<Value> = pipeline.query_async(&mut connection).await?;
+            let mut connection = self.live_connection().await?;
+            let metadata: Vec<Value> = pipeline.query_async(&mut *connection).await?;
             if metadata.len() != keys.len() * 2 {
                 return Err(DbxError::Decode(format!(
                     "Redis SCAN metadata returned {} values for {} keys",
@@ -247,10 +284,10 @@ impl crate::Engine for RedisEngine {
         })?;
         let mut cmd = Cmd::new();
         cmd.arg("SELECT").arg(index);
-        let mut connection = self.connection.clone();
+        let mut connection = self.live_connection().await?;
         tokio::time::timeout(
             Duration::from_secs(5),
-            cmd.query_async::<()>(&mut connection),
+            cmd.query_async::<()>(&mut *connection),
         )
         .await
         .map_err(|_| DbxError::Connection("Redis SELECT timed out".into()))?
@@ -268,6 +305,7 @@ impl crate::Engine for RedisEngine {
                 nullable: false,
                 ordinal: 0,
                 primary_key: true,
+                default_value: None,
             },
             ColumnInfo {
                 name: "type".to_owned(),
@@ -276,6 +314,7 @@ impl crate::Engine for RedisEngine {
                 nullable: true,
                 ordinal: 1,
                 primary_key: false,
+                default_value: None,
             },
             ColumnInfo {
                 name: "ttl".to_owned(),
@@ -284,6 +323,7 @@ impl crate::Engine for RedisEngine {
                 nullable: true,
                 ordinal: 2,
                 primary_key: false,
+                default_value: None,
             },
         ])
     }
@@ -292,6 +332,7 @@ impl crate::Engine for RedisEngine {
         Ok(TableStructure {
             columns: self.describe_table(table).await?,
             foreign_keys: Vec::new(),
+            ..Default::default()
         })
     }
 

@@ -659,6 +659,7 @@ impl Engine for HttpEngine {
                         i,
                     );
                     c.nullable = f["mode"] != "REQUIRED";
+                    c.default_value = f["defaultValueExpression"].as_str().map(str::to_owned);
                     Ok(c)
                 })
                 .collect();
@@ -693,6 +694,7 @@ impl Engine for HttpEngine {
                 .position(|c| c.name == name)
                 .ok_or_else(decode_error)
         };
+        let default = index("dflt_value")?;
         let (name, ty, notnull, pk) = (
             index("name")?,
             index("type")?,
@@ -707,6 +709,11 @@ impl Engine for HttpEngine {
                 let mut c = super::column(super::text(r, name), super::text(r, ty), i);
                 c.primary_key = super::text(r, pk) != "0";
                 c.nullable = super::text(r, notnull) == "0" && !c.primary_key;
+                c.default_value = r
+                    .values
+                    .get(default)
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string);
                 c
             })
             .collect())
@@ -770,13 +777,98 @@ impl Engine for HttpEngine {
             return Ok(crate::TableStructure {
                 columns,
                 foreign_keys,
+                definition: metadata["view"]["query"].as_str().map(str::to_owned),
+                ..Default::default()
             });
         }
         if !matches!(self.kind, DatabaseKind::Turso | DatabaseKind::CloudflareD1) {
             return Ok(crate::TableStructure {
                 columns,
                 foreign_keys: Vec::new(),
+                ..Default::default()
             });
+        }
+        let definition_result = self
+            .query_statement(
+                &SqlStatement::new(
+                    "SELECT sql FROM sqlite_master WHERE name=? AND type IN ('table','view')",
+                    vec![CellValue::Text(table.name.clone())],
+                ),
+                QueryOptions::default(),
+            )
+            .await?;
+        let definition = definition_result
+            .rows
+            .first()
+            .and_then(|row| row.values.first())
+            .filter(|value| !matches!(value, CellValue::Null))
+            .map(ToString::to_string);
+        let index_result = self
+            .query(
+                &format!("PRAGMA index_list('{}')", table.name.replace('\'', "''")),
+                QueryOptions { max_rows: None },
+            )
+            .await?;
+        let column_index = |name: &str| {
+            index_result
+                .columns
+                .iter()
+                .position(|column| column.name == name)
+                .ok_or_else(decode_error)
+        };
+        let checks = definition
+            .as_deref()
+            .map(crate::schema_objects::sqlite_checks)
+            .unwrap_or_default();
+        let mut indexes = Vec::new();
+        if !index_result.rows.is_empty() {
+            let name_index = column_index("name")?;
+            let unique_index = column_index("unique")?;
+            let origin_index = column_index("origin")?;
+            for row in &index_result.rows {
+                let name = super::text(row, name_index);
+                let parts = self
+                    .query(
+                        &format!("PRAGMA index_info('{}')", name.replace('\'', "''")),
+                        QueryOptions { max_rows: None },
+                    )
+                    .await?;
+                let part_index = parts
+                    .columns
+                    .iter()
+                    .position(|column| column.name == "name");
+                let columns = parts
+                    .rows
+                    .iter()
+                    .filter_map(|row| part_index.and_then(|index| row.values.get(index)))
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string)
+                    .collect();
+                let source = self
+                    .query_statement(
+                        &SqlStatement::new(
+                            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                            vec![CellValue::Text(name.clone())],
+                        ),
+                        QueryOptions::default(),
+                    )
+                    .await?;
+                let definition = source
+                    .rows
+                    .first()
+                    .and_then(|row| row.values.first())
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string);
+                indexes.push(crate::IndexInfo {
+                    name,
+                    columns,
+                    unique: super::text(row, unique_index) == "1",
+                    primary: super::text(row, origin_index) == "pk",
+                    method: None,
+                    predicate: None,
+                    definition,
+                });
+            }
         }
         let result = self
             .query(
@@ -790,6 +882,9 @@ impl Engine for HttpEngine {
         if result.rows.is_empty() {
             return Ok(crate::TableStructure {
                 columns,
+                indexes,
+                definition,
+                checks,
                 foreign_keys: Vec::new(),
             });
         }
@@ -837,6 +932,9 @@ impl Engine for HttpEngine {
         Ok(crate::TableStructure {
             columns,
             foreign_keys: groups.into_values().collect(),
+            indexes,
+            checks,
+            definition,
         })
     }
     async fn query(&self, command: &str, options: QueryOptions) -> Result<QueryResult> {

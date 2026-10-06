@@ -112,7 +112,7 @@ impl Engine for DuckEngine {
     }
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
         let result = self.query_statement(&SqlStatement::new(
-            "SELECT c.column_name, c.data_type, c.is_nullable, EXISTS (SELECT 1 FROM duckdb_constraints() d WHERE d.schema_name = c.table_schema AND d.table_name = c.table_name AND d.constraint_type = 'PRIMARY KEY' AND list_contains(d.constraint_column_names, c.column_name)) FROM information_schema.columns c WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+            "SELECT c.column_name, c.data_type, c.is_nullable, EXISTS (SELECT 1 FROM duckdb_constraints() d WHERE d.schema_name = c.table_schema AND d.table_name = c.table_name AND d.constraint_type = 'PRIMARY KEY' AND list_contains(d.constraint_column_names, c.column_name)), c.column_default FROM information_schema.columns c WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
             vec![CellValue::Text(table.schema.clone().unwrap_or_else(||"main".into())), CellValue::Text(table.name.clone())]),QueryOptions {max_rows:None}).await?;
         Ok(result
             .rows
@@ -122,6 +122,11 @@ impl Engine for DuckEngine {
                 let mut c = super::column(super::text(row, 0), super::text(row, 1), i);
                 c.nullable = super::text(row, 2) == "YES";
                 c.primary_key = super::text(row, 3) == "true";
+                c.default_value = row
+                    .values
+                    .get(4)
+                    .filter(|value| !matches!(value, CellValue::Null))
+                    .map(ToString::to_string);
                 c
             })
             .collect())
@@ -154,9 +159,45 @@ impl Engine for DuckEngine {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let params = vec![
+            CellValue::Text(table.schema.clone().unwrap_or_else(|| "main".into())),
+            CellValue::Text(table.name.clone()),
+        ];
+        let constraints = self.query_statement(&SqlStatement::new("SELECT constraint_name, expression FROM duckdb_constraints() WHERE schema_name=? AND table_name=? AND constraint_type='CHECK' ORDER BY constraint_index", params.clone()), QueryOptions { max_rows: None }).await?;
+        let checks = constraints
+            .rows
+            .iter()
+            .map(|row| crate::CheckConstraintInfo {
+                name: Some(super::text(row, 0)),
+                expression: super::text(row, 1),
+            })
+            .collect();
+        let sources = self.query_statement(&SqlStatement::new("SELECT sql FROM duckdb_tables() WHERE schema_name=? AND table_name=? UNION ALL SELECT sql FROM duckdb_views() WHERE schema_name=? AND view_name=?", params.iter().cloned().chain(params.iter().cloned()).collect()), QueryOptions::default()).await?;
+        let definition = sources
+            .rows
+            .first()
+            .and_then(|row| row.values.first())
+            .map(ToString::to_string);
+        let index_rows = self.query_statement(&SqlStatement::new("SELECT index_name, is_unique, is_primary, expressions, sql FROM duckdb_indexes() WHERE schema_name=? AND table_name=? ORDER BY index_name", params), QueryOptions { max_rows: None }).await?;
+        let indexes = index_rows
+            .rows
+            .iter()
+            .map(|row| crate::IndexInfo {
+                name: super::text(row, 0),
+                unique: super::text(row, 1) == "true",
+                primary: super::text(row, 2) == "true",
+                columns: Vec::new(),
+                method: None,
+                predicate: None,
+                definition: Some(super::text(row, 4)),
+            })
+            .collect();
         Ok(crate::TableStructure {
             columns,
             foreign_keys,
+            indexes,
+            checks,
+            definition,
         })
     }
     async fn query_statement(

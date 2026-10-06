@@ -16,6 +16,10 @@ impl Render for DbxApp {
             window.focus(&self.focus_handle, cx);
         }
         let unlocked = self.vault_state == Some(VaultState::Unlocked);
+        if unlocked && !self.startup_recovery_started {
+            self.startup_recovery_started = true;
+            self.restore_startup_workspace(window, cx);
+        }
         let content = if !unlocked {
             self.render_connection(cx).into_any_element()
         } else if self.settings_open {

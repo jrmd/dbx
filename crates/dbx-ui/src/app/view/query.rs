@@ -361,6 +361,16 @@ impl DbxApp {
         let history = self.recent_query_history_limited(session_id, 10);
         let agent_open = self.agent_panel_open(session_id, tab_id);
         let agent_panel = self.render_agent_panel(session_id, tab_id, cx);
+        let parameter_prompt = self.render_parameter_prompt(session_id, cx);
+        let find_bar = self.render_find_bar(session_id, cx);
+        let export_target = self
+            .active_query_tab(session_id)
+            .unwrap()
+            .export_target
+            .clone();
+        let inspected_value = self
+            .active_query_tab(session_id)
+            .and_then(|query| query.inspected_value.clone());
 
         div()
             .flex_1()
@@ -374,6 +384,14 @@ impl DbxApp {
             }))
             .on_action(cx.listener(move |this, _: &ToggleQueryAgent, window, cx| {
                 this.toggle_agent_panel(session_id, tab_id, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(move |this, _: &OpenFind, window, cx| {
+                this.open_find_for(session_id, false, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(move |this, _: &OpenReplace, window, cx| {
+                this.open_find_for(session_id, true, window, cx);
                 cx.stop_propagation();
             }))
             .child(
@@ -489,6 +507,8 @@ impl DbxApp {
                                         let copy_tsv = app.clone();
                                         let copy_csv = app.clone();
                                         let copy_json = app.clone();
+                                        let copy_insert = app.clone();
+                                        let export_insert = app.clone();
                                         let export_tsv = app.clone();
                                         let export_csv = app.clone();
                                         let export_json = app.clone();
@@ -610,6 +630,14 @@ impl DbxApp {
                                                         });
                                                     }),
                                             )
+                                            .item(PopupMenuItem::new("Copy result as INSERT statements")
+                                                .disabled(!has_rowset).on_click(move |_, _, cx| {
+                                                    let _ = copy_insert.update(cx, |this, cx| this.copy_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
+                                                }))
+                                            .item(PopupMenuItem::new("Export INSERT statements…")
+                                                .disabled(!has_rowset).on_click(move |_, _, cx| {
+                                                    let _ = export_insert.update(cx, |this, cx| this.export_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
+                                                }))
                                             .separator()
                                             .item(
                                                 PopupMenuItem::new("Export TSV…")
@@ -733,6 +761,24 @@ impl DbxApp {
                     .on_click(cx.listener(move |this, _, _, cx| this.select_statement_result_for(session_id, index, cx)))
                 }))))
             .when_some(agent_panel, |view, panel| view.child(panel))
+            .when_some(parameter_prompt, |view, prompt| view.child(prompt))
+            .when_some(find_bar, |view, bar| view.child(bar))
+            .when(has_rowset, |view| view.child(div().flex().items_center().gap(px(8.)).px(px(10.)).py(px(4.))
+                .child(div().text_size(px(11.)).child("INSERT export target table:"))
+                .child(div().w(px(220.)).child(export_target))))
+            .when_some(inspected_value, |view, value| view.child(
+                div().id("query-value-viewer").max_h(px(300.)).overflow_y_scroll().p(px(10.))
+                    .child(div().flex().justify_between().child("Value")
+                        .child(button("copy-query-value", "Copy full value", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(value) = this.active_query_tab(session_id).and_then(|query| query.inspected_value.as_ref()) {
+                                cx.write_to_clipboard(ClipboardItem::new_string(value_view::value_clipboard_text(value)));
+                            }
+                        })))
+                        .child(button("close-query-value", "Close", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(query) = this.active_query_tab_mut(session_id) { query.inspected_value = None; }
+                            cx.notify();
+                        }))))
+                    .child(crate::app::value_view::value_view(Some(&value)))))
             .child(
                 gpui_component::resizable::v_resizable(SharedString::from(format!(
                     "query-workbench-split-{session_id}-{tab_id}"

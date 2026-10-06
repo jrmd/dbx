@@ -48,6 +48,15 @@ impl From<sqlx::Error> for DbxError {
             | sqlx::Error::PoolClosed
             | sqlx::Error::Io(_)
             | sqlx::Error::Tls(_) => Self::Connection(error.to_string()),
+            // SQLSTATE class 08 and PostgreSQL's admin/crash shutdown codes
+            // mean the server closed this session.
+            sqlx::Error::Database(ref database)
+                if database.code().is_some_and(|code| {
+                    code.starts_with("08") || matches!(code.as_ref(), "57P01" | "57P02" | "57P03")
+                }) =>
+            {
+                Self::Connection(error.to_string())
+            }
             other => Self::Query(other.to_string()),
         }
     }

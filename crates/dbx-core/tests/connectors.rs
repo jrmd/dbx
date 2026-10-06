@@ -5,7 +5,9 @@ use dbx_core::*;
 async fn clickhouse_live_sql_metadata_filters_limits_and_database_switching() {
     let engine = DatabaseEngine::connect(ConnectionConfig::new(
         DatabaseKind::ClickHouse,
-        "clickhouse://dbx_test:dbx_test_password@127.0.0.1:58123/dbx_test",
+        std::env::var("DBX_TEST_CLICKHOUSE_URL").unwrap_or_else(|_| {
+            "clickhouse://dbx_test:dbx_test_password@127.0.0.1:58123/dbx_test".into()
+        }),
     ))
     .await
     .unwrap();
@@ -365,7 +367,8 @@ async fn duckdb_browses_filters_and_mutates_without_sqlite_substitution() {
 async fn mongo_live_commands_and_collection_browsing() {
     let engine = DatabaseEngine::connect(ConnectionConfig::new(
         DatabaseKind::MongoDB,
-        "mongodb://localhost:57017/dbx_qa",
+        std::env::var("DBX_TEST_MONGO_URL")
+            .unwrap_or_else(|_| "mongodb://localhost:57017/dbx_qa".into()),
     ))
     .await
     .unwrap();
@@ -406,7 +409,8 @@ async fn mongo_live_commands_and_collection_browsing() {
 async fn cockroach_live_postgres_driver_and_metadata() {
     let engine = DatabaseEngine::connect(ConnectionConfig::new(
         DatabaseKind::CockroachDB,
-        "postgres://root@localhost:56257/defaultdb?sslmode=disable",
+        std::env::var("DBX_TEST_COCKROACH_URL")
+            .unwrap_or_else(|_| "postgres://root@localhost:56257/defaultdb?sslmode=disable".into()),
     ))
     .await
     .unwrap();
@@ -435,6 +439,41 @@ async fn cockroach_live_postgres_driver_and_metadata() {
         .unwrap();
     assert!(columns[0].primary_key);
     assert!(!engine.relational_schema().await.unwrap().tables.is_empty());
+
+    engine
+        .execute_sql("DROP TABLE IF EXISTS dbx_qa_details")
+        .await
+        .unwrap();
+    engine
+        .execute_sql("CREATE TABLE dbx_qa_details (id INT PRIMARY KEY, code STRING NOT NULL DEFAULT 'new', qty INT CHECK (qty >= 0), INDEX dbx_qa_qty (qty))")
+        .await
+        .unwrap();
+    let structure = engine
+        .table_structure(&TableRef {
+            schema: Some("public".into()),
+            name: "dbx_qa_details".into(),
+        })
+        .await
+        .unwrap();
+    let code = structure
+        .columns
+        .iter()
+        .find(|column| column.name == "code")
+        .unwrap();
+    assert!(
+        code.default_value
+            .as_deref()
+            .unwrap_or_default()
+            .contains("new")
+    );
+    assert!(
+        structure
+            .indexes
+            .iter()
+            .any(|index| index.name == "dbx_qa_qty" && index.columns == ["qty"] && !index.unique)
+    );
+    assert!(structure.indexes.iter().any(|index| index.primary));
+    assert_eq!(structure.checks.len(), 1, "{:?}", structure.checks);
     assert_eq!(
         engine
             .query("SELECT name FROM dbx_qa_items", QueryOptions::default())
@@ -451,7 +490,8 @@ async fn cockroach_live_postgres_driver_and_metadata() {
 async fn elastic_live_requests_and_index_browsing() {
     let engine = DatabaseEngine::connect(ConnectionConfig::new(
         DatabaseKind::Elasticsearch,
-        "http://localhost:59200",
+        std::env::var("DBX_TEST_ELASTICSEARCH_URL")
+            .unwrap_or_else(|_| "http://localhost:59200".into()),
     ))
     .await
     .unwrap();
@@ -490,7 +530,7 @@ async fn elastic_live_requests_and_index_browsing() {
 async fn kafka_live_acknowledged_produce_and_noncommitting_consume() {
     let engine = DatabaseEngine::connect(ConnectionConfig::new(
         DatabaseKind::Kafka,
-        "kafka://localhost:59092",
+        std::env::var("DBX_TEST_KAFKA_URL").unwrap_or_else(|_| "kafka://localhost:59092".into()),
     ))
     .await
     .unwrap();
@@ -522,4 +562,231 @@ async fn kafka_live_acknowledged_produce_and_noncommitting_consume() {
         .await
         .unwrap();
     assert!(!result.rows.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires disposable SQL Server on port 51433"]
+async fn sqlserver_live_sql_metadata_browsing_and_checked_edits() {
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(
+        DatabaseKind::SqlServer,
+        std::env::var("DBX_TEST_SQLSERVER_URL").unwrap_or_else(|_| "sqlserver://sa:Dbx_test_Passw0rd@127.0.0.1:51433/master?trust_server_certificate=true".into()),
+    ))
+    .await
+    .unwrap();
+    engine
+        .execute_sql("IF DB_ID(N'dbx_test') IS NULL CREATE DATABASE dbx_test")
+        .await
+        .unwrap();
+    engine.use_database("dbx_test").await.unwrap();
+    assert_eq!(engine.current_database().await.unwrap(), "dbx_test");
+    assert!(
+        engine
+            .list_databases()
+            .await
+            .unwrap()
+            .contains(&"dbx_test".to_owned())
+    );
+    for statement in [
+        "IF OBJECT_ID(N'dbo.dbx_items_view', N'V') IS NOT NULL DROP VIEW dbo.dbx_items_view",
+        "IF OBJECT_ID(N'dbo.dbx_items', N'U') IS NOT NULL DROP TABLE dbo.dbx_items",
+        "IF OBJECT_ID(N'dbo.dbx_owners', N'U') IS NOT NULL DROP TABLE dbo.dbx_owners",
+        "CREATE TABLE dbo.dbx_owners (id INT PRIMARY KEY)",
+        "CREATE TABLE dbo.dbx_items (id INT IDENTITY(1,1) PRIMARY KEY, code NVARCHAR(20) NOT NULL DEFAULT N'new', qty INT NOT NULL CONSTRAINT dbx_qty CHECK (qty >= 0), price DECIMAL(10,2) NULL, seen DATETIME2 NULL, owner_id INT NULL CONSTRAINT dbx_owner_fk REFERENCES dbo.dbx_owners (id) ON DELETE SET NULL)",
+        "CREATE UNIQUE INDEX dbx_items_code ON dbo.dbx_items (code)",
+        "CREATE VIEW dbo.dbx_items_view AS SELECT id, code FROM dbo.dbx_items",
+        "INSERT INTO dbo.dbx_owners (id) VALUES (1)",
+    ] {
+        engine.execute_sql(statement).await.unwrap();
+    }
+    let table = TableRef {
+        schema: Some("dbo".into()),
+        name: "dbx_items".into(),
+    };
+    let inserted = engine
+        .insert(&dbx_core::InsertRequest::from_row(
+            table.clone(),
+            vec![
+                ("code".into(), CellValue::Text("a[1]".into())),
+                ("qty".into(), CellValue::Integer(3)),
+                ("price".into(), CellValue::Text("12.50".into())),
+                ("owner_id".into(), CellValue::Integer(1)),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(inserted.rows_affected, 1);
+    engine
+        .execute_sql(
+            "INSERT INTO dbo.dbx_items (code, qty, seen) VALUES (N'b', 5, '2026-01-02T03:04:05')",
+        )
+        .await
+        .unwrap();
+
+    let tables = engine.list_tables().await.unwrap();
+    assert!(
+        tables
+            .iter()
+            .any(|t| t.name == "dbx_items" && t.schema.as_deref() == Some("dbo"))
+    );
+    assert!(
+        tables
+            .iter()
+            .any(|t| t.name == "dbx_items_view" && t.kind == EntityKind::View)
+    );
+
+    let structure = engine.table_structure(&table).await.unwrap();
+    let column = |name: &str| structure.columns.iter().find(|c| c.name == name).unwrap();
+    assert!(column("id").primary_key);
+    assert_eq!(column("code").data_type, "nvarchar(20)");
+    assert_eq!(column("price").data_type, "decimal(10,2)");
+    assert!(
+        column("code")
+            .default_value
+            .as_deref()
+            .unwrap()
+            .contains("new")
+    );
+    assert!(!column("qty").nullable);
+    assert_eq!(structure.foreign_keys.len(), 1);
+    assert_eq!(structure.foreign_keys[0].referenced_table, "dbx_owners");
+    assert_eq!(
+        structure.foreign_keys[0].on_delete,
+        Some(dbx_core::ReferentialAction::SetNull)
+    );
+    assert!(
+        structure
+            .indexes
+            .iter()
+            .any(|i| i.name == "dbx_items_code" && i.unique && i.columns == ["code"])
+    );
+    assert!(structure.indexes.iter().any(|i| i.primary));
+    assert_eq!(structure.checks.len(), 1);
+    assert!(structure.checks[0].expression.contains("qty"));
+    let view = engine
+        .table_structure(&TableRef {
+            schema: Some("dbo".into()),
+            name: "dbx_items_view".into(),
+        })
+        .await
+        .unwrap();
+    assert!(view.definition.unwrap().contains("SELECT"));
+
+    // Filters escape LIKE character classes; pages need OFFSET/FETCH.
+    let filtered = engine
+        .query_table(
+            &table,
+            &[],
+            &[dbx_core::Filter {
+                column: "code".into(),
+                operator: dbx_core::FilterOperator::Contains,
+                value: Some(CellValue::Text("[1]".into())),
+            }],
+            &[dbx_core::Order {
+                column: "id".into(),
+                direction: dbx_core::OrderDirection::Descending,
+            }],
+            Some(dbx_core::Page {
+                limit: 10,
+                offset: 0,
+            }),
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.rows.len(), 1);
+    let code_index = filtered
+        .columns
+        .iter()
+        .position(|c| c.name == "code")
+        .unwrap();
+    let price_index = filtered
+        .columns
+        .iter()
+        .position(|c| c.name == "price")
+        .unwrap();
+    assert_eq!(
+        filtered.rows[0].values[code_index],
+        CellValue::Text("a[1]".into())
+    );
+    assert_eq!(
+        filtered.rows[0].values[price_index],
+        CellValue::Text("12.50".into())
+    );
+    let second_page = engine
+        .query_table(
+            &table,
+            &[],
+            &[],
+            &[dbx_core::Order {
+                column: "id".into(),
+                direction: dbx_core::OrderDirection::Ascending,
+            }],
+            Some(dbx_core::Page {
+                limit: 1,
+                offset: 1,
+            }),
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_page.rows.len(), 1);
+    let seen_index = second_page
+        .columns
+        .iter()
+        .position(|c| c.name == "seen")
+        .unwrap();
+    assert_eq!(
+        second_page.rows[0].values[seen_index],
+        CellValue::Text("2026-01-02 03:04:05".into())
+    );
+
+    for monitor in [Monitor::Sessions, Monitor::Locks] {
+        let sql = monitor_query(DatabaseKind::SqlServer, monitor).unwrap();
+        engine.query(&sql, QueryOptions::default()).await.unwrap();
+    }
+
+    // Checked edits detect concurrent changes.
+    let request = dbx_core::UpdateRequest::for_primary_key(
+        table.clone(),
+        vec![("qty".into(), CellValue::Integer(9))],
+        vec![("id".into(), CellValue::Integer(1))],
+    );
+    engine
+        .update_checked(&request, &[("qty".into(), CellValue::Integer(3))])
+        .await
+        .unwrap();
+    assert!(matches!(
+        engine
+            .update_checked(&request, &[("qty".into(), CellValue::Integer(3))])
+            .await,
+        Err(dbx_core::DbxError::Conflict)
+    ));
+
+    // T-SQL scripts: GO batches, #temp tables and module bodies.
+    let session = dbx_core::QuerySession::new(std::sync::Arc::new(engine));
+    let script = session
+        .run(
+            "SELECT 1 AS one INTO #scratch;\nSELECT one FROM #scratch\nGO\nCREATE OR ALTER PROCEDURE dbo.dbx_proc AS\nBEGIN\n  SET NOCOUNT ON;\n  SELECT 42 AS answer;\nEND\nGO\nEXEC dbo.dbx_proc",
+            QueryOptions::default(),
+            std::time::Duration::from_secs(30),
+            dbx_core::QueryCancellation::default(),
+        )
+        .await
+        .unwrap();
+    for statement in &script.statements {
+        assert!(
+            statement.error.is_none(),
+            "{}: {:?}",
+            statement.statement,
+            statement.error
+        );
+    }
+    assert_eq!(
+        script.statements[1].result.rows[0].values[0],
+        CellValue::Integer(1)
+    );
+    assert_eq!(
+        script.statements.last().unwrap().result.rows[0].values[0],
+        CellValue::Integer(42)
+    );
 }
