@@ -12,7 +12,7 @@ DBX is for developers and data operators who need to inspect, query, and safely 
 
 ## Product Purpose
 
-DBX provides one workbench for PostgreSQL, MySQL, SQLite, and Redis. It lets users configure a connection through equal Details and Connection String modes, save and name connections, keep several connections open simultaneously, browse schemas and tables, filter records with structured controls, inspect and edit complete rows, create tables, and run highlighted SQL.
+DBX provides one workbench for PostgreSQL, MySQL, SQLite, Redis, MongoDB, CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1, ClickHouse, SQL Server, and Snowflake. It lets users configure a connection through equal Details and Connection String modes, save and name connections, keep several connections open simultaneously, browse schemas and tables, filter records with structured controls, inspect and edit complete rows, create and visually alter tables through SQL drafts, stage inline or JSON edits, and run highlighted SQL with bound parameters.
 
 ## Positioning
 
@@ -24,7 +24,7 @@ Users move repeatedly between saved connections, schema navigation, table data, 
 
 ## Capabilities and Constraints
 
-- PostgreSQL, MySQL, SQLite, and Redis are required engines.
+- PostgreSQL, MySQL, SQLite, and Redis are the core engines; MongoDB, CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1, ClickHouse, SQL Server, and Snowflake are provider connectors with the capabilities listed in `docs/database-connectors.md`.
 - Connection setup must offer Details fields for host, port, user, password, and database alongside an equally capable Connection String mode; SQLite must offer a native database-file chooser.
 - Connections can be named, saved to disk, opened concurrently, and switched through persistent primary tabs.
 - Test Connection must validate the entered configuration without saving it, opening a workspace, or changing database state.
@@ -34,13 +34,13 @@ Users move repeatedly between saved connections, schema navigation, table data, 
 - SQL editing requires syntax highlighting.
 - Table browsing supports predefined multi-row filters, full-row insert and edit, refresh, and destructive table actions behind confirmation.
 - Tables can be exported to SQL dump, CSV, or TSV files (optionally gzip-compressed) through a native save dialog, and the active database can export a selected set of tables with a chosen format, output name, destination folder, and schema-only SQL mode. Database SQL dumps replay their statements behind an explicit confirmation, while CSV/TSV files bulk-append rows whose header maps to one table's columns.
-- Structure documents expose columns, primary keys, and normalized foreign-key relationships for PostgreSQL, MySQL, and SQLite.
+- Structure documents expose columns, defaults, primary keys, indexes, available checks and normalized foreign-key relationships. The explorer also captures available triggers, functions, procedures and standalone sequences; views expose their definitions. Coverage follows each engine’s catalog.
 - The application must remain native and responsive under large result sets.
 - Light and dark appearances are first-class, persist across launches, and preserve the same semantic color roles and dense workbench hierarchy.
 
 ## Brand Commitments
 
-The product name is DBX. The supplied DBX logo asset anchors the disconnected connection setup/top-bar identity and the connected app rail; the connected workspace should not repeat the same mark in both places. The supplied DBX screen-map image at `/tmp/codex-clipboard-9272fa2f-5a32-4169-962f-0c077297d380.png` is the binding visual reference for the desktop workbench: compact dark surfaces, crisp blue navigation and actions, green connection health, and dense professional database tooling.
+The product name is DBX. The supplied DBX logo asset anchors the disconnected connection setup/top-bar identity and the connected app rail; the connected workspace should not repeat the same mark in both places. `DESIGN.md` and the screenshots in `docs/screenshots/` are the visual reference for the desktop workbench: compact surfaces, crisp blue navigation and actions, green connection health, and dense professional database tooling.
 
 ## Evidence on Hand
 

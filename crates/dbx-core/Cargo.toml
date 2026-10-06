@@ -21,10 +21,15 @@ tempfile.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 base64 = "0.22"
 percent-encoding.workspace = true
+gcp_auth = { version = "0.12.7", default-features = false, features = ["ring"] }
 mongodb = "3.3"
 duckdb = { version = "1.4", features = ["bundled"] }
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
+chrono.workspace = true
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

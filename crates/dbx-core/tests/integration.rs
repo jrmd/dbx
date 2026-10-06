@@ -19,6 +19,7 @@ async fn socket_and_ssh_connections_integration() -> Result<()> {
         port: std::env::var("DBX_TEST_SSH_PORT").unwrap().parse().unwrap(),
         username: std::env::var("DBX_TEST_SSH_USER").unwrap(),
         identity_file: Some(root.join("identity")),
+        jump_host: None,
     };
     for (kind, socket) in [
         (DatabaseKind::PostgreSQL, root.join("sockets/pg")),
@@ -409,6 +410,7 @@ async fn run_sql_scenario(kind: DatabaseKind, variable: &str) -> Result<()> {
     assert!(!columns[0].nullable);
     assert!(!columns[1].nullable);
 
+    assert_schema_details(&engine, kind).await?;
     assert_foreign_key_structure(&engine, kind).await?;
 
     for (id, name, score) in [(1_i64, "Ada", 10_i64), (2, "Grace", 20), (3, "Linus", 30)] {
@@ -596,6 +598,143 @@ async fn assert_postgres_enum_decoding(engine: &DatabaseEngine) -> Result<()> {
         .await;
     engine.execute_sql("DROP TYPE dbx_integration_mood").await?;
     result
+}
+
+/// Defaults, indexes, checks, and view definitions, which the structure tab,
+/// SQL dumps, and schema comparison all rely on.
+async fn assert_schema_details(engine: &DatabaseEngine, kind: DatabaseKind) -> Result<()> {
+    let table = table_ref_named(kind, "dbx_integration_details");
+    let view = qualified_table_named(kind, "dbx_integration_details_view");
+    let _ = engine
+        .execute_sql(&format!("DROP VIEW IF EXISTS {view}"))
+        .await;
+    let _ = engine.drop_table(&table).await;
+    let name = qualified_table_named(kind, "dbx_integration_details");
+    engine
+        .execute_sql(&format!(
+            "CREATE TABLE {name} (id INTEGER PRIMARY KEY, code VARCHAR(20) NOT NULL DEFAULT 'new', qty INTEGER NOT NULL DEFAULT 1, CONSTRAINT dbx_integration_qty CHECK (qty >= 0))"
+        ))
+        .await?;
+    engine
+        .execute_sql(&format!(
+            "CREATE UNIQUE INDEX dbx_integration_code ON {name} (code)"
+        ))
+        .await?;
+    engine
+        .execute_sql(&format!(
+            "CREATE INDEX dbx_integration_qty_code ON {name} (qty, code DESC)"
+        ))
+        .await?;
+    engine
+        .execute_sql(&format!(
+            "CREATE VIEW {view} AS SELECT id, code FROM {name}"
+        ))
+        .await?;
+
+    if kind == DatabaseKind::MySQL {
+        engine
+            .execute_sql(&format!(
+                "CREATE INDEX dbx_integration_expression ON {name} ((LOWER(code)))"
+            ))
+            .await?;
+    }
+    let structure = engine.table_structure(&table).await?;
+    let default = |column: &str| {
+        structure
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column)
+            .and_then(|candidate| candidate.default_value.clone())
+            .unwrap_or_default()
+    };
+    assert!(default("code").contains("new"), "{:?}", default("code"));
+    assert!(default("qty").contains('1'), "{:?}", default("qty"));
+    assert_eq!(
+        structure
+            .columns
+            .iter()
+            .find(|column| column.name == "id")
+            .and_then(|column| column.default_value.as_ref()),
+        None
+    );
+
+    if kind == DatabaseKind::MySQL {
+        let expression = structure
+            .indexes
+            .iter()
+            .find(|index| index.name == "dbx_integration_expression")
+            .expect("functional index");
+        assert!(
+            expression
+                .definition
+                .as_deref()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("lower")
+        );
+        let rendered = dbx_core::render_sql_indexes(kind, &table, &structure)?;
+        let sql = rendered
+            .iter()
+            .find(|sql| sql.contains("dbx_integration_expression"))
+            .unwrap();
+        engine
+            .execute_sql(&format!("DROP INDEX dbx_integration_expression ON {name}"))
+            .await?;
+        engine.execute_sql(sql).await?;
+        assert!(
+            engine
+                .table_structure(&table)
+                .await?
+                .indexes
+                .iter()
+                .any(|index| index.name == "dbx_integration_expression")
+        );
+    }
+    let unique = structure
+        .indexes
+        .iter()
+        .find(|index| index.name == "dbx_integration_code")
+        .expect("unique index");
+    assert!(unique.unique && !unique.primary);
+    assert_eq!(unique.columns, ["code"]);
+    let composite = structure
+        .indexes
+        .iter()
+        .find(|index| index.name == "dbx_integration_qty_code")
+        .expect("composite index");
+    assert!(!composite.unique);
+    assert_eq!(composite.columns[0], "qty");
+    assert!(composite.columns[1].starts_with("code"));
+    if kind != DatabaseKind::SQLite {
+        assert!(structure.indexes.iter().any(|index| index.primary));
+    }
+
+    if kind == DatabaseKind::SQLite {
+        let definition = structure
+            .definition
+            .as_deref()
+            .expect("SQLite CREATE TABLE");
+        assert!(definition.contains("CHECK (qty >= 0)"), "{definition}");
+    } else {
+        assert_eq!(structure.checks.len(), 1, "{:?}", structure.checks);
+        assert_eq!(
+            structure.checks[0].name.as_deref(),
+            Some("dbx_integration_qty")
+        );
+        assert!(structure.checks[0].expression.contains("qty"));
+        assert!(structure.checks[0].expression.contains(">="));
+    }
+
+    let view_structure = engine
+        .table_structure(&table_ref_named(kind, "dbx_integration_details_view"))
+        .await?;
+    let view_definition = view_structure
+        .definition
+        .expect("view definition")
+        .to_ascii_lowercase();
+    assert!(view_definition.contains("select"), "{view_definition}");
+    assert!(view_definition.contains("code"), "{view_definition}");
+    Ok(())
 }
 
 async fn assert_foreign_key_structure(engine: &DatabaseEngine, kind: DatabaseKind) -> Result<()> {

@@ -465,6 +465,8 @@ pub enum Icon {
     Pencil,
     Tag,
     Download,
+    ChevronUp,
+    ChevronDown,
 }
 
 /// Draw a 16px icon from the embedded SVG set. Consumers provide the color so
@@ -496,6 +498,8 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
         Icon::Pencil => assets::ICON_PENCIL,
         Icon::Tag => assets::ICON_TAG,
         Icon::Download => assets::ICON_DOWNLOAD,
+        Icon::ChevronUp => assets::ICON_CHEVRON_UP,
+        Icon::ChevronDown => assets::ICON_CHEVRON_DOWN,
     };
 
     svg().path(path).size(px(16.)).text_color(color)
@@ -518,6 +522,8 @@ pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
         DatabaseKind::Turso => assets::LOGO_TURSO,
         DatabaseKind::CloudflareD1 => assets::LOGO_CLOUDFLARE_D1,
         DatabaseKind::ClickHouse => assets::LOGO_CLICKHOUSE,
+        DatabaseKind::SqlServer => assets::LOGO_SQLSERVER,
+        DatabaseKind::Snowflake => assets::LOGO_SNOWFLAKE,
     };
 
     svg().path(path).size(px(16.)).text_color(color)

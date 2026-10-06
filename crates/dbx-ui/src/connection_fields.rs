@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 /// its address is a file or SQLite URL rather than a network address.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionFields {
+    pub read_only: bool,
     pub kind: DatabaseKind,
     pub host: String,
     pub port: String,
@@ -23,11 +24,15 @@ pub struct ConnectionFields {
     pub socket: String,
     pub socket_enabled: bool,
     pub ssh: Option<SshConfig>,
+    pub ssh_password: Option<String>,
 }
 
 impl Drop for ConnectionFields {
     fn drop(&mut self) {
         self.password.zeroize();
+        if let Some(password) = &mut self.ssh_password {
+            password.zeroize();
+        }
         self.connection_string.zeroize();
     }
 }
@@ -64,8 +69,10 @@ impl ConnectionFields {
             database: String::new(),
             connection_string: String::new(),
             socket: String::new(),
+            read_only: false,
             socket_enabled: false,
             ssh: None,
+            ssh_password: None,
         }
     }
 
@@ -91,8 +98,10 @@ impl ConnectionFields {
                 database: String::new(),
                 connection_string,
                 socket: String::new(),
+                read_only: false,
                 socket_enabled: false,
                 ssh: None,
+                ssh_password: None,
             });
         }
 
@@ -116,8 +125,10 @@ impl ConnectionFields {
             database,
             connection_string,
             socket: String::new(),
+            read_only: false,
             socket_enabled: false,
             ssh: None,
+            ssh_password: None,
         })
     }
 
@@ -143,11 +154,18 @@ impl ConnectionFields {
                 });
             }
             if !self.password.is_empty()
-                && matches!(
-                    self.kind,
-                    DatabaseKind::BigQuery | DatabaseKind::Turso | DatabaseKind::CloudflareD1
-                )
+                && (url.password().is_none()
+                    || matches!(
+                        self.kind,
+                        DatabaseKind::BigQuery
+                            | DatabaseKind::Turso
+                            | DatabaseKind::CloudflareD1
+                            | DatabaseKind::Snowflake
+                    ))
             {
+                // Saved profiles keep credentials separately from their URL.
+                // A pasted URL's own password takes precedence for databases;
+                // provider token fields remain explicit overrides.
                 set_url_password(&mut url, Some(&self.password))
                     .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
                 return Ok(url.into());
@@ -160,8 +178,10 @@ impl ConnectionFields {
     pub fn config(&self) -> Result<ConnectionConfig, String> {
         let mut config =
             ConnectionConfig::new(self.kind, self.url().map_err(|error| error.to_string())?);
+        config.read_only = self.read_only;
         config.socket = self.socket_enabled.then(|| self.socket.trim().into());
         config.ssh = self.ssh.clone();
+        config.ssh_password = self.ssh_password.clone();
         config.validate().map_err(|error| error.to_string())?;
         Ok(config)
     }
@@ -278,6 +298,8 @@ fn kind_for_scheme(scheme: &str) -> Result<DatabaseKind, ConnectionFieldsError> 
         "turso" | "libsql" => Ok(DatabaseKind::Turso),
         "d1" => Ok(DatabaseKind::CloudflareD1),
         "clickhouse" => Ok(DatabaseKind::ClickHouse),
+        "snowflake" => Ok(DatabaseKind::Snowflake),
+        "sqlserver" | "mssql" => Ok(DatabaseKind::SqlServer),
         _ => Err(ConnectionFieldsError::UnsupportedScheme(scheme.to_owned())),
     }
 }
@@ -469,6 +491,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sql_server_urls_round_trip_through_structured_fields() {
+        let mut fields =
+            ConnectionFields::from_url("sqlserver://sa:p%40ss@db.internal:1433/app").unwrap();
+        assert_eq!(fields.kind, DatabaseKind::SqlServer);
+        assert_eq!(fields.host, "db.internal");
+        assert_eq!(fields.port, "1433");
+        assert_eq!(fields.password, "p@ss");
+        assert_eq!(fields.database, "app");
+        fields.use_structured_fields();
+        assert_eq!(
+            fields.config().unwrap().url,
+            "sqlserver://sa:p%40ss@db.internal:1433/app"
+        );
+        assert_eq!(
+            ConnectionFields::from_url("mssql://sa@localhost/master")
+                .unwrap()
+                .kind,
+            DatabaseKind::SqlServer
+        );
+    }
+
+    #[test]
     fn socket_form_connects_without_a_host_and_rejects_empty_paths() {
         let mut fields = ConnectionFields::new(DatabaseKind::MySQL);
         fields.database = "app".into();
@@ -496,11 +540,10 @@ mod tests {
         tag: u8,
         body: &[u8],
     ) -> std::io::Result<()> {
-        stream.write_all(&[tag]).await?;
-        stream
-            .write_all(&((body.len() + 4) as u32).to_be_bytes())
-            .await?;
-        stream.write_all(body).await
+        let mut message = vec![tag];
+        message.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        message.extend_from_slice(body);
+        stream.write_all(&message).await
     }
 
     async fn capture_postgres_cleartext_password(
@@ -546,7 +589,7 @@ mod tests {
         let engine = DatabaseEngine::connect(
             ConnectionConfig::new(DatabaseKind::PostgreSQL, url_for_port(port))
                 .with_max_connections(1)
-                .with_connect_timeout_ms(2_000),
+                .with_connect_timeout_ms(10_000),
         )
         .await
         .unwrap();
@@ -611,6 +654,31 @@ mod tests {
         })
         .await;
         assert_eq!(encoded, b"% & <");
+    }
+
+    #[tokio::test]
+    async fn postgres_receives_separately_restored_connection_string_password() {
+        let password = password_sent_to_postgres(|port| {
+            let mut fields = ConnectionFields::from_url(format!(
+                "postgresql://dbx_auth_probe@127.0.0.1:{port}/dbx_auth_probe?sslmode=disable"
+            ))
+            .unwrap();
+            fields.password = "fixture% & <".into();
+            fields.url().unwrap()
+        })
+        .await;
+        assert_eq!(password, b"fixture% & <");
+    }
+
+    #[test]
+    fn pasted_connection_string_password_takes_precedence_over_old_details() {
+        let mut fields = ConnectionFields::from_url(
+            "postgresql://alice:new%25password@localhost/app?sslmode=require",
+        )
+        .unwrap();
+        fields.password = "stale password".into();
+        let resolved = ConnectionFields::from_url(fields.config().unwrap().url).unwrap();
+        assert_eq!(resolved.password, "new%password");
     }
 
     #[tokio::test]

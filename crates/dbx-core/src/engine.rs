@@ -2,11 +2,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError, ExecResult, Filter,
-    InsertRequest, Order, Page, QueryResult, RelationalSchema, Result, SqlStatement, TableInfo,
-    TableRef, TableStructure, UpdateRequest, build_create_table, build_delete_with_columns,
-    build_drop_table, build_insert_with_columns, build_select_with_columns, build_truncate_table,
-    build_update_with_columns,
+    CellValue, ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError,
+    ExecResult, Filter, InsertRequest, Order, Page, QueryResult, RelationalSchema, Result,
+    SqlStatement, TableInfo, TableRef, TableStructure, UpdateRequest, build_create_table,
+    build_delete_with_columns, build_drop_table, build_insert_with_columns,
+    build_select_with_columns, build_truncate_table, build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
 
@@ -30,6 +30,9 @@ impl Default for QueryOptions {
 #[async_trait]
 pub trait Engine: Send + Sync {
     fn kind(&self) -> DatabaseKind;
+    fn is_read_only(&self) -> bool {
+        false
+    }
 
     async fn list_tables(&self) -> Result<Vec<TableInfo>>;
 
@@ -61,7 +64,12 @@ pub trait Engine: Send + Sync {
         Ok(TableStructure {
             columns: self.describe_table(table).await?,
             foreign_keys: Vec::new(),
+            ..Default::default()
         })
+    }
+
+    async fn schema_objects(&self) -> Result<Vec<crate::SchemaObject>> {
+        crate::schema_objects::capture(self).await
     }
 
     /// Load a complete relational metadata snapshot for the active database.
@@ -87,6 +95,9 @@ pub trait Engine: Send + Sync {
         Ok(RelationalSchema {
             database: self.current_database().await?,
             tables,
+            objects: self.schema_objects().await?,
+            objects_captured: true,
+            details_captured: true,
         })
     }
 
@@ -149,7 +160,13 @@ impl DatabaseEngine {
         } else if config.kind == DatabaseKind::Redis {
             Ok(Self::Redis(RedisEngine::connect(config).await?))
         } else {
-            Ok(Self::Other(crate::connectors::connect(config).await?))
+            let protected = config.read_only;
+            let engine = crate::connectors::connect(config).await?;
+            Ok(Self::Other(if protected {
+                Box::new(crate::protected::ProtectedEngine(engine))
+            } else {
+                engine
+            }))
         }
     }
 
@@ -159,6 +176,22 @@ impl DatabaseEngine {
             Self::Redis(engine) => engine.kind(),
             Self::Other(engine) => engine.kind(),
         }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Self::Sql(engine) => engine.is_read_only(),
+            Self::Redis(engine) => engine.is_read_only(),
+            Self::Other(engine) => engine.is_read_only(),
+        }
+    }
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        if self.is_read_only() {
+            return Err(DbxError::Query(
+                "Protected connection: writes are disabled".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Discover the Redis commands available on this connected server.
@@ -196,6 +229,10 @@ impl DatabaseEngine {
         Engine::table_structure(self, table).await
     }
 
+    pub async fn schema_objects(&self) -> Result<Vec<crate::SchemaObject>> {
+        Engine::schema_objects(self).await
+    }
+
     pub async fn relational_schema(&self) -> Result<RelationalSchema> {
         Engine::relational_schema(self).await
     }
@@ -224,6 +261,7 @@ impl DatabaseEngine {
     /// every statement succeeds. PostgreSQL and SQLite include transactional
     /// DDL; MySQL may implicitly commit DDL according to server semantics.
     pub async fn execute_transaction(&self, statements: &[String]) -> Result<()> {
+        self.ensure_writable()?;
         match self {
             Self::Sql(engine) => engine.execute_transaction(statements).await,
             _ => Err(DbxError::Unsupported {
@@ -337,12 +375,96 @@ impl DatabaseEngine {
     }
 
     pub async fn update(&self, request: &UpdateRequest) -> Result<ExecResult> {
+        self.update_checked(request, &[]).await
+    }
+
+    pub async fn update_checked(
+        &self,
+        request: &UpdateRequest,
+        originals: &[(String, CellValue)],
+    ) -> Result<ExecResult> {
         ensure_clickhouse_sql_writes(self.kind(), "update")?;
         ensure_sql(self.kind(), "update")?;
         let columns = self.describe_table(&request.table).await?;
         ensure_primary_key_filters(&columns, &request.filters)?;
-        let statement = build_update_with_columns(self.kind(), request, &columns)?;
-        self.execute(&statement).await
+        let mut statement = build_update_with_columns(self.kind(), request, &columns)?;
+        crate::sql::guard_original_values(self.kind(), &mut statement, originals, &columns)?;
+        let result = self.execute(&statement).await?;
+        if result.rows_affected != 1 {
+            return Err(DbxError::Conflict);
+        }
+        Ok(result)
+    }
+
+    /// Apply several checked updates as one unit. Each must still match its
+    /// original values and affect exactly one row. Native SQL engines run them
+    /// in one transaction, so a conflict rolls every update back; other
+    /// writable engines apply them in order and stop at the first failure.
+    pub async fn update_checked_batch(
+        &self,
+        updates: &[(UpdateRequest, Vec<(String, CellValue)>)],
+    ) -> Result<u64> {
+        ensure_clickhouse_sql_writes(self.kind(), "update")?;
+        ensure_sql(self.kind(), "update")?;
+        if !matches!(self, Self::Sql(_)) {
+            for (applied, (request, originals)) in updates.iter().enumerate() {
+                self.update_checked(request, originals)
+                    .await
+                    .map_err(|error| match applied {
+                        0 => error,
+                        applied => DbxError::Query(format!(
+                            "{error}; {applied} earlier row update(s) were already applied"
+                        )),
+                    })?;
+            }
+            return Ok(updates.len() as u64);
+        }
+        let mut described: Vec<(TableRef, Vec<ColumnInfo>)> = Vec::new();
+        let mut statements = Vec::with_capacity(updates.len());
+        for (request, originals) in updates {
+            let columns = match described.iter().find(|(table, _)| *table == request.table) {
+                Some((_, columns)) => columns.clone(),
+                None => {
+                    let columns = self.describe_table(&request.table).await?;
+                    described.push((request.table.clone(), columns.clone()));
+                    columns
+                }
+            };
+            ensure_primary_key_filters(&columns, &request.filters)?;
+            let mut statement = build_update_with_columns(self.kind(), request, &columns)?;
+            crate::sql::guard_original_values(self.kind(), &mut statement, originals, &columns)?;
+            statements.push(statement);
+        }
+        let mut transaction = crate::console::SqlTransaction::begin(self, false).await?;
+        for statement in &statements {
+            let result = transaction.query(statement).await?;
+            if result.rows_affected != Some(1) {
+                // Dropping the transaction closes its connection and rolls back.
+                return Err(DbxError::Conflict);
+            }
+        }
+        transaction.commit().await?;
+        Ok(statements.len() as u64)
+    }
+
+    /// Delete exactly one unchanged, primary-key identified row.
+    pub async fn delete_checked(
+        &self,
+        table: &TableRef,
+        filters: &[Filter],
+        originals: &[(String, CellValue)],
+    ) -> Result<ExecResult> {
+        ensure_sql(self.kind(), "delete")?;
+        ensure_clickhouse_sql_writes(self.kind(), "delete")?;
+        let columns = self.describe_table(table).await?;
+        ensure_primary_key_filters(&columns, filters)?;
+        let mut statement = build_delete_with_columns(self.kind(), table, filters, &columns)?;
+        crate::sql::guard_original_values(self.kind(), &mut statement, originals, &columns)?;
+        let result = self.execute(&statement).await?;
+        if result.rows_affected != 1 {
+            return Err(DbxError::Conflict);
+        }
+        Ok(result)
     }
 
     pub async fn delete(&self, table: &TableRef, filters: &[Filter]) -> Result<ExecResult> {
@@ -419,6 +541,7 @@ fn ensure_primary_key_filters(columns: &[ColumnInfo], filters: &[Filter]) -> Res
         || filters.iter().any(|filter| {
             filter.operator != crate::FilterOperator::Equals
                 || filter.value.is_none()
+                || filter.value == Some(CellValue::Null)
                 || !primary_keys.contains(&filter.column.as_str())
         })
         || primary_keys.iter().any(|column| {
@@ -440,6 +563,9 @@ fn ensure_primary_key_filters(columns: &[ColumnInfo], filters: &[Filter]) -> Res
 impl Engine for DatabaseEngine {
     fn kind(&self) -> DatabaseKind {
         self.kind()
+    }
+    fn is_read_only(&self) -> bool {
+        DatabaseEngine::is_read_only(self)
     }
 
     async fn list_tables(&self) -> Result<Vec<TableInfo>> {

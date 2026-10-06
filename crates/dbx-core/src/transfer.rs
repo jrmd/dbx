@@ -2,7 +2,7 @@
 //!
 //! Supported formats are SQL dumps (`.sql`), CSV (`.csv`), and TSV
 //! (`.tsv`), each optionally gzip-compressed with a `.gz` suffix. SQL dumps
-//! contain dialect-aware `INSERT` statements wrapped in a transaction; CSV
+//! contain dialect-aware `INSERT` statements; the importer owns its transaction. CSV
 //! and TSV carry one header row of column names followed by data rows.
 //!
 //! Delimited conventions shared by both directions:
@@ -15,19 +15,61 @@
 //!   nor TSV has a binary convention.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
+use crate::console::SqlTransaction;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+#[derive(Clone, Default)]
+pub struct TransferControl {
+    cancellation: crate::QueryCancellation,
+    rows: Arc<AtomicU64>,
+    statements: Arc<AtomicU64>,
+}
+impl TransferControl {
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+    pub fn progress(&self) -> (u64, u64) {
+        (
+            self.rows.load(Ordering::Relaxed),
+            self.statements.load(Ordering::Relaxed),
+        )
+    }
+}
+tokio::task_local! { static TRANSFER_CONTROL: TransferControl; }
+pub async fn with_transfer_control<T>(
+    control: TransferControl,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    TRANSFER_CONTROL.scope(control.clone(), async move {
+        tokio::select! {
+            biased;
+            _ = control.cancellation.cancelled() => Err(DbxError::Interrupted("Transfer cancelled. Uncommitted imports roll back and unfinished temporary files are removed. Previously completed export files remain.".into())),
+            result = work => result,
+        }
+    }).await
+}
+fn report_transfer(rows: u64, statements: u64) {
+    let _ = TRANSFER_CONTROL.try_with(|control| {
+        control.rows.fetch_add(rows, Ordering::Relaxed);
+        control.statements.fetch_add(statements, Ordering::Relaxed);
+    });
+}
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 use crate::{
     CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Page, QueryOptions, Result,
     TableRef, TableStructure,
-    sql::{build_multi_row_insert, quote_identifier, quote_table},
+    sql::{build_multi_row_insert_with_columns, quote_identifier, quote_table},
 };
 
 /// Rows fetched per page while exporting. Bounded so a large table streams
@@ -114,6 +156,7 @@ pub struct ExportSummary {
     pub rows_exported: u64,
     pub format: DumpFormat,
     pub gzipped: bool,
+    pub consistent_snapshot: bool,
 }
 
 /// A connection-level export request.
@@ -142,6 +185,174 @@ pub struct DatabaseExportSummary {
     pub format: DumpFormat,
     pub gzipped: bool,
     pub schema_only: bool,
+    pub consistent_snapshot: bool,
+}
+
+/// Output becomes visible only after the complete stream and gzip footer have
+/// been flushed. A failed/cancelled export leaves the previous file untouched.
+struct ExportFile {
+    temporary: tempfile::NamedTempFile,
+    destination: PathBuf,
+    writer: ExportWriter,
+}
+enum ExportWriter {
+    Plain(BufWriter<fs::File>),
+    Gzip(GzEncoder<BufWriter<fs::File>>),
+}
+impl ExportFile {
+    fn new(path: &Path, gzipped: bool) -> Result<Self> {
+        let temporary = tempfile::NamedTempFile::new_in(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .map_err(io_error)?;
+        let buffer = BufWriter::new(temporary.as_file().try_clone().map_err(io_error)?);
+        let writer = if gzipped {
+            ExportWriter::Gzip(GzEncoder::new(buffer, Compression::default()))
+        } else {
+            ExportWriter::Plain(buffer)
+        };
+        Ok(Self {
+            temporary,
+            destination: path.to_owned(),
+            writer,
+        })
+    }
+    fn finish(self) -> Result<()> {
+        let mut buffer = match self.writer {
+            ExportWriter::Plain(buffer) => buffer,
+            ExportWriter::Gzip(encoder) => encoder.finish().map_err(io_error)?,
+        };
+        buffer.flush().map_err(io_error)?;
+        buffer.get_ref().sync_all().map_err(io_error)?;
+        drop(buffer);
+        self.temporary
+            .persist(&self.destination)
+            .map_err(|error| io_error(error.error))?;
+        Ok(())
+    }
+}
+impl Write for ExportFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match &mut self.writer {
+            ExportWriter::Plain(writer) => writer.write(bytes),
+            ExportWriter::Gzip(writer) => writer.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.writer {
+            ExportWriter::Plain(writer) => writer.flush(),
+            ExportWriter::Gzip(writer) => writer.flush(),
+        }
+    }
+}
+
+struct ExportReader<'a> {
+    engine: &'a DatabaseEngine,
+    snapshot: Option<SqlTransaction>,
+    structures: Vec<(TableRef, TableStructure)>,
+}
+impl<'a> ExportReader<'a> {
+    async fn new(engine: &'a DatabaseEngine, tables: &[TableRef]) -> Result<Self> {
+        let mut structures = Vec::new();
+        for table in tables {
+            structures.push((table.clone(), engine.table_structure(table).await?));
+        }
+        let transactional = if engine.kind() == DatabaseKind::MySQL {
+            let mut all_transactional = true;
+            for table in tables {
+                all_transactional &= mysql_table_transactional(engine, table).await?;
+            }
+            all_transactional
+        } else {
+            true
+        };
+        let snapshot = if transactional && matches!(engine, DatabaseEngine::Sql(_)) {
+            Some(SqlTransaction::begin(engine, true).await?)
+        } else {
+            None
+        };
+        Ok(Self {
+            engine,
+            snapshot,
+            structures,
+        })
+    }
+    fn structure(&self, table: &TableRef) -> TableStructure {
+        self.structures
+            .iter()
+            .find(|(source, _)| source == table)
+            .unwrap()
+            .1
+            .clone()
+    }
+    async fn page(
+        &mut self,
+        table: &TableRef,
+        columns: &[ColumnInfo],
+        offset: u64,
+    ) -> Result<crate::QueryResult> {
+        let kind = self.engine.kind();
+        let mut order: Vec<crate::Order> = columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .map(|column| crate::Order {
+                column: column.name.clone(),
+                direction: crate::OrderDirection::Ascending,
+            })
+            .collect();
+        let has_primary_key = !order.is_empty();
+        if !has_primary_key {
+            order = columns
+                .iter()
+                .map(|column| crate::Order {
+                    column: column.name.clone(),
+                    direction: crate::OrderDirection::Ascending,
+                })
+                .collect();
+        }
+        let names = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let page = Some(Page {
+            limit: EXPORT_PAGE_SIZE as u32,
+            offset,
+        });
+        if let Some(snapshot) = &mut self.snapshot {
+            let mut statement =
+                crate::build_select_with_columns(kind, table, &names, &[], &order, page, columns)?;
+            if !has_primary_key && kind.dialect() == DatabaseKind::PostgreSQL {
+                for column in columns {
+                    let identifier = quote_identifier(kind, &column.name)?;
+                    statement.sql = statement.sql.replace(
+                        &format!("{identifier} ASC"),
+                        &format!("CAST({identifier} AS text) ASC"),
+                    );
+                }
+            }
+            snapshot.query(&statement).await
+        } else {
+            self.engine
+                .query_table_with_columns(
+                    table,
+                    &names,
+                    &[],
+                    &order,
+                    page,
+                    QueryOptions { max_rows: None },
+                    Some(columns),
+                )
+                .await
+        }
+    }
+    async fn finish(mut self) -> Result<()> {
+        if let Some(snapshot) = self.snapshot.take() {
+            snapshot.commit().await?;
+        }
+        Ok(())
+    }
 }
 
 struct PreparedExportTable {
@@ -171,6 +382,18 @@ pub async fn export_table(
     table: &TableRef,
     path: &Path,
 ) -> Result<ExportSummary> {
+    let mut reader = ExportReader::new(engine, std::slice::from_ref(table)).await?;
+    let summary = export_table_with_reader(&mut reader, table, path).await?;
+    reader.finish().await?;
+    Ok(summary)
+}
+
+async fn export_table_with_reader(
+    reader: &mut ExportReader<'_>,
+    table: &TableRef,
+    path: &Path,
+) -> Result<ExportSummary> {
+    let engine = reader.engine;
     let kind = engine.kind();
     if !kind.is_sql() {
         return Err(DbxError::Unsupported {
@@ -179,16 +402,18 @@ pub async fn export_table(
         });
     }
     let file_format = detect_file_format(path)?;
-    if kind == DatabaseKind::ClickHouse && file_format.format == DumpFormat::Sql {
+    if matches!(kind, DatabaseKind::ClickHouse | DatabaseKind::SqlServer)
+        && file_format.format == DumpFormat::Sql
+    {
         return Err(DbxError::Unsupported {
-            operation: "ClickHouse SQL dump export; use CSV or TSV".into(),
+            operation: format!("{kind} SQL dump export; use CSV or TSV"),
             kind,
         });
     }
-    let columns = engine.describe_table(table).await?;
+    let columns = reader.structure(table).columns;
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
 
-    let mut output = Vec::<u8>::new();
+    let mut output = ExportFile::new(path, file_format.gzipped)?;
     match file_format.format {
         DumpFormat::Sql => write_sql_dump_header(&mut output, kind, table)?,
         DumpFormat::Csv | DumpFormat::Tsv => {
@@ -204,25 +429,13 @@ pub async fn export_table(
     let mut rows_exported = 0u64;
     let mut offset = 0u64;
     loop {
-        let result = engine
-            .query_table(
-                table,
-                &[],
-                &[],
-                &[],
-                Some(Page {
-                    limit: EXPORT_PAGE_SIZE as u32,
-                    offset,
-                }),
-                QueryOptions { max_rows: None },
-            )
-            .await?;
+        let result = reader.page(table, &columns, offset).await?;
         for row in &result.rows {
             match file_format.format {
                 DumpFormat::Sql => {
                     let statement = render_sql_insert(kind, table, &column_names, &row.values)?;
-                    output.extend_from_slice(statement.as_bytes());
-                    output.extend_from_slice(b";\n");
+                    output.write_all(statement.as_bytes()).map_err(io_error)?;
+                    output.write_all(b";\n").map_err(io_error)?;
                 }
                 DumpFormat::Csv | DumpFormat::Tsv => {
                     let delimiter = file_format.format.delimiter().unwrap_or(b',');
@@ -236,6 +449,7 @@ pub async fn export_table(
         }
         let page_rows = result.rows.len();
         rows_exported += page_rows as u64;
+        report_transfer(page_rows as u64, 0);
         offset += page_rows as u64;
         if page_rows < EXPORT_PAGE_SIZE {
             break;
@@ -243,21 +457,13 @@ pub async fn export_table(
     }
 
     let gzipped = file_format.gzipped;
-    let bytes = if gzipped {
-        gzip_encode(output)?
-    } else {
-        output
-    };
-    let target: PathBuf = path.to_owned();
-    tokio::task::spawn_blocking(move || fs::write(target, bytes))
-        .await
-        .map_err(|error| DbxError::Io(error.to_string()))?
-        .map_err(|error| DbxError::Io(error.to_string()))?;
+    output.finish()?;
 
     Ok(ExportSummary {
         rows_exported,
         format: file_format.format,
         gzipped,
+        consistent_snapshot: reader.snapshot.is_some(),
     })
 }
 
@@ -286,9 +492,11 @@ pub async fn export_database(
             "database export requires at least one table".into(),
         ));
     }
-    if kind == DatabaseKind::ClickHouse && request.format == DumpFormat::Sql {
+    if matches!(kind, DatabaseKind::ClickHouse | DatabaseKind::SqlServer)
+        && request.format == DumpFormat::Sql
+    {
         return Err(DbxError::Unsupported {
-            operation: "ClickHouse SQL dump export; use CSV or TSV".into(),
+            operation: format!("{kind} SQL dump export; use CSV or TSV"),
             kind,
         });
     }
@@ -301,6 +509,59 @@ pub async fn export_database(
     validate_output_directory(&request.output_directory)?;
     let stem = normalize_output_stem(&request.output_name)?;
 
+    let schema_objects = if request.format == DumpFormat::Sql {
+        engine.schema_objects().await?
+    } else {
+        Vec::new()
+    };
+    let schema_objects = schema_objects
+        .into_iter()
+        .filter(|object| {
+            request
+                .tables
+                .iter()
+                .any(|table| table.schema == object.schema || object.schema.is_none())
+                && object
+                    .table
+                    .as_ref()
+                    .is_none_or(|name| request.tables.iter().any(|table| table.name == *name))
+        })
+        .collect::<Vec<_>>();
+    let mut view_definitions = Vec::new();
+    if request.format == DumpFormat::Sql {
+        for view in engine.list_tables().await?.iter().filter(|table| {
+            table.kind == crate::EntityKind::View
+                && request
+                    .tables
+                    .iter()
+                    .any(|selected| selected.schema == table.schema)
+        }) {
+            let table = TableRef {
+                schema: view.schema.clone(),
+                name: view.name.clone(),
+            };
+            let structure = engine.table_structure(&table).await?;
+            let definition = structure.definition.ok_or_else(|| {
+                DbxError::Query(format!(
+                    "Cannot export the definition of view {}",
+                    view.name
+                ))
+            })?;
+            let definition = if definition
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CREATE ")
+            {
+                definition
+            } else {
+                format!("CREATE VIEW {} AS {definition}", quote_table(kind, &table)?)
+            };
+            view_definitions.push((table, definition));
+        }
+    }
+    let view_definitions = order_export_views(engine, view_definitions, &request.tables).await?;
+    let mut reader = ExportReader::new(engine, &request.tables).await?;
+    let consistent_snapshot = reader.snapshot.is_some();
     if request.format == DumpFormat::Sql {
         // Snapshot every structure before writing any output. This lets the
         // dump emit a complete schema phase before it starts querying rows.
@@ -308,31 +569,60 @@ pub async fn export_database(
         for table in &request.tables {
             export_tables.push(PreparedExportTable {
                 table: table.clone(),
-                structure: engine.table_structure(table).await?,
+                structure: reader.structure(table),
             });
         }
         let table_order = table_export_order(&export_tables);
-        let mut output = Vec::new();
-        output.extend_from_slice(b"-- DBX database dump\n");
-        output.extend_from_slice(
-            format!(
-                "-- Tables: {}\n{}\n",
-                request.tables.len(),
-                if request.schema_only {
-                    "-- Schema only"
-                } else {
-                    "-- Schema and data"
-                }
+        let path =
+            request
+                .output_directory
+                .join(with_extension(&stem, DumpFormat::Sql, request.gzipped));
+        let mut output = ExportFile::new(&path, request.gzipped)?;
+        output
+            .write_all(b"-- DBX database dump\n")
+            .map_err(io_error)?;
+        output
+            .write_all(
+                format!(
+                    "-- Tables: {}\n{}\n",
+                    request.tables.len(),
+                    if request.schema_only {
+                        "-- Schema only"
+                    } else {
+                        "-- Schema and data"
+                    }
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .map_err(io_error)?;
         append_database_prelude(kind, &request.tables, &table_order, &mut output)?;
-        output.extend_from_slice(b"\n-- Schema\n");
+        if kind == DatabaseKind::PostgreSQL {
+            output
+                .write_all(b"SET check_function_bodies = false;\n")
+                .map_err(io_error)?;
+        }
+        for object in schema_objects.iter().filter(|object| {
+            matches!(
+                object.kind,
+                crate::SchemaObjectKind::Sequence
+                    | crate::SchemaObjectKind::Function
+                    | crate::SchemaObjectKind::Procedure
+            )
+        }) {
+            append_schema_object(kind, object, &mut output)?;
+        }
+        output.write_all(b"\n-- Schema\n").map_err(io_error)?;
         for &index in &table_order {
             let export_table = &export_tables[index];
-            output.extend_from_slice(
-                format!("-- Table: {}\n", quote_table(kind, &export_table.table)?).as_bytes(),
-            );
+            output
+                .write_all(
+                    format!(
+                        "-- Table: {}\n",
+                        comment_label(&quote_table(kind, &export_table.table)?)
+                    )
+                    .as_bytes(),
+                )
+                .map_err(io_error)?;
             let schema = if kind.dialect() == DatabaseKind::SQLite {
                 render_sql_schema(
                     kind,
@@ -348,25 +638,39 @@ pub async fn export_database(
                     &request.tables,
                 )?
             };
-            output.extend_from_slice(schema.as_bytes());
-            output.extend_from_slice(b";\n");
-            output.push(b'\n');
+            output.write_all(schema.as_bytes()).map_err(io_error)?;
+            output.write_all(b";\n").map_err(io_error)?;
+            for statement in render_sql_indexes(kind, &export_table.table, &export_table.structure)?
+            {
+                output.write_all(statement.as_bytes()).map_err(io_error)?;
+                if !statement.starts_with("--") {
+                    output.write_all(b";").map_err(io_error)?;
+                }
+                output.write_all(b"\n").map_err(io_error)?;
+            }
+            output.write_all(b"\n").map_err(io_error)?;
         }
 
         let mut rows_exported = 0u64;
         if !request.schema_only {
-            output.extend_from_slice(b"-- Data\n");
+            output.write_all(b"-- Data\n").map_err(io_error)?;
             for &index in &table_order {
                 let export_table = &export_tables[index];
                 rows_exported += append_sql_table_data(
-                    engine,
+                    &mut reader,
                     kind,
                     &export_table.table,
                     &export_table.structure.columns,
                     &mut output,
                 )
                 .await?;
-                output.push(b'\n');
+                for statement in
+                    render_sql_sequence_resets(kind, &export_table.table, &export_table.structure)?
+                {
+                    output.write_all(statement.as_bytes()).map_err(io_error)?;
+                    output.write_all(b";\n").map_err(io_error)?;
+                }
+                output.write_all(b"\n").map_err(io_error)?;
             }
         }
 
@@ -375,7 +679,9 @@ pub async fn export_database(
         // them after the data phase, which also handles cycles and arbitrary
         // selection order without disabling referential checks.
         if kind.dialect() != DatabaseKind::SQLite {
-            output.extend_from_slice(b"-- Foreign-key constraints\n");
+            output
+                .write_all(b"-- Foreign-key constraints\n")
+                .map_err(io_error)?;
             for &index in &table_order {
                 append_sql_foreign_keys(
                     kind,
@@ -385,19 +691,23 @@ pub async fn export_database(
                     &mut output,
                 )?;
             }
-            output.push(b'\n');
+            output.write_all(b"\n").map_err(io_error)?;
         }
 
-        let path =
-            request
-                .output_directory
-                .join(with_extension(&stem, DumpFormat::Sql, request.gzipped));
-        let bytes = if request.gzipped {
-            gzip_encode(output)?
-        } else {
+        // Install triggers after copying data so restore does not fire them.
+        for object in schema_objects
+            .iter()
+            .filter(|object| object.kind == crate::SchemaObjectKind::Trigger)
+        {
+            append_schema_object(kind, object, &mut output)?;
+        }
+        for (_, definition) in view_definitions {
             output
-        };
-        write_export_file(path, bytes).await?;
+                .write_all(format!("\n{definition};\n").as_bytes())
+                .map_err(io_error)?;
+        }
+        reader.finish().await?;
+        output.finish()?;
         return Ok(DatabaseExportSummary {
             tables_exported: request.tables.len() as u64,
             files_written: 1,
@@ -405,6 +715,7 @@ pub async fn export_database(
             format: request.format,
             gzipped: request.gzipped,
             schema_only: request.schema_only,
+            consistent_snapshot,
         });
     }
 
@@ -417,10 +728,11 @@ pub async fn export_database(
             request.format,
             request.gzipped,
         ));
-        let summary = export_table(engine, table, &path).await?;
+        let summary = export_table_with_reader(&mut reader, table, &path).await?;
         rows_exported += summary.rows_exported;
     }
 
+    reader.finish().await?;
     Ok(DatabaseExportSummary {
         tables_exported: request.tables.len() as u64,
         files_written: request.tables.len() as u64,
@@ -428,6 +740,7 @@ pub async fn export_database(
         format: request.format,
         gzipped: request.gzipped,
         schema_only: false,
+        consistent_snapshot,
     })
 }
 
@@ -435,7 +748,7 @@ fn append_database_prelude(
     kind: DatabaseKind,
     tables: &[TableRef],
     table_order: &[usize],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
 ) -> Result<()> {
     if kind.dialect() == DatabaseKind::PostgreSQL {
         let schemas: BTreeSet<&str> = tables
@@ -443,20 +756,24 @@ fn append_database_prelude(
             .filter_map(|table| table.schema.as_deref())
             .collect();
         if !schemas.is_empty() {
-            output.extend_from_slice(b"\n-- Schemas\n");
+            output.write_all(b"\n-- Schemas\n").map_err(io_error)?;
             for schema in schemas {
-                output.extend_from_slice(
-                    format!(
-                        "CREATE SCHEMA IF NOT EXISTS {};\n",
-                        quote_identifier(kind, schema)?
+                output
+                    .write_all(
+                        format!(
+                            "CREATE SCHEMA IF NOT EXISTS {};\n",
+                            quote_identifier(kind, schema)?
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                );
+                    .map_err(io_error)?;
             }
         }
     }
 
-    output.extend_from_slice(b"\n-- Replace existing tables\n");
+    output
+        .write_all(b"\n-- Replace existing tables\n")
+        .map_err(io_error)?;
     let reverse_order: Vec<&TableRef> = table_order
         .iter()
         .rev()
@@ -464,9 +781,11 @@ fn append_database_prelude(
         .collect();
     if kind.dialect() == DatabaseKind::SQLite {
         for table in reverse_order {
-            output.extend_from_slice(
-                format!("DROP TABLE IF EXISTS {};\n", quote_table(kind, table)?).as_bytes(),
-            );
+            output
+                .write_all(
+                    format!("DROP TABLE IF EXISTS {};\n", quote_table(kind, table)?).as_bytes(),
+                )
+                .map_err(io_error)?;
         }
     } else {
         let quoted = reverse_order
@@ -474,7 +793,8 @@ fn append_database_prelude(
             .map(|table| quote_table(kind, table))
             .collect::<Result<Vec<_>>>()?;
         output
-            .extend_from_slice(format!("DROP TABLE IF EXISTS {};\n", quoted.join(", ")).as_bytes());
+            .write_all(format!("DROP TABLE IF EXISTS {};\n", quoted.join(", ")).as_bytes())
+            .map_err(io_error)?;
     }
     Ok(())
 }
@@ -493,9 +813,10 @@ pub async fn import_database(engine: &DatabaseEngine, path: &Path) -> Result<Imp
 
 /// Render a portable `CREATE TABLE` statement from DBX's normalized metadata.
 ///
-/// Defaults, generated expressions, and indexes are not currently part of
-/// [`TableStructure`], so the output intentionally includes only columns,
-/// primary keys, and foreign keys that DBX can verify from metadata.
+/// The statement includes columns, defaults, primary keys, check constraints,
+/// and foreign keys. Indexes are separate statements from
+/// [`render_sql_indexes`]. Generated expressions, triggers, and grants are not
+/// part of [`TableStructure`].
 pub fn render_sql_schema(
     kind: DatabaseKind,
     table: &TableRef,
@@ -505,7 +826,7 @@ pub fn render_sql_schema(
     render_sql_schema_with_foreign_keys(kind, table, structure, selected_tables, true)
 }
 
-fn render_sql_schema_without_foreign_keys(
+pub(crate) fn render_sql_schema_without_foreign_keys(
     kind: DatabaseKind,
     table: &TableRef,
     structure: &TableStructure,
@@ -536,11 +857,18 @@ fn render_sql_schema_with_foreign_keys(
 
     let mut definitions = Vec::new();
     for column in &structure.columns {
-        let mut definition = format!(
-            "{} {}",
-            quote_identifier(kind, &column.name)?,
-            safe_schema_type(&column.data_type)?
-        );
+        let (data_type, default) = match postgres_serial_type(kind, column) {
+            Some(serial) => (serial.to_owned(), None),
+            None => (
+                safe_schema_type(&column.data_type)?,
+                column.default_value.as_deref(),
+            ),
+        };
+        let mut definition = format!("{} {}", quote_identifier(kind, &column.name)?, data_type);
+        if let Some(default) = default {
+            definition.push_str(" DEFAULT ");
+            definition.push_str(safe_schema_expression(default)?);
+        }
         if !column.nullable {
             definition.push_str(" NOT NULL");
         }
@@ -555,6 +883,19 @@ fn render_sql_schema_with_foreign_keys(
         .collect::<Result<Vec<_>>>()?;
     if !primary_keys.is_empty() {
         definitions.push(format!("PRIMARY KEY ({})", primary_keys.join(", ")));
+    }
+
+    for check in &structure.checks {
+        let mut definition = String::new();
+        if let Some(name) = &check.name {
+            definition.push_str("CONSTRAINT ");
+            definition.push_str(&quote_identifier(kind, name)?);
+            definition.push(' ');
+        }
+        definition.push_str("CHECK (");
+        definition.push_str(safe_schema_expression(&check.expression)?);
+        definition.push(')');
+        definitions.push(definition);
     }
 
     for foreign_key in &structure.foreign_keys {
@@ -581,6 +922,181 @@ fn render_sql_schema_with_foreign_keys(
     }
     statement.push_str("\n)");
     Ok(statement)
+}
+
+/// PostgreSQL `nextval(...)` defaults point at sequences owned by the column,
+/// which a dump's `DROP TABLE` removes. Recreate them as serial types.
+fn postgres_serial_type(kind: DatabaseKind, column: &ColumnInfo) -> Option<&'static str> {
+    if kind != DatabaseKind::PostgreSQL
+        || !column
+            .default_value
+            .as_deref()
+            .is_some_and(|default| default.trim_start().starts_with("nextval("))
+    {
+        return None;
+    }
+    match column.data_type.trim().to_ascii_lowercase().as_str() {
+        "integer" | "int" | "int4" => Some("serial"),
+        "bigint" | "int8" => Some("bigserial"),
+        "smallint" | "int2" => Some("smallserial"),
+        _ => None,
+    }
+}
+
+/// Statements that move recreated serial sequences past the imported rows.
+pub(crate) fn render_sql_sequence_resets(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+) -> Result<Vec<String>> {
+    let quoted_table = quote_table(kind, table)?;
+    let literal_table = quoted_table.replace('\'', "''");
+    structure
+        .columns
+        .iter()
+        .filter(|column| postgres_serial_type(kind, column).is_some())
+        .map(|column| {
+            let column_name = quote_identifier(kind, &column.name)?;
+            Ok(format!(
+                "SELECT setval(pg_get_serial_sequence('{literal_table}', '{}'), COALESCE((SELECT MAX({column_name}) FROM {quoted_table}), 0) + 1, false)",
+                column.name.replace('\'', "''")
+            ))
+        })
+        .collect()
+}
+
+/// Render `CREATE INDEX` statements for a table's secondary indexes. Primary
+/// keys are part of `CREATE TABLE`. MySQL functional indexes cannot be
+/// reconstructed from its catalog and are emitted as comments.
+pub fn render_sql_indexes(
+    kind: DatabaseKind,
+    table: &TableRef,
+    structure: &TableStructure,
+) -> Result<Vec<String>> {
+    let mut statements = Vec::new();
+    for index in structure.indexes.iter().filter(|index| !index.primary) {
+        if let Some(definition) = index.definition.as_deref() {
+            let definition = safe_schema_expression(definition)?;
+            if kind.dialect() == DatabaseKind::MySQL {
+                statements.push(definition.to_owned());
+                continue;
+            }
+            let statement = ["CREATE UNIQUE INDEX ", "CREATE INDEX "]
+                .into_iter()
+                .find_map(|prefix| {
+                    let rest = definition.strip_prefix(prefix)?;
+                    let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+                    Some(format!("{prefix}IF NOT EXISTS {rest}"))
+                })
+                .ok_or_else(|| {
+                    DbxError::Parse(format!("unexpected index definition for `{}`", index.name))
+                })?;
+            statements.push(statement);
+            continue;
+        }
+        let mut parts = Vec::with_capacity(index.columns.len());
+        for part in &index.columns {
+            let (column, descending) = match part.strip_suffix(" DESC") {
+                Some(column) => (column, true),
+                None => (part.as_str(), false),
+            };
+            let (column, length) = match column
+                .strip_suffix(')')
+                .and_then(|rest| rest.rsplit_once('('))
+                .filter(|(_, length)| {
+                    !length.is_empty() && length.bytes().all(|byte| byte.is_ascii_digit())
+                }) {
+                Some((column, length)) => (column, Some(length)),
+                None => (column, None),
+            };
+            if column == "(expression)" {
+                parts.clear();
+                break;
+            }
+            let mut rendered = quote_identifier(kind, column)?;
+            if let Some(length) = length {
+                rendered.push_str(&format!("({length})"));
+            }
+            if descending {
+                rendered.push_str(" DESC");
+            }
+            parts.push(rendered);
+        }
+        if parts.is_empty() {
+            statements.push(format!(
+                "-- Index {} uses expressions; recreate it manually",
+                comment_label(&index.name)
+            ));
+            continue;
+        }
+        // SQLite reserves `sqlite_` names for its automatic UNIQUE indexes.
+        let name = match index.name.strip_prefix("sqlite_autoindex_") {
+            Some(_) => format!(
+                "{}_{}_key",
+                table.name,
+                index.columns.join("_").replace(" DESC", "")
+            ),
+            None => index.name.clone(),
+        };
+        let kind_prefix = match index.method.as_deref() {
+            Some("FULLTEXT") if kind.dialect() == DatabaseKind::MySQL => "FULLTEXT ",
+            Some("SPATIAL") if kind.dialect() == DatabaseKind::MySQL => "SPATIAL ",
+            _ if index.unique => "UNIQUE ",
+            _ => "",
+        };
+        // MySQL has no `IF NOT EXISTS` for indexes; the table is new anyway.
+        let if_not_exists = if kind.dialect() == DatabaseKind::MySQL {
+            ""
+        } else {
+            "IF NOT EXISTS "
+        };
+        statements.push(format!(
+            "CREATE {kind_prefix}INDEX {if_not_exists}{} ON {} ({})",
+            quote_identifier(kind, &name)?,
+            quote_table(kind, table)?,
+            parts.join(", ")
+        ));
+    }
+    Ok(statements)
+}
+
+/// Accept a catalog-produced SQL expression only when it is one statement
+/// fragment: balanced quotes and parentheses, with no terminator or comment
+/// outside a literal.
+pub(crate) fn safe_schema_expression(expression: &str) -> Result<&str> {
+    let expression = expression.trim();
+    let invalid = || DbxError::Parse(format!("invalid metadata expression `{expression}`"));
+    if expression.is_empty() || expression.contains('\0') {
+        return Err(invalid());
+    }
+    let mut quote = None;
+    let mut depth = 0i32;
+    let mut previous = '\0';
+    for character in expression.chars() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None => match character {
+                '\'' | '"' | '`' => quote = Some(character),
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(invalid());
+                    }
+                }
+                ';' => return Err(invalid()),
+                '-' if previous == '-' => return Err(invalid()),
+                '*' if previous == '/' => return Err(invalid()),
+                _ => {}
+            },
+        }
+        previous = character;
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(invalid());
+    }
+    Ok(expression)
 }
 
 fn render_sql_foreign_key_definition(
@@ -646,12 +1162,12 @@ fn render_sql_foreign_key_definition(
     Ok(Some(definition))
 }
 
-fn append_sql_foreign_keys(
+pub(crate) fn append_sql_foreign_keys(
     kind: DatabaseKind,
     table: &TableRef,
     structure: &TableStructure,
     selected_tables: &[TableRef],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
 ) -> Result<()> {
     for foreign_key in &structure.foreign_keys {
         let Some(definition) =
@@ -659,14 +1175,16 @@ fn append_sql_foreign_keys(
         else {
             continue;
         };
-        output.extend_from_slice(
-            format!(
-                "ALTER TABLE {} ADD {};\n",
-                quote_table(kind, table)?,
-                definition
+        output
+            .write_all(
+                format!(
+                    "ALTER TABLE {} ADD {};\n",
+                    quote_table(kind, table)?,
+                    definition
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .map_err(io_error)?;
     }
     Ok(())
 }
@@ -731,37 +1249,26 @@ fn table_export_order(tables: &[PreparedExportTable]) -> Vec<usize> {
 }
 
 async fn append_sql_table_data(
-    engine: &DatabaseEngine,
+    reader: &mut ExportReader<'_>,
     kind: DatabaseKind,
     table: &TableRef,
     columns: &[ColumnInfo],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
 ) -> Result<u64> {
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
     let mut rows_exported = 0u64;
     let mut offset = 0u64;
     loop {
-        let result = engine
-            .query_table(
-                table,
-                &[],
-                &[],
-                &[],
-                Some(Page {
-                    limit: EXPORT_PAGE_SIZE as u32,
-                    offset,
-                }),
-                QueryOptions { max_rows: None },
-            )
-            .await?;
+        let result = reader.page(table, columns, offset).await?;
         for row in &result.rows {
-            output.extend_from_slice(
-                render_sql_insert(kind, table, &column_names, &row.values)?.as_bytes(),
-            );
-            output.extend_from_slice(b";\n");
+            output
+                .write_all(render_sql_insert(kind, table, &column_names, &row.values)?.as_bytes())
+                .map_err(io_error)?;
+            output.write_all(b";\n").map_err(io_error)?;
         }
         let page_rows = result.rows.len();
         rows_exported += page_rows as u64;
+        report_transfer(page_rows as u64, 0);
         offset += page_rows as u64;
         if page_rows < EXPORT_PAGE_SIZE {
             break;
@@ -834,18 +1341,11 @@ fn transfer_file_stem(table: &TableRef) -> String {
     }
 }
 
-async fn write_export_file(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
-    tokio::task::spawn_blocking(move || fs::write(path, bytes))
-        .await
-        .map_err(|error| DbxError::Io(error.to_string()))?
-        .map_err(|error| DbxError::Io(error.to_string()))
-}
-
 /// Accept a catalog type spelling (`numeric(10,2)`, `int unsigned`,
 /// `enum('a','b')`, `"Mixed Case"`) for a generated `CREATE TABLE`. Quoted
 /// labels and identifiers may contain spaces and punctuation, but nothing
 /// outside them may end the statement or open a comment.
-fn safe_schema_type(data_type: &str) -> Result<String> {
+pub(crate) fn safe_schema_type(data_type: &str) -> Result<String> {
     let data_type = data_type.trim();
     let invalid = || DbxError::Parse(format!("invalid metadata column type `{data_type}`"));
     if data_type.is_empty()
@@ -886,14 +1386,31 @@ fn referential_action_sql(action: crate::ReferentialAction) -> &'static str {
     }
 }
 
-fn write_sql_dump_header(output: &mut Vec<u8>, kind: DatabaseKind, table: &TableRef) -> Result<()> {
+fn write_sql_dump_header(
+    output: &mut impl Write,
+    kind: DatabaseKind,
+    table: &TableRef,
+) -> Result<()> {
     let qualified = quote_table(kind, table)?;
-    output.extend_from_slice(b"-- DBX table dump\n");
-    output.extend_from_slice(format!("-- Source: {qualified}\n").as_bytes());
-    // Statements deliberately stay outside an explicit transaction: imports
-    // replay through a connection pool where BEGIN/COMMIT would land on
-    // whichever connection executes each statement.
+    output.write_all(b"-- DBX table dump\n").map_err(io_error)?;
+    output
+        .write_all(format!("-- Source: {}\n", comment_label(&qualified)).as_bytes())
+        .map_err(io_error)?;
+    // DBX owns the transaction when importing this dump.
     Ok(())
+}
+
+fn comment_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Render one row as the body of an `INSERT` statement without its trailing
@@ -926,6 +1443,117 @@ pub fn render_sql_insert(
     }
     statement.push(')');
     Ok(statement)
+}
+
+async fn order_export_views(
+    engine: &DatabaseEngine,
+    mut views: Vec<(TableRef, String)>,
+    selected: &[TableRef],
+) -> Result<Vec<(TableRef, String)>> {
+    if views.is_empty() {
+        return Ok(views);
+    }
+    let sql = match engine.kind() {
+        DatabaseKind::PostgreSQL => {
+            "SELECT vn.nspname, v.relname, rn.nspname, r.relname FROM pg_rewrite rw JOIN pg_class v ON v.oid=rw.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_depend d ON d.objid=rw.oid AND d.classid='pg_rewrite'::regclass AND d.refclassid='pg_class'::regclass JOIN pg_class r ON r.oid=d.refobjid JOIN pg_namespace rn ON rn.oid=r.relnamespace WHERE v.relkind='v' AND r.oid<>v.oid AND r.relkind IN ('r','p','v','m') AND vn.nspname NOT IN ('pg_catalog','information_schema')"
+        }
+        DatabaseKind::MySQL => {
+            "SELECT VIEW_SCHEMA, VIEW_NAME, TABLE_SCHEMA, TABLE_NAME FROM information_schema.VIEW_TABLE_USAGE WHERE VIEW_SCHEMA=DATABASE()"
+        }
+        _ => return Ok(views),
+    };
+    let result = engine.query(sql, QueryOptions { max_rows: None }).await?;
+    let mut dependencies: HashMap<TableRef, Vec<TableRef>> = HashMap::new();
+    for row in result.rows {
+        if row.values.len() != 4 {
+            return Err(DbxError::Decode("Invalid view dependency metadata".into()));
+        }
+        dependencies
+            .entry(TableRef::in_schema(
+                row.values[0].to_string(),
+                row.values[1].to_string(),
+            ))
+            .or_default()
+            .push(TableRef::in_schema(
+                row.values[2].to_string(),
+                row.values[3].to_string(),
+            ));
+    }
+    let included = views
+        .iter()
+        .map(|(view, _)| view.clone())
+        .collect::<Vec<_>>();
+    // A table-scoped dump cannot recreate views referring to omitted tables.
+    // Full database selections retain every view with captured dependencies.
+    loop {
+        let previous = views.len();
+        let current = views
+            .iter()
+            .map(|(view, _)| view.clone())
+            .collect::<Vec<_>>();
+        views.retain(|(view, _)| {
+            dependencies.get(view).is_none_or(|references| {
+                references.iter().all(|reference| {
+                    selected.contains(reference)
+                        || current.contains(reference)
+                        || reference.schema.as_deref() == Some("pg_catalog")
+                })
+            })
+        });
+        if views.len() == previous {
+            break;
+        }
+    }
+    let mut ordered = Vec::new();
+    while !views.is_empty() {
+        let ready = views.iter().position(|(view, _)| {
+            dependencies.get(view).is_none_or(|references| {
+                references.iter().all(|reference| {
+                    !included.contains(reference)
+                        || ordered.iter().any(|(ready, _)| ready == reference)
+                })
+            })
+        });
+        let Some(index) = ready else {
+            return Err(DbxError::Query(
+                "View dependencies cannot be ordered; export the views separately".into(),
+            ));
+        };
+        ordered.push(views.remove(index));
+    }
+    Ok(ordered)
+}
+
+fn append_schema_object(
+    kind: DatabaseKind,
+    object: &crate::SchemaObject,
+    output: &mut ExportFile,
+) -> Result<()> {
+    let definition = object.definition.as_ref().ok_or_else(|| {
+        DbxError::Query(format!("Cannot export the definition of {}", object.name))
+    })?;
+    if kind == DatabaseKind::MySQL {
+        let delimiter = "__DBX_ROUTINE_END__";
+        if definition.contains(delimiter) {
+            return Err(DbxError::Parse(
+                "Routine contains the dump delimiter".into(),
+            ));
+        }
+        output
+            .write_all(
+                format!(
+                    "\nDELIMITER {delimiter}\n{}{delimiter}\nDELIMITER ;\n",
+                    definition.trim_end_matches(';')
+                )
+                .as_bytes(),
+            )
+            .map_err(io_error)?;
+    } else {
+        output
+            .write_all(format!("\n{};\n", definition.trim_end_matches(';')).as_bytes())
+            .map_err(io_error)?;
+    }
+    Ok(())
 }
 
 fn render_sql_literal(kind: DatabaseKind, value: &CellValue) -> Result<String> {
@@ -991,9 +1619,8 @@ fn quote_sql_text(kind: DatabaseKind, value: &str) -> String {
 /// replace tables themselves; `target` is unused for them. CSV and TSV files
 /// append rows to `target`, which must be provided.
 ///
-/// The whole (decompressed) file is held in memory. That keeps the MVP honest
-/// about scale: very large loads should go through the database's native
-/// bulk loader instead.
+/// Files and gzip input stream one bounded record/statement at a time.
+/// DBX owns the transaction; failed imports discard their connection.
 pub async fn import_file(
     engine: &DatabaseEngine,
     target: Option<&TableRef>,
@@ -1014,19 +1641,80 @@ pub async fn import_file(
         });
     }
     let file_format = detect_file_format(path)?;
-    let source: PathBuf = path.to_owned();
-    let raw = tokio::task::spawn_blocking(move || fs::read(source))
-        .await
-        .map_err(|error| DbxError::Io(error.to_string()))?
-        .map_err(|error| DbxError::Io(error.to_string()))?;
-    let script = decode_input(raw, file_format.gzipped)?;
+    let file = fs::File::open(path).map_err(io_error)?;
+    let input: Box<dyn BufRead + Send> = if file_format.gzipped {
+        Box::new(BufReader::new(GzDecoder::new(BufReader::new(file))))
+    } else {
+        Box::new(BufReader::new(file))
+    };
 
     match file_format.format {
         DumpFormat::Sql => {
-            let statements = split_sql_statements(&script);
-            engine.execute_transaction(&statements).await?;
+            if kind == DatabaseKind::MySQL {
+                for table in engine
+                    .list_tables()
+                    .await?
+                    .into_iter()
+                    .filter(|table| table.kind == crate::EntityKind::Table)
+                {
+                    if !mysql_table_transactional(
+                        engine,
+                        &TableRef {
+                            name: table.name,
+                            schema: table.schema,
+                        },
+                    )
+                    .await?
+                    {
+                        return Err(DbxError::Query("Atomic SQL imports require InnoDB storage for the active database tables".into()));
+                    }
+                }
+            }
+            let mut reader = SqlScriptReader::with_kind(input, Some(kind));
+            let mut transaction = SqlTransaction::begin(engine, false).await?;
+            let mut statements_executed = 0;
+            while let Some(mut statement) = reader.next_statement().map_err(io_error)? {
+                let function_check_setting = kind == DatabaseKind::PostgreSQL
+                    && statement
+                        .trim()
+                        .eq_ignore_ascii_case("SET check_function_bodies = false");
+                if function_check_setting {
+                    statement = "SET LOCAL check_function_bodies = false".into();
+                }
+                let keyword = crate::sqlx_engine::top_level_operation_keyword(&statement)
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                if matches!(
+                    keyword.as_str(),
+                    "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
+                ) {
+                    return Err(DbxError::Parse("dump contains transaction controls; remove them so DBX can own the import transaction".into()));
+                }
+                if !function_check_setting
+                    && matches!(
+                        keyword.as_str(),
+                        "ATTACH" | "DETACH" | "VACUUM" | "PRAGMA" | "SET" | "RESET"
+                    )
+                {
+                    return Err(DbxError::Parse("dump changes session or transaction settings; remove those statements so DBX can preserve atomic rollback".into()));
+                }
+                if engine.kind() == DatabaseKind::MySQL
+                    && !matches!(
+                        keyword.as_str(),
+                        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "SELECT"
+                    )
+                {
+                    return Err(DbxError::Parse("MySQL dump contains statements that may implicitly commit. DBX accepts data-only dumps to preserve atomic rollback; apply schema changes separately in a query tab.".into()));
+                }
+                transaction
+                    .query(&crate::SqlStatement::new(statement, Vec::new()))
+                    .await?;
+                statements_executed += 1;
+                report_transfer(0, 1);
+            }
+            transaction.commit().await?;
             Ok(ImportReport {
-                statements_executed: statements.len() as u64,
+                statements_executed,
                 rows_inserted: 0,
                 elapsed_ms: elapsed_ms_since(started),
             })
@@ -1035,7 +1723,7 @@ pub async fn import_file(
             let target = target.ok_or_else(|| {
                 DbxError::Parse("CSV and TSV imports require a target table".into())
             })?;
-            import_delimited(engine, target, &script, file_format.format)
+            import_delimited(engine, target, input, file_format.format)
                 .await
                 .map(|report| ImportReport {
                     elapsed_ms: elapsed_ms_since(started),
@@ -1048,15 +1736,18 @@ pub async fn import_file(
 async fn import_delimited(
     engine: &DatabaseEngine,
     target: &TableRef,
-    script: &str,
+    input: Box<dyn BufRead + Send>,
     format: DumpFormat,
 ) -> Result<ImportReport> {
     let kind = engine.kind();
+    if kind == DatabaseKind::MySQL && !mysql_table_transactional(engine, target).await? {
+        return Err(DbxError::Query("Atomic imports require an InnoDB table; this table uses a nontransactional storage engine".into()));
+    }
     let columns = engine.describe_table(target).await?;
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
 
     let delimiter = format.delimiter().unwrap_or(b',');
-    let mut reader = DelimitedReader::new(script.as_bytes(), delimiter);
+    let mut reader = DelimitedStream::new(input, delimiter);
     let header = reader
         .next_record()
         .map_err(io_error)?
@@ -1070,8 +1761,10 @@ async fn import_delimited(
         .min(max_params / columns_per_row)
         .max(1);
 
+    let mut transaction = SqlTransaction::begin(engine, false).await?;
     let mut rows_inserted = 0u64;
     let mut pending: Vec<Vec<CellValue>> = Vec::with_capacity(batch_limit);
+    let mut pending_bytes = 0usize;
     while let Some(record) = reader.next_record().map_err(io_error)? {
         if record.len() != header_len {
             return Err(DbxError::Parse(format!(
@@ -1089,17 +1782,23 @@ async fn import_delimited(
                 .map(|(position, _)| delimited_field_to_cell(record[*position].clone()))
                 .collect(),
         );
-        if pending.len() >= batch_limit {
-            flush_batch(engine, target, &mapped, &pending).await?;
+        pending_bytes =
+            pending_bytes.saturating_add(record.iter().flatten().map(String::len).sum::<usize>());
+        if pending.len() >= batch_limit || pending_bytes >= 4 * 1024 * 1024 {
+            flush_batch(&mut transaction, kind, target, &mapped, &pending, &columns).await?;
             rows_inserted += pending.len() as u64;
+            report_transfer(pending.len() as u64, 0);
             pending.clear();
+            pending_bytes = 0;
         }
     }
     if !pending.is_empty() {
-        flush_batch(engine, target, &mapped, &pending).await?;
+        flush_batch(&mut transaction, kind, target, &mapped, &pending, &columns).await?;
         rows_inserted += pending.len() as u64;
+        report_transfer(pending.len() as u64, 0);
     }
 
+    transaction.commit().await?;
     Ok(ImportReport {
         statements_executed: 0,
         rows_inserted,
@@ -1107,15 +1806,37 @@ async fn import_delimited(
     })
 }
 
+async fn mysql_table_transactional(engine: &DatabaseEngine, table: &TableRef) -> Result<bool> {
+    let sql = if table.schema.is_some() {
+        "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?"
+    } else {
+        "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?"
+    };
+    let mut params = Vec::new();
+    if let Some(schema) = &table.schema {
+        params.push(CellValue::Text(schema.clone()));
+    }
+    params.push(CellValue::Text(table.name.clone()));
+    let result = engine
+        .query_statement(
+            &crate::SqlStatement::new(sql, params),
+            QueryOptions::default(),
+        )
+        .await?;
+    Ok(result.rows.first().and_then(|row| row.values.first()).is_some_and(|value| matches!(value, CellValue::Text(engine) if engine.eq_ignore_ascii_case("InnoDB"))))
+}
+
 async fn flush_batch(
-    engine: &DatabaseEngine,
+    transaction: &mut SqlTransaction,
+    kind: DatabaseKind,
     target: &TableRef,
     columns: &[(usize, String)],
     rows: &[Vec<CellValue>],
+    metadata: &[ColumnInfo],
 ) -> Result<()> {
     let names: Vec<String> = columns.iter().map(|(_, name)| name.clone()).collect();
-    let statement = build_multi_row_insert(engine.kind(), target, &names, rows)?;
-    engine.execute(&statement).await?;
+    let statement = build_multi_row_insert_with_columns(kind, target, &names, rows, metadata)?;
+    transaction.query(&statement).await?;
     Ok(())
 }
 
@@ -1201,10 +1922,81 @@ enum FieldState {
     QuoteClosed,
 }
 
+/// Retain one complete CSV/TSV record, preserving quoted NULL/empty semantics.
+struct DelimitedStream<R> {
+    input: R,
+    delimiter: u8,
+    first: bool,
+}
+impl<R: BufRead> DelimitedStream<R> {
+    fn new(input: R, delimiter: u8) -> Self {
+        Self {
+            input,
+            delimiter,
+            first: true,
+        }
+    }
+    fn next_record(&mut self) -> io::Result<Option<Vec<Option<String>>>> {
+        loop {
+            let mut record = Vec::new();
+            let mut state = FieldState::Start;
+            loop {
+                let mut byte = [0];
+                if self.input.read(&mut byte)? == 0 {
+                    break;
+                }
+                let byte = byte[0];
+                record.push(byte);
+                if self.first && record == [0xEF, 0xBB, 0xBF] {
+                    record.clear();
+                    state = FieldState::Start;
+                    self.first = false;
+                    continue;
+                }
+                if record.len() >= 3 || byte == b'\n' || byte == b'\r' {
+                    self.first = false;
+                }
+                if record.len() > MAX_TRANSFER_RECORD_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CSV/TSV record exceeds the 64 MiB transfer budget",
+                    ));
+                }
+                if (byte == b'\n' || byte == b'\r') && state != FieldState::Quoted {
+                    break;
+                }
+                state = match (state, byte) {
+                    (FieldState::Start, b'"') => FieldState::Quoted,
+                    (FieldState::Quoted, b'"') => FieldState::QuoteClosed,
+                    (FieldState::QuoteClosed, b'"') => FieldState::Quoted,
+                    (FieldState::Quoted, _) => FieldState::Quoted,
+                    (_, byte) if byte == self.delimiter => FieldState::Start,
+                    (FieldState::Start, _) => FieldState::Unquoted,
+                    (state, _) => state,
+                };
+            }
+            if record.is_empty() {
+                return Ok(None);
+            }
+            std::str::from_utf8(&record)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if let Some(fields) = (DelimitedReader {
+                input: &record,
+                position: 0,
+                delimiter: self.delimiter,
+            })
+            .next_record()?
+            {
+                return Ok(Some(fields));
+            }
+        }
+    }
+}
+
 impl<'a> DelimitedReader<'a> {
     pub fn new(input: &'a [u8], delimiter: u8) -> Self {
         Self {
-            input,
+            input: input.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(input),
             position: 0,
             delimiter,
         }
@@ -1212,9 +2004,6 @@ impl<'a> DelimitedReader<'a> {
 
     /// Return the next record, or `None` at end of input.
     pub fn next_record(&mut self) -> io::Result<Option<Vec<Option<String>>>> {
-        if self.position == 0 && self.input.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.position = 3;
-        }
         'records: loop {
             if self.position >= self.input.len() {
                 return Ok(None);
@@ -1349,13 +2138,13 @@ fn take_field(field: &mut Vec<u8>, quoted_field: &mut bool) -> Option<String> {
 /// it contains the delimiter, a quote, or a line break, or when it is an
 /// explicitly non-NULL empty string.
 fn write_delimited_record(
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
     delimiter: u8,
     fields: &[Option<&str>],
 ) -> Result<()> {
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {
-            output.push(delimiter);
+            output.write_all(&[delimiter]).map_err(io_error)?;
         }
         let Some(field) = field else {
             continue;
@@ -1366,21 +2155,23 @@ fn write_delimited_record(
             || field.contains('\n')
             || field.contains('\r')
         {
-            output.push(b'"');
+            output.write_all(b"\"").map_err(io_error)?;
             for character in field.chars() {
                 if character == '"' {
-                    output.extend_from_slice(b"\"\"");
+                    output.write_all(b"\"\"").map_err(io_error)?;
                 } else {
                     let mut buffer = [0u8; 4];
-                    output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                    output
+                        .write_all(character.encode_utf8(&mut buffer).as_bytes())
+                        .map_err(io_error)?;
                 }
             }
-            output.push(b'"');
+            output.write_all(b"\"").map_err(io_error)?;
         } else {
-            output.extend_from_slice(field.as_bytes());
+            output.write_all(field.as_bytes()).map_err(io_error)?;
         }
     }
-    output.push(b'\n');
+    output.write_all(b"\n").map_err(io_error)?;
     Ok(())
 }
 
@@ -1416,199 +2207,430 @@ fn delimited_value_field(value: &CellValue) -> Option<String> {
 /// fails: malformed scripts simply produce statements the engine will
 /// reject with its own diagnostics.
 pub fn split_sql_statements(script: &str) -> Vec<String> {
-    #[derive(Clone)]
-    enum State {
-        Normal,
-        LineComment,
-        BlockComment(usize),
-        SingleQuote,
-        DoubleQuote,
-        Backtick,
-        Dollar(String),
+    checked_split_sql_statements(script).unwrap_or_else(|_| vec![script.to_owned()])
+}
+pub(crate) fn checked_split_sql_statements(script: &str) -> Result<Vec<String>> {
+    checked_split_sql_for(None, script)
+}
+pub fn checked_split_sql_for(kind: Option<DatabaseKind>, script: &str) -> Result<Vec<String>> {
+    if kind == Some(DatabaseKind::SqlServer) {
+        return split_sql_server_script(script);
     }
-
-    let characters: Vec<char> = script.chars().collect();
+    let mut reader = SqlScriptReader::with_kind(script.as_bytes(), kind);
     let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut delimiter = ";".to_owned();
-    let mut state = State::Normal;
-    let mut at_line_start = true;
-    let mut index = 0usize;
+    while let Some(statement) = reader.next_statement().map_err(io_error)? {
+        statements.push(statement);
+    }
+    Ok(statements)
+}
 
-    while index < characters.len() {
-        let character = characters[index];
-        let matches_here = |needle: &str, at: usize| {
-            characters[at..].starts_with(needle.chars().collect::<Vec<_>>().as_slice())
-        };
-        match state.clone() {
-            State::Normal => {
-                if at_line_start
-                    && current.trim().is_empty()
-                    && matches_here_ci(&characters, index, "delimiter")
-                    && characters
-                        .get(index + "delimiter".len())
-                        .is_some_and(|next| next.is_whitespace())
-                {
-                    index += "delimiter".len();
-                    let mut token = String::new();
-                    while let Some(&next) = characters.get(index) {
-                        if next == '\n' || next == '\r' {
-                            break;
+/// T-SQL module bodies (procedures, functions, triggers, views) contain
+/// semicolons but must reach the server as one batch, ended by `GO`.
+fn split_sql_server_script(script: &str) -> Result<Vec<String>> {
+    let mut batches = vec![String::new()];
+    for line in script.split_inclusive('\n') {
+        if line.trim().eq_ignore_ascii_case("go") {
+            batches.push(String::new());
+        } else if let Some(batch) = batches.last_mut() {
+            batch.push_str(line);
+        }
+    }
+    let mut statements = Vec::new();
+    for batch in batches {
+        let words = sql_words_for(&batch);
+        let module = matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER"))
+            && words
+                .iter()
+                .skip(1)
+                .find(|word| !matches!(word.as_str(), "OR" | "ALTER"))
+                .is_some_and(|word| {
+                    matches!(
+                        word.as_str(),
+                        "PROCEDURE" | "PROC" | "FUNCTION" | "TRIGGER" | "VIEW"
+                    )
+                });
+        if module {
+            let trimmed = batch.trim();
+            if !trimmed.is_empty() {
+                statements.push(trimmed.to_owned());
+            }
+            continue;
+        }
+        let mut reader =
+            SqlScriptReader::with_kind(batch.as_bytes(), Some(DatabaseKind::SqlServer));
+        while let Some(statement) = reader.next_statement().map_err(io_error)? {
+            statements.push(statement);
+        }
+    }
+    Ok(statements)
+}
+
+/// The first few upper-cased words of a batch, skipping leading comments.
+fn sql_words_for(batch: &str) -> Vec<String> {
+    let mut text = batch.trim_start();
+    loop {
+        if let Some(rest) = text.strip_prefix("--") {
+            text = rest
+                .split_once('\n')
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
+        } else if let Some(rest) = text.strip_prefix("/*") {
+            text = rest
+                .split_once("*/")
+                .map_or("", |(_, rest)| rest)
+                .trim_start();
+        } else {
+            break;
+        }
+    }
+    text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+        .take(4)
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
+#[derive(Clone)]
+enum ScriptState {
+    Normal,
+    LineComment,
+    BlockComment(usize, bool),
+    SingleQuote(bool),
+    DoubleQuote,
+    Backtick,
+    Dollar(String),
+}
+
+const MAX_TRANSFER_RECORD_BYTES: usize = 64 * 1024 * 1024;
+struct SqlScriptReader<R> {
+    kind: Option<DatabaseKind>,
+    input: R,
+    state: ScriptState,
+    delimiter: String,
+    trigger: bool,
+    trigger_depth: usize,
+    current: String,
+    ready: VecDeque<String>,
+    at_line_start: bool,
+    first_line: bool,
+    ended: bool,
+}
+impl<R: BufRead> SqlScriptReader<R> {
+    fn with_kind(input: R, kind: Option<DatabaseKind>) -> Self {
+        Self {
+            kind,
+            input,
+            state: ScriptState::Normal,
+            delimiter: ";".into(),
+            trigger: false,
+            trigger_depth: 0,
+            current: String::new(),
+            ready: VecDeque::new(),
+            at_line_start: true,
+            first_line: true,
+            ended: false,
+        }
+    }
+    fn next_statement(&mut self) -> io::Result<Option<String>> {
+        loop {
+            if let Some(statement) = self.ready.pop_front() {
+                return Ok(Some(statement));
+            }
+            if self.ended {
+                return Ok(None);
+            }
+            let mut line = String::new();
+            let count = (&mut self.input)
+                .take((MAX_TRANSFER_RECORD_BYTES + 1) as u64)
+                .read_line(&mut line)?;
+            if line.len() > MAX_TRANSFER_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SQL line exceeds the 64 MiB transfer budget",
+                ));
+            }
+            if count == 0 {
+                self.ended = true;
+                let remaining = std::mem::take(&mut self.current);
+                if !remaining.trim().is_empty() {
+                    return Ok(Some(remaining.trim().to_owned()));
+                }
+                return Ok(None);
+            }
+            if self.first_line {
+                line = line.trim_start_matches('\u{feff}').to_owned();
+                self.first_line = false;
+            }
+            self.feed(&line)?;
+        }
+    }
+    fn feed(&mut self, script: &str) -> io::Result<()> {
+        let characters: Vec<char> = script.chars().collect();
+        let mut statements = Vec::new();
+        let mut current = std::mem::take(&mut self.current);
+        let mut delimiter = self.delimiter.clone();
+        let mut state = self.state.clone();
+        let mut at_line_start = self.at_line_start;
+        let mut index = 0usize;
+        while index < characters.len() {
+            if current.len() > MAX_TRANSFER_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SQL statement exceeds the 64 MiB transfer budget",
+                ));
+            }
+            let character = characters[index];
+            let matches_here = |needle: &str, at: usize| {
+                characters[at..].starts_with(needle.chars().collect::<Vec<_>>().as_slice())
+            };
+            match state.clone() {
+                ScriptState::Normal => {
+                    if at_line_start
+                        && current.trim().is_empty()
+                        && matches_here_ci(&characters, index, "delimiter")
+                        && characters
+                            .get(index + "delimiter".len())
+                            .is_some_and(|next| next.is_whitespace())
+                    {
+                        index += "delimiter".len();
+                        let mut token = String::new();
+                        while let Some(&next) = characters.get(index) {
+                            if next == '\n' || next == '\r' {
+                                break;
+                            }
+                            token.push(next);
+                            index += 1;
                         }
-                        token.push(next);
+                        let trimmed = token.trim();
+                        if !trimmed.is_empty() {
+                            delimiter = trimmed.to_owned();
+                        }
+                        continue;
+                    }
+                    // T-SQL clients separate batches with a line holding
+                    // only GO; it is not SQL the server understands.
+                    if self.kind == Some(DatabaseKind::SqlServer)
+                        && matches_here_ci(&characters, index, "go")
+                        && characters[..index].iter().all(|c| c.is_whitespace())
+                        && characters[index + 2..].iter().all(|c| c.is_whitespace())
+                    {
+                        let trimmed = current.trim();
+                        if !trimmed.is_empty() {
+                            statements.push(trimmed.to_owned());
+                        }
+                        current.clear();
+                        at_line_start = true;
+                        index = characters.len();
+                        continue;
+                    }
+                    if character == '-' && matches_here("--", index) {
+                        state = ScriptState::LineComment;
+                        index += 2;
+                        continue;
+                    }
+                    // `#name` is a temporary table in T-SQL, not a comment.
+                    if character == '#' && self.kind != Some(DatabaseKind::SqlServer) {
+                        state = ScriptState::LineComment;
                         index += 1;
+                        continue;
                     }
-                    let trimmed = token.trim();
-                    if !trimmed.is_empty() {
-                        delimiter = trimmed.to_owned();
-                    }
-                    continue;
-                }
-                if character == '-' && matches_here("--", index) {
-                    state = State::LineComment;
-                    index += 2;
-                    continue;
-                }
-                if character == '#' {
-                    state = State::LineComment;
-                    index += 1;
-                    continue;
-                }
-                if character == '/' && matches_here("/*", index) {
-                    state = State::BlockComment(1);
-                    index += 2;
-                    continue;
-                }
-                if matches_here(&delimiter, index) {
-                    let trimmed = current.trim();
-                    if !trimmed.is_empty() {
-                        statements.push(trimmed.to_owned());
-                    }
-                    current.clear();
-                    at_line_start = true;
-                    index += delimiter.chars().count();
-                    continue;
-                }
-                match character {
-                    '\'' => {
-                        state = State::SingleQuote;
-                        current.push(character);
-                        index += 1;
-                    }
-                    '"' => {
-                        state = State::DoubleQuote;
-                        current.push(character);
-                        index += 1;
-                    }
-                    '`' => {
-                        state = State::Backtick;
-                        current.push(character);
-                        index += 1;
-                    }
-                    '$' => {
-                        if let Some(tag) = parse_dollar_tag(&characters[index..]) {
-                            let token_length = tag.chars().count() + 2;
-                            current.extend(characters[index..index + token_length].iter());
-                            index += token_length;
-                            state = State::Dollar(tag);
+                    if character == '/' && matches_here("/*", index) {
+                        if matches_here("/*!", index) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Expand executable MySQL version comments before running or importing a script",
+                            ));
+                        }
+                        let preserve = matches_here("/*+", index);
+                        if preserve {
+                            current.push_str("/*");
                         } else {
+                            current.push(' ');
+                        }
+                        state = ScriptState::BlockComment(1, preserve);
+                        index += 2;
+                        continue;
+                    }
+                    if delimiter == ";"
+                        && character.is_ascii_alphabetic()
+                        && self
+                            .kind
+                            .is_none_or(|kind| kind.dialect() == DatabaseKind::SQLite)
+                    {
+                        let start = index;
+                        while characters.get(index).is_some_and(|character| {
+                            character.is_ascii_alphanumeric() || *character == '_'
+                        }) {
+                            index += 1;
+                        }
+                        let word = characters[start..index].iter().collect::<String>();
+                        if word.eq_ignore_ascii_case("TRIGGER") {
+                            let prefix = sql_words_for(&current);
+                            if prefix.first().is_some_and(|word| word == "CREATE")
+                                && prefix.iter().all(|word| {
+                                    matches!(word.as_str(), "CREATE" | "TEMP" | "TEMPORARY")
+                                })
+                            {
+                                self.trigger = true;
+                            }
+                        }
+                        if self.trigger {
+                            match word.to_ascii_uppercase().as_str() {
+                                "BEGIN" | "CASE" => self.trigger_depth += 1,
+                                "END" => self.trigger_depth = self.trigger_depth.saturating_sub(1),
+                                _ => {}
+                            }
+                        }
+                        current.push_str(&word);
+                        at_line_start = false;
+                        continue;
+                    }
+                    if matches_here(&delimiter, index) && (!self.trigger || self.trigger_depth == 0)
+                    {
+                        let trimmed = current.trim();
+                        if !trimmed.is_empty() {
+                            statements.push(trimmed.to_owned());
+                        }
+                        current.clear();
+                        self.trigger = false;
+                        self.trigger_depth = 0;
+                        at_line_start = true;
+                        index += delimiter.chars().count();
+                        continue;
+                    }
+                    match character {
+                        '\'' => {
+                            state = ScriptState::SingleQuote(crate::protected::backslash_string(
+                                self.kind, &current,
+                            ));
+                            current.push(character);
+                            index += 1;
+                        }
+                        '"' => {
+                            state = ScriptState::DoubleQuote;
+                            current.push(character);
+                            index += 1;
+                        }
+                        '`' => {
+                            state = ScriptState::Backtick;
+                            current.push(character);
+                            index += 1;
+                        }
+                        '$' => {
+                            if let Some(tag) = parse_dollar_tag(&characters[index..]) {
+                                let token_length = tag.chars().count() + 2;
+                                current.extend(characters[index..index + token_length].iter());
+                                index += token_length;
+                                state = ScriptState::Dollar(tag);
+                            } else {
+                                current.push(character);
+                                index += 1;
+                            }
+                        }
+                        _ => {
+                            if !character.is_whitespace() {
+                                at_line_start = false;
+                            }
                             current.push(character);
                             index += 1;
                         }
                     }
-                    _ => {
-                        if !character.is_whitespace() {
-                            at_line_start = false;
+                }
+                ScriptState::LineComment => {
+                    if character == '\n' {
+                        state = ScriptState::Normal;
+                        at_line_start = true;
+                        current.push(character);
+                    }
+                    index += 1;
+                }
+                ScriptState::BlockComment(depth, preserve) => {
+                    if character == '/' && matches_here("/*", index) {
+                        if preserve {
+                            current.push_str("/*");
                         }
+                        state = ScriptState::BlockComment(depth + 1, preserve);
+                        index += 2;
+                    } else if character == '*' && matches_here("*/", index) {
+                        if preserve {
+                            current.push_str("*/");
+                        }
+                        state = if depth <= 1 {
+                            ScriptState::Normal
+                        } else {
+                            ScriptState::BlockComment(depth - 1, preserve)
+                        };
+                        index += 2;
+                    } else {
+                        if preserve {
+                            current.push(character);
+                        }
+                        index += 1;
+                    }
+                }
+                ScriptState::SingleQuote(escape) => {
+                    current.push(character);
+                    if character == '\\' && escape {
+                        if let Some(&next) = characters.get(index + 1) {
+                            current.push(next);
+                            index += 2;
+                            continue;
+                        }
+                    } else if character == '\'' {
+                        if characters.get(index + 1) == Some(&'\'') {
+                            current.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        state = ScriptState::Normal;
+                    }
+                    index += 1;
+                }
+                ScriptState::DoubleQuote => {
+                    current.push(character);
+                    if character == '"' {
+                        if characters.get(index + 1) == Some(&'"') {
+                            current.push('"');
+                            index += 2;
+                            continue;
+                        }
+                        state = ScriptState::Normal;
+                    }
+                    index += 1;
+                }
+                ScriptState::Backtick => {
+                    current.push(character);
+                    if character == '`' {
+                        if characters.get(index + 1) == Some(&'`') {
+                            current.push('`');
+                            index += 2;
+                            continue;
+                        }
+                        state = ScriptState::Normal;
+                    }
+                    index += 1;
+                }
+                ScriptState::Dollar(tag) => {
+                    let closing = format!("${tag}$");
+                    if matches_here(&closing, index) {
+                        current.push_str(&closing);
+                        index += closing.chars().count();
+                        state = ScriptState::Normal;
+                    } else {
                         current.push(character);
                         index += 1;
                     }
                 }
             }
-            State::LineComment => {
-                if character == '\n' {
-                    state = State::Normal;
-                    at_line_start = true;
-                    current.push(character);
-                }
-                index += 1;
-            }
-            State::BlockComment(depth) => {
-                if character == '/' && matches_here("/*", index) {
-                    state = State::BlockComment(depth + 1);
-                    index += 2;
-                } else if character == '*' && matches_here("*/", index) {
-                    state = if depth <= 1 {
-                        State::Normal
-                    } else {
-                        State::BlockComment(depth - 1)
-                    };
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-            State::SingleQuote => {
-                current.push(character);
-                if character == '\\' {
-                    if let Some(&next) = characters.get(index + 1) {
-                        current.push(next);
-                        index += 2;
-                        continue;
-                    }
-                } else if character == '\'' {
-                    if characters.get(index + 1) == Some(&'\'') {
-                        current.push('\'');
-                        index += 2;
-                        continue;
-                    }
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::DoubleQuote => {
-                current.push(character);
-                if character == '"' {
-                    if characters.get(index + 1) == Some(&'"') {
-                        current.push('"');
-                        index += 2;
-                        continue;
-                    }
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::Backtick => {
-                current.push(character);
-                if character == '`' {
-                    if characters.get(index + 1) == Some(&'`') {
-                        current.push('`');
-                        index += 2;
-                        continue;
-                    }
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::Dollar(tag) => {
-                let closing = format!("${tag}$");
-                if matches_here(&closing, index) {
-                    current.push_str(&closing);
-                    index += closing.chars().count();
-                    state = State::Normal;
-                } else {
-                    current.push(character);
-                    index += 1;
-                }
-            }
         }
-    }
 
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        statements.push(trimmed.to_owned());
+        self.current = current;
+        self.state = state;
+        self.delimiter = delimiter;
+        self.at_line_start = at_line_start;
+        self.ready.extend(statements);
+        Ok(())
     }
-    statements
 }
 
 fn matches_here_ci(characters: &[char], index: usize, needle: &str) -> bool {
@@ -1637,28 +2659,6 @@ fn parse_dollar_tag(characters: &[char]) -> Option<String> {
 // Compression helpers
 // ---------------------------------------------------------------------------
 
-fn decode_input(raw: Vec<u8>, gzipped: bool) -> Result<String> {
-    if gzipped {
-        let mut decoder = GzDecoder::new(&raw[..]);
-        let mut text = String::new();
-        decoder
-            .read_to_string(&mut text)
-            .map_err(|error| DbxError::Io(format!("could not decompress gzip input: {error}")))?;
-        Ok(text)
-    } else {
-        String::from_utf8(raw)
-            .map_err(|error| DbxError::Io(format!("file is not valid UTF-8: {error}")))
-    }
-}
-
-fn gzip_encode(bytes: Vec<u8>) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&bytes)
-        .and_then(|_| encoder.finish())
-        .map_err(|error| DbxError::Io(format!("could not compress gzip output: {error}")))
-}
-
 fn io_error(error: io::Error) -> DbxError {
     DbxError::Io(error.to_string())
 }
@@ -1670,6 +2670,62 @@ fn elapsed_ms_since(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dump_header_keeps_identifier_line_breaks_inside_comments() {
+        let mut output = Vec::new();
+        write_sql_dump_header(
+            &mut output,
+            DatabaseKind::SQLite,
+            &TableRef::new("odd\nSELECT 1;\rtable"),
+        )
+        .unwrap();
+        let header = String::from_utf8(output).unwrap();
+        assert!(split_sql_statements(&header).is_empty());
+        assert_eq!(header.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn export_pages_keep_one_snapshot_during_concurrent_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = DatabaseEngine::connect(crate::ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("snapshot.sqlite").display()
+            ),
+        ))
+        .await
+        .unwrap();
+        engine.execute_sql("PRAGMA journal_mode=WAL").await.unwrap();
+        engine
+            .execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        engine.execute_sql("WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<1001) INSERT INTO items SELECT id FROM n").await.unwrap();
+        let table = TableRef::new("items");
+        let mut reader = ExportReader::new(&engine, std::slice::from_ref(&table))
+            .await
+            .unwrap();
+        let columns = reader.structure(&table).columns;
+        assert_eq!(
+            reader.page(&table, &columns, 0).await.unwrap().rows.len(),
+            1000
+        );
+        engine
+            .execute_sql("DELETE FROM items WHERE id=1001; INSERT INTO items VALUES(1002)")
+            .await
+            .unwrap();
+        let second = reader.page(&table, &columns, 1000).await.unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].values[0], CellValue::Integer(1001));
+        reader.finish().await.unwrap();
+        let current = engine
+            .query("SELECT max(id) FROM items", QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(current.rows[0].values[0], CellValue::Integer(1002));
+    }
 
     #[test]
     fn schema_types_allow_quoted_labels_but_nothing_that_escapes_them() {
@@ -1821,6 +2877,49 @@ mod tests {
         let statements = split_sql_statements("SELECT `weird;name` FROM `t``ick`;");
         assert_eq!(statements, vec!["SELECT `weird;name` FROM `t``ick`"]);
     }
+    #[test]
+    fn streamed_records_preserve_multiline_bom_headers_and_data() {
+        let input = "\u{feff}\"multi\nline\",value\n\u{feff}data,\"\"\n";
+        let mut reader = DelimitedStream::new(BufReader::with_capacity(1, input.as_bytes()), b',');
+        assert_eq!(
+            reader.next_record().unwrap().unwrap(),
+            vec![Some("multi\nline".into()), Some("value".into())]
+        );
+        assert_eq!(
+            reader.next_record().unwrap().unwrap(),
+            vec![Some("\u{feff}data".into()), Some("".into())]
+        );
+        assert!(reader.next_record().unwrap().is_none());
+    }
+    #[test]
+    fn dialect_splitting_preserves_backslashes_hints_and_token_boundaries() {
+        let pg = checked_split_sql_for(Some(DatabaseKind::PostgreSQL), "SELECT 'C:\\'; SELECT 2")
+            .unwrap();
+        assert_eq!(pg.len(), 2);
+        let sqlite =
+            checked_split_sql_for(Some(DatabaseKind::SQLite), "SELECT 'C:\\'; SELECT 2").unwrap();
+        assert_eq!(sqlite.len(), 2);
+        let escaped = checked_split_sql_for(
+            Some(DatabaseKind::PostgreSQL),
+            "SELECT E'it\\'s;here'; SELECT 2",
+        )
+        .unwrap();
+        assert_eq!(escaped.len(), 2);
+        let hint = checked_split_sql_for(
+            Some(DatabaseKind::MySQL),
+            "SELECT /*+ MAX_EXECUTION_TIME(1000) */ 1",
+        )
+        .unwrap();
+        assert!(hint[0].contains("/*+ MAX_EXECUTION_TIME(1000) */"));
+        assert!(
+            checked_split_sql_for(Some(DatabaseKind::MySQL), "/*!50000 DELETE FROM items */")
+                .is_err()
+        );
+        assert_eq!(
+            split_sql_statements("SELECT/* comment */1"),
+            vec!["SELECT 1"]
+        );
+    }
 
     #[test]
     fn sql_insert_rendering_quotes_and_escapes_per_dialect() {
@@ -1877,6 +2976,7 @@ mod tests {
                     nullable: false,
                     ordinal: 1,
                     primary_key: true,
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "account_id".into(),
@@ -1885,6 +2985,7 @@ mod tests {
                     nullable: false,
                     ordinal: 2,
                     primary_key: false,
+                    default_value: None,
                 },
             ],
             foreign_keys: vec![crate::ForeignKeyInfo {
@@ -1896,6 +2997,7 @@ mod tests {
                 on_update: Some(crate::ReferentialAction::Cascade),
                 on_delete: Some(crate::ReferentialAction::SetNull),
             }],
+            ..Default::default()
         };
 
         let sql =
@@ -1904,6 +3006,218 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (\"id\")"));
         assert!(sql.contains("CONSTRAINT \"events_account_id_fkey\""));
         assert!(sql.contains("ON UPDATE CASCADE ON DELETE SET NULL"));
+    }
+
+    #[test]
+    fn schema_expressions_reject_terminators_and_comments_outside_literals() {
+        assert_eq!(
+            safe_schema_expression(" 'a;b'::text ").unwrap(),
+            "'a;b'::text"
+        );
+        assert!(safe_schema_expression("now()").is_ok());
+        assert!(safe_schema_expression("-1").is_ok());
+        for bad in [
+            "1); DROP TABLE x",
+            "1 -- x",
+            "1 /* x */",
+            "(1",
+            "'open",
+            "1)",
+        ] {
+            assert!(safe_schema_expression(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn schema_rendering_includes_defaults_checks_serials_and_indexes() {
+        let table = TableRef::in_schema("public", "items");
+        let column = |name: &str, data_type: &str, default: Option<&str>| ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            enum_values: Vec::new(),
+            nullable: false,
+            ordinal: 1,
+            primary_key: name == "id",
+            default_value: default.map(str::to_owned),
+        };
+        let structure = TableStructure {
+            columns: vec![
+                column("id", "integer", Some("nextval('items_id_seq'::regclass)")),
+                column("code", "text", Some("'new'::text")),
+            ],
+            checks: vec![crate::CheckConstraintInfo {
+                name: Some("code_length".into()),
+                expression: "length(code) > 0".into(),
+            }],
+            indexes: vec![
+                crate::IndexInfo {
+                    name: "items_pkey".into(),
+                    columns: vec!["id".into()],
+                    unique: true,
+                    primary: true,
+                    method: None,
+                    predicate: None,
+                    definition: Some(
+                        "CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)".into(),
+                    ),
+                },
+                crate::IndexInfo {
+                    name: "items_code".into(),
+                    columns: vec!["code".into()],
+                    unique: true,
+                    primary: false,
+                    method: Some("btree".into()),
+                    predicate: None,
+                    definition: Some(
+                        "CREATE UNIQUE INDEX items_code ON public.items USING btree (code)".into(),
+                    ),
+                },
+            ],
+            ..Default::default()
+        };
+        let sql = render_sql_schema(DatabaseKind::PostgreSQL, &table, &structure, &[]).unwrap();
+        assert!(sql.contains("\"id\" serial NOT NULL"), "{sql}");
+        assert!(
+            sql.contains("\"code\" text DEFAULT 'new'::text NOT NULL"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("CONSTRAINT \"code_length\" CHECK (length(code) > 0)"),
+            "{sql}"
+        );
+        assert_eq!(
+            render_sql_indexes(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
+            ["CREATE UNIQUE INDEX IF NOT EXISTS items_code ON public.items USING btree (code)"]
+        );
+        assert_eq!(
+            render_sql_sequence_resets(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
+            [
+                "SELECT setval(pg_get_serial_sequence('\"public\".\"items\"', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"public\".\"items\"), 0) + 1, false)"
+            ]
+        );
+
+        let mysql = TableStructure {
+            indexes: vec![
+                crate::IndexInfo {
+                    name: "by_name".into(),
+                    columns: vec!["name(10)".into(), "created DESC".into()],
+                    unique: false,
+                    primary: false,
+                    method: Some("BTREE".into()),
+                    predicate: None,
+                    definition: None,
+                },
+                crate::IndexInfo {
+                    name: "by_expression".into(),
+                    columns: vec!["(expression)".into()],
+                    unique: false,
+                    primary: false,
+                    method: Some("BTREE".into()),
+                    predicate: None,
+                    definition: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            render_sql_indexes(DatabaseKind::MySQL, &TableRef::new("people"), &mysql).unwrap(),
+            [
+                "CREATE INDEX `by_name` ON `people` (`name`(10), `created` DESC)",
+                "-- Index by_expression uses expressions; recreate it manually",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_dump_round_trips_defaults_and_indexes() {
+        let connect = || {
+            DatabaseEngine::connect(crate::ConnectionConfig::new(
+                crate::DatabaseKind::SQLite,
+                "sqlite::memory:",
+            ))
+        };
+        let source = connect().await.unwrap();
+        source
+            .execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, qty INTEGER NOT NULL DEFAULT 1 CHECK (qty >= 0))")
+            .await
+            .unwrap();
+        source
+            .execute_sql("CREATE INDEX items_qty ON items (qty DESC)")
+            .await
+            .unwrap();
+        source
+            .execute_sql("INSERT INTO items (id, code) VALUES (1, 'a')")
+            .await
+            .unwrap();
+        source.execute_sql("CREATE TRIGGER items_insert AFTER INSERT ON items BEGIN UPDATE items SET qty=qty+1 WHERE id=NEW.id; END").await.unwrap();
+        source
+            .execute_sql("CREATE VIEW items_view AS SELECT code, qty FROM items")
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let request = DatabaseExportRequest {
+            tables: vec![TableRef::new("items")],
+            output_directory: directory.path().to_owned(),
+            output_name: "items.sql".into(),
+            format: DumpFormat::Sql,
+            schema_only: false,
+            gzipped: false,
+        };
+        export_database(&source, &request).await.unwrap();
+
+        let target = connect().await.unwrap();
+        import_database(&target, &directory.path().join("items.sql"))
+            .await
+            .unwrap();
+        let structure = target
+            .table_structure(&TableRef::new("items"))
+            .await
+            .unwrap();
+        assert_eq!(structure.checks.len(), 1);
+        assert!(
+            target
+                .execute_sql("INSERT INTO items(id, code, qty) VALUES (2,'invalid',-1)")
+                .await
+                .is_err()
+        );
+        target
+            .execute_sql("INSERT INTO items(id, code) VALUES (2,'trigger')")
+            .await
+            .unwrap();
+        let view = target
+            .query(
+                "SELECT qty FROM items_view WHERE code='trigger'",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(view.rows[0].values[0], CellValue::Integer(2));
+        assert!(
+            target
+                .schema_objects()
+                .await
+                .unwrap()
+                .iter()
+                .any(|object| object.name == "items_insert")
+        );
+        let qty = structure
+            .columns
+            .iter()
+            .find(|column| column.name == "qty")
+            .unwrap();
+        assert_eq!(qty.default_value.as_deref(), Some("1"));
+        assert!(
+            structure
+                .indexes
+                .iter()
+                .any(|index| index.name == "items_qty" && index.columns == ["qty DESC"])
+        );
+        assert!(
+            structure
+                .indexes
+                .iter()
+                .any(|index| index.unique && index.columns == ["code"])
+        );
     }
 
     #[test]
@@ -1919,6 +3233,7 @@ mod tests {
                     nullable: false,
                     ordinal: 1,
                     primary_key: true,
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "account_id".into(),
@@ -1927,6 +3242,7 @@ mod tests {
                     nullable: false,
                     ordinal: 2,
                     primary_key: false,
+                    default_value: None,
                 },
             ],
             foreign_keys: vec![crate::ForeignKeyInfo {
@@ -1938,6 +3254,7 @@ mod tests {
                 on_update: Some(crate::ReferentialAction::Cascade),
                 on_delete: Some(crate::ReferentialAction::SetNull),
             }],
+            ..Default::default()
         };
         let selected = [parent];
 

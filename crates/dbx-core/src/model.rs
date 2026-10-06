@@ -19,10 +19,12 @@ pub enum DatabaseKind {
     Turso,
     CloudflareD1,
     ClickHouse,
+    SqlServer,
+    Snowflake,
 }
 
 impl DatabaseKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::PostgreSQL,
         Self::MySQL,
         Self::SQLite,
@@ -36,8 +38,10 @@ impl DatabaseKind {
         Self::Turso,
         Self::CloudflareD1,
         Self::ClickHouse,
+        Self::SqlServer,
+        Self::Snowflake,
     ];
-    pub const SQL: [Self; 9] = [
+    pub const SQL: [Self; 11] = [
         Self::PostgreSQL,
         Self::MySQL,
         Self::SQLite,
@@ -47,6 +51,8 @@ impl DatabaseKind {
         Self::Turso,
         Self::CloudflareD1,
         Self::ClickHouse,
+        Self::SqlServer,
+        Self::Snowflake,
     ];
 
     pub const fn is_sql(self) -> bool {
@@ -61,6 +67,8 @@ impl DatabaseKind {
                 | Self::Turso
                 | Self::CloudflareD1
                 | Self::ClickHouse
+                | Self::SqlServer
+                | Self::Snowflake
         )
     }
 
@@ -84,11 +92,15 @@ impl DatabaseKind {
         self.supports_transport()
             || matches!(
                 self,
-                Self::MongoDB | Self::Elasticsearch | Self::Kafka | Self::ClickHouse
+                Self::MongoDB
+                    | Self::Elasticsearch
+                    | Self::Kafka
+                    | Self::ClickHouse
+                    | Self::SqlServer
             )
     }
     pub const fn supports_row_mutations(self) -> bool {
-        self.is_sql() && !matches!(self, Self::BigQuery | Self::ClickHouse)
+        self.is_sql() && !matches!(self, Self::BigQuery | Self::ClickHouse | Self::Snowflake)
     }
     pub fn accepts_scheme(self, scheme: &str) -> bool {
         match self {
@@ -97,6 +109,7 @@ impl DatabaseKind {
             Self::Elasticsearch => matches!(scheme, "http" | "https"),
             Self::ClickHouse => matches!(scheme, "clickhouse" | "http" | "https"),
             Self::Turso => matches!(scheme, "libsql" | "turso" | "https" | "http"),
+            Self::SqlServer => matches!(scheme, "sqlserver" | "mssql"),
             _ => scheme == self.scheme(),
         }
     }
@@ -110,6 +123,7 @@ impl DatabaseKind {
             Self::Elasticsearch => Some("9200"),
             Self::Kafka => Some("9092"),
             Self::ClickHouse => Some("8123"),
+            Self::SqlServer => Some("1433"),
             _ => None,
         }
     }
@@ -128,6 +142,10 @@ impl DatabaseKind {
             Self::Turso => "libsql://database-organization.turso.io",
             Self::CloudflareD1 => "d1://account-id/database-id",
             Self::ClickHouse => "clickhouse://default@localhost:8123/default",
+            Self::SqlServer => "sqlserver://sa@localhost:1433/master",
+            Self::Snowflake => {
+                "snowflake://user@account.snowflakecomputing.com/database?warehouse=COMPUTE_WH&schema=PUBLIC"
+            }
         }
     }
     pub const fn connection_help(self) -> &'static str {
@@ -136,6 +154,9 @@ impl DatabaseKind {
                 "Use clickhouse://user:password@host:8123/database for HTTP, or https://user:password@host:8443/database for TLS (ClickHouse Cloud). Row editing is disabled; run writes in SQL."
             }
             Self::PostgreSQL => "Supabase: use your direct or session-pooler PostgreSQL URL.",
+            Self::SqlServer => {
+                "sqlserver://user:password@host:1433/database. TLS is required and verified; add ?trust_server_certificate=true only for a local self-signed server, or ?encrypt=false for a non-TLS development server."
+            }
             Self::CockroachDB => {
                 "Use a PostgreSQL URL with the TLS options supplied by CockroachDB."
             }
@@ -154,6 +175,9 @@ impl DatabaseKind {
             Self::Kafka => {
                 "kafka://host:9092?brokers=host:9092,other:9092. TLS/SASL options: security.protocol, sasl.mechanism; username/password in URL. Queries use JSON actions."
             }
+            Self::Snowflake => {
+                "snowflake://user@account.snowflakecomputing.com/database?warehouse=NAME&schema=PUBLIC&auth=pat. Enter a PAT or OAuth token below (auth=oauth); key-pair JWTs use auth=jwt. Each request is an independent session."
+            }
             Self::Turso => {
                 "libsql://database-organization.turso.io (also accepts turso:// and HTTPS). Enter your database token below."
             }
@@ -170,7 +194,11 @@ impl DatabaseKind {
             Self::SQLite | Self::Turso | Self::CloudflareD1 => "SELECT sqlite_version();",
             Self::DuckDB => "SELECT version();",
             Self::ClickHouse => "SELECT currentDatabase(), currentUser(), version();",
+            Self::SqlServer => {
+                "SELECT DB_NAME() AS database_name, SUSER_SNAME() AS login, @@VERSION AS version;"
+            }
             Self::BigQuery => "SELECT 1 AS connected;",
+            Self::Snowflake => "SELECT CURRENT_DATABASE(), CURRENT_USER(), CURRENT_VERSION();",
             Self::Redis => "SCAN 0 COUNT 100",
             Self::MongoDB => "{\"ping\": 1}",
             Self::Elasticsearch => "GET /",
@@ -192,6 +220,8 @@ impl DatabaseKind {
             Self::Turso => "libsql",
             Self::CloudflareD1 => "d1",
             Self::ClickHouse => "clickhouse",
+            Self::SqlServer => "sqlserver",
+            Self::Snowflake => "snowflake",
         }
     }
 }
@@ -212,6 +242,8 @@ impl fmt::Display for DatabaseKind {
             Self::Turso => "Turso",
             Self::CloudflareD1 => "Cloudflare D1",
             Self::ClickHouse => "ClickHouse",
+            Self::SqlServer => "SQL Server",
+            Self::Snowflake => "Snowflake",
         })
     }
 }
@@ -222,6 +254,8 @@ impl fmt::Display for DatabaseKind {
 /// it is safe to log the rest of a connection configuration.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionConfig {
+    #[serde(default)]
+    pub read_only: bool,
     pub kind: DatabaseKind,
     pub url: String,
     #[serde(default = "default_max_connections")]
@@ -233,6 +267,9 @@ pub struct ConnectionConfig {
     pub socket: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<crate::SshConfig>,
+    /// Resolved only from encrypted credential storage.
+    #[serde(skip)]
+    pub ssh_password: Option<String>,
 }
 
 fn default_max_connections() -> u32 {
@@ -248,11 +285,18 @@ impl ConnectionConfig {
         Self {
             kind,
             url: url.into(),
+            read_only: false,
             max_connections: default_max_connections(),
             connect_timeout_ms: default_connect_timeout_ms(),
             socket: None,
             ssh: None,
+            ssh_password: None,
         }
+    }
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     pub fn with_max_connections(mut self, max_connections: u32) -> Self {
@@ -366,6 +410,9 @@ pub struct ColumnInfo {
     pub nullable: bool,
     pub ordinal: usize,
     pub primary_key: bool,
+    /// The column default as an SQL expression, when the catalog exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
 }
 
 impl ColumnInfo {
@@ -377,6 +424,7 @@ impl ColumnInfo {
             nullable: true,
             ordinal,
             primary_key: false,
+            default_value: None,
         }
     }
 }
@@ -418,11 +466,65 @@ impl ReferentialAction {
     }
 }
 
+/// A secondary or primary index on a table.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IndexInfo {
+    pub name: String,
+    /// Indexed columns or expressions, in key order. Descending parts end in
+    /// ` DESC`.
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub primary: bool,
+    /// The access method, such as `btree`, `gin`, or `HASH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// A partial-index predicate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// The engine's own `CREATE INDEX` statement, when it can produce one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+/// A `CHECK` constraint on a table.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckConstraintInfo {
+    pub name: Option<String>,
+    /// The boolean expression inside `CHECK (...)`.
+    pub expression: String,
+}
+
 /// The full structural metadata for a table or collection.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TableStructure {
     pub columns: Vec<ColumnInfo>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<IndexInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckConstraintInfo>,
+    /// The engine's source for the object: a view's query, or SQLite's
+    /// original `CREATE` statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaObjectKind {
+    Trigger,
+    Sequence,
+    Function,
+    Procedure,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SchemaObject {
+    pub kind: SchemaObjectKind,
+    pub name: String,
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub definition: Option<String>,
 }
 
 /// A point-in-time snapshot of the relational metadata available to a
@@ -432,6 +534,14 @@ pub struct TableStructure {
 pub struct RelationalSchema {
     pub database: String,
     pub tables: Vec<RelationalTable>,
+    /// True when defaults, indexes, and checks were read. Baselines captured
+    /// by earlier versions lack them and must not report them as changes.
+    #[serde(default)]
+    pub details_captured: bool,
+    #[serde(default)]
+    pub objects: Vec<SchemaObject>,
+    #[serde(default)]
+    pub objects_captured: bool,
 }
 
 /// Structural metadata for one table or view in a [`RelationalSchema`].
@@ -527,7 +637,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// A table reference with an optional schema/database qualifier.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TableRef {
     pub schema: Option<String>,
     pub name: String,

@@ -17,6 +17,7 @@ mod settings;
 mod theme;
 mod updater;
 mod vault;
+mod workspace;
 
 use app::DbxApp;
 use gpui::{
@@ -144,6 +145,34 @@ fn main() {
                 KeyBinding::new("shift-tab", app::VaultFocusPrevious, Some("VaultGate")),
                 KeyBinding::new("enter", app::SubmitVault, Some("VaultGate")),
                 KeyBinding::new("enter", app::ApplyFilters, Some("DbxFilters")),
+                KeyBinding::new("enter", app::CommitCellEdit, Some("DbxCellEditor")),
+                KeyBinding::new(
+                    "enter",
+                    app::SubmitQueryParameters,
+                    Some("DbxQueryParameters"),
+                ),
+                KeyBinding::new(
+                    "escape",
+                    app::CancelQueryParameters,
+                    Some("DbxQueryParameters"),
+                ),
+                KeyBinding::new("tab", app::CommitCellEditNext, Some("DbxCellEditor")),
+                KeyBinding::new(
+                    "shift-tab",
+                    app::CommitCellEditPrevious,
+                    Some("DbxCellEditor"),
+                ),
+                KeyBinding::new("escape", app::CancelCellEdit, Some("DbxCellEditor")),
+                KeyBinding::new(
+                    "cmd-shift-backspace",
+                    app::SetCellNull,
+                    Some("DbxCellEditor"),
+                ),
+                KeyBinding::new(
+                    "ctrl-shift-backspace",
+                    app::SetCellNull,
+                    Some("DbxCellEditor"),
+                ),
                 KeyBinding::new("cmd-enter", app::RunQuery, Some(editor::SQL_EDITOR_CONTEXT)),
                 KeyBinding::new(
                     "ctrl-enter",
@@ -163,6 +192,13 @@ fn main() {
                 KeyBinding::new("escape", app::CancelQuery, Some(editor::SQL_EDITOR_CONTEXT)),
                 KeyBinding::new("escape", app::CancelQuery, Some("QueryWorkbench")),
                 KeyBinding::new("cmd-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
+                KeyBinding::new("cmd-f", app::OpenFind, Some("QueryWorkbench")),
+                KeyBinding::new("ctrl-f", app::OpenFind, Some("QueryWorkbench")),
+                KeyBinding::new("cmd-alt-f", app::OpenReplace, Some("QueryWorkbench")),
+                KeyBinding::new("ctrl-h", app::OpenReplace, Some("QueryWorkbench")),
+                KeyBinding::new("enter", app::FindNext, Some("DbxFind")),
+                KeyBinding::new("shift-enter", app::FindPrevious, Some("DbxFind")),
+                KeyBinding::new("escape", app::CloseFind, Some("DbxFind")),
                 KeyBinding::new("ctrl-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
                 KeyBinding::new("enter", app::SubmitQueryAgent, Some("DbxQueryAgent")),
                 KeyBinding::new("shift-enter", editor::Enter, Some("DbxQueryAgent")),
