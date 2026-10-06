@@ -6,18 +6,26 @@
 //! operations for the GPUI client.
 
 mod connectors;
+mod console;
+mod diagnostics;
 mod engine;
 mod error;
 mod model;
+mod protected;
 mod redis_catalog;
 mod redis_engine;
 mod sql;
 mod sqlx_engine;
 mod transfer;
+pub use diagnostics::{
+    MigrationDraft, Monitor, compare_execution_plans, execution_plan_query, format_execution_plan,
+    monitor_query, schema_migration,
+};
 mod transport;
 
 pub use transport::SshConfig;
 
+pub use console::{QueryCancellation, QuerySession, ScriptResult, StatementResult};
 pub use engine::{DatabaseEngine, Engine, QueryOptions};
 pub use error::{DbxError, Result};
 pub use model::{
@@ -37,8 +45,9 @@ pub use sql::{
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::{
     DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
-    FileFormat, ImportReport, detect_file_format, export_database, export_table, import_database,
-    import_file, render_sql_insert, render_sql_schema, split_sql_statements,
+    FileFormat, ImportReport, TransferControl, detect_file_format, export_database, export_table,
+    import_database, import_file, render_sql_insert, render_sql_schema, split_sql_statements,
+    with_transfer_control,
 };
 
 #[cfg(test)]

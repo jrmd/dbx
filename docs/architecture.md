@@ -48,6 +48,9 @@ behavior each module hides:
   hydration, Test Connection, and session-opening workflow.
 - `app/transfer.rs` owns database/table import and export prompts,
   confirmations, background work, and generation-safe result application.
+- `app/workspace.rs` owns encrypted draft recovery and named queries; `workspace.rs`
+  stores bounded, revision-ordered documents in the vault. `app/diagnostics.rs`
+  coordinates plans, server monitors, and schema comparison drafts.
 - `app/sql_completion.rs` owns SQL tokenization, scope/source inference,
   dialect-aware candidate ranking, and its focused regression tests.
 - `app/result_table.rs` is the shared virtualized table adapter for browsed and
@@ -77,7 +80,9 @@ The exact Rust module names may change, but the seam should remain close to thes
 - `DbValue`: null, booleans, signed/unsigned numbers, floating values, text, bytes, timestamps, JSON, and an explicit opaque/display-only value for types the grid cannot safely edit.
 - `FilterExpr`: a structured predicate (`and`, `or`, `not`, equality, comparison, null checks, text match, and membership) plus sort and page information. It compiles to SQL and bound parameters for relational engines; Redis uses an intentionally narrower key/type predicate set.
 - `Mutation`: insert/update/delete or create-table intent, including the target identity, values, expected row count/version when available, and a preview representation before execution.
-- `Transfer`: table and connection-level import/export between a connection and local files. SQL dumps (`.sql`), CSV/TSV, each optionally gzip-compressed. Database SQL exports can select tables and emit every generated table schema before the data phase, or schemas only; PostgreSQL/MySQL foreign-key constraints are added after data, while SQLite orders dependent tables before their rows. Delimited database exports write one independently consumable file per selected table. Exports page through the shared query path; SQL-dump imports replay statements through the same execute path as the console (behind an explicit confirmation), and delimited imports bulk-append parameterized multi-row inserts after mapping the file header onto real columns. Transfers are connection-level operations in core, so they inherit quoting, parameterization, capability checks, and redacted errors for free.
+- `QuerySession` (`console.rs`): a query tab owns its SQL connection and transaction state. It splits scripts into independent result sets, bounds retained results, and coordinates deadlines and cancellation. PostgreSQL/MySQL cancellation uses a separate control connection; SQLite uses a progress handler. Stateless connectors keep explicit capability limits.
+- `Transfer`: streamed SQL/CSV/TSV, optionally gzip-compressed. `ExportReader` reads bounded pages in one native SQL snapshot, with an explicitly reported live-read fallback. `SqlTransaction` owns atomic file imports and rolls back on drop; MySQL DDL and non-InnoDB imports are rejected. Atomic temporary-file replacement protects each export destination. Transfer progress and cancellation are connection-owned. See [the full contracts](workbench-safety.md).
+- `Diagnostics` (`diagnostics.rs`): provider-specific plan and monitor queries plus conservative migration drafts built from normalized column/key metadata. Drafts open in the editor and are never automatically applied.
 
 Identifiers are represented as identifiers, not raw SQL fragments. Each connector quotes them according to its engine. User-entered SQL is still allowed in the console, but is clearly separated from generated statements and is never silently mixed with GUI filter input.
 
@@ -92,7 +97,7 @@ GPUI owns the main event/render loop. Connector calls should run in background t
 - avoid putting passwords, full query results, or parameter values in debug output;
 - close or return a session's connection when a tab is disposed.
 
-Connection pooling is an implementation choice per driver. A simple per-session connection is sufficient for the MVP, provided concurrent metadata and query operations do not race on a non-thread-safe client. Pooling and parallel query tabs can be added behind the same session interface.
+Metadata and grid browsing use engine pools; native SQL query tabs retain dedicated connections behind `QuerySession`. SQLite `:memory:` deliberately shares its sole connection to preserve the database, so an open transaction can delay other operations. Tab/session teardown discards the connection and rolls back unfinished native transactions.
 
 ## Main user flows
 
@@ -167,6 +172,6 @@ The safest vertical slices are:
 - PostgreSQL and MySQL adapter parity for metadata, paging, filters, and writes.
 - Relational SQL console with cancellation and result limits.
 - Redis keyspace browser and command-aware value editor.
-- Vault/TLS hardening, conflict handling, accessibility, transfer progress/streaming for very large files, and future migration tooling.
+- Continued vault/TLS hardening, accessibility, live cloud-account verification, and richer schema metadata for migration tooling.
 
 Each slice should keep connector-specific code behind the core contracts and add an integration test before widening the UI surface.

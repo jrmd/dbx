@@ -9,11 +9,13 @@
 
 mod agents;
 mod connection;
+mod diagnostics;
 mod redis_completion;
 mod result_table;
 mod sql_completion;
 mod transfer;
 mod view;
+mod workspace;
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -25,9 +27,9 @@ use std::{
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
     DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Page,
-    QueryOptions, QueryResult, RedisCommandCatalog, ReferentialAction, RelationalSchema, RowData,
-    TableInfo, TableRef, UpdateRequest, detect_file_format, export_database, export_table,
-    import_database, import_file,
+    QueryCancellation, QueryOptions, QueryResult, QuerySession, RedisCommandCatalog,
+    ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo, TableRef,
+    UpdateRequest, detect_file_format, export_database, export_table, import_database, import_file,
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, Decorations, Div, ElementId, Entity,
@@ -226,6 +228,7 @@ pub(crate) struct Toast {
 const MAX_TOASTS: usize = 3;
 
 struct ConnectionDraft {
+    read_only: bool,
     kind: DatabaseKind,
     mode: ConnectionFormMode,
     selected_profile: Option<Uuid>,
@@ -379,6 +382,7 @@ impl ConnectionDraft {
 
         Self {
             kind: DatabaseKind::SQLite,
+            read_only: false,
             mode: ConnectionFormMode::Details,
             selected_profile: None,
             choosing_kind: true,
@@ -730,6 +734,18 @@ impl Drop for BackgroundTaskSet {
 }
 
 struct QueryTab {
+    timeout_secs: u64,
+    plan_pending: bool,
+    plan: Option<QueryResult>,
+    plan_baseline: Option<QueryResult>,
+    name: Entity<String>,
+    name_editor: Entity<TextEditor>,
+    console: Option<Arc<QuerySession>>,
+    cancellation: Option<QueryCancellation>,
+    statement_results: Vec<StatementResult>,
+    active_result: usize,
+    in_transaction: bool,
+    execution_override: Option<String>,
     agent: agents::AgentQuery,
     query_text: Entity<String>,
     query_editor: Entity<TextEditor>,
@@ -765,6 +781,8 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<DbxApp>,
     ) -> Self {
+        let name = cx.new(|_| "Untitled".to_owned());
+        let name_editor = cx.new(|cx| TextEditor::new(name.clone(), false, window, cx));
         let query_text = cx.new(|_| DbxApp::default_query(kind).to_owned());
         let query_editor = cx.new(|cx| match query_editor_language(kind) {
             editor::EditorLanguage::Sql => TextEditor::new_sql(query_text.clone(), window, cx),
@@ -805,15 +823,32 @@ impl QueryTab {
                 query.completion_signature = None;
                 query.completion_dismissed_signature = None;
             }
+            this.persist_query_workspace_for(session_id, cx);
             cx.notify();
         });
         let editor_subscription = cx.observe(&query_editor, |_, _, cx| cx.notify());
+        let name_subscription = cx.observe(&name, move |this, _, cx| {
+            this.persist_query_workspace_for(session_id, cx);
+            cx.notify();
+        });
         let table_subscription =
             cx.subscribe_in(&result_grid, window, move |this, _, event, _, cx| {
                 this.on_query_grid_event(session_id, tab_id, event, cx)
             });
 
         Self {
+            name,
+            timeout_secs: 60,
+            plan_pending: false,
+            plan: None,
+            plan_baseline: None,
+            name_editor,
+            console: None,
+            cancellation: None,
+            statement_results: Vec::new(),
+            active_result: 0,
+            in_transaction: false,
+            execution_override: None,
             agent: agents::AgentQuery::new(window, cx),
             query_text,
             query_editor,
@@ -834,7 +869,12 @@ impl QueryTab {
             completion_signature: None,
             completion_dismissed_signature: None,
             completion_index: 0,
-            _subscriptions: vec![text_subscription, editor_subscription, table_subscription],
+            _subscriptions: vec![
+                text_subscription,
+                name_subscription,
+                editor_subscription,
+                table_subscription,
+            ],
         }
     }
 
@@ -854,7 +894,12 @@ impl QueryTab {
 
     fn invalidate_request(&mut self) {
         self.request_generation = self.request_generation.saturating_add(1);
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
         self.abort_handle.cancel();
+        self.console = None;
+        self.in_transaction = false;
         self.busy = false;
         self.agent.cancel();
         self.agent.result = None;
@@ -875,6 +920,9 @@ fn query_editor_language(kind: DatabaseKind) -> editor::EditorLanguage {
 
 impl Drop for QueryTab {
     fn drop(&mut self) {
+        if let Some(cancellation) = self.cancellation.take() {
+            cancellation.cancel();
+        }
         self.abort_handle.cancel();
     }
 }
@@ -1204,6 +1252,8 @@ fn find_data_tab_mut(tabs: &mut [SecondaryTab], id: SecondaryTabId) -> Option<&m
 }
 
 struct ConnectionSession {
+    schema_baseline: Option<RelationalSchema>,
+    transfer_control: Option<dbx_core::TransferControl>,
     id: SessionId,
     profile_id: Option<Uuid>,
     name: String,
@@ -1286,6 +1336,8 @@ impl ConnectionSession {
             error: None,
             request_generation: 0,
             background_tasks: BackgroundTaskSet::default(),
+            transfer_control: None,
+            schema_baseline: None,
         }
     }
 
@@ -1460,6 +1512,7 @@ enum ConfirmationAction {
         tab_id: SecondaryTabId,
         table: TableRef,
         filters: Vec<Filter>,
+        originals: Vec<(String, CellValue)>,
     },
     DatabaseImport {
         session_id: SessionId,
@@ -1553,6 +1606,8 @@ pub struct DbxApp {
     /// Newest-first cache for the history UI. Disk access is never performed
     /// from render or query completion on the GPUI thread.
     recent_query_history: Vec<QueryHistoryEntry>,
+    workspace_store: Option<Arc<crate::workspace::WorkspaceStore>>,
+    workspace_documents: HashMap<String, crate::workspace::WorkspaceDocument>,
     sessions: Vec<ConnectionSession>,
     active_session_id: Option<SessionId>,
     connection_picker_open: bool,
@@ -1591,6 +1646,10 @@ impl DbxApp {
         let vault_editors = VaultEditors::new(window, cx);
 
         let subscriptions = vec![
+            cx.on_app_quit(|this, cx| {
+                let _ = this.flush_query_workspaces(cx);
+                async {}
+            }),
             cx.observe(&draft.connection_name, |_, _, cx| cx.notify()),
             cx.observe(&draft.connection_url, |_, _, cx| cx.notify()),
             cx.observe(&draft.host, |_, _, cx| cx.notify()),
@@ -1663,6 +1722,11 @@ impl DbxApp {
             credential_hydrating: false,
             credential_hydration_generation: 0,
             credential_connect_window: None,
+            workspace_store: profile_store
+                .as_ref()
+                .and_then(ProfileStore::vault)
+                .map(|vault| Arc::new(crate::workspace::WorkspaceStore::new(vault))),
+            workspace_documents: HashMap::new(),
             profile_store,
             saved_connections,
             connection_tags,
@@ -2045,6 +2109,7 @@ impl DbxApp {
     }
 
     fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        self.persist_query_workspace_for(session_id, cx);
         let Some(index) = self
             .sessions
             .iter()
@@ -3131,6 +3196,7 @@ impl DbxApp {
                 session.recent_data_tab = session.active_secondary_tab;
             }
         }
+        self.persist_query_workspace_for(session_id, cx);
         cx.notify();
     }
 
@@ -3870,6 +3936,13 @@ impl DbxApp {
         tab_id: SecondaryTabId,
     ) -> Option<&TableRef> {
         let session = self.session(session_id)?;
+        if session
+            .engine
+            .as_ref()
+            .is_some_and(|engine| engine.is_read_only())
+        {
+            return None;
+        }
         let data = session.data_tab(tab_id)?;
         let is_real_table = session
             .tables
@@ -4316,7 +4389,21 @@ impl DbxApp {
         if busy {
             return;
         }
-        let full_query = query_editor.read(cx).text(cx);
+        let override_query = self
+            .session_mut(session_id)
+            .and_then(|session| {
+                session
+                    .secondary_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+            })
+            .and_then(|tab| match &mut tab.kind {
+                SecondaryTabKind::Query(query) => query.execution_override.take(),
+                _ => None,
+            });
+        let full_query = override_query
+            .clone()
+            .unwrap_or_else(|| query_editor.read(cx).text(cx));
         let scope = if run_all {
             editor::QueryExecutionScope::Document
         } else if kind.is_sql() {
@@ -4326,7 +4413,7 @@ impl DbxApp {
         } else {
             editor::QueryExecutionScope::Document
         };
-        let range = if run_all {
+        let range = if run_all || override_query.is_some() {
             0..full_query.len()
         } else {
             query_editor.read(cx).execution_range(scope, cx)
@@ -4364,8 +4451,23 @@ impl DbxApp {
         // The executed statement moves into the blocking task; the original
         // stays behind so failures can locate the offending token in it.
         let executed_query = query.clone();
-        let task = runtime
-            .spawn(async move { engine.query(&executed_query, QueryOptions::default()).await });
+        let console = query_tab
+            .console
+            .get_or_insert_with(|| Arc::new(QuerySession::new(engine)))
+            .clone();
+        let cancellation = QueryCancellation::default();
+        query_tab.cancellation = Some(cancellation.clone());
+        let timeout_secs = query_tab.timeout_secs;
+        let task = runtime.spawn(async move {
+            console
+                .run(
+                    &executed_query,
+                    QueryOptions::default(),
+                    std::time::Duration::from_secs(timeout_secs),
+                    cancellation,
+                )
+                .await
+        });
         query_tab.abort_handle.replace(task.abort_handle());
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -4389,17 +4491,45 @@ impl DbxApp {
                     }
                     query_tab.busy = false;
                     query_tab.abort_handle.clear();
+                    query_tab.cancellation = None;
                     match result {
-                        Ok(Ok(result)) => {
-                            query_tab.status = query_result_status(&result);
-                            let outcome = QueryHistoryOutcome::success(query_tab.status.clone());
-                            query_tab.set_result(Some(result), cx);
+                        Ok(Ok(script)) => {
+                            query_tab.in_transaction = script.in_transaction;
+                            query_tab.statement_results = script.statements;
+                            query_tab.active_result =
+                                query_tab.statement_results.len().saturating_sub(1);
+                            let mut result = query_tab
+                                .statement_results
+                                .last()
+                                .map(|item| item.result.clone());
+                            let error = query_tab
+                                .statement_results
+                                .last()
+                                .and_then(|item| item.error.clone());
+                            if std::mem::take(&mut query_tab.plan_pending)
+                                && error.is_none()
+                                && let Some(raw) = &result
+                            {
+                                let plan = dbx_core::format_execution_plan(kind, raw);
+                                query_tab.plan = Some(plan.clone());
+                                result = Some(plan);
+                            }
+                            query_tab.status =
+                                result.as_ref().map(query_result_status).unwrap_or_default();
+                            let outcome = if let Some(error) = &error {
+                                QueryHistoryOutcome::failure(error.clone())
+                            } else {
+                                QueryHistoryOutcome::success(query_tab.status.clone())
+                            };
+                            query_tab.set_result(result, cx);
                             query_tab.results_stale = false;
-                            query_tab.error = None;
+                            query_tab.error = error;
                             query_tab.error_highlight = None;
-                            (outcome, may_change_schema)
+                            (outcome, may_change_schema && !query_tab.in_transaction)
                         }
                         Ok(Err(error)) => {
+                            query_tab.plan_pending = false;
+                            query_tab.in_transaction = false;
                             let message = error.to_string();
                             // Positions reported against the trimmed statement
                             // shift by the trimmed leading whitespace.
@@ -4446,6 +4576,49 @@ impl DbxApp {
             Ok::<(), anyhow::Error>(())
         })
         .detach();
+    }
+
+    pub(super) fn run_console_command_for(
+        &mut self,
+        session_id: SessionId,
+        command: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.session_mut(session_id)
+            && let Some(tab_id) = session.active_secondary_tab
+            && let Some(tab) = session
+                .secondary_tabs
+                .iter_mut()
+                .find(|tab| tab.id == tab_id)
+            && let SecondaryTabKind::Query(query) = &mut tab.kind
+            && !query.busy
+        {
+            query.execution_override = Some(command.to_owned());
+            self.run_query_for_execution(session_id, true, cx);
+        }
+    }
+
+    pub(super) fn select_statement_result_for(
+        &mut self,
+        session_id: SessionId,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.session_mut(session_id)
+            && let Some(tab_id) = session.active_secondary_tab
+            && let Some(tab) = session
+                .secondary_tabs
+                .iter_mut()
+                .find(|tab| tab.id == tab_id)
+            && let SecondaryTabKind::Query(query) = &mut tab.kind
+            && let Some(item) = query.statement_results.get(index).cloned()
+        {
+            query.active_result = index;
+            query.status = query_result_status(&item.result);
+            query.error = item.error;
+            query.set_result(Some(item.result), cx);
+            cx.notify();
+        }
     }
 
     fn copy_query_selection_action(
@@ -4495,11 +4668,10 @@ impl DbxApp {
         if !query_tab.busy {
             return;
         }
-        query_tab.invalidate_request();
-        query_tab.results_stale = query_tab.result.is_some();
-        query_tab.error = None;
-        query_tab.error_highlight = None;
-        query_tab.status = "Query cancelled".into();
+        if let Some(cancellation) = &query_tab.cancellation {
+            cancellation.cancel();
+        }
+        query_tab.status = "Stopping query; verifying server cancellation…".into();
         cx.notify();
     }
 
@@ -5087,6 +5259,10 @@ impl DbxApp {
             return;
         };
         if session.current_database.as_deref() == Some(database.as_str()) || session.busy {
+            return;
+        }
+        if session.secondary_tabs.iter().any(|tab| matches!(&tab.kind, SecondaryTabKind::Query(query) if query.in_transaction || query.busy)) {
+            session.error = Some("Finish or roll back open query transactions before switching databases".into());
             return;
         }
         for tab in &mut session.secondary_tabs {
@@ -5705,6 +5881,29 @@ impl DbxApp {
                 return;
             }
         };
+        let originals = match &request {
+            Mutation::Update(request) => data
+                .selected_row
+                .and_then(|index| data.result.as_ref()?.rows.get(index))
+                .map(|row| {
+                    data.result
+                        .as_ref()
+                        .unwrap()
+                        .columns
+                        .iter()
+                        .zip(&row.values)
+                        .filter(|(column, _)| {
+                            request
+                                .assignments
+                                .iter()
+                                .any(|(name, _)| *name == column.name)
+                        })
+                        .map(|(column, value)| (column.name.clone(), value.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            Mutation::Insert(_) => Vec::new(),
+        };
         let error_return_focus = self
             .row_draft_focus_for(session_id, tab_id, None, cx)
             .or_else(|| window.focused(cx));
@@ -5723,7 +5922,7 @@ impl DbxApp {
         let task = runtime.spawn(async move {
             match request {
                 Mutation::Insert(request) => engine.insert(&request).await,
-                Mutation::Update(request) => engine.update(&request).await,
+                Mutation::Update(request) => engine.update_checked(&request, &originals).await,
             }
         });
         if let Some(session) = self.session_mut(session_id) {
@@ -5793,6 +5992,18 @@ impl DbxApp {
                 return;
             }
         };
+        let originals = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.result.as_ref())
+            .map(|result| {
+                result
+                    .columns
+                    .iter()
+                    .zip(&row.values)
+                    .map(|(column, value)| (column.name.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let return_focus = window.focused(cx);
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
@@ -5808,6 +6019,7 @@ impl DbxApp {
                 tab_id,
                 table,
                 filters,
+                originals,
             },
             focus: focus.clone(),
             return_focus,
@@ -5822,6 +6034,7 @@ impl DbxApp {
         tab_id: SecondaryTabId,
         table: TableRef,
         filters: Vec<Filter>,
+        originals: Vec<(String, CellValue)>,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.session(session_id) else {
@@ -5843,11 +6056,6 @@ impl DbxApp {
         let Some(engine) = session.engine.clone() else {
             return;
         };
-        let known_columns = if data.table == table {
-            data.table_columns.clone()
-        } else {
-            Vec::new()
-        };
         let runtime = self.runtime.clone();
         let Some(session) = self.session_mut(session_id) else {
             return;
@@ -5861,11 +6069,8 @@ impl DbxApp {
         data.status = "Deleting row…".into();
         data.request_generation += 1;
         let generation = data.request_generation;
-        let task = runtime.spawn(async move {
-            engine
-                .delete_with_columns(&table, &filters, Some(&known_columns))
-                .await
-        });
+        let task =
+            runtime.spawn(async move { engine.delete_checked(&table, &filters, &originals).await });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
         }
@@ -6065,7 +6270,8 @@ impl DbxApp {
                 tab_id,
                 table,
                 filters,
-            } => self.delete_row_for(session_id, tab_id, table, filters, cx),
+                originals,
+            } => self.delete_row_for(session_id, tab_id, table, filters, originals, cx),
             ConfirmationAction::DatabaseImport { session_id, path } => {
                 self.execute_database_import(session_id, path, cx)
             }
@@ -6798,6 +7004,148 @@ mod tests {
             query_editor_language(DatabaseKind::Redis),
             editor::EditorLanguage::Redis
         );
+    }
+
+    #[gpui::test]
+    fn named_query_drafts_are_flushed_before_vault_lock(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let profile_store = ProfileStore::at(directory.path().join("connections.json"));
+        let vault = profile_store.vault().unwrap();
+        vault.create("draft recovery passphrase").unwrap();
+        let workspace = Arc::new(crate::workspace::WorkspaceStore::new(vault.clone()));
+        let session_id = Uuid::new_v4();
+        let profile_id = Uuid::new_v4();
+        let key = crate::workspace::connection_key(&QueryHistoryConnection::profile(profile_id));
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.profile_store = Some(profile_store);
+                app.workspace_store = Some(workspace.clone());
+                app.workspace_documents
+                    .insert(key.clone(), Default::default());
+                app.vault_state = Some(VaultState::Unlocked);
+                app.sessions.push(ConnectionSession::new(
+                    session_id,
+                    Some(profile_id),
+                    "Recovery test".into(),
+                    DatabaseKind::SQLite,
+                    None,
+                    window,
+                    cx,
+                ));
+                app.active_session_id = Some(session_id);
+                app.open_saved_query_for(
+                    session_id,
+                    crate::workspace::SavedQuery {
+                        name: "Unfinished investigation".into(),
+                        sql: "SELECT 'private unfinished draft'".into(),
+                    },
+                    window,
+                    cx,
+                );
+                app.save_named_query_for(session_id, cx);
+                app.lock_vault(cx);
+                assert!(app.sessions.is_empty());
+                assert!(app.workspace_documents.is_empty());
+            })
+        });
+        vault.unlock("draft recovery passphrase").unwrap();
+        let recovered = workspace.load(&key).unwrap();
+        assert_eq!(recovered.drafts.len(), 1);
+        assert_eq!(recovered.saved.len(), 1);
+        assert_eq!(recovered.drafts[0].sql, "SELECT 'private unfinished draft'");
+        assert_eq!(recovered.saved[0].name, "Unfinished investigation");
+    }
+    #[gpui::test]
+    fn workbench_renders_transaction_controls_result_tabs_and_saved_queries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Workbench test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            let mut query = QueryTab::new(DatabaseKind::SQLite, session_id, tab_id, window, cx);
+            query.in_transaction = true;
+            query.statement_results = vec![
+                StatementResult {
+                    statement: "SELECT 1".into(),
+                    result: QueryResult::empty(None, 1),
+                    error: None,
+                },
+                StatementResult {
+                    statement: "SELECT 2".into(),
+                    result: QueryResult {
+                        columns: vec![ColumnInfo::result("second", 0, "INTEGER")],
+                        rows: vec![dbx_core::RowData::new(vec![CellValue::Integer(2)])],
+                        ..QueryResult::empty(None, 1)
+                    },
+                    error: None,
+                },
+            ];
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Query(Box::new(query)),
+            });
+            session.active_secondary_tab = Some(tab_id);
+            session.pane = Pane::Query;
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app.connection_picker_open = false;
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("save-named-query").is_some());
+        assert!(cx.debug_bounds("query-workbench-more").is_some());
+        assert!(cx.debug_bounds("commit-query").is_some());
+        assert!(cx.debug_bounds("rollback-query").is_some());
+        assert!(cx.debug_bounds("statement-result-0").is_some());
+        assert!(cx.debug_bounds("statement-result-1").is_some());
+        let second = cx.debug_bounds("statement-result-1").unwrap();
+        cx.simulate_click(second.center(), gpui::Modifiers::none());
+        cx.update(|_, cx| {
+            let session = app.read(cx).session(session_id).unwrap();
+            let SecondaryTabKind::Query(query) = &session.secondary_tabs[0].kind else {
+                panic!("query tab")
+            };
+            assert_eq!(query.active_result, 1);
+            assert_eq!(query.result.as_ref().unwrap().columns[0].name, "second");
+            assert_eq!(
+                query.result.as_ref().unwrap().rows[0].values[0],
+                CellValue::Integer(2)
+            );
+        });
+        cx.simulate_resize(gpui::size(px(720.), px(640.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for selector in [
+            "save-named-query",
+            "commit-query",
+            "rollback-query",
+            "query-workbench-more",
+        ] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("query control remains visible");
+            assert!(
+                bounds.origin.x >= px(0.) && bounds.right() <= px(720.),
+                "{selector} is outside the compact window: {bounds:?}"
+            );
+        }
+        let options = cx.debug_bounds("query-workbench-more").unwrap();
+        cx.simulate_click(options.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| assert!(app.read(cx).session(session_id).is_some()));
     }
 
     #[gpui::test]

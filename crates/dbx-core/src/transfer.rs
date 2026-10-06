@@ -2,7 +2,7 @@
 //!
 //! Supported formats are SQL dumps (`.sql`), CSV (`.csv`), and TSV
 //! (`.tsv`), each optionally gzip-compressed with a `.gz` suffix. SQL dumps
-//! contain dialect-aware `INSERT` statements wrapped in a transaction; CSV
+//! contain dialect-aware `INSERT` statements; the importer owns its transaction. CSV
 //! and TSV carry one header row of column names followed by data rows.
 //!
 //! Delimited conventions shared by both directions:
@@ -17,17 +17,59 @@
 use std::{
     collections::{BTreeSet, VecDeque},
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
+use crate::console::SqlTransaction;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
+#[derive(Clone, Default)]
+pub struct TransferControl {
+    cancellation: crate::QueryCancellation,
+    rows: Arc<AtomicU64>,
+    statements: Arc<AtomicU64>,
+}
+impl TransferControl {
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+    pub fn progress(&self) -> (u64, u64) {
+        (
+            self.rows.load(Ordering::Relaxed),
+            self.statements.load(Ordering::Relaxed),
+        )
+    }
+}
+tokio::task_local! { static TRANSFER_CONTROL: TransferControl; }
+pub async fn with_transfer_control<T>(
+    control: TransferControl,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    TRANSFER_CONTROL.scope(control.clone(), async move {
+        tokio::select! {
+            biased;
+            _ = control.cancellation.cancelled() => Err(DbxError::Interrupted("Transfer cancelled. Uncommitted imports roll back and unfinished temporary files are removed. Previously completed export files remain.".into())),
+            result = work => result,
+        }
+    }).await
+}
+fn report_transfer(rows: u64, statements: u64) {
+    let _ = TRANSFER_CONTROL.try_with(|control| {
+        control.rows.fetch_add(rows, Ordering::Relaxed);
+        control.statements.fetch_add(statements, Ordering::Relaxed);
+    });
+}
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 use crate::{
     CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Page, QueryOptions, Result,
     TableRef, TableStructure,
-    sql::{build_multi_row_insert, quote_identifier, quote_table},
+    sql::{build_multi_row_insert_with_columns, quote_identifier, quote_table},
 };
 
 /// Rows fetched per page while exporting. Bounded so a large table streams
@@ -114,6 +156,7 @@ pub struct ExportSummary {
     pub rows_exported: u64,
     pub format: DumpFormat,
     pub gzipped: bool,
+    pub consistent_snapshot: bool,
 }
 
 /// A connection-level export request.
@@ -142,6 +185,174 @@ pub struct DatabaseExportSummary {
     pub format: DumpFormat,
     pub gzipped: bool,
     pub schema_only: bool,
+    pub consistent_snapshot: bool,
+}
+
+/// Output becomes visible only after the complete stream and gzip footer have
+/// been flushed. A failed/cancelled export leaves the previous file untouched.
+struct ExportFile {
+    temporary: tempfile::NamedTempFile,
+    destination: PathBuf,
+    writer: ExportWriter,
+}
+enum ExportWriter {
+    Plain(BufWriter<fs::File>),
+    Gzip(GzEncoder<BufWriter<fs::File>>),
+}
+impl ExportFile {
+    fn new(path: &Path, gzipped: bool) -> Result<Self> {
+        let temporary = tempfile::NamedTempFile::new_in(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )
+        .map_err(io_error)?;
+        let buffer = BufWriter::new(temporary.as_file().try_clone().map_err(io_error)?);
+        let writer = if gzipped {
+            ExportWriter::Gzip(GzEncoder::new(buffer, Compression::default()))
+        } else {
+            ExportWriter::Plain(buffer)
+        };
+        Ok(Self {
+            temporary,
+            destination: path.to_owned(),
+            writer,
+        })
+    }
+    fn finish(self) -> Result<()> {
+        let mut buffer = match self.writer {
+            ExportWriter::Plain(buffer) => buffer,
+            ExportWriter::Gzip(encoder) => encoder.finish().map_err(io_error)?,
+        };
+        buffer.flush().map_err(io_error)?;
+        buffer.get_ref().sync_all().map_err(io_error)?;
+        drop(buffer);
+        self.temporary
+            .persist(&self.destination)
+            .map_err(|error| io_error(error.error))?;
+        Ok(())
+    }
+}
+impl Write for ExportFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match &mut self.writer {
+            ExportWriter::Plain(writer) => writer.write(bytes),
+            ExportWriter::Gzip(writer) => writer.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.writer {
+            ExportWriter::Plain(writer) => writer.flush(),
+            ExportWriter::Gzip(writer) => writer.flush(),
+        }
+    }
+}
+
+struct ExportReader<'a> {
+    engine: &'a DatabaseEngine,
+    snapshot: Option<SqlTransaction>,
+    structures: Vec<(TableRef, TableStructure)>,
+}
+impl<'a> ExportReader<'a> {
+    async fn new(engine: &'a DatabaseEngine, tables: &[TableRef]) -> Result<Self> {
+        let mut structures = Vec::new();
+        for table in tables {
+            structures.push((table.clone(), engine.table_structure(table).await?));
+        }
+        let transactional = if engine.kind() == DatabaseKind::MySQL {
+            let mut all_transactional = true;
+            for table in tables {
+                all_transactional &= mysql_table_transactional(engine, table).await?;
+            }
+            all_transactional
+        } else {
+            true
+        };
+        let snapshot = if transactional && matches!(engine, DatabaseEngine::Sql(_)) {
+            Some(SqlTransaction::begin(engine, true).await?)
+        } else {
+            None
+        };
+        Ok(Self {
+            engine,
+            snapshot,
+            structures,
+        })
+    }
+    fn structure(&self, table: &TableRef) -> TableStructure {
+        self.structures
+            .iter()
+            .find(|(source, _)| source == table)
+            .unwrap()
+            .1
+            .clone()
+    }
+    async fn page(
+        &mut self,
+        table: &TableRef,
+        columns: &[ColumnInfo],
+        offset: u64,
+    ) -> Result<crate::QueryResult> {
+        let kind = self.engine.kind();
+        let mut order: Vec<crate::Order> = columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .map(|column| crate::Order {
+                column: column.name.clone(),
+                direction: crate::OrderDirection::Ascending,
+            })
+            .collect();
+        let has_primary_key = !order.is_empty();
+        if !has_primary_key {
+            order = columns
+                .iter()
+                .map(|column| crate::Order {
+                    column: column.name.clone(),
+                    direction: crate::OrderDirection::Ascending,
+                })
+                .collect();
+        }
+        let names = columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let page = Some(Page {
+            limit: EXPORT_PAGE_SIZE as u32,
+            offset,
+        });
+        if let Some(snapshot) = &mut self.snapshot {
+            let mut statement =
+                crate::build_select_with_columns(kind, table, &names, &[], &order, page, columns)?;
+            if !has_primary_key && kind.dialect() == DatabaseKind::PostgreSQL {
+                for column in columns {
+                    let identifier = quote_identifier(kind, &column.name)?;
+                    statement.sql = statement.sql.replace(
+                        &format!("{identifier} ASC"),
+                        &format!("CAST({identifier} AS text) ASC"),
+                    );
+                }
+            }
+            snapshot.query(&statement).await
+        } else {
+            self.engine
+                .query_table_with_columns(
+                    table,
+                    &names,
+                    &[],
+                    &order,
+                    page,
+                    QueryOptions { max_rows: None },
+                    Some(columns),
+                )
+                .await
+        }
+    }
+    async fn finish(mut self) -> Result<()> {
+        if let Some(snapshot) = self.snapshot.take() {
+            snapshot.commit().await?;
+        }
+        Ok(())
+    }
 }
 
 struct PreparedExportTable {
@@ -171,6 +382,18 @@ pub async fn export_table(
     table: &TableRef,
     path: &Path,
 ) -> Result<ExportSummary> {
+    let mut reader = ExportReader::new(engine, std::slice::from_ref(table)).await?;
+    let summary = export_table_with_reader(&mut reader, table, path).await?;
+    reader.finish().await?;
+    Ok(summary)
+}
+
+async fn export_table_with_reader(
+    reader: &mut ExportReader<'_>,
+    table: &TableRef,
+    path: &Path,
+) -> Result<ExportSummary> {
+    let engine = reader.engine;
     let kind = engine.kind();
     if !kind.is_sql() {
         return Err(DbxError::Unsupported {
@@ -185,10 +408,10 @@ pub async fn export_table(
             kind,
         });
     }
-    let columns = engine.describe_table(table).await?;
+    let columns = reader.structure(table).columns;
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
 
-    let mut output = Vec::<u8>::new();
+    let mut output = ExportFile::new(path, file_format.gzipped)?;
     match file_format.format {
         DumpFormat::Sql => write_sql_dump_header(&mut output, kind, table)?,
         DumpFormat::Csv | DumpFormat::Tsv => {
@@ -204,25 +427,13 @@ pub async fn export_table(
     let mut rows_exported = 0u64;
     let mut offset = 0u64;
     loop {
-        let result = engine
-            .query_table(
-                table,
-                &[],
-                &[],
-                &[],
-                Some(Page {
-                    limit: EXPORT_PAGE_SIZE as u32,
-                    offset,
-                }),
-                QueryOptions { max_rows: None },
-            )
-            .await?;
+        let result = reader.page(table, &columns, offset).await?;
         for row in &result.rows {
             match file_format.format {
                 DumpFormat::Sql => {
                     let statement = render_sql_insert(kind, table, &column_names, &row.values)?;
-                    output.extend_from_slice(statement.as_bytes());
-                    output.extend_from_slice(b";\n");
+                    output.write_all(statement.as_bytes()).map_err(io_error)?;
+                    output.write_all(b";\n").map_err(io_error)?;
                 }
                 DumpFormat::Csv | DumpFormat::Tsv => {
                     let delimiter = file_format.format.delimiter().unwrap_or(b',');
@@ -236,6 +447,7 @@ pub async fn export_table(
         }
         let page_rows = result.rows.len();
         rows_exported += page_rows as u64;
+        report_transfer(page_rows as u64, 0);
         offset += page_rows as u64;
         if page_rows < EXPORT_PAGE_SIZE {
             break;
@@ -243,21 +455,13 @@ pub async fn export_table(
     }
 
     let gzipped = file_format.gzipped;
-    let bytes = if gzipped {
-        gzip_encode(output)?
-    } else {
-        output
-    };
-    let target: PathBuf = path.to_owned();
-    tokio::task::spawn_blocking(move || fs::write(target, bytes))
-        .await
-        .map_err(|error| DbxError::Io(error.to_string()))?
-        .map_err(|error| DbxError::Io(error.to_string()))?;
+    output.finish()?;
 
     Ok(ExportSummary {
         rows_exported,
         format: file_format.format,
         gzipped,
+        consistent_snapshot: reader.snapshot.is_some(),
     })
 }
 
@@ -301,6 +505,8 @@ pub async fn export_database(
     validate_output_directory(&request.output_directory)?;
     let stem = normalize_output_stem(&request.output_name)?;
 
+    let mut reader = ExportReader::new(engine, &request.tables).await?;
+    let consistent_snapshot = reader.snapshot.is_some();
     if request.format == DumpFormat::Sql {
         // Snapshot every structure before writing any output. This lets the
         // dump emit a complete schema phase before it starts querying rows.
@@ -308,31 +514,45 @@ pub async fn export_database(
         for table in &request.tables {
             export_tables.push(PreparedExportTable {
                 table: table.clone(),
-                structure: engine.table_structure(table).await?,
+                structure: reader.structure(table),
             });
         }
         let table_order = table_export_order(&export_tables);
-        let mut output = Vec::new();
-        output.extend_from_slice(b"-- DBX database dump\n");
-        output.extend_from_slice(
-            format!(
-                "-- Tables: {}\n{}\n",
-                request.tables.len(),
-                if request.schema_only {
-                    "-- Schema only"
-                } else {
-                    "-- Schema and data"
-                }
+        let path =
+            request
+                .output_directory
+                .join(with_extension(&stem, DumpFormat::Sql, request.gzipped));
+        let mut output = ExportFile::new(&path, request.gzipped)?;
+        output
+            .write_all(b"-- DBX database dump\n")
+            .map_err(io_error)?;
+        output
+            .write_all(
+                format!(
+                    "-- Tables: {}\n{}\n",
+                    request.tables.len(),
+                    if request.schema_only {
+                        "-- Schema only"
+                    } else {
+                        "-- Schema and data"
+                    }
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .map_err(io_error)?;
         append_database_prelude(kind, &request.tables, &table_order, &mut output)?;
-        output.extend_from_slice(b"\n-- Schema\n");
+        output.write_all(b"\n-- Schema\n").map_err(io_error)?;
         for &index in &table_order {
             let export_table = &export_tables[index];
-            output.extend_from_slice(
-                format!("-- Table: {}\n", quote_table(kind, &export_table.table)?).as_bytes(),
-            );
+            output
+                .write_all(
+                    format!(
+                        "-- Table: {}\n",
+                        comment_label(&quote_table(kind, &export_table.table)?)
+                    )
+                    .as_bytes(),
+                )
+                .map_err(io_error)?;
             let schema = if kind.dialect() == DatabaseKind::SQLite {
                 render_sql_schema(
                     kind,
@@ -348,25 +568,25 @@ pub async fn export_database(
                     &request.tables,
                 )?
             };
-            output.extend_from_slice(schema.as_bytes());
-            output.extend_from_slice(b";\n");
-            output.push(b'\n');
+            output.write_all(schema.as_bytes()).map_err(io_error)?;
+            output.write_all(b";\n").map_err(io_error)?;
+            output.write_all(b"\n").map_err(io_error)?;
         }
 
         let mut rows_exported = 0u64;
         if !request.schema_only {
-            output.extend_from_slice(b"-- Data\n");
+            output.write_all(b"-- Data\n").map_err(io_error)?;
             for &index in &table_order {
                 let export_table = &export_tables[index];
                 rows_exported += append_sql_table_data(
-                    engine,
+                    &mut reader,
                     kind,
                     &export_table.table,
                     &export_table.structure.columns,
                     &mut output,
                 )
                 .await?;
-                output.push(b'\n');
+                output.write_all(b"\n").map_err(io_error)?;
             }
         }
 
@@ -375,7 +595,9 @@ pub async fn export_database(
         // them after the data phase, which also handles cycles and arbitrary
         // selection order without disabling referential checks.
         if kind.dialect() != DatabaseKind::SQLite {
-            output.extend_from_slice(b"-- Foreign-key constraints\n");
+            output
+                .write_all(b"-- Foreign-key constraints\n")
+                .map_err(io_error)?;
             for &index in &table_order {
                 append_sql_foreign_keys(
                     kind,
@@ -385,19 +607,11 @@ pub async fn export_database(
                     &mut output,
                 )?;
             }
-            output.push(b'\n');
+            output.write_all(b"\n").map_err(io_error)?;
         }
 
-        let path =
-            request
-                .output_directory
-                .join(with_extension(&stem, DumpFormat::Sql, request.gzipped));
-        let bytes = if request.gzipped {
-            gzip_encode(output)?
-        } else {
-            output
-        };
-        write_export_file(path, bytes).await?;
+        reader.finish().await?;
+        output.finish()?;
         return Ok(DatabaseExportSummary {
             tables_exported: request.tables.len() as u64,
             files_written: 1,
@@ -405,6 +619,7 @@ pub async fn export_database(
             format: request.format,
             gzipped: request.gzipped,
             schema_only: request.schema_only,
+            consistent_snapshot,
         });
     }
 
@@ -417,10 +632,11 @@ pub async fn export_database(
             request.format,
             request.gzipped,
         ));
-        let summary = export_table(engine, table, &path).await?;
+        let summary = export_table_with_reader(&mut reader, table, &path).await?;
         rows_exported += summary.rows_exported;
     }
 
+    reader.finish().await?;
     Ok(DatabaseExportSummary {
         tables_exported: request.tables.len() as u64,
         files_written: request.tables.len() as u64,
@@ -428,6 +644,7 @@ pub async fn export_database(
         format: request.format,
         gzipped: request.gzipped,
         schema_only: false,
+        consistent_snapshot,
     })
 }
 
@@ -435,7 +652,7 @@ fn append_database_prelude(
     kind: DatabaseKind,
     tables: &[TableRef],
     table_order: &[usize],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
 ) -> Result<()> {
     if kind.dialect() == DatabaseKind::PostgreSQL {
         let schemas: BTreeSet<&str> = tables
@@ -443,20 +660,24 @@ fn append_database_prelude(
             .filter_map(|table| table.schema.as_deref())
             .collect();
         if !schemas.is_empty() {
-            output.extend_from_slice(b"\n-- Schemas\n");
+            output.write_all(b"\n-- Schemas\n").map_err(io_error)?;
             for schema in schemas {
-                output.extend_from_slice(
-                    format!(
-                        "CREATE SCHEMA IF NOT EXISTS {};\n",
-                        quote_identifier(kind, schema)?
+                output
+                    .write_all(
+                        format!(
+                            "CREATE SCHEMA IF NOT EXISTS {};\n",
+                            quote_identifier(kind, schema)?
+                        )
+                        .as_bytes(),
                     )
-                    .as_bytes(),
-                );
+                    .map_err(io_error)?;
             }
         }
     }
 
-    output.extend_from_slice(b"\n-- Replace existing tables\n");
+    output
+        .write_all(b"\n-- Replace existing tables\n")
+        .map_err(io_error)?;
     let reverse_order: Vec<&TableRef> = table_order
         .iter()
         .rev()
@@ -464,9 +685,11 @@ fn append_database_prelude(
         .collect();
     if kind.dialect() == DatabaseKind::SQLite {
         for table in reverse_order {
-            output.extend_from_slice(
-                format!("DROP TABLE IF EXISTS {};\n", quote_table(kind, table)?).as_bytes(),
-            );
+            output
+                .write_all(
+                    format!("DROP TABLE IF EXISTS {};\n", quote_table(kind, table)?).as_bytes(),
+                )
+                .map_err(io_error)?;
         }
     } else {
         let quoted = reverse_order
@@ -474,7 +697,8 @@ fn append_database_prelude(
             .map(|table| quote_table(kind, table))
             .collect::<Result<Vec<_>>>()?;
         output
-            .extend_from_slice(format!("DROP TABLE IF EXISTS {};\n", quoted.join(", ")).as_bytes());
+            .write_all(format!("DROP TABLE IF EXISTS {};\n", quoted.join(", ")).as_bytes())
+            .map_err(io_error)?;
     }
     Ok(())
 }
@@ -505,7 +729,7 @@ pub fn render_sql_schema(
     render_sql_schema_with_foreign_keys(kind, table, structure, selected_tables, true)
 }
 
-fn render_sql_schema_without_foreign_keys(
+pub(crate) fn render_sql_schema_without_foreign_keys(
     kind: DatabaseKind,
     table: &TableRef,
     structure: &TableStructure,
@@ -646,12 +870,12 @@ fn render_sql_foreign_key_definition(
     Ok(Some(definition))
 }
 
-fn append_sql_foreign_keys(
+pub(crate) fn append_sql_foreign_keys(
     kind: DatabaseKind,
     table: &TableRef,
     structure: &TableStructure,
     selected_tables: &[TableRef],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
 ) -> Result<()> {
     for foreign_key in &structure.foreign_keys {
         let Some(definition) =
@@ -659,14 +883,16 @@ fn append_sql_foreign_keys(
         else {
             continue;
         };
-        output.extend_from_slice(
-            format!(
-                "ALTER TABLE {} ADD {};\n",
-                quote_table(kind, table)?,
-                definition
+        output
+            .write_all(
+                format!(
+                    "ALTER TABLE {} ADD {};\n",
+                    quote_table(kind, table)?,
+                    definition
+                )
+                .as_bytes(),
             )
-            .as_bytes(),
-        );
+            .map_err(io_error)?;
     }
     Ok(())
 }
@@ -731,37 +957,26 @@ fn table_export_order(tables: &[PreparedExportTable]) -> Vec<usize> {
 }
 
 async fn append_sql_table_data(
-    engine: &DatabaseEngine,
+    reader: &mut ExportReader<'_>,
     kind: DatabaseKind,
     table: &TableRef,
     columns: &[ColumnInfo],
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
 ) -> Result<u64> {
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
     let mut rows_exported = 0u64;
     let mut offset = 0u64;
     loop {
-        let result = engine
-            .query_table(
-                table,
-                &[],
-                &[],
-                &[],
-                Some(Page {
-                    limit: EXPORT_PAGE_SIZE as u32,
-                    offset,
-                }),
-                QueryOptions { max_rows: None },
-            )
-            .await?;
+        let result = reader.page(table, columns, offset).await?;
         for row in &result.rows {
-            output.extend_from_slice(
-                render_sql_insert(kind, table, &column_names, &row.values)?.as_bytes(),
-            );
-            output.extend_from_slice(b";\n");
+            output
+                .write_all(render_sql_insert(kind, table, &column_names, &row.values)?.as_bytes())
+                .map_err(io_error)?;
+            output.write_all(b";\n").map_err(io_error)?;
         }
         let page_rows = result.rows.len();
         rows_exported += page_rows as u64;
+        report_transfer(page_rows as u64, 0);
         offset += page_rows as u64;
         if page_rows < EXPORT_PAGE_SIZE {
             break;
@@ -834,18 +1049,11 @@ fn transfer_file_stem(table: &TableRef) -> String {
     }
 }
 
-async fn write_export_file(path: PathBuf, bytes: Vec<u8>) -> Result<()> {
-    tokio::task::spawn_blocking(move || fs::write(path, bytes))
-        .await
-        .map_err(|error| DbxError::Io(error.to_string()))?
-        .map_err(|error| DbxError::Io(error.to_string()))
-}
-
 /// Accept a catalog type spelling (`numeric(10,2)`, `int unsigned`,
 /// `enum('a','b')`, `"Mixed Case"`) for a generated `CREATE TABLE`. Quoted
 /// labels and identifiers may contain spaces and punctuation, but nothing
 /// outside them may end the statement or open a comment.
-fn safe_schema_type(data_type: &str) -> Result<String> {
+pub(crate) fn safe_schema_type(data_type: &str) -> Result<String> {
     let data_type = data_type.trim();
     let invalid = || DbxError::Parse(format!("invalid metadata column type `{data_type}`"));
     if data_type.is_empty()
@@ -886,14 +1094,31 @@ fn referential_action_sql(action: crate::ReferentialAction) -> &'static str {
     }
 }
 
-fn write_sql_dump_header(output: &mut Vec<u8>, kind: DatabaseKind, table: &TableRef) -> Result<()> {
+fn write_sql_dump_header(
+    output: &mut impl Write,
+    kind: DatabaseKind,
+    table: &TableRef,
+) -> Result<()> {
     let qualified = quote_table(kind, table)?;
-    output.extend_from_slice(b"-- DBX table dump\n");
-    output.extend_from_slice(format!("-- Source: {qualified}\n").as_bytes());
-    // Statements deliberately stay outside an explicit transaction: imports
-    // replay through a connection pool where BEGIN/COMMIT would land on
-    // whichever connection executes each statement.
+    output.write_all(b"-- DBX table dump\n").map_err(io_error)?;
+    output
+        .write_all(format!("-- Source: {}\n", comment_label(&qualified)).as_bytes())
+        .map_err(io_error)?;
+    // DBX owns the transaction when importing this dump.
     Ok(())
+}
+
+fn comment_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Render one row as the body of an `INSERT` statement without its trailing
@@ -991,9 +1216,8 @@ fn quote_sql_text(kind: DatabaseKind, value: &str) -> String {
 /// replace tables themselves; `target` is unused for them. CSV and TSV files
 /// append rows to `target`, which must be provided.
 ///
-/// The whole (decompressed) file is held in memory. That keeps the MVP honest
-/// about scale: very large loads should go through the database's native
-/// bulk loader instead.
+/// Files and gzip input stream one bounded record/statement at a time.
+/// DBX owns the transaction; failed imports discard their connection.
 pub async fn import_file(
     engine: &DatabaseEngine,
     target: Option<&TableRef>,
@@ -1014,19 +1238,71 @@ pub async fn import_file(
         });
     }
     let file_format = detect_file_format(path)?;
-    let source: PathBuf = path.to_owned();
-    let raw = tokio::task::spawn_blocking(move || fs::read(source))
-        .await
-        .map_err(|error| DbxError::Io(error.to_string()))?
-        .map_err(|error| DbxError::Io(error.to_string()))?;
-    let script = decode_input(raw, file_format.gzipped)?;
+    let file = fs::File::open(path).map_err(io_error)?;
+    let input: Box<dyn BufRead + Send> = if file_format.gzipped {
+        Box::new(BufReader::new(GzDecoder::new(BufReader::new(file))))
+    } else {
+        Box::new(BufReader::new(file))
+    };
 
     match file_format.format {
         DumpFormat::Sql => {
-            let statements = split_sql_statements(&script);
-            engine.execute_transaction(&statements).await?;
+            if kind == DatabaseKind::MySQL {
+                for table in engine
+                    .list_tables()
+                    .await?
+                    .into_iter()
+                    .filter(|table| table.kind == crate::EntityKind::Table)
+                {
+                    if !mysql_table_transactional(
+                        engine,
+                        &TableRef {
+                            name: table.name,
+                            schema: table.schema,
+                        },
+                    )
+                    .await?
+                    {
+                        return Err(DbxError::Query("Atomic SQL imports require InnoDB storage for the active database tables".into()));
+                    }
+                }
+            }
+            let mut reader = SqlScriptReader::with_kind(input, Some(kind));
+            let mut transaction = SqlTransaction::begin(engine, false).await?;
+            let mut statements_executed = 0;
+            while let Some(statement) = reader.next_statement().map_err(io_error)? {
+                let keyword = crate::sqlx_engine::top_level_operation_keyword(&statement)
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                if matches!(
+                    keyword.as_str(),
+                    "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
+                ) {
+                    return Err(DbxError::Parse("dump contains transaction controls; remove them so DBX can own the import transaction".into()));
+                }
+                if matches!(
+                    keyword.as_str(),
+                    "ATTACH" | "DETACH" | "VACUUM" | "PRAGMA" | "SET" | "RESET"
+                ) {
+                    return Err(DbxError::Parse("dump changes session or transaction settings; remove those statements so DBX can preserve atomic rollback".into()));
+                }
+                if engine.kind() == DatabaseKind::MySQL
+                    && !matches!(
+                        keyword.as_str(),
+                        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" | "SELECT"
+                    )
+                {
+                    return Err(DbxError::Parse("MySQL dump contains statements that may implicitly commit. DBX accepts data-only dumps to preserve atomic rollback; apply schema changes separately in a query tab.".into()));
+                }
+                transaction
+                    .query(&crate::SqlStatement::new(statement, Vec::new()))
+                    .await?;
+                statements_executed += 1;
+                report_transfer(0, 1);
+            }
+            transaction.commit().await?;
             Ok(ImportReport {
-                statements_executed: statements.len() as u64,
+                statements_executed,
                 rows_inserted: 0,
                 elapsed_ms: elapsed_ms_since(started),
             })
@@ -1035,7 +1311,7 @@ pub async fn import_file(
             let target = target.ok_or_else(|| {
                 DbxError::Parse("CSV and TSV imports require a target table".into())
             })?;
-            import_delimited(engine, target, &script, file_format.format)
+            import_delimited(engine, target, input, file_format.format)
                 .await
                 .map(|report| ImportReport {
                     elapsed_ms: elapsed_ms_since(started),
@@ -1048,15 +1324,18 @@ pub async fn import_file(
 async fn import_delimited(
     engine: &DatabaseEngine,
     target: &TableRef,
-    script: &str,
+    input: Box<dyn BufRead + Send>,
     format: DumpFormat,
 ) -> Result<ImportReport> {
     let kind = engine.kind();
+    if kind == DatabaseKind::MySQL && !mysql_table_transactional(engine, target).await? {
+        return Err(DbxError::Query("Atomic imports require an InnoDB table; this table uses a nontransactional storage engine".into()));
+    }
     let columns = engine.describe_table(target).await?;
     let column_names: Vec<String> = columns.iter().map(|column| column.name.clone()).collect();
 
     let delimiter = format.delimiter().unwrap_or(b',');
-    let mut reader = DelimitedReader::new(script.as_bytes(), delimiter);
+    let mut reader = DelimitedStream::new(input, delimiter);
     let header = reader
         .next_record()
         .map_err(io_error)?
@@ -1070,8 +1349,10 @@ async fn import_delimited(
         .min(max_params / columns_per_row)
         .max(1);
 
+    let mut transaction = SqlTransaction::begin(engine, false).await?;
     let mut rows_inserted = 0u64;
     let mut pending: Vec<Vec<CellValue>> = Vec::with_capacity(batch_limit);
+    let mut pending_bytes = 0usize;
     while let Some(record) = reader.next_record().map_err(io_error)? {
         if record.len() != header_len {
             return Err(DbxError::Parse(format!(
@@ -1089,17 +1370,23 @@ async fn import_delimited(
                 .map(|(position, _)| delimited_field_to_cell(record[*position].clone()))
                 .collect(),
         );
-        if pending.len() >= batch_limit {
-            flush_batch(engine, target, &mapped, &pending).await?;
+        pending_bytes =
+            pending_bytes.saturating_add(record.iter().flatten().map(String::len).sum::<usize>());
+        if pending.len() >= batch_limit || pending_bytes >= 4 * 1024 * 1024 {
+            flush_batch(&mut transaction, kind, target, &mapped, &pending, &columns).await?;
             rows_inserted += pending.len() as u64;
+            report_transfer(pending.len() as u64, 0);
             pending.clear();
+            pending_bytes = 0;
         }
     }
     if !pending.is_empty() {
-        flush_batch(engine, target, &mapped, &pending).await?;
+        flush_batch(&mut transaction, kind, target, &mapped, &pending, &columns).await?;
         rows_inserted += pending.len() as u64;
+        report_transfer(pending.len() as u64, 0);
     }
 
+    transaction.commit().await?;
     Ok(ImportReport {
         statements_executed: 0,
         rows_inserted,
@@ -1107,15 +1394,37 @@ async fn import_delimited(
     })
 }
 
+async fn mysql_table_transactional(engine: &DatabaseEngine, table: &TableRef) -> Result<bool> {
+    let sql = if table.schema.is_some() {
+        "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?"
+    } else {
+        "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?"
+    };
+    let mut params = Vec::new();
+    if let Some(schema) = &table.schema {
+        params.push(CellValue::Text(schema.clone()));
+    }
+    params.push(CellValue::Text(table.name.clone()));
+    let result = engine
+        .query_statement(
+            &crate::SqlStatement::new(sql, params),
+            QueryOptions::default(),
+        )
+        .await?;
+    Ok(result.rows.first().and_then(|row| row.values.first()).is_some_and(|value| matches!(value, CellValue::Text(engine) if engine.eq_ignore_ascii_case("InnoDB"))))
+}
+
 async fn flush_batch(
-    engine: &DatabaseEngine,
+    transaction: &mut SqlTransaction,
+    kind: DatabaseKind,
     target: &TableRef,
     columns: &[(usize, String)],
     rows: &[Vec<CellValue>],
+    metadata: &[ColumnInfo],
 ) -> Result<()> {
     let names: Vec<String> = columns.iter().map(|(_, name)| name.clone()).collect();
-    let statement = build_multi_row_insert(engine.kind(), target, &names, rows)?;
-    engine.execute(&statement).await?;
+    let statement = build_multi_row_insert_with_columns(kind, target, &names, rows, metadata)?;
+    transaction.query(&statement).await?;
     Ok(())
 }
 
@@ -1201,10 +1510,81 @@ enum FieldState {
     QuoteClosed,
 }
 
+/// Retain one complete CSV/TSV record, preserving quoted NULL/empty semantics.
+struct DelimitedStream<R> {
+    input: R,
+    delimiter: u8,
+    first: bool,
+}
+impl<R: BufRead> DelimitedStream<R> {
+    fn new(input: R, delimiter: u8) -> Self {
+        Self {
+            input,
+            delimiter,
+            first: true,
+        }
+    }
+    fn next_record(&mut self) -> io::Result<Option<Vec<Option<String>>>> {
+        loop {
+            let mut record = Vec::new();
+            let mut state = FieldState::Start;
+            loop {
+                let mut byte = [0];
+                if self.input.read(&mut byte)? == 0 {
+                    break;
+                }
+                let byte = byte[0];
+                record.push(byte);
+                if self.first && record == [0xEF, 0xBB, 0xBF] {
+                    record.clear();
+                    state = FieldState::Start;
+                    self.first = false;
+                    continue;
+                }
+                if record.len() >= 3 || byte == b'\n' || byte == b'\r' {
+                    self.first = false;
+                }
+                if record.len() > MAX_TRANSFER_RECORD_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CSV/TSV record exceeds the 64 MiB transfer budget",
+                    ));
+                }
+                if (byte == b'\n' || byte == b'\r') && state != FieldState::Quoted {
+                    break;
+                }
+                state = match (state, byte) {
+                    (FieldState::Start, b'"') => FieldState::Quoted,
+                    (FieldState::Quoted, b'"') => FieldState::QuoteClosed,
+                    (FieldState::QuoteClosed, b'"') => FieldState::Quoted,
+                    (FieldState::Quoted, _) => FieldState::Quoted,
+                    (_, byte) if byte == self.delimiter => FieldState::Start,
+                    (FieldState::Start, _) => FieldState::Unquoted,
+                    (state, _) => state,
+                };
+            }
+            if record.is_empty() {
+                return Ok(None);
+            }
+            std::str::from_utf8(&record)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if let Some(fields) = (DelimitedReader {
+                input: &record,
+                position: 0,
+                delimiter: self.delimiter,
+            })
+            .next_record()?
+            {
+                return Ok(Some(fields));
+            }
+        }
+    }
+}
+
 impl<'a> DelimitedReader<'a> {
     pub fn new(input: &'a [u8], delimiter: u8) -> Self {
         Self {
-            input,
+            input: input.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(input),
             position: 0,
             delimiter,
         }
@@ -1212,9 +1592,6 @@ impl<'a> DelimitedReader<'a> {
 
     /// Return the next record, or `None` at end of input.
     pub fn next_record(&mut self) -> io::Result<Option<Vec<Option<String>>>> {
-        if self.position == 0 && self.input.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            self.position = 3;
-        }
         'records: loop {
             if self.position >= self.input.len() {
                 return Ok(None);
@@ -1349,13 +1726,13 @@ fn take_field(field: &mut Vec<u8>, quoted_field: &mut bool) -> Option<String> {
 /// it contains the delimiter, a quote, or a line break, or when it is an
 /// explicitly non-NULL empty string.
 fn write_delimited_record(
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
     delimiter: u8,
     fields: &[Option<&str>],
 ) -> Result<()> {
     for (index, field) in fields.iter().enumerate() {
         if index > 0 {
-            output.push(delimiter);
+            output.write_all(&[delimiter]).map_err(io_error)?;
         }
         let Some(field) = field else {
             continue;
@@ -1366,21 +1743,23 @@ fn write_delimited_record(
             || field.contains('\n')
             || field.contains('\r')
         {
-            output.push(b'"');
+            output.write_all(b"\"").map_err(io_error)?;
             for character in field.chars() {
                 if character == '"' {
-                    output.extend_from_slice(b"\"\"");
+                    output.write_all(b"\"\"").map_err(io_error)?;
                 } else {
                     let mut buffer = [0u8; 4];
-                    output.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                    output
+                        .write_all(character.encode_utf8(&mut buffer).as_bytes())
+                        .map_err(io_error)?;
                 }
             }
-            output.push(b'"');
+            output.write_all(b"\"").map_err(io_error)?;
         } else {
-            output.extend_from_slice(field.as_bytes());
+            output.write_all(field.as_bytes()).map_err(io_error)?;
         }
     }
-    output.push(b'\n');
+    output.write_all(b"\n").map_err(io_error)?;
     Ok(())
 }
 
@@ -1416,199 +1795,306 @@ fn delimited_value_field(value: &CellValue) -> Option<String> {
 /// fails: malformed scripts simply produce statements the engine will
 /// reject with its own diagnostics.
 pub fn split_sql_statements(script: &str) -> Vec<String> {
-    #[derive(Clone)]
-    enum State {
-        Normal,
-        LineComment,
-        BlockComment(usize),
-        SingleQuote,
-        DoubleQuote,
-        Backtick,
-        Dollar(String),
-    }
-
-    let characters: Vec<char> = script.chars().collect();
+    checked_split_sql_statements(script).unwrap_or_else(|_| vec![script.to_owned()])
+}
+pub(crate) fn checked_split_sql_statements(script: &str) -> Result<Vec<String>> {
+    checked_split_sql_for(None, script)
+}
+pub(crate) fn checked_split_sql_for(
+    kind: Option<DatabaseKind>,
+    script: &str,
+) -> Result<Vec<String>> {
+    let mut reader = SqlScriptReader::with_kind(script.as_bytes(), kind);
     let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut delimiter = ";".to_owned();
-    let mut state = State::Normal;
-    let mut at_line_start = true;
-    let mut index = 0usize;
+    while let Some(statement) = reader.next_statement().map_err(io_error)? {
+        statements.push(statement);
+    }
+    Ok(statements)
+}
 
-    while index < characters.len() {
-        let character = characters[index];
-        let matches_here = |needle: &str, at: usize| {
-            characters[at..].starts_with(needle.chars().collect::<Vec<_>>().as_slice())
-        };
-        match state.clone() {
-            State::Normal => {
-                if at_line_start
-                    && current.trim().is_empty()
-                    && matches_here_ci(&characters, index, "delimiter")
-                    && characters
-                        .get(index + "delimiter".len())
-                        .is_some_and(|next| next.is_whitespace())
-                {
-                    index += "delimiter".len();
-                    let mut token = String::new();
-                    while let Some(&next) = characters.get(index) {
-                        if next == '\n' || next == '\r' {
-                            break;
+#[derive(Clone)]
+enum ScriptState {
+    Normal,
+    LineComment,
+    BlockComment(usize, bool),
+    SingleQuote(bool),
+    DoubleQuote,
+    Backtick,
+    Dollar(String),
+}
+
+const MAX_TRANSFER_RECORD_BYTES: usize = 64 * 1024 * 1024;
+struct SqlScriptReader<R> {
+    kind: Option<DatabaseKind>,
+    input: R,
+    state: ScriptState,
+    delimiter: String,
+    current: String,
+    ready: VecDeque<String>,
+    at_line_start: bool,
+    first_line: bool,
+    ended: bool,
+}
+impl<R: BufRead> SqlScriptReader<R> {
+    fn with_kind(input: R, kind: Option<DatabaseKind>) -> Self {
+        Self {
+            kind,
+            input,
+            state: ScriptState::Normal,
+            delimiter: ";".into(),
+            current: String::new(),
+            ready: VecDeque::new(),
+            at_line_start: true,
+            first_line: true,
+            ended: false,
+        }
+    }
+    fn next_statement(&mut self) -> io::Result<Option<String>> {
+        loop {
+            if let Some(statement) = self.ready.pop_front() {
+                return Ok(Some(statement));
+            }
+            if self.ended {
+                return Ok(None);
+            }
+            let mut line = String::new();
+            let count = (&mut self.input)
+                .take((MAX_TRANSFER_RECORD_BYTES + 1) as u64)
+                .read_line(&mut line)?;
+            if line.len() > MAX_TRANSFER_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SQL line exceeds the 64 MiB transfer budget",
+                ));
+            }
+            if count == 0 {
+                self.ended = true;
+                let remaining = std::mem::take(&mut self.current);
+                if !remaining.trim().is_empty() {
+                    return Ok(Some(remaining.trim().to_owned()));
+                }
+                return Ok(None);
+            }
+            if self.first_line {
+                line = line.trim_start_matches('\u{feff}').to_owned();
+                self.first_line = false;
+            }
+            self.feed(&line)?;
+        }
+    }
+    fn feed(&mut self, script: &str) -> io::Result<()> {
+        let characters: Vec<char> = script.chars().collect();
+        let mut statements = Vec::new();
+        let mut current = std::mem::take(&mut self.current);
+        let mut delimiter = self.delimiter.clone();
+        let mut state = self.state.clone();
+        let mut at_line_start = self.at_line_start;
+        let mut index = 0usize;
+        while index < characters.len() {
+            if current.len() > MAX_TRANSFER_RECORD_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SQL statement exceeds the 64 MiB transfer budget",
+                ));
+            }
+            let character = characters[index];
+            let matches_here = |needle: &str, at: usize| {
+                characters[at..].starts_with(needle.chars().collect::<Vec<_>>().as_slice())
+            };
+            match state.clone() {
+                ScriptState::Normal => {
+                    if at_line_start
+                        && current.trim().is_empty()
+                        && matches_here_ci(&characters, index, "delimiter")
+                        && characters
+                            .get(index + "delimiter".len())
+                            .is_some_and(|next| next.is_whitespace())
+                    {
+                        index += "delimiter".len();
+                        let mut token = String::new();
+                        while let Some(&next) = characters.get(index) {
+                            if next == '\n' || next == '\r' {
+                                break;
+                            }
+                            token.push(next);
+                            index += 1;
                         }
-                        token.push(next);
+                        let trimmed = token.trim();
+                        if !trimmed.is_empty() {
+                            delimiter = trimmed.to_owned();
+                        }
+                        continue;
+                    }
+                    if character == '-' && matches_here("--", index) {
+                        state = ScriptState::LineComment;
+                        index += 2;
+                        continue;
+                    }
+                    if character == '#' {
+                        state = ScriptState::LineComment;
                         index += 1;
+                        continue;
                     }
-                    let trimmed = token.trim();
-                    if !trimmed.is_empty() {
-                        delimiter = trimmed.to_owned();
-                    }
-                    continue;
-                }
-                if character == '-' && matches_here("--", index) {
-                    state = State::LineComment;
-                    index += 2;
-                    continue;
-                }
-                if character == '#' {
-                    state = State::LineComment;
-                    index += 1;
-                    continue;
-                }
-                if character == '/' && matches_here("/*", index) {
-                    state = State::BlockComment(1);
-                    index += 2;
-                    continue;
-                }
-                if matches_here(&delimiter, index) {
-                    let trimmed = current.trim();
-                    if !trimmed.is_empty() {
-                        statements.push(trimmed.to_owned());
-                    }
-                    current.clear();
-                    at_line_start = true;
-                    index += delimiter.chars().count();
-                    continue;
-                }
-                match character {
-                    '\'' => {
-                        state = State::SingleQuote;
-                        current.push(character);
-                        index += 1;
-                    }
-                    '"' => {
-                        state = State::DoubleQuote;
-                        current.push(character);
-                        index += 1;
-                    }
-                    '`' => {
-                        state = State::Backtick;
-                        current.push(character);
-                        index += 1;
-                    }
-                    '$' => {
-                        if let Some(tag) = parse_dollar_tag(&characters[index..]) {
-                            let token_length = tag.chars().count() + 2;
-                            current.extend(characters[index..index + token_length].iter());
-                            index += token_length;
-                            state = State::Dollar(tag);
+                    if character == '/' && matches_here("/*", index) {
+                        if matches_here("/*!", index) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Expand executable MySQL version comments before running or importing a script",
+                            ));
+                        }
+                        let preserve = matches_here("/*+", index);
+                        if preserve {
+                            current.push_str("/*");
                         } else {
+                            current.push(' ');
+                        }
+                        state = ScriptState::BlockComment(1, preserve);
+                        index += 2;
+                        continue;
+                    }
+                    if matches_here(&delimiter, index) {
+                        let trimmed = current.trim();
+                        if !trimmed.is_empty() {
+                            statements.push(trimmed.to_owned());
+                        }
+                        current.clear();
+                        at_line_start = true;
+                        index += delimiter.chars().count();
+                        continue;
+                    }
+                    match character {
+                        '\'' => {
+                            state = ScriptState::SingleQuote(crate::protected::backslash_string(
+                                self.kind, &current,
+                            ));
+                            current.push(character);
+                            index += 1;
+                        }
+                        '"' => {
+                            state = ScriptState::DoubleQuote;
+                            current.push(character);
+                            index += 1;
+                        }
+                        '`' => {
+                            state = ScriptState::Backtick;
+                            current.push(character);
+                            index += 1;
+                        }
+                        '$' => {
+                            if let Some(tag) = parse_dollar_tag(&characters[index..]) {
+                                let token_length = tag.chars().count() + 2;
+                                current.extend(characters[index..index + token_length].iter());
+                                index += token_length;
+                                state = ScriptState::Dollar(tag);
+                            } else {
+                                current.push(character);
+                                index += 1;
+                            }
+                        }
+                        _ => {
+                            if !character.is_whitespace() {
+                                at_line_start = false;
+                            }
                             current.push(character);
                             index += 1;
                         }
                     }
-                    _ => {
-                        if !character.is_whitespace() {
-                            at_line_start = false;
+                }
+                ScriptState::LineComment => {
+                    if character == '\n' {
+                        state = ScriptState::Normal;
+                        at_line_start = true;
+                        current.push(character);
+                    }
+                    index += 1;
+                }
+                ScriptState::BlockComment(depth, preserve) => {
+                    if character == '/' && matches_here("/*", index) {
+                        if preserve {
+                            current.push_str("/*");
                         }
+                        state = ScriptState::BlockComment(depth + 1, preserve);
+                        index += 2;
+                    } else if character == '*' && matches_here("*/", index) {
+                        if preserve {
+                            current.push_str("*/");
+                        }
+                        state = if depth <= 1 {
+                            ScriptState::Normal
+                        } else {
+                            ScriptState::BlockComment(depth - 1, preserve)
+                        };
+                        index += 2;
+                    } else {
+                        if preserve {
+                            current.push(character);
+                        }
+                        index += 1;
+                    }
+                }
+                ScriptState::SingleQuote(escape) => {
+                    current.push(character);
+                    if character == '\\' && escape {
+                        if let Some(&next) = characters.get(index + 1) {
+                            current.push(next);
+                            index += 2;
+                            continue;
+                        }
+                    } else if character == '\'' {
+                        if characters.get(index + 1) == Some(&'\'') {
+                            current.push('\'');
+                            index += 2;
+                            continue;
+                        }
+                        state = ScriptState::Normal;
+                    }
+                    index += 1;
+                }
+                ScriptState::DoubleQuote => {
+                    current.push(character);
+                    if character == '"' {
+                        if characters.get(index + 1) == Some(&'"') {
+                            current.push('"');
+                            index += 2;
+                            continue;
+                        }
+                        state = ScriptState::Normal;
+                    }
+                    index += 1;
+                }
+                ScriptState::Backtick => {
+                    current.push(character);
+                    if character == '`' {
+                        if characters.get(index + 1) == Some(&'`') {
+                            current.push('`');
+                            index += 2;
+                            continue;
+                        }
+                        state = ScriptState::Normal;
+                    }
+                    index += 1;
+                }
+                ScriptState::Dollar(tag) => {
+                    let closing = format!("${tag}$");
+                    if matches_here(&closing, index) {
+                        current.push_str(&closing);
+                        index += closing.chars().count();
+                        state = ScriptState::Normal;
+                    } else {
                         current.push(character);
                         index += 1;
                     }
                 }
             }
-            State::LineComment => {
-                if character == '\n' {
-                    state = State::Normal;
-                    at_line_start = true;
-                    current.push(character);
-                }
-                index += 1;
-            }
-            State::BlockComment(depth) => {
-                if character == '/' && matches_here("/*", index) {
-                    state = State::BlockComment(depth + 1);
-                    index += 2;
-                } else if character == '*' && matches_here("*/", index) {
-                    state = if depth <= 1 {
-                        State::Normal
-                    } else {
-                        State::BlockComment(depth - 1)
-                    };
-                    index += 2;
-                } else {
-                    index += 1;
-                }
-            }
-            State::SingleQuote => {
-                current.push(character);
-                if character == '\\' {
-                    if let Some(&next) = characters.get(index + 1) {
-                        current.push(next);
-                        index += 2;
-                        continue;
-                    }
-                } else if character == '\'' {
-                    if characters.get(index + 1) == Some(&'\'') {
-                        current.push('\'');
-                        index += 2;
-                        continue;
-                    }
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::DoubleQuote => {
-                current.push(character);
-                if character == '"' {
-                    if characters.get(index + 1) == Some(&'"') {
-                        current.push('"');
-                        index += 2;
-                        continue;
-                    }
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::Backtick => {
-                current.push(character);
-                if character == '`' {
-                    if characters.get(index + 1) == Some(&'`') {
-                        current.push('`');
-                        index += 2;
-                        continue;
-                    }
-                    state = State::Normal;
-                }
-                index += 1;
-            }
-            State::Dollar(tag) => {
-                let closing = format!("${tag}$");
-                if matches_here(&closing, index) {
-                    current.push_str(&closing);
-                    index += closing.chars().count();
-                    state = State::Normal;
-                } else {
-                    current.push(character);
-                    index += 1;
-                }
-            }
         }
-    }
 
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        statements.push(trimmed.to_owned());
+        self.current = current;
+        self.state = state;
+        self.delimiter = delimiter;
+        self.at_line_start = at_line_start;
+        self.ready.extend(statements);
+        Ok(())
     }
-    statements
 }
 
 fn matches_here_ci(characters: &[char], index: usize, needle: &str) -> bool {
@@ -1637,28 +2123,6 @@ fn parse_dollar_tag(characters: &[char]) -> Option<String> {
 // Compression helpers
 // ---------------------------------------------------------------------------
 
-fn decode_input(raw: Vec<u8>, gzipped: bool) -> Result<String> {
-    if gzipped {
-        let mut decoder = GzDecoder::new(&raw[..]);
-        let mut text = String::new();
-        decoder
-            .read_to_string(&mut text)
-            .map_err(|error| DbxError::Io(format!("could not decompress gzip input: {error}")))?;
-        Ok(text)
-    } else {
-        String::from_utf8(raw)
-            .map_err(|error| DbxError::Io(format!("file is not valid UTF-8: {error}")))
-    }
-}
-
-fn gzip_encode(bytes: Vec<u8>) -> Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&bytes)
-        .and_then(|_| encoder.finish())
-        .map_err(|error| DbxError::Io(format!("could not compress gzip output: {error}")))
-}
-
 fn io_error(error: io::Error) -> DbxError {
     DbxError::Io(error.to_string())
 }
@@ -1670,6 +2134,62 @@ fn elapsed_ms_since(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dump_header_keeps_identifier_line_breaks_inside_comments() {
+        let mut output = Vec::new();
+        write_sql_dump_header(
+            &mut output,
+            DatabaseKind::SQLite,
+            &TableRef::new("odd\nSELECT 1;\rtable"),
+        )
+        .unwrap();
+        let header = String::from_utf8(output).unwrap();
+        assert!(split_sql_statements(&header).is_empty());
+        assert_eq!(header.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn export_pages_keep_one_snapshot_during_concurrent_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = DatabaseEngine::connect(crate::ConnectionConfig::new(
+            DatabaseKind::SQLite,
+            format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("snapshot.sqlite").display()
+            ),
+        ))
+        .await
+        .unwrap();
+        engine.execute_sql("PRAGMA journal_mode=WAL").await.unwrap();
+        engine
+            .execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        engine.execute_sql("WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<1001) INSERT INTO items SELECT id FROM n").await.unwrap();
+        let table = TableRef::new("items");
+        let mut reader = ExportReader::new(&engine, std::slice::from_ref(&table))
+            .await
+            .unwrap();
+        let columns = reader.structure(&table).columns;
+        assert_eq!(
+            reader.page(&table, &columns, 0).await.unwrap().rows.len(),
+            1000
+        );
+        engine
+            .execute_sql("DELETE FROM items WHERE id=1001; INSERT INTO items VALUES(1002)")
+            .await
+            .unwrap();
+        let second = reader.page(&table, &columns, 1000).await.unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].values[0], CellValue::Integer(1001));
+        reader.finish().await.unwrap();
+        let current = engine
+            .query("SELECT max(id) FROM items", QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(current.rows[0].values[0], CellValue::Integer(1002));
+    }
 
     #[test]
     fn schema_types_allow_quoted_labels_but_nothing_that_escapes_them() {
@@ -1820,6 +2340,49 @@ mod tests {
     fn sql_statements_keep_backtick_identifiers_intact() {
         let statements = split_sql_statements("SELECT `weird;name` FROM `t``ick`;");
         assert_eq!(statements, vec!["SELECT `weird;name` FROM `t``ick`"]);
+    }
+    #[test]
+    fn streamed_records_preserve_multiline_bom_headers_and_data() {
+        let input = "\u{feff}\"multi\nline\",value\n\u{feff}data,\"\"\n";
+        let mut reader = DelimitedStream::new(BufReader::with_capacity(1, input.as_bytes()), b',');
+        assert_eq!(
+            reader.next_record().unwrap().unwrap(),
+            vec![Some("multi\nline".into()), Some("value".into())]
+        );
+        assert_eq!(
+            reader.next_record().unwrap().unwrap(),
+            vec![Some("\u{feff}data".into()), Some("".into())]
+        );
+        assert!(reader.next_record().unwrap().is_none());
+    }
+    #[test]
+    fn dialect_splitting_preserves_backslashes_hints_and_token_boundaries() {
+        let pg = checked_split_sql_for(Some(DatabaseKind::PostgreSQL), "SELECT 'C:\\'; SELECT 2")
+            .unwrap();
+        assert_eq!(pg.len(), 2);
+        let sqlite =
+            checked_split_sql_for(Some(DatabaseKind::SQLite), "SELECT 'C:\\'; SELECT 2").unwrap();
+        assert_eq!(sqlite.len(), 2);
+        let escaped = checked_split_sql_for(
+            Some(DatabaseKind::PostgreSQL),
+            "SELECT E'it\\'s;here'; SELECT 2",
+        )
+        .unwrap();
+        assert_eq!(escaped.len(), 2);
+        let hint = checked_split_sql_for(
+            Some(DatabaseKind::MySQL),
+            "SELECT /*+ MAX_EXECUTION_TIME(1000) */ 1",
+        )
+        .unwrap();
+        assert!(hint[0].contains("/*+ MAX_EXECUTION_TIME(1000) */"));
+        assert!(
+            checked_split_sql_for(Some(DatabaseKind::MySQL), "/*!50000 DELETE FROM items */")
+                .is_err()
+        );
+        assert_eq!(
+            split_sql_statements("SELECT/* comment */1"),
+            vec!["SELECT 1"]
+        );
     }
 
     #[test]

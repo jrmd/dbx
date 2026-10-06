@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 /// its address is a file or SQLite URL rather than a network address.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionFields {
+    pub read_only: bool,
     pub kind: DatabaseKind,
     pub host: String,
     pub port: String,
@@ -64,6 +65,7 @@ impl ConnectionFields {
             database: String::new(),
             connection_string: String::new(),
             socket: String::new(),
+            read_only: false,
             socket_enabled: false,
             ssh: None,
         }
@@ -91,6 +93,7 @@ impl ConnectionFields {
                 database: String::new(),
                 connection_string,
                 socket: String::new(),
+                read_only: false,
                 socket_enabled: false,
                 ssh: None,
             });
@@ -116,6 +119,7 @@ impl ConnectionFields {
             database,
             connection_string,
             socket: String::new(),
+            read_only: false,
             socket_enabled: false,
             ssh: None,
         })
@@ -160,6 +164,7 @@ impl ConnectionFields {
     pub fn config(&self) -> Result<ConnectionConfig, String> {
         let mut config =
             ConnectionConfig::new(self.kind, self.url().map_err(|error| error.to_string())?);
+        config.read_only = self.read_only;
         config.socket = self.socket_enabled.then(|| self.socket.trim().into());
         config.ssh = self.ssh.clone();
         config.validate().map_err(|error| error.to_string())?;

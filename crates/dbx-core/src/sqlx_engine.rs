@@ -34,6 +34,9 @@ fn postgres_options(
     if let Some(socket) = &config.socket {
         options = options.socket(socket);
     }
+    if config.read_only {
+        options = options.options([("default_transaction_read_only", "on")]);
+    }
     Ok(options)
 }
 
@@ -145,6 +148,7 @@ impl SqlxEngine {
         let connect_error = |error: sqlx::Error| {
             DbxError::Connection(crate::error::connection_message(&config.url, error))
         };
+        let read_only = config.read_only;
         let pool = match config.kind.dialect() {
             DatabaseKind::PostgreSQL => SqlxPool::Postgres(
                 pool_options::<Postgres>(max_connections, timeout, idle_timeout)
@@ -154,12 +158,32 @@ impl SqlxEngine {
             ),
             DatabaseKind::MySQL => SqlxPool::MySql(
                 pool_options::<MySql>(max_connections, timeout, idle_timeout)
+                    .after_connect(move |connection, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("SET SESSION TRANSACTION READ ONLY")
+                                    .execute(connection)
+                                    .await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect_with(mysql_options(&config).map_err(connect_error)?)
                     .await
                     .map_err(connect_error)?,
             ),
             DatabaseKind::SQLite => SqlxPool::SQLite(
                 pool_options::<Sqlite>(max_connections, timeout, idle_timeout)
+                    .after_connect(move |connection, _| {
+                        Box::pin(async move {
+                            if read_only {
+                                sqlx::query("PRAGMA query_only=ON")
+                                    .execute(connection)
+                                    .await?;
+                            }
+                            Ok(())
+                        })
+                    })
                     .connect(&config.url)
                     .await
                     .map_err(connect_error)?,
@@ -177,6 +201,9 @@ impl SqlxEngine {
     pub fn kind(&self) -> DatabaseKind {
         self.kind
     }
+    pub fn is_read_only(&self) -> bool {
+        self.config.read_only
+    }
 
     pub fn pool(&self) -> &RwLock<SqlxPool> {
         &self.pool
@@ -184,7 +211,7 @@ impl SqlxEngine {
 
     /// Snapshot the current pool handle. `SqlxPool` clones are cheap and stay
     /// valid even if a later `use_database` swaps the pool underneath.
-    async fn pool_snapshot(&self) -> SqlxPool {
+    pub(crate) async fn pool_snapshot(&self) -> SqlxPool {
         self.pool.read().await.clone()
     }
 
@@ -193,6 +220,9 @@ impl SqlxEngine {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        if self.config.read_only {
+            crate::protected::ensure_query(self.kind, &statement.sql)?;
+        }
         self.query_statement_impl(statement, options, true).await
     }
 
@@ -214,6 +244,9 @@ impl SqlxEngine {
         options: QueryOptions,
         describe_empty: bool,
     ) -> Result<QueryResult> {
+        if self.config.read_only {
+            crate::protected::ensure_query(self.kind, &statement.sql)?;
+        }
         let started = Instant::now();
         let limit = row_limit(options);
         let mut columns = Vec::new();
@@ -275,6 +308,9 @@ impl SqlxEngine {
     /// statements continue through `query_with_statement` so parameters remain
     /// safely bound.
     async fn query_raw(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {
+        if self.config.read_only {
+            crate::protected::ensure_query(self.kind, sql)?;
+        }
         let started = Instant::now();
         let limit = row_limit(options);
         let mut columns = Vec::new();
@@ -417,6 +453,11 @@ impl SqlxEngine {
     }
 
     async fn execute_statement(&self, statement: &SqlStatement) -> Result<ExecResult> {
+        if self.config.read_only {
+            return Err(DbxError::Query(
+                "Protected connection: writes are disabled".into(),
+            ));
+        }
         let started = Instant::now();
         let (rows_affected, last_insert_id) = match &self.pool_snapshot().await {
             SqlxPool::Postgres(pool) => {
@@ -871,7 +912,7 @@ impl SqlxEngine {
     }
 }
 
-fn statement_likely_returns_rows(statement: &str) -> bool {
+pub(crate) fn statement_likely_returns_rows(statement: &str) -> bool {
     top_level_operation_keyword(statement).is_some_and(|keyword| {
         [
             "SELECT", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "PRAGMA",
@@ -881,7 +922,7 @@ fn statement_likely_returns_rows(statement: &str) -> bool {
     })
 }
 
-fn top_level_operation_keyword(statement: &str) -> Option<&str> {
+pub(crate) fn top_level_operation_keyword(statement: &str) -> Option<&str> {
     let words = top_level_sql_words(statement);
     let first = *words.first()?;
     if !first.eq_ignore_ascii_case("WITH") {
@@ -1139,7 +1180,7 @@ fn push_bounded_row(
     Ok(())
 }
 
-fn refine_dynamic_column_types(columns: &mut [ColumnInfo], values: &[CellValue]) {
+pub(crate) fn refine_dynamic_column_types(columns: &mut [ColumnInfo], values: &[CellValue]) {
     for (column, value) in columns.iter_mut().zip(values) {
         let data_type = column.data_type.trim();
         if !(data_type.is_empty()
@@ -1296,7 +1337,7 @@ fn foreign_keys_from_rows(kind: DatabaseKind, rows: Vec<RowData>) -> Result<Vec<
     }
 }
 
-fn result_columns<C>(columns: &[C]) -> Vec<ColumnInfo>
+pub(crate) fn result_columns<C>(columns: &[C]) -> Vec<ColumnInfo>
 where
     C: Column,
 {
@@ -1309,7 +1350,7 @@ where
         .collect()
 }
 
-fn bind_postgres_query<'q>(
+pub(crate) fn bind_postgres_query<'q>(
     statement: &'q SqlStatement,
 ) -> sqlx::query::Query<'q, Postgres, PgArguments> {
     let mut query = sqlx::query::<Postgres>(statement.sql.as_str());
@@ -1337,7 +1378,7 @@ fn bind_postgres_query<'q>(
     query
 }
 
-fn bind_mysql_query<'q>(
+pub(crate) fn bind_mysql_query<'q>(
     statement: &'q SqlStatement,
 ) -> sqlx::query::Query<'q, MySql, MySqlArguments> {
     let mut query = sqlx::query::<MySql>(statement.sql.as_str());
@@ -1357,7 +1398,7 @@ fn bind_mysql_query<'q>(
     query
 }
 
-fn bind_sqlite_query<'q>(
+pub(crate) fn bind_sqlite_query<'q>(
     statement: &'q SqlStatement,
 ) -> sqlx::query::Query<'q, Sqlite, SqliteArguments<'q>> {
     let mut query = sqlx::query::<Sqlite>(statement.sql.as_str());
@@ -1382,7 +1423,7 @@ fn bind_sqlite_query<'q>(
     query
 }
 
-fn decode_postgres_row(row: &PgRow) -> Result<Vec<CellValue>> {
+pub(crate) fn decode_postgres_row(row: &PgRow) -> Result<Vec<CellValue>> {
     row.columns()
         .iter()
         .enumerate()
@@ -1390,7 +1431,7 @@ fn decode_postgres_row(row: &PgRow) -> Result<Vec<CellValue>> {
         .collect()
 }
 
-fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<CellValue>> {
+pub(crate) fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<CellValue>> {
     row.columns()
         .iter()
         .enumerate()
@@ -1398,7 +1439,7 @@ fn decode_mysql_row(row: &MySqlRow) -> Result<Vec<CellValue>> {
         .collect()
 }
 
-fn decode_sqlite_row(row: &SqliteRow) -> Result<Vec<CellValue>> {
+pub(crate) fn decode_sqlite_row(row: &SqliteRow) -> Result<Vec<CellValue>> {
     row.columns()
         .iter()
         .enumerate()

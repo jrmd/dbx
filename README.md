@@ -18,9 +18,10 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 - **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
 - **Data you can work with:** virtualized grids over bounded row pages, structured filters, foreign-key navigation, and an all-field row inspector.
 - **Explicit edits:** typed insert/update drafts, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
-- **A query editor:** syntax highlighting, SQL completion, result grids, and per-connection query history.
+- **A query editor:** syntax highlighting, SQL completion, separate statement results, saved queries, encrypted draft recovery, and per-connection query history. Native SQL tabs retain their own transaction sessions.
 - **Bring your own query agent:** describe queries using Claude, Cursor, Codex, OpenCode or GitHub Copilot CLI, with saved agent/model defaults and schema context. See [agent setup](docs/query-agents.md).
-- **Import and export:** SQL, CSV, and TSV transfers; database exports with table selection, gzip, and schema-only SQL options.
+- **Import and export:** streamed SQL, CSV, and TSV transfers with progress and cancellation; atomic imports and snapshot exports on supported engines. Database exports include table selection, gzip, and schema-only SQL options. See [workbench safety and limits](docs/workbench-safety.md).
+- **Database diagnostics:** execution-plan views and comparisons, PostgreSQL/MySQL session and lock queries, protected connection profiles, and reviewable schema comparison drafts.
 - **Saved connections:** named profiles, colour-coded tags managed in Settings, connection testing, and encrypted credentials in the DBX Vault.
 - **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
 - **Native appearance:** light, dark, and system themes, with an option to reduce transparency.

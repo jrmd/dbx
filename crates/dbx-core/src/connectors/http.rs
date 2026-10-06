@@ -15,6 +15,7 @@ pub(super) struct HttpEngine {
     client: Client,
     endpoint: Url,
     token: String,
+    google_auth: Option<std::sync::Arc<dyn gcp_auth::TokenProvider>>,
     username: String,
     database: RwLock<String>,
     location: Option<String>,
@@ -65,11 +66,6 @@ impl HttpEngine {
                 endpoint
             }
             DatabaseKind::BigQuery => {
-                if token.is_empty() {
-                    return Err(invalid(
-                        "BigQuery requires a Google OAuth access token in the URL password",
-                    ));
-                }
                 let mut endpoint =
                     Url::parse("https://bigquery.googleapis.com/bigquery/v2/").unwrap();
                 endpoint
@@ -106,6 +102,13 @@ impl HttpEngine {
             return Err(invalid("Use HTTPS when sending database credentials"));
         }
         let timeout = Duration::from_millis(config.connect_timeout_ms);
+        let google_auth = if config.kind == DatabaseKind::BigQuery && token.is_empty() {
+            Some(tokio::time::timeout(timeout, gcp_auth::provider()).await
+                .map_err(|_| invalid("Google credentials discovery timed out"))?
+                .map_err(|_| invalid("Configure Google Application Default Credentials or provide an OAuth access token"))?)
+        } else {
+            None
+        };
         let client = Client::builder()
             .connect_timeout(timeout)
             .timeout(timeout)
@@ -117,6 +120,7 @@ impl HttpEngine {
             client,
             endpoint,
             token,
+            google_auth,
             username,
             database: RwLock::new(database),
             location,
@@ -155,6 +159,19 @@ impl HttpEngine {
             } else if !self.token.is_empty() {
                 request = request.header("Authorization", format!("ApiKey {}", self.token));
             }
+        } else if let Some(provider) = &self.google_auth {
+            let token = tokio::time::timeout(
+                self.timeout,
+                provider.token(&["https://www.googleapis.com/auth/cloud-platform"]),
+            )
+            .await
+            .map_err(|_| DbxError::Connection("Google token refresh timed out".into()))?
+            .map_err(|_| {
+                DbxError::Connection(
+                    "Google token refresh failed; check ADC credentials and permissions".into(),
+                )
+            })?;
+            request = request.bearer_auth(token.as_str());
         } else if !self.token.is_empty() {
             request = request.bearer_auth(&self.token);
         }
@@ -962,6 +979,7 @@ mod tests {
                 .unwrap(),
             endpoint: Url::parse(&format!("http://127.0.0.1:{port}/projects/project")).unwrap(),
             token: "fixture-secret".into(),
+            google_auth: None,
             username: String::new(),
             database: RwLock::new("dataset".into()),
             location: Some("EU".into()),
@@ -999,6 +1017,51 @@ mod tests {
             json!({"type":"text","value":"O'Reilly"})
         );
         assert_eq!(requests[0].1["requests"][1]["type"], "close");
+    }
+    #[tokio::test]
+    async fn bigquery_requests_a_current_google_token_for_each_api_call() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Provider(AtomicUsize);
+        #[async_trait]
+        impl gcp_auth::TokenProvider for Provider {
+            async fn token(
+                &self,
+                scopes: &[&str],
+            ) -> std::result::Result<Arc<gcp_auth::Token>, gcp_auth::Error> {
+                assert_eq!(scopes, ["https://www.googleapis.com/auth/cloud-platform"]);
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::new(
+                    serde_json::from_value(
+                        json!({"access_token":"fixture-secret", "expires_in":3600}),
+                    )
+                    .unwrap(),
+                ))
+            }
+            async fn project_id(&self) -> std::result::Result<Arc<str>, gcp_auth::Error> {
+                Ok(Arc::from("project"))
+            }
+        }
+        let (mut engine, server) = fixture(
+            DatabaseKind::BigQuery,
+            vec![json!({"datasets":[]}), json!({"datasets":[]})],
+        )
+        .await;
+        let provider = Arc::new(Provider(AtomicUsize::new(0)));
+        engine.token.clear();
+        engine.google_auth = Some(provider.clone());
+        engine
+            .request(Method::GET, engine.url(&["datasets"]), None)
+            .await
+            .unwrap();
+        engine
+            .request(Method::GET, engine.url(&["datasets"]), None)
+            .await
+            .unwrap();
+        assert_eq!(provider.0.load(Ordering::Relaxed), 2);
+        assert_eq!(server.await.unwrap().len(), 2);
     }
     #[tokio::test]
     async fn d1_uses_database_endpoint_and_bound_parameters() {
