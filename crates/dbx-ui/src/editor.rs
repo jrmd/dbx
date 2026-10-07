@@ -186,8 +186,11 @@ pub struct TextEditor {
     /// The currently composing IME text, as a UTF-8 byte range.
     marked_range: Option<Range<usize>>,
     scroll_handle: ScrollHandle,
-    last_layout: Vec<ShapedLine>,
+    last_layout: LineLayouts,
     last_bounds: Option<Bounds<Pixels>>,
+    /// Lexer tokens, line starts and the measured width, reused across frames
+    /// until the text changes.
+    paint_cache: std::cell::RefCell<PaintCache>,
     /// The painted text origin at the start of a pointer selection. A
     /// selection updates this view on every pointer move; retaining the
     /// original origin keeps those updates from changing the coordinates used
@@ -250,8 +253,9 @@ impl TextEditor {
             selection_reversed: false,
             marked_range: None,
             scroll_handle: ScrollHandle::new(),
-            last_layout: Vec::new(),
+            last_layout: LineLayouts::default(),
             last_bounds: None,
+            paint_cache: Default::default(),
             selection_bounds: None,
             is_selecting: false,
             undo_history: Vec::new(),
@@ -760,7 +764,7 @@ impl TextEditor {
         let text = self.value.read(cx);
         let bounds =
             selection_hit_bounds(self.is_selecting, self.selection_bounds, self.last_bounds);
-        let (Some(bounds), false) = (bounds, self.last_layout.is_empty()) else {
+        let (Some(bounds), false) = (bounds, self.last_layout.count == 0) else {
             return 0;
         };
         if position.y <= bounds.top() {
@@ -770,12 +774,16 @@ impl TextEditor {
             return text.len();
         }
 
-        let line_height = bounds.size.height / self.last_layout.len().max(1) as f32;
+        let line_height = bounds.size.height / self.last_layout.count.max(1) as f32;
         let line = ((position.y - bounds.top()) / line_height) as usize;
-        let line = line.min(self.last_layout.len() - 1);
+        let line = line.min(self.last_layout.count - 1);
         let local_x = position.x - bounds.left();
         let offset = nth_line_start(text, line);
-        let display_index = self.last_layout[line].closest_index_for_x(local_x);
+        // Only visible lines are laid out; the pointer is over one of them.
+        let Some(shaped) = self.last_layout.get(line) else {
+            return offset;
+        };
+        let display_index = shaped.closest_index_for_x(local_x);
         let source_index = if self.password {
             password_source_offset(&text[offset..line_end(text, offset)], display_index)
         } else {
@@ -838,22 +846,129 @@ fn completion_anchor(
     text: &str,
     cursor: usize,
     bounds: Option<Bounds<Pixels>>,
-    layout: &[ShapedLine],
+    layout: &LineLayouts,
 ) -> Point<Pixels> {
     let Some(bounds) = bounds else {
         return point(px(0.), px(0.));
     };
     let cursor = clamp_boundary(text, cursor);
     let (line, column) = line_and_column(text, cursor);
-    let line_height = bounds.size.height / layout.len().max(1) as f32;
+    let line_height = bounds.size.height / layout.count.max(1) as f32;
     let x = layout
         .get(line)
         .map(|line| line.x_for_index(column))
         .unwrap_or(px(0.));
     point(
         bounds.left() + x,
-        bounds.top() + line_height * (line + 1).min(layout.len().max(1)) as f32,
+        bounds.top() + line_height * (line + 1).min(layout.count.max(1)) as f32,
     )
+}
+
+/// The lines laid out in the last frame: the visible ones and the caret's.
+#[derive(Default)]
+struct LineLayouts {
+    /// Total lines in the document, laid out or not.
+    count: usize,
+    /// Shaped lines by line index, in ascending order.
+    lines: Vec<(usize, ShapedLine)>,
+}
+
+impl LineLayouts {
+    fn get(&self, line: usize) -> Option<&ShapedLine> {
+        self.lines
+            .binary_search_by_key(&line, |(index, _)| *index)
+            .ok()
+            .map(|index| &self.lines[index].1)
+    }
+}
+
+/// Per-text analysis that painting reuses until the text changes. Comparing
+/// the stored copy is a memcmp, far cheaper than lexing or re-shaping.
+#[derive(Default)]
+struct PaintCache {
+    text: String,
+    language: EditorLanguage,
+    valid: bool,
+    tokens: Vec<HighlightToken>,
+    line_starts: Vec<usize>,
+    /// The lines with the most characters. The widest painted line is among
+    /// them, so only these are measured for the content width.
+    longest_lines: Vec<usize>,
+    /// The measured width and the font size it was measured at.
+    width: Option<(Pixels, Pixels)>,
+}
+
+impl PaintCache {
+    const MEASURED_LINES: usize = 4;
+
+    fn refresh(&mut self, text: &str, language: EditorLanguage) {
+        if self.valid && self.language == language && self.text == text {
+            return;
+        }
+        self.text.clear();
+        self.text.push_str(text);
+        self.language = language;
+        self.valid = true;
+        self.width = None;
+        self.tokens = match language {
+            EditorLanguage::PlainText => Vec::new(),
+            EditorLanguage::Sql => lex_sql(text)
+                .into_iter()
+                .map(HighlightToken::from)
+                .collect(),
+            EditorLanguage::Redis => lex_redis(text)
+                .into_iter()
+                .map(HighlightToken::from)
+                .collect(),
+            EditorLanguage::Json => lex_json(text)
+                .into_iter()
+                .map(HighlightToken::from)
+                .collect(),
+        };
+        self.line_starts.clear();
+        self.line_starts.push(0);
+        self.line_starts
+            .extend(text.match_indices('\n').map(|(index, _)| index + 1));
+        let mut lengths = (0..self.line_starts.len())
+            .map(|line| (self.line(text, line).chars().count(), line))
+            .collect::<Vec<_>>();
+        let keep = Self::MEASURED_LINES.min(lengths.len());
+        if keep > 0 && keep < lengths.len() {
+            lengths.select_nth_unstable_by(keep - 1, |left, right| right.cmp(left));
+        }
+        self.longest_lines = lengths
+            .into_iter()
+            .take(keep)
+            .map(|(_, line)| line)
+            .collect();
+    }
+
+    fn line_range(&self, text: &str, line: usize) -> Range<usize> {
+        let start = self.line_starts[line];
+        let end = self
+            .line_starts
+            .get(line + 1)
+            .map_or(text.len(), |next| next - 1);
+        start..end
+    }
+
+    fn line<'a>(&self, text: &'a str, line: usize) -> &'a str {
+        &text[self.line_range(text, line)]
+    }
+
+    /// (line, column) of a byte offset, by binary search.
+    fn line_and_column(&self, offset: usize) -> (usize, usize) {
+        let line = self.line_starts.partition_point(|start| *start <= offset) - 1;
+        (line, offset - self.line_starts[line])
+    }
+
+    /// Tokens from the first one that can touch `line_start`.
+    fn tokens_from(&self, line_start: usize) -> &[HighlightToken] {
+        let first = self
+            .tokens
+            .partition_point(|token| token.range.end <= line_start);
+        &self.tokens[first..]
+    }
 }
 
 fn mouse_selection_active(is_selecting: bool, dragging: bool) -> bool {
@@ -989,7 +1104,7 @@ impl EntityInputHandler for TextEditor {
         let (start_line, start_col) = line_and_column(&text, range.start);
         let (end_line, end_col) = line_and_column(&text, range.end);
         let bounds = self.last_bounds.unwrap_or(viewport_bounds);
-        let line_height = bounds.size.height / self.last_layout.len().max(1) as f32;
+        let line_height = bounds.size.height / self.last_layout.count.max(1) as f32;
         let start = self.last_layout.get(start_line)?;
         let end = self.last_layout.get(end_line)?;
         let start_col = if self.password {
@@ -1062,7 +1177,7 @@ struct TextEditorText {
 }
 
 struct PrepaintState {
-    lines: Vec<ShapedLine>,
+    lines: LineLayouts,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
     /// The child bounds after applying any caret-reveal delta calculated for
@@ -1101,37 +1216,58 @@ impl Element for TextEditorText {
     ) -> (LayoutId, ()) {
         let editor = self.editor.read(cx);
         let text = editor.value.read(cx);
-        let display = editor.password.then(|| password_mask(text));
-        let painted_text = display.as_deref().unwrap_or(text);
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let measured_width = painted_text
-            .split('\n')
-            .map(|line| {
-                window
-                    .text_system()
-                    .shape_line(
-                        line.to_owned().into(),
-                        font_size,
-                        &[TextRun {
-                            len: line.len(),
-                            font: text_style.font(),
-                            color: text_style.color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }],
-                        None,
-                    )
-                    .width
-            })
-            .max()
-            .unwrap_or(px(1.));
+        let shape = |window: &mut Window, line: &str| {
+            window
+                .text_system()
+                .shape_line(
+                    line.to_owned().into(),
+                    font_size,
+                    &[TextRun {
+                        len: line.len(),
+                        font: text_style.font(),
+                        color: text_style.color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                )
+                .width
+        };
+        let (measured_width, line_count) = if editor.password {
+            // Password fields are single short lines; mask and measure them.
+            let painted = password_mask(text);
+            let width = painted
+                .split('\n')
+                .map(|line| shape(window, line))
+                .max()
+                .unwrap_or(px(1.));
+            (width, painted.split('\n').count())
+        } else {
+            let mut cache = editor.paint_cache.borrow_mut();
+            cache.refresh(text, editor.language);
+            let width = match cache.width {
+                Some((size, width)) if size == font_size => width,
+                _ => {
+                    let width = cache
+                        .longest_lines
+                        .clone()
+                        .into_iter()
+                        .map(|line| shape(window, cache.line(text, line)))
+                        .max()
+                        .unwrap_or(px(1.));
+                    cache.width = Some((font_size, width));
+                    width
+                }
+            };
+            (width, cache.line_starts.len())
+        };
 
         let mut style = Style::default();
         style.size.width = measured_width.max(px(1.)).into();
-        style.size.height =
-            (window.line_height() * painted_text.split('\n').count().max(1) as f32).into();
+        style.size.height = (window.line_height() * line_count.max(1) as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -1146,66 +1282,61 @@ impl Element for TextEditorText {
     ) -> PrepaintState {
         let editor = self.editor.read(cx);
         let text = editor.value.read(cx);
-        let display = editor.password.then(|| password_mask(text));
-        let painted_text = display.as_deref().unwrap_or(text);
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let mut lines = Vec::new();
-        let mut line_start = 0;
-        let syntax_tokens = match editor.language {
-            EditorLanguage::PlainText => Vec::new(),
-            EditorLanguage::Sql => lex_sql(text)
-                .into_iter()
-                .map(HighlightToken::from)
-                .collect(),
-            EditorLanguage::Redis => lex_redis(text)
-                .into_iter()
-                .map(HighlightToken::from)
-                .collect(),
-            EditorLanguage::Json => lex_json(text)
-                .into_iter()
-                .map(HighlightToken::from)
-                .collect(),
-        };
+        let line_height = window.line_height();
+        let mut cache = editor.paint_cache.borrow_mut();
+        cache.refresh(text, editor.language);
+        // Password fields paint a mask whose byte offsets differ per line.
+        let masked = editor.password.then(|| password_mask(text));
+        let masked_lines = masked
+            .as_deref()
+            .map(|masked| masked.split('\n').collect::<Vec<_>>());
+        let line_count = cache.line_starts.len();
 
-        for (line, painted_line) in text.split('\n').zip(painted_text.split('\n')) {
+        let shape = |window: &mut Window, line: usize| {
+            let line_start = cache.line_starts[line];
+            let source = cache.line(text, line);
+            let painted = masked_lines
+                .as_ref()
+                .and_then(|lines| lines.get(line).copied())
+                .unwrap_or(source);
             let marked_range = editor.marked_range.as_ref().and_then(|range| {
-                let range = marked_slice(line.len(), line_start, range)?;
+                let range = marked_slice(source.len(), line_start, range)?;
                 let range = if editor.password {
-                    password_display_offset(line, range.start)
-                        ..password_display_offset(line, range.end)
+                    password_display_offset(source, range.start)
+                        ..password_display_offset(source, range.end)
                 } else {
                     range
                 };
                 Some(line_start + range.start..line_start + range.end)
             });
             let runs = editor_text_runs(
-                painted_line,
+                painted,
                 line_start,
                 &style,
                 editor.language,
-                &syntax_tokens,
+                cache.tokens_from(line_start),
                 marked_range.as_ref(),
                 &editor.diagnostics,
             );
-            lines.push(window.text_system().shape_line(
-                painted_line.to_owned().into(),
-                font_size,
-                &runs,
-                None,
-            ));
-            line_start += line.len() + 1;
-        }
-
-        let line_height = window.line_height();
-        let cursor = editor.cursor_offset();
-        let (cursor_line, cursor_col) = line_and_column(text, cursor);
-        let cursor_position = point(
-            lines[cursor_line].x_for_index(if editor.password {
-                password_display_offset(&text[nth_line_start(text, cursor_line)..], cursor_col)
+            window
+                .text_system()
+                .shape_line(painted.to_owned().into(), font_size, &runs, None)
+        };
+        let display_column = |line: usize, column: usize| {
+            if editor.password {
+                password_display_offset(cache.line(text, line), column)
             } else {
-                cursor_col
-            }),
+                column
+            }
+        };
+
+        let cursor = clamp_boundary(text, editor.cursor_offset());
+        let (cursor_line, cursor_col) = cache.line_and_column(cursor);
+        let cursor_shaped = shape(window, cursor_line);
+        let cursor_position = point(
+            cursor_shaped.x_for_index(display_column(cursor_line, cursor_col)),
             line_height * cursor_line as f32,
         );
         let focused = editor.focus_handle.is_focused(window);
@@ -1225,6 +1356,34 @@ impl Element for TextEditorText {
             } else {
                 (bounds, None)
             };
+
+        // Lay out only the lines inside the scroll viewport, plus the caret's
+        // line for hit testing and input-method bounds.
+        let viewport = window.content_mask().bounds;
+        let first = ((viewport.top() - paint_bounds.top()) / line_height)
+            .floor()
+            .max(0.) as usize;
+        let last = (((viewport.bottom() - paint_bounds.top()) / line_height)
+            .ceil()
+            .max(0.) as usize)
+            .min(line_count);
+        let mut cursor_shaped = Some(cursor_shaped);
+        let mut lines = Vec::with_capacity(last.saturating_sub(first) + 1);
+        if cursor_line < first {
+            lines.push((cursor_line, cursor_shaped.take().unwrap()));
+        }
+        for line in first..last.max(first) {
+            let shaped = if line == cursor_line {
+                cursor_shaped.take().unwrap()
+            } else {
+                shape(window, line)
+            };
+            lines.push((line, shaped));
+        }
+        if let Some(shaped) = cursor_shaped {
+            lines.push((cursor_line, shaped));
+        }
+
         let cursor_quad = focused.then(|| {
             fill(
                 Bounds::new(
@@ -1242,29 +1401,22 @@ impl Element for TextEditorText {
 
         let mut selections = Vec::new();
         if !editor.selected_range.is_empty() {
-            let (start_line, start_col) = line_and_column(text, editor.selected_range.start);
-            let (end_line, end_col) = line_and_column(text, editor.selected_range.end);
+            let (start_line, start_col) =
+                cache.line_and_column(clamp_boundary(text, editor.selected_range.start));
+            let (end_line, end_col) =
+                cache.line_and_column(clamp_boundary(text, editor.selected_range.end));
             for (line, shaped_line) in lines
                 .iter()
-                .enumerate()
-                .skip(start_line)
-                .take(end_line - start_line + 1)
+                .filter(|(line, _)| (start_line..=end_line).contains(line))
             {
+                let line = *line;
                 let start = if line == start_line {
-                    shaped_line.x_for_index(if editor.password {
-                        password_display_offset(&text[nth_line_start(text, line)..], start_col)
-                    } else {
-                        start_col
-                    })
+                    shaped_line.x_for_index(display_column(line, start_col))
                 } else {
                     px(0.)
                 };
                 let end = if line == end_line {
-                    shaped_line.x_for_index(if editor.password {
-                        password_display_offset(&text[nth_line_start(text, line)..], end_col)
-                    } else {
-                        end_col
-                    })
+                    shaped_line.x_for_index(display_column(line, end_col))
                 } else {
                     shaped_line.x_for_index(shaped_line.text.len())
                 };
@@ -1285,7 +1437,10 @@ impl Element for TextEditorText {
         }
 
         PrepaintState {
-            lines,
+            lines: LineLayouts {
+                count: line_count,
+                lines,
+            },
             cursor: cursor_quad,
             selections,
             paint_bounds,
@@ -1316,12 +1471,12 @@ impl Element for TextEditorText {
         for selection in state.selections.drain(..) {
             window.paint_quad(selection);
         }
-        for (line, shaped_line) in state.lines.iter().enumerate() {
+        for (line, shaped_line) in &state.lines.lines {
             shaped_line
                 .paint(
                     point(
                         state.paint_bounds.left(),
-                        state.paint_bounds.top() + window.line_height() * line as f32,
+                        state.paint_bounds.top() + window.line_height() * *line as f32,
                     ),
                     window.line_height(),
                     TextAlign::Left,
@@ -1343,7 +1498,7 @@ impl Element for TextEditorText {
             }
             // The prepaint state is no longer needed after painting. Move the
             // shaped lines into the editor so the hit-test/completion cache
-            // does not allocate and clone the full layout every frame.
+            // does not allocate and clone the layout every frame.
             editor.last_layout = std::mem::take(&mut state.lines);
             editor.last_bounds = Some(state.paint_bounds);
         });
@@ -2315,7 +2470,7 @@ mod tests {
     #[test]
     fn completion_anchor_has_a_safe_pre_layout_fallback() {
         assert_eq!(
-            completion_anchor("SELECT 🦀", 8, None, &[]),
+            completion_anchor("SELECT 🦀", 8, None, &LineLayouts::default()),
             point(px(0.), px(0.))
         );
     }
@@ -2324,6 +2479,33 @@ mod tests {
     fn single_line_values_replace_newlines_without_changing_other_text() {
         assert_eq!(normalize_value("a\nb\r\nc", false), "a b  c");
         assert_eq!(normalize_value("a\nb", true), "a\nb");
+    }
+
+    #[test]
+    fn paint_cache_indexes_lines_and_tokens_without_rescanning() {
+        let line = "SELECT id, name FROM users WHERE id = 1;";
+        let text = std::iter::repeat_n(line, 20_000)
+            .chain(["SELECT 'the longest line in this document by far';"])
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut cache = PaintCache::default();
+        cache.refresh(&text, EditorLanguage::Sql);
+        assert_eq!(cache.line_starts.len(), 20_001);
+        assert!(cache.longest_lines.contains(&20_000));
+        assert_eq!(cache.longest_lines.len(), PaintCache::MEASURED_LINES);
+        let offset = cache.line_starts[12_345] + 7;
+        assert_eq!(cache.line_and_column(offset), (12_345, 7));
+        assert_eq!(cache.line_and_column(text.len()), (20_000, 50));
+        // A late line sees only its own and later tokens.
+        let tokens = cache.tokens_from(cache.line_starts[19_999]);
+        assert!(tokens.len() < 30);
+        assert!(tokens[0].range.start >= cache.line_starts[19_999]);
+        // Unchanged text keeps the measured width; edits clear it.
+        cache.width = Some((px(13.), px(500.)));
+        cache.refresh(&text, EditorLanguage::Sql);
+        assert!(cache.width.is_some());
+        cache.refresh(&format!("{text} "), EditorLanguage::Sql);
+        assert!(cache.width.is_none());
     }
 
     #[test]

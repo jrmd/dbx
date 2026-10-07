@@ -271,6 +271,16 @@ pub(super) struct CompletionSignature {
     pub(super) cursor: usize,
 }
 
+/// Everything a completion result depends on: the query text and caret,
+/// plus a cheap stamp of the schema metadata and recently browsed result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CompletionCacheKey {
+    pub(super) signature: CompletionSignature,
+    pub(super) tables: usize,
+    pub(super) columns: usize,
+    pub(super) recent_result: usize,
+}
+
 #[derive(Default)]
 pub(super) struct AbortOnDrop(Option<tokio::task::AbortHandle>);
 
@@ -370,6 +380,12 @@ pub(super) struct QueryTab {
     pub(super) request_generation: u64,
     pub(super) query_revision: u64,
     pub(super) completion_signature: Option<CompletionSignature>,
+    /// The last computed completion and what it was computed from. Rendering
+    /// asks for completion every frame; recomputing lexes the whole query.
+    pub(super) completion_cache: Option<(
+        CompletionCacheKey,
+        Option<(Range<usize>, Vec<SqlCompletionItem>)>,
+    )>,
     pub(super) completion_dismissed_signature: Option<CompletionSignature>,
     pub(super) completion_index: usize,
     pub(super) _subscriptions: Vec<Subscription>,
@@ -476,6 +492,7 @@ impl QueryTab {
             request_generation: 0,
             query_revision: 0,
             completion_signature: None,
+            completion_cache: None,
             completion_dismissed_signature: None,
             completion_index: 0,
             _subscriptions: vec![
