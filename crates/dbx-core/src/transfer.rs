@@ -67,8 +67,8 @@ fn report_transfer(rows: u64, statements: u64) {
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 use crate::{
-    CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Page, QueryOptions, Result,
-    TableRef, TableStructure,
+    CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Filter, MutationValue, Page,
+    QueryOptions, Result, RowChange, TableRef, TableStructure,
     sql::{build_multi_row_insert_with_columns, quote_identifier, quote_table},
 };
 
@@ -1443,6 +1443,75 @@ pub fn render_sql_insert(
     }
     statement.push(')');
     Ok(statement)
+}
+
+/// Render a staged row change as readable SQL for review. Values are shown as
+/// literals; the applied statement binds them and also checks the row still
+/// holds its original values.
+pub fn render_row_change(kind: DatabaseKind, change: &RowChange) -> Result<String> {
+    let value = |value: &MutationValue| match value {
+        MutationValue::Parameter(value) => render_sql_literal(kind, value),
+        MutationValue::Expression(expression) => Ok(expression.clone()),
+    };
+    let predicate = |filters: &[Filter]| -> Result<String> {
+        let mut parts = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let column = quote_identifier(kind, &filter.column)?;
+            parts.push(match &filter.value {
+                None | Some(CellValue::Null) => format!("{column} IS NULL"),
+                Some(literal) => format!("{column} = {}", render_sql_literal(kind, literal)?),
+            });
+        }
+        Ok(parts.join(" AND "))
+    };
+    Ok(match change {
+        RowChange::Insert(request) => {
+            let table = quote_table(kind, &request.table)?;
+            if request.columns.is_empty() {
+                format!("INSERT INTO {table} DEFAULT VALUES;")
+            } else {
+                let columns = request
+                    .columns
+                    .iter()
+                    .map(|column| quote_identifier(kind, column))
+                    .collect::<Result<Vec<_>>>()?;
+                let values = request
+                    .values
+                    .iter()
+                    .map(value)
+                    .collect::<Result<Vec<_>>>()?;
+                format!(
+                    "INSERT INTO {table} ({}) VALUES ({});",
+                    columns.join(", "),
+                    values.join(", ")
+                )
+            }
+        }
+        RowChange::Update { request, .. } => {
+            let assignments = request
+                .assignments
+                .iter()
+                .map(|(column, assigned)| {
+                    Ok(format!(
+                        "{} = {}",
+                        quote_identifier(kind, column)?,
+                        value(assigned)?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            format!(
+                "UPDATE {} SET {} WHERE {};",
+                quote_table(kind, &request.table)?,
+                assignments.join(", "),
+                predicate(&request.filters)?
+            )
+        }
+        RowChange::Delete { table, filters, .. } => format!(
+            "DELETE FROM {} WHERE {};",
+            quote_table(kind, table)?,
+            predicate(filters)?
+        ),
+    })
 }
 
 async fn order_export_views(

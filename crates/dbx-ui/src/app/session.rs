@@ -686,6 +686,18 @@ impl Drop for DiagramTab {
     }
 }
 
+/// Where a browsed page begins. Keyset and Redis starts are only known after
+/// the previous page loads, so a data tab remembers the start of every page it
+/// has visited to make Previous exact.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum PageStart {
+    Offset,
+    /// Rows strictly after (or before, when descending) this primary key.
+    After(CellValue),
+    /// A Redis `SCAN` cursor.
+    RedisCursor(u64),
+}
+
 /// One open table. Each tab owns its grid, filters, page, and row draft, so
 /// switching between tables keeps every view exactly where the user left it.
 pub(super) struct DataTab {
@@ -703,6 +715,10 @@ pub(super) struct DataTab {
     pub(super) result_table: Option<TableRef>,
     pub(super) table_page: u64,
     pub(super) table_has_next_page: bool,
+    /// `page_starts[p]` is how page `p` began; `next_page_start` continues
+    /// after the current page.
+    pub(super) page_starts: Vec<PageStart>,
+    pub(super) next_page_start: Option<PageStart>,
     /// Header sort applied as `ORDER BY` when the engine supports it.
     pub(super) sort: Option<Order>,
     pub(super) sortable: bool,
@@ -760,6 +776,8 @@ impl DataTab {
             result_table: None,
             table_page: 0,
             table_has_next_page: false,
+            page_starts: Vec::new(),
+            next_page_start: None,
             sort: None,
             sortable,
             pending_edits: Default::default(),

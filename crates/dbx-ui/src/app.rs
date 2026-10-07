@@ -36,10 +36,11 @@ use std::{
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
-    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Order, Page,
-    QueryCancellation, QueryOptions, QueryResult, QuerySession, RedisCommandCatalog,
-    ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo, TableRef,
-    UpdateRequest, detect_file_format, export_database, export_table, import_database, import_file,
+    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Order,
+    OrderDirection, Page, QueryCancellation, QueryOptions, QueryResult, QuerySession,
+    RedisCommandCatalog, ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo,
+    TableRef, UpdateRequest, detect_file_format, export_database, export_table, import_database,
+    import_file,
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, Decorations, Div, ElementId, Entity,
@@ -225,6 +226,56 @@ fn table_browse_page(page: u64) -> Page {
 pub(crate) fn counted(count: impl TryInto<u64>, singular: &str, plural: &str) -> String {
     let count = count.try_into().unwrap_or(u64::MAX);
     format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// The primary key to page by, when keyset paging can replace OFFSET: a
+/// single-column key on a native SQL engine, with no sort or a sort on that
+/// key. Composite keys and other sorts keep exact OFFSET paging.
+fn keyset_column(
+    kind: DatabaseKind,
+    columns: &[ColumnInfo],
+    sort: Option<&Order>,
+) -> Option<Order> {
+    if !supports_keyset_paging(kind) {
+        return None;
+    }
+    let mut keys = columns.iter().filter(|column| column.primary_key);
+    let key = keys.next()?;
+    if keys.next().is_some() {
+        return None;
+    }
+    match sort {
+        None => Some(Order {
+            column: key.name.clone(),
+            direction: OrderDirection::Ascending,
+        }),
+        Some(order) if order.column == key.name => Some(order.clone()),
+        Some(_) => None,
+    }
+}
+
+fn supports_keyset_paging(kind: DatabaseKind) -> bool {
+    matches!(
+        kind,
+        DatabaseKind::PostgreSQL
+            | DatabaseKind::MySQL
+            | DatabaseKind::SQLite
+            | DatabaseKind::CockroachDB
+            | DatabaseKind::DuckDB
+            | DatabaseKind::Turso
+            | DatabaseKind::CloudflareD1
+            | DatabaseKind::SqlServer
+    )
+}
+
+/// The seek position after a keyset-ordered page: its last primary key.
+fn keyset_start(result: &QueryResult, order_by: &Order) -> Option<PageStart> {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == order_by.column)?;
+    let value = result.rows.last()?.values.get(index)?.clone();
+    (value != CellValue::Null).then_some(PageStart::After(value))
 }
 
 fn trim_table_browse_result(result: &mut QueryResult) -> bool {
@@ -1446,7 +1497,13 @@ impl DbxApp {
         data.reset_row_state(cx);
         data.filters = filter_model;
         data.filter_subscriptions.clear();
-        let order = data.sort.clone().into_iter().collect::<Vec<_>>();
+        let sort = data.sort.clone();
+        let keyset = keyset_column(kind, &filter_columns, sort.as_ref());
+        let order = sort
+            .clone()
+            .or_else(|| keyset.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading {}…", table_ref.name);
@@ -1457,33 +1514,60 @@ impl DbxApp {
         for row_id in filter_row_ids {
             self.watch_filter_row_for(session_id, tab_id, row_id, window, cx);
         }
+        let keyset_capable = filter_columns.is_empty() && supports_keyset_paging(kind);
         let task = runtime.spawn(async move {
-            // Structure and the first page are independent, so overlap them
-            // instead of paying two sequential round trips.
-            let first_page = async {
-                if kind != DatabaseKind::Redis {
-                    let mut result = engine
-                        .query_table(
-                            &table_ref,
-                            &[],
-                            &filters,
-                            &order,
-                            Some(table_browse_page(0)),
-                            QueryOptions::default(),
-                        )
-                        .await?;
-                    let has_next_page = trim_table_browse_result(&mut result);
-                    Ok::<_, dbx_core::DbxError>((result, has_next_page))
-                } else {
-                    let result = engine
-                        .query("SCAN 0 COUNT 100", QueryOptions::default())
-                        .await?;
-                    Ok((result, false))
+            let first_page = |order: Vec<Order>| {
+                let (engine, table_ref, filters) = (&engine, &table_ref, &filters);
+                async move {
+                    if kind != DatabaseKind::Redis {
+                        let mut result = engine
+                            .query_table(
+                                table_ref,
+                                &[],
+                                filters,
+                                &order,
+                                Some(table_browse_page(0)),
+                                QueryOptions::default(),
+                            )
+                            .await?;
+                        let has_next_page = trim_table_browse_result(&mut result);
+                        Ok::<_, dbx_core::DbxError>((
+                            result,
+                            has_next_page.then_some(PageStart::Offset),
+                        ))
+                    } else {
+                        let (result, next) = engine
+                            .redis_scan_page("*", 0, TABLE_BROWSE_PAGE_SIZE as usize)
+                            .await?;
+                        Ok((result, (next != 0).then_some(PageStart::RedisCursor(next))))
+                    }
                 }
             };
-            let (structure, (result, has_next_page)) =
-                tokio::try_join!(engine.table_structure(&table_ref), first_page)?;
-            Ok::<_, dbx_core::DbxError>((structure, result, has_next_page))
+            let (structure, (result, next), keyset) = if keyset.is_none() && keyset_capable {
+                // The key is unknown until the structure arrives; reading it
+                // first lets even the first visit page by key.
+                let structure = engine.table_structure(&table_ref).await?;
+                let keyset = keyset_column(kind, &structure.columns, sort.as_ref());
+                let order = sort
+                    .clone()
+                    .or_else(|| keyset.clone())
+                    .into_iter()
+                    .collect();
+                (structure, first_page(order).await?, keyset)
+            } else {
+                // Structure and the first page are independent, so overlap
+                // them instead of paying two sequential round trips.
+                let (structure, page) =
+                    tokio::try_join!(engine.table_structure(&table_ref), first_page(order))?;
+                let confirmed = keyset_column(kind, &structure.columns, sort.as_ref());
+                let keyset = keyset.filter(|keyset| confirmed.as_ref() == Some(keyset));
+                (structure, page, keyset)
+            };
+            let next = match (&keyset, next) {
+                (Some(order_by), Some(_)) => keyset_start(&result, order_by),
+                (_, next) => next,
+            };
+            Ok::<_, dbx_core::DbxError>((structure, result, next))
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
@@ -1511,7 +1595,7 @@ impl DbxApp {
                 data.abort_handle.clear();
                 let mut referenced_row_missing = false;
                 match result {
-                    Ok((structure, result, has_next_page)) => {
+                    Ok((structure, result, next)) => {
                         let has_rows = !result.rows.is_empty();
                         data.table_columns = structure.columns;
                         session.completion_columns.insert(
@@ -1520,7 +1604,12 @@ impl DbxApp {
                         );
                         data.foreign_keys = structure.foreign_keys;
                         data.table_page = 0;
-                        data.table_has_next_page = has_next_page;
+                        data.table_has_next_page = next.is_some();
+                        data.next_page_start = next;
+                        data.page_starts = vec![match kind {
+                            DatabaseKind::Redis => PageStart::RedisCursor(0),
+                            _ => PageStart::Offset,
+                        }];
                         data.set_result(Some(result), &session.tables, cx);
                         data.result_table = Some(result_table.clone());
                         referenced_row_missing = row_navigation && !has_rows;
@@ -1864,15 +1953,23 @@ impl DbxApp {
         if self.pending_edits_block(session_id, tab_id, cx) {
             return;
         }
-        let Some((engine, table, kind, busy, known_columns)) =
+        let Some((engine, table, kind, busy, known_columns, start)) =
             self.session(session_id).and_then(|session| {
                 let data = session.data_tab(tab_id)?;
+                let start = if page == 0 {
+                    None
+                } else if page == data.table_page + 1 {
+                    data.next_page_start.clone()
+                } else {
+                    data.page_starts.get(page as usize).cloned()
+                };
                 Some((
                     session.engine.clone(),
                     data.table.clone(),
                     session.kind,
                     data.busy,
                     data.table_columns.clone(),
+                    start,
                 ))
             })
         else {
@@ -1898,7 +1995,42 @@ impl DbxApp {
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
-        let order = data.sort.clone().into_iter().collect::<Vec<_>>();
+        let keyset = keyset_column(kind, &known_columns, data.sort.as_ref());
+        let start = start.unwrap_or(match (kind, &keyset) {
+            (DatabaseKind::Redis, _) => PageStart::RedisCursor(0),
+            _ => PageStart::Offset,
+        });
+        let mut order = data.sort.clone().into_iter().collect::<Vec<_>>();
+        // A page reached by OFFSET continues by OFFSET; keyset paging starts
+        // from a fresh first page.
+        let keyset = keyset.filter(|_| page == 0 || matches!(start, PageStart::After(_)));
+        let mut filters = filters;
+        let mut offset_page = page;
+        if let Some(order_by) = &keyset {
+            // Seeking by primary key keeps every page as fast as the first,
+            // where OFFSET rescans all earlier rows.
+            if order.is_empty() {
+                order.push(order_by.clone());
+            }
+            if let PageStart::After(value) = &start {
+                let operator = match order_by.direction {
+                    OrderDirection::Ascending => FilterOperator::GreaterThan,
+                    OrderDirection::Descending => FilterOperator::LessThan,
+                };
+                filters.push(Filter::new(
+                    order_by.column.clone(),
+                    operator,
+                    Some(value.clone()),
+                ));
+            }
+            offset_page = 0;
+        }
+        let pattern = filters
+            .first()
+            .and_then(|filter| filter.value.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "*".into());
+        let page_start = start.clone();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading page {}…", page + 1);
@@ -1916,27 +2048,27 @@ impl DbxApp {
                         &[],
                         &filters,
                         &order,
-                        Some(table_browse_page(page)),
+                        Some(table_browse_page(offset_page)),
                         QueryOptions::default(),
                         Some(&known_columns),
                     )
                     .await?;
                 let has_next_page = trim_table_browse_result(&mut result);
-                Ok::<_, dbx_core::DbxError>((result, has_next_page))
+                let next = match &keyset {
+                    Some(order_by) if has_next_page => keyset_start(&result, order_by),
+                    None if has_next_page => Some(PageStart::Offset),
+                    _ => None,
+                };
+                Ok::<_, dbx_core::DbxError>((result, next))
             } else {
-                let pattern = filters
-                    .first()
-                    .and_then(|filter| filter.value.as_ref())
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "*".into());
-                let pattern = redis_command_word(&pattern);
-                let result = engine
-                    .query(
-                        &format!("SCAN 0 MATCH {pattern} COUNT 100"),
-                        QueryOptions::default(),
-                    )
+                let cursor = match start {
+                    PageStart::RedisCursor(cursor) => cursor,
+                    _ => 0,
+                };
+                let (result, next) = engine
+                    .redis_scan_page(&pattern, cursor, TABLE_BROWSE_PAGE_SIZE as usize)
                     .await?;
-                Ok((result, false))
+                Ok((result, (next != 0).then_some(PageStart::RedisCursor(next))))
             }
         });
         if let Some(session) = self.session_mut(session_id) {
@@ -1964,9 +2096,12 @@ impl DbxApp {
                 data.busy = false;
                 data.abort_handle.clear();
                 match result {
-                    Ok((result, has_next_page)) => {
+                    Ok((result, next)) => {
                         data.table_page = page;
-                        data.table_has_next_page = has_next_page;
+                        data.table_has_next_page = next.is_some();
+                        data.next_page_start = next;
+                        data.page_starts.truncate(page as usize);
+                        data.page_starts.push(page_start);
                         data.set_result(Some(result), &session.tables, cx);
                         data.result_table = Some(result_table.clone());
                         data.error = None;
@@ -4301,10 +4436,6 @@ fn table_click_action(event: &gpui::ClickEvent) -> TableClickAction {
     }
 }
 
-fn redis_command_word(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 const DIAGRAM_MINIMAP_MAX_WIDTH: f32 = 188.0;
 const DIAGRAM_MINIMAP_MAX_HEIGHT: f32 = 124.0;
 const DIAGRAM_MINIMAP_MARGIN: f32 = 14.0;
@@ -4902,12 +5033,6 @@ mod tests {
 
         let written = QueryResult::empty(Some(1), 4);
         assert_eq!(query_result_status(&written), "1 row affected · 4 ms");
-    }
-
-    #[test]
-    fn redis_filter_stays_one_command_argument() {
-        assert_eq!(redis_command_word("user:* archive"), "\"user:* archive\"");
-        assert_eq!(redis_command_word("a\"b"), "\"a\\\"b\"");
     }
 
     #[test]

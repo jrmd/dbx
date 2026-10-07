@@ -809,6 +809,32 @@ impl InsertRequest {
 /// equality-only shape before it emits a statement. The caller obtains the
 /// primary-key columns from table metadata because this request is kept
 /// independent of a second metadata round trip.
+/// One staged row change. Updates and deletes carry the values the user saw,
+/// so applying them refuses to overwrite a row that changed underneath.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowChange {
+    Insert(InsertRequest),
+    Update {
+        request: UpdateRequest,
+        originals: Vec<(String, CellValue)>,
+    },
+    Delete {
+        table: TableRef,
+        filters: Vec<Filter>,
+        originals: Vec<(String, CellValue)>,
+    },
+}
+
+impl RowChange {
+    pub fn table(&self) -> &TableRef {
+        match self {
+            Self::Insert(request) => &request.table,
+            Self::Update { request, .. } => &request.table,
+            Self::Delete { table, .. } => table,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UpdateRequest {
     pub table: TableRef,
