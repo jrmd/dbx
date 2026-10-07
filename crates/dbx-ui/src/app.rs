@@ -23,6 +23,7 @@ mod query_parameters;
 mod redis_completion;
 mod result_table;
 mod sql_completion;
+mod table_layout;
 mod transfer;
 mod value_view;
 mod view;
@@ -1455,14 +1456,10 @@ impl DbxApp {
         }
 
         let tab_id = Uuid::new_v4();
-        let data = DataTab::new(
-            session_id,
-            tab_id,
-            table_ref,
-            session.kind.is_sql(),
-            window,
-            cx,
-        );
+        let sortable = session.kind.is_sql();
+        let layout = self.table_layout_for(session_id, &table_ref);
+        let mut data = DataTab::new(session_id, tab_id, table_ref, sortable, window, cx);
+        data.layout = layout;
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
@@ -1515,16 +1512,19 @@ impl DbxApp {
         let runtime = self.runtime.clone();
         let mut filter_model = FilterModel::new();
         for filter in &filters {
-            if let Some(value) = filter.value.as_ref() {
-                filter_model.add_row_with_value_and_columns(
-                    filter.column.clone(),
-                    filter.operator,
-                    value.to_string(),
-                    &filter_columns,
-                    window,
-                    cx,
-                );
-            }
+            // IS NULL and IS NOT NULL carry no value but are still filters.
+            filter_model.add_row_with_value_and_columns(
+                filter.column.clone(),
+                filter.operator,
+                filter
+                    .value
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                &filter_columns,
+                window,
+                cx,
+            );
         }
         let filter_row_ids = filter_model
             .rows()
@@ -1728,7 +1728,12 @@ impl DbxApp {
                 let data = session.data_tab(tab_id)?;
                 let result = data.result.as_ref()?;
                 let row = result.rows.get(row_index)?;
-                let local_column = result.columns.get(column_index.checked_sub(1)?)?;
+                let local_column = result.columns.get(
+                    data.data_grid
+                        .read(cx)
+                        .delegate()
+                        .result_column(column_index)?,
+                )?;
                 let foreign_key = data
                     .foreign_keys
                     .iter()
@@ -3172,8 +3177,33 @@ impl DbxApp {
         match event {
             TableEvent::ColumnWidthsChanged(widths) => {
                 if let Some(data) = self.data_tab_mut(session_id, tab_id) {
-                    data.result_column_widths =
-                        ResultTableDelegate::widths_by_key(data.result.as_deref(), widths);
+                    let delegate = data.data_grid.read(cx).delegate();
+                    data.result_column_widths = delegate.widths_by_key(widths);
+                    let widths = delegate.widths_by_name();
+                    data.layout.widths.extend(widths);
+                    self.store_table_layout_for(session_id, tab_id, cx);
+                }
+            }
+            TableEvent::MoveColumn(..) => {
+                if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+                    let names = data
+                        .result
+                        .as_deref()
+                        .map(|result| {
+                            data.data_grid
+                                .read(cx)
+                                .delegate()
+                                .display_order()
+                                .iter()
+                                .map(|index| result.columns[*index].name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    data.layout.order = names
+                        .into_iter()
+                        .filter(|name| !data.layout.pinned.contains(name))
+                        .collect();
+                    self.store_table_layout_for(session_id, tab_id, cx);
                 }
             }
             TableEvent::SelectRow(row_index) => {
@@ -3182,17 +3212,19 @@ impl DbxApp {
             // Selecting a cell also selects its row for the inspector.
             TableEvent::SelectCell(row_index, column_index) => {
                 self.select_row_for(session_id, tab_id, *row_index, cx);
-                if let Some(column) = column_index.checked_sub(1) {
+                if let Some(column) = self.data_grid_column(session_id, tab_id, *column_index, cx) {
                     self.select_column_for(session_id, tab_id, column, cx);
                 }
             }
             TableEvent::DoubleClickedCell(row_index, column_index) => {
-                if let Some(column) = column_index.checked_sub(1) {
+                if let Some(column) = self.data_grid_column(session_id, tab_id, *column_index, cx) {
                     self.begin_cell_edit_for(session_id, tab_id, *row_index, column, window, cx);
                 }
             }
-            TableEvent::SelectColumn(column_index) if *column_index > 0 => {
-                self.select_column_for(session_id, tab_id, *column_index - 1, cx);
+            TableEvent::SelectColumn(column_index) => {
+                if let Some(column) = self.data_grid_column(session_id, tab_id, *column_index, cx) {
+                    self.select_column_for(session_id, tab_id, column, cx);
+                }
             }
             TableEvent::ClearSelection => {
                 if let Some(data) = self.data_tab_mut(session_id, tab_id)
@@ -3206,6 +3238,21 @@ impl DbxApp {
             }
             _ => {}
         }
+    }
+
+    /// The result column a data grid column shows.
+    pub(super) fn data_grid_column(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        col_ix: usize,
+        cx: &App,
+    ) -> Option<usize> {
+        self.data_tab(session_id, tab_id)?
+            .data_grid
+            .read(cx)
+            .delegate()
+            .result_column(col_ix)
     }
 
     fn on_query_grid_event(
@@ -3235,12 +3282,23 @@ impl DbxApp {
                     .result_grid
                     .read(cx)
                     .delegate()
-                    .cell_value(*row, *column - 1)
+                    .cell_value(
+                        *row,
+                        query_tab
+                            .result_grid
+                            .read(cx)
+                            .delegate()
+                            .result_column(*column)
+                            .unwrap_or_default(),
+                    )
                     .cloned();
             }
             TableEvent::ColumnWidthsChanged(widths) => {
-                query_tab.result_column_widths =
-                    ResultTableDelegate::widths_by_key(query_tab.result.as_deref(), widths);
+                query_tab.result_column_widths = query_tab
+                    .result_grid
+                    .read(cx)
+                    .delegate()
+                    .widths_by_key(widths);
             }
             TableEvent::SelectCell(..) => {
                 query_tab.result_selection = QueryResultSelection::Cell;

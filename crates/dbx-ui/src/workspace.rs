@@ -22,8 +22,44 @@ pub enum SavedTab {
     Structure(dbx_core::TableRef),
     Diagram,
 }
+/// How the user arranged one table's grid. Columns are named, so a layout
+/// survives added or dropped columns.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct TableLayout {
+    #[serde(default)]
+    pub widths: std::collections::BTreeMap<String, f32>,
+    #[serde(default)]
+    pub hidden: std::collections::BTreeSet<String>,
+    /// Columns pinned to the left edge, in pin order.
+    #[serde(default)]
+    pub pinned: Vec<String>,
+    /// Display order of the unpinned columns. Unlisted columns follow in
+    /// table order.
+    #[serde(default)]
+    pub order: Vec<String>,
+    #[serde(default)]
+    pub saved_filters: Vec<SavedFilter>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SavedFilter {
+    pub name: String,
+    pub filters: Vec<dbx_core::Filter>,
+}
+
+/// The key for a table's layout within its connection's workspace.
+pub fn table_layout_key(table: &dbx_core::TableRef) -> String {
+    match &table.schema {
+        Some(schema) => format!("{schema}.{}", table.name),
+        None => table.name.clone(),
+    }
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct WorkspaceDocument {
+    /// Per-table grid layouts and saved filters, keyed by [`table_layout_key`].
+    #[serde(default)]
+    pub table_layouts: HashMap<String, TableLayout>,
     #[serde(default)]
     pub schema_baseline: Option<dbx_core::RelationalSchema>,
     pub drafts: Vec<SavedQuery>,
