@@ -20,8 +20,10 @@ mod data_clipboard;
 mod diagnostics;
 mod find;
 mod query_parameters;
+mod quick_open;
 mod redis_completion;
 mod result_table;
+mod row_count;
 mod sql_completion;
 mod table_layout;
 mod transfer;
@@ -143,6 +145,9 @@ gpui::actions!(
         CopyDataSelection,
         PasteRows,
         OpenQuickOpen,
+        QuickOpenNext,
+        QuickOpenPrevious,
+        QuickOpenConfirm,
         SubmitQueryParameters,
         CancelQueryParameters,
         OpenFind,
@@ -682,6 +687,7 @@ pub struct DbxApp {
     table_context_menu: Option<TableContextMenu>,
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
+    quick_open: Option<quick_open::QuickOpen>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     settings_open: bool,
     settings_section: SettingsSection,
@@ -808,6 +814,7 @@ impl DbxApp {
             table_context_menu: None,
             database_export_dialog: None,
             confirmation_dialog: None,
+            quick_open: None,
             mutation_error_dialog: None,
             settings_open: false,
             settings_section: SettingsSection::Appearance,
@@ -1157,7 +1164,10 @@ impl DbxApp {
         if event.keystroke.modifiers.modified() || event.keystroke.key.as_str() != "escape" {
             return;
         }
-        let dismissed = if self.dismiss_mutation_error_dialog(window, cx) {
+        let dismissed = if self.quick_open.is_some() {
+            self.close_quick_open(window, cx);
+            true
+        } else if self.dismiss_mutation_error_dialog(window, cx) {
             true
         } else if self.confirmation_dialog.is_some() {
             self.cancel_confirmation(window, cx);
@@ -1563,6 +1573,7 @@ impl DbxApp {
             self.watch_filter_row_for(session_id, tab_id, row_id, window, cx);
         }
         let keyset_capable = filter_columns.is_empty() && supports_keyset_paging(kind);
+        let loaded_filters = filters.clone();
         let task = runtime.spawn(async move {
             let first_page = |order: Vec<Order>| {
                 let (engine, table_ref, filters) = (&engine, &table_ref, &filters);
@@ -1642,6 +1653,7 @@ impl DbxApp {
                 data.busy = false;
                 data.abort_handle.clear();
                 let mut referenced_row_missing = false;
+                let loaded = result.is_ok();
                 match result {
                     Ok((structure, result, next)) => {
                         let has_rows = !result.rows.is_empty();
@@ -1670,6 +1682,9 @@ impl DbxApp {
                     Err(error) => {
                         data.error = Some(error.to_string());
                     }
+                }
+                if loaded {
+                    this.page_loaded_for(session_id, tab_id, loaded_filters, cx);
                 }
                 if referenced_row_missing {
                     this.show_toast(ToastKind::Info, "Referenced row not found", cx);
@@ -2084,6 +2099,7 @@ impl DbxApp {
             .map(ToString::to_string)
             .unwrap_or_else(|| "*".into());
         let page_start = start.clone();
+        let loaded_filters = filters.clone();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading page {}…", page + 1);
@@ -2158,6 +2174,7 @@ impl DbxApp {
                         data.set_result(Some(result), &session.tables, cx);
                         data.result_table = Some(result_table.clone());
                         data.error = None;
+                        this.page_loaded_for(session_id, tab_id, loaded_filters, cx);
                     }
                     Err(error) => {
                         data.error = Some(error.to_string());
