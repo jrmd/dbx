@@ -44,10 +44,10 @@ pub use model::{
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
 pub use sql::{
-    SqlStatement, build_create_table, build_delete, build_delete_with_columns, build_drop_table,
-    build_insert, build_insert_with_columns, build_multi_row_insert, build_select,
-    build_select_with_columns, build_truncate_table, build_update, build_update_with_columns,
-    quote_identifier, validate_sql_expression,
+    SqlStatement, build_count, build_create_table, build_delete, build_delete_with_columns,
+    build_drop_table, build_insert, build_insert_with_columns, build_multi_row_insert,
+    build_row_estimate, build_select, build_select_with_columns, build_truncate_table,
+    build_update, build_update_with_columns, quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::checked_split_sql_for;

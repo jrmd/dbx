@@ -739,6 +739,9 @@ pub(super) struct DataTab {
     /// after the current page.
     pub(super) page_starts: Vec<PageStart>,
     pub(super) next_page_start: Option<PageStart>,
+    pub(super) row_count: super::row_count::RowCount,
+    /// The filters the loaded pages and `row_count` reflect.
+    pub(super) counted_filters: Vec<Filter>,
     /// Header sort applied as `ORDER BY` when the engine supports it.
     pub(super) sort: Option<Order>,
     pub(super) sortable: bool,
@@ -810,6 +813,8 @@ impl DataTab {
             table_has_next_page: false,
             page_starts: Vec::new(),
             next_page_start: None,
+            row_count: Default::default(),
+            counted_filters: Vec::new(),
             sort: None,
             sortable,
             pending_edits: Default::default(),

@@ -52,6 +52,7 @@ impl Render for DbxApp {
             .on_action(cx.listener(Self::next_connection_action))
             .on_action(cx.listener(Self::previous_connection_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
+            .on_action(cx.listener(Self::open_quick_open_action))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
             .child(self.render_topbar(window, cx))
             .child(
@@ -66,7 +67,8 @@ impl Render for DbxApp {
             )
             .child(self.render_toasts(cx))
             .when(unlocked, |view| {
-                view.child(self.render_confirmation_dialog(cx))
+                view.child(self.render_quick_open(cx))
+                    .child(self.render_confirmation_dialog(cx))
             })
             .children(resize_edges(window))
     }

@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CellValue, ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError,
     ExecResult, Filter, InsertRequest, Order, Page, QueryResult, RelationalSchema, Result,
-    RowChange, SqlStatement, TableInfo, TableRef, TableStructure, UpdateRequest,
+    RowChange, SqlStatement, TableInfo, TableRef, TableStructure, UpdateRequest, build_count,
     build_create_table, build_delete_with_columns, build_drop_table, build_insert_with_columns,
-    build_select_with_columns, build_truncate_table, build_update_with_columns,
+    build_row_estimate, build_select_with_columns, build_truncate_table, build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
 
@@ -357,6 +357,42 @@ impl DatabaseEngine {
             };
         }
         Ok(result)
+    }
+
+    /// Count the rows matching `filters` exactly.
+    pub async fn count_rows(
+        &self,
+        table: &TableRef,
+        filters: &[Filter],
+        known_columns: Option<&[ColumnInfo]>,
+    ) -> Result<u64> {
+        ensure_sql(self.kind(), "count_rows")?;
+        let metadata = self.filter_metadata(table, filters, known_columns).await?;
+        let statement = build_count(
+            self.kind(),
+            table,
+            filters,
+            metadata.as_deref().unwrap_or_default(),
+        )?;
+        let result = self
+            .query_statement(&statement, QueryOptions::default())
+            .await?;
+        first_count(&result).ok_or_else(|| DbxError::Query("COUNT(*) returned no number".into()))
+    }
+
+    /// The catalog's row estimate for `table`, when the engine keeps one.
+    /// Never scans the table.
+    pub async fn estimate_rows(&self, table: &TableRef) -> Result<Option<u64>> {
+        if !self.kind().is_sql() {
+            return Ok(None);
+        }
+        let Some(statement) = build_row_estimate(self.kind(), table)? else {
+            return Ok(None);
+        };
+        let result = self
+            .query_statement(&statement, QueryOptions::default())
+            .await?;
+        Ok(first_count(&result))
     }
 
     /// PostgreSQL needs column types to cast text filter parameters (for
@@ -763,5 +799,17 @@ pub(crate) fn query_result(
         rows_affected,
         truncated,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+/// The first cell of a one-row numeric result. Negative values (PostgreSQL's
+/// "never analyzed" `-1`) count as unknown.
+fn first_count(result: &QueryResult) -> Option<u64> {
+    match result.rows.first()?.values.first()? {
+        CellValue::Integer(value) => u64::try_from(*value).ok(),
+        CellValue::Unsigned(value) => Some(*value),
+        CellValue::Real(value) if *value >= 0.0 => Some(*value as u64),
+        CellValue::Text(value) => value.trim().parse().ok(),
+        _ => None,
     }
 }

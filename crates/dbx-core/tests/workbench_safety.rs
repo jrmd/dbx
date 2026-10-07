@@ -1084,3 +1084,29 @@ async fn postgres_schema_objects_dump_restore_round_trip() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn rows_are_counted_with_filters() {
+    let (_directory, engine) = database().await;
+    engine
+        .execute_sql(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); \
+             INSERT INTO items VALUES (1, 'one'), (2, NULL), (3, 'three');",
+        )
+        .await
+        .unwrap();
+    let table = TableRef::new("items");
+    assert_eq!(engine.count_rows(&table, &[], None).await.unwrap(), 3);
+    assert_eq!(
+        engine
+            .count_rows(
+                &table,
+                &[Filter::new("value", FilterOperator::IsNull, None)],
+                None
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(engine.estimate_rows(&table).await.unwrap(), None);
+}

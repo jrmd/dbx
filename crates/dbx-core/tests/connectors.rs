@@ -621,6 +621,8 @@ async fn sqlserver_live_sql_metadata_browsing_and_checked_edits() {
         )
         .await
         .unwrap();
+    assert_eq!(engine.count_rows(&table, &[], None).await.unwrap(), 2);
+    assert_eq!(engine.estimate_rows(&table).await.unwrap(), Some(2));
 
     let tables = engine.list_tables().await.unwrap();
     assert!(

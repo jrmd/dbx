@@ -474,6 +474,30 @@ async fn run_sql_scenario(kind: DatabaseKind, variable: &str) -> Result<()> {
         )
         .await?;
     assert_eq!(integer_value(&raw.rows[0].values[0]), 3);
+    assert_eq!(engine.count_rows(&table, &[], None).await?, 3);
+    assert_eq!(
+        engine
+            .count_rows(
+                &table,
+                &[Filter::new(
+                    "score",
+                    FilterOperator::GreaterThan,
+                    Some(CellValue::Integer(15)),
+                )],
+                None,
+            )
+            .await?,
+        2
+    );
+    if kind == DatabaseKind::PostgreSQL {
+        engine
+            .execute_sql(&format!("ANALYZE {}", qualified_table(kind)))
+            .await?;
+        assert_eq!(engine.estimate_rows(&table).await?, Some(3));
+    } else {
+        // Statistics may lag the inserts above; the query itself must work.
+        engine.estimate_rows(&table).await?;
+    }
 
     if kind == DatabaseKind::PostgreSQL {
         assert_postgres_enum_decoding(&engine).await?;
