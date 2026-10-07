@@ -29,8 +29,8 @@ impl DbxApp {
             let label = counted(rows.len(), "row", "rows");
             Some((rows.join("\n"), label))
         } else if let Some((row, column)) = grid.selected_cell() {
-            column
-                .checked_sub(1)
+            delegate
+                .result_column(column)
                 .and_then(|column| data.shown_value(row, column))
                 .map(|value| (value.to_string(), "cell".to_owned()))
         } else if let Some(row) = grid.selected_row() {
@@ -39,7 +39,7 @@ impl DbxApp {
                 .map(|text| (text, "row".to_owned()))
         } else {
             grid.selected_col()
-                .and_then(|column| delegate.column_as_tsv(column.checked_sub(1)?))
+                .and_then(|column| delegate.column_as_tsv(delegate.result_column(column)?))
                 .map(|text| (text, "column".to_owned()))
         };
         let Some((text, label)) = copied else {
@@ -79,6 +79,8 @@ impl DbxApp {
             return;
         };
         let grid = data.data_grid.read(cx);
+        // Pasted fields fill columns in display order from the selected cell.
+        let order = grid.delegate().display_order().to_vec();
         let (start_row, start_column) = match grid.selected_cell() {
             Some((row, column)) => (row, column.saturating_sub(1)),
             None => (data.loaded_rows_with_inserts(), 0),
@@ -88,10 +90,10 @@ impl DbxApp {
         for (offset, record) in records.iter().enumerate() {
             let row = start_row + offset;
             for (index, field) in record.iter().enumerate() {
-                let column = start_column + index;
-                let Some(info) = result.columns.get(column) else {
+                let Some(&column) = order.get(start_column + index) else {
                     break;
                 };
+                let info = &result.columns[column];
                 let metadata = data
                     .table_columns
                     .iter()

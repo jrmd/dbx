@@ -1,5 +1,5 @@
 use super::*;
-use crate::workspace::{SavedQuery, SavedTab, connection_key};
+use crate::workspace::{SavedQuery, SavedTab, TableLayout, connection_key, table_layout_key};
 
 impl DbxApp {
     pub(super) fn persist_startup_workspace(&mut self, cx: &mut Context<Self>) {
@@ -411,6 +411,66 @@ impl DbxApp {
             Ok::<(), anyhow::Error>(())
         })
         .detach();
+    }
+
+    /// The saved grid layout for a table on this connection.
+    pub(super) fn table_layout_for(&self, session_id: SessionId, table: &TableRef) -> TableLayout {
+        self.session(session_id)
+            .and_then(query_history_connection)
+            .map(|identity| connection_key(&identity))
+            .and_then(|key| self.workspace_documents.get(&key))
+            .and_then(|document| document.table_layouts.get(&table_layout_key(table)))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Persist a data tab's layout and re-render its grid with it.
+    pub(super) fn store_table_layout_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((table, layout)) = self
+            .data_tab(session_id, tab_id)
+            .map(|data| (data.table.clone(), data.layout.clone()))
+        else {
+            return;
+        };
+        let key = self
+            .session(session_id)
+            .and_then(query_history_connection)
+            .map(|identity| connection_key(&identity));
+        if let Some(document) = key.and_then(|key| self.workspace_documents.get_mut(&key)) {
+            let entry = table_layout_key(&table);
+            if layout == TableLayout::default() {
+                document.table_layouts.remove(&entry);
+            } else {
+                document.table_layouts.insert(entry, layout);
+            }
+            self.persist_query_workspace_for(session_id, cx);
+        }
+    }
+
+    /// Change a data tab's layout, apply it to the grid, and persist it.
+    pub(super) fn update_table_layout_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut TableLayout),
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let tables = session.tables.clone();
+        let Some(data) = session.data_tab_mut(tab_id) else {
+            return;
+        };
+        update(&mut data.layout);
+        data.sync_result_grid(false, &tables, cx);
+        self.store_table_layout_for(session_id, tab_id, cx);
+        cx.notify();
     }
 
     pub(super) fn saved_queries_for(&self, session_id: SessionId) -> Vec<SavedQuery> {

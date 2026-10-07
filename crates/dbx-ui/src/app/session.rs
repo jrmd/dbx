@@ -495,7 +495,7 @@ impl QueryTab {
         self.result_grid.update(cx, move |table, cx| {
             table
                 .delegate_mut()
-                .set_result(result, &remembered_widths, &[], &[]);
+                .set_result(result, &remembered_widths, None, &[], &[]);
             table.clear_selection(cx);
             table.refresh(cx);
         });
@@ -704,6 +704,9 @@ pub(super) struct DataTab {
     pub(super) table: TableRef,
     pub(super) data_grid: Entity<TableState<ResultTableDelegate>>,
     pub(super) result_column_widths: HashMap<String, Pixels>,
+    /// Column widths, order, pins, hidden columns and saved filters, persisted
+    /// per table in the connection's workspace.
+    pub(super) layout: crate::workspace::TableLayout,
     pub(super) _data_grid_subscription: Subscription,
     pub(super) filters: FilterModel,
     pub(super) filter_subscriptions: Vec<Subscription>,
@@ -762,8 +765,9 @@ impl DataTab {
             ResultTableDelegate::with_row_actions(cx.entity().downgrade(), session_id, id, true);
         let data_grid = cx.new(|cx| {
             TableState::new(row_actions, window, cx)
-                .col_resizable(true)
-                .col_movable(false)
+                // The header draws its own, wider resize handle.
+                .col_resizable(false)
+                .col_movable(true)
                 .sortable(sortable)
                 .row_selectable(true)
                 .col_selectable(true)
@@ -777,6 +781,7 @@ impl DataTab {
             table,
             data_grid,
             result_column_widths: HashMap::new(),
+            layout: Default::default(),
             _data_grid_subscription: data_grid_subscription,
             filters: FilterModel::new(),
             filter_subscriptions: Vec::new(),
@@ -830,6 +835,7 @@ impl DataTab {
     ) {
         let result = self.result.clone();
         let remembered_widths = self.result_column_widths.clone();
+        let layout = self.layout.clone();
         let foreign_keys = self.foreign_keys.clone();
         let tables = tables.to_vec();
         let (sortable, sort) = (self.sortable, self.sort.clone());
@@ -838,7 +844,13 @@ impl DataTab {
             let delegate = table.delegate_mut();
             delegate.set_server_sort(sortable, sort.as_ref());
             delegate.set_row_offset(row_offset);
-            delegate.set_result(result, &remembered_widths, &foreign_keys, &tables);
+            delegate.set_result(
+                result,
+                &remembered_widths,
+                Some(&layout),
+                &foreign_keys,
+                &tables,
+            );
             table.refresh(cx);
             if clear_selection {
                 table.clear_selection(cx);

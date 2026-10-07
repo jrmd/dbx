@@ -1,5 +1,7 @@
 use super::super::*;
 use crate::diagram::display_type;
+use crate::popups::DropdownMenu as _;
+use gpui_component::menu::PopupMenuItem;
 
 fn row_field_heading(
     field_id: FieldId,
@@ -64,7 +66,16 @@ impl DbxApp {
                 .child("Select a table to browse rows")
                 .into_any_element();
         };
-        let Some((kind, redis_filter_editor, can_mutate, filter_rows, inspector_open)) = self
+        let Some((
+            kind,
+            redis_filter_editor,
+            can_mutate,
+            filter_rows,
+            inspector_open,
+            column_names,
+            hidden_columns,
+            saved_filters,
+        )) = self
             .session(session_id)
             .zip(self.data_tab(session_id, tab_id))
             .map(|(session, data)| {
@@ -86,12 +97,31 @@ impl DbxApp {
                         })
                         .collect::<Vec<_>>(),
                     data.inspector_open,
+                    data.result
+                        .as_ref()
+                        .map(|result| {
+                            result
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    data.layout.hidden.clone(),
+                    data.layout
+                        .saved_filters
+                        .iter()
+                        .map(|saved| saved.name.clone())
+                        .collect::<Vec<_>>(),
                 )
             })
         else {
             return div().into_any_element();
         };
         let has_filter_rows = !filter_rows.is_empty();
+        let app = cx.entity().downgrade();
+        let columns_app = app.clone();
+        let saved_app = app.clone();
         let redis_filter_focus = redis_filter_editor.read(cx).focus_handle();
         div()
             .key_context("DbxDataTab")
@@ -163,6 +193,115 @@ impl DbxApp {
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.clear_filters_for(session_id, tab_id, cx)
                                                 })),
+                                        )
+                                    })
+                                    .when(
+                                        kind.is_sql()
+                                            && (has_filter_rows || !saved_filters.is_empty()),
+                                        move |view| {
+                                            view.child(
+                                                button(
+                                                    "saved-filters",
+                                                    "Saved",
+                                                    ButtonKind::Quiet,
+                                                )
+                                                .cursor_pointer()
+                                                .dropdown_menu(move |mut menu, _, _| {
+                                                    for (index, name) in
+                                                        saved_filters.iter().enumerate()
+                                                    {
+                                                        let app = saved_app.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(name.clone())
+                                                                .on_click(move |_, window, cx| {
+                                                                    let _ = app.update(cx, |this, cx| {
+                                                                        this.apply_saved_filter_for(
+                                                                            session_id, tab_id,
+                                                                            index, window, cx,
+                                                                        )
+                                                                    });
+                                                                }),
+                                                        );
+                                                    }
+                                                    if !saved_filters.is_empty() {
+                                                        menu = menu.separator();
+                                                    }
+                                                    let app = saved_app.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new("Save current filters")
+                                                            .disabled(!has_filter_rows)
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = app.update(cx, |this, cx| {
+                                                                    this.save_current_filters_for(
+                                                                        session_id, tab_id, cx,
+                                                                    )
+                                                                });
+                                                            }),
+                                                    );
+                                                    for (index, name) in
+                                                        saved_filters.iter().enumerate()
+                                                    {
+                                                        let app = saved_app.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(format!(
+                                                                "Delete “{name}”"
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = app.update(cx, |this, cx| {
+                                                                    this.delete_saved_filter_for(
+                                                                        session_id, tab_id, index,
+                                                                        cx,
+                                                                    )
+                                                                });
+                                                            }),
+                                                        );
+                                                    }
+                                                    menu
+                                                }),
+                                            )
+                                        },
+                                    )
+                                    .when(kind.is_sql() && !column_names.is_empty(), move |view| {
+                                        view.child(
+                                            button("table-columns", "Columns", ButtonKind::Quiet)
+                                                .cursor_pointer()
+                                                .dropdown_menu(move |mut menu, _, _| {
+                                                    let visible = column_names.len()
+                                                        - hidden_columns.len().min(column_names.len());
+                                                    for name in &column_names {
+                                                        let shown = !hidden_columns.contains(name);
+                                                        let app = columns_app.clone();
+                                                        let toggled = name.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(name.clone())
+                                                                .checked(shown)
+                                                                // Keep at least one column.
+                                                                .disabled(shown && visible < 2)
+                                                                .on_click(move |_, _, cx| {
+                                                                    let _ = app.update(cx, |this, cx| {
+                                                                        this.toggle_column_for(
+                                                                            session_id,
+                                                                            tab_id,
+                                                                            toggled.clone(),
+                                                                            cx,
+                                                                        )
+                                                                    });
+                                                                }),
+                                                        );
+                                                    }
+                                                    let app = columns_app.clone();
+                                                    menu.separator().item(
+                                                        PopupMenuItem::new("Reset layout").on_click(
+                                                            move |_, _, cx| {
+                                                                let _ = app.update(cx, |this, cx| {
+                                                                    this.reset_table_layout_for(
+                                                                        session_id, tab_id, cx,
+                                                                    )
+                                                                });
+                                                            },
+                                                        ),
+                                                    )
+                                                }),
                                         )
                                     })
                                     .when(kind == DatabaseKind::Redis || has_filter_rows, |view| {

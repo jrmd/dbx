@@ -4,8 +4,8 @@ use std::{
 };
 
 use dbx_core::{
-    CellValue, ColumnInfo, ForeignKeyInfo, MutationValue, Order, OrderDirection, QueryResult,
-    TableInfo,
+    CellValue, ColumnInfo, FilterOperator, ForeignKeyInfo, MutationValue, Order, OrderDirection,
+    QueryResult, TableInfo,
 };
 use gpui::{
     App, Context, Div, FontWeight, IntoElement, Pixels, SharedString, Stateful, Window, div,
@@ -19,7 +19,13 @@ use gpui_component::{
 
 use super::{DbxApp, SecondaryTabId, SessionId};
 use crate::editor::TextEditor;
-use gpui::{ClipboardItem, Entity, MouseButton, MouseDownEvent, WeakEntity};
+use gpui::{
+    ClickEvent, ClipboardItem, DragMoveEvent, Entity, EntityId, MouseButton, MouseDownEvent,
+    MouseUpEvent, Render, WeakEntity,
+};
+use gpui_component::table::TableEvent;
+
+use crate::workspace::TableLayout;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use crate::diagram::display_type;
@@ -47,6 +53,71 @@ pub(super) struct GridChanges {
 }
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
+const MIN_COLUMN_WIDTH: f32 = 60.;
+const MAX_COLUMN_WIDTH: f32 = 1_200.;
+const RESIZE_HANDLE_WIDTH: f32 = 7.;
+
+/// The drag payload for a header resize: the owning table and grid column.
+#[derive(Clone, Copy)]
+struct ColumnResize(EntityId, usize);
+
+impl Render for ColumnResize {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+fn finish_resize(
+    table: &mut TableState<ResultTableDelegate>,
+    _: &MouseUpEvent,
+    _: &mut Window,
+    cx: &mut Context<TableState<ResultTableDelegate>>,
+) {
+    if table.delegate_mut().resizing.take().is_some() {
+        emit_widths(table, cx);
+        cx.notify();
+    }
+}
+
+/// Report widths the way the table's own resize does, so owners remember them.
+fn emit_widths(
+    table: &mut TableState<ResultTableDelegate>,
+    cx: &mut Context<TableState<ResultTableDelegate>>,
+) {
+    let widths = table
+        .delegate()
+        .columns
+        .iter()
+        .map(|column| column.width)
+        .collect();
+    cx.emit(TableEvent::ColumnWidthsChanged(widths));
+}
+
+/// Result columns in display order: pinned columns first, then the saved
+/// order, then any remaining columns in result order. Hidden columns are
+/// left out, though at least one column always stays visible.
+fn display_order(columns: &[ColumnInfo], layout: Option<&TableLayout>) -> Vec<usize> {
+    let Some(layout) = layout else {
+        return (0..columns.len()).collect();
+    };
+    let position = |name: &String| columns.iter().position(|column| column.name == *name);
+    let mut order = Vec::with_capacity(columns.len());
+    for index in layout
+        .pinned
+        .iter()
+        .chain(&layout.order)
+        .filter_map(position)
+        .chain(0..columns.len())
+    {
+        if !order.contains(&index) && !layout.hidden.contains(&columns[index].name) {
+            order.push(index);
+        }
+    }
+    if order.is_empty() && !columns.is_empty() {
+        order.push(0);
+    }
+    order
+}
 const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
 /// Longest text handed to a grid cell. The column ellipsizes visually; this only
 /// keeps huge values from being shaped or copied every frame.
@@ -137,6 +208,13 @@ pub(super) struct ResultTableDelegate {
     changes: GridChanges,
     /// Absolute number of the first loaded row, so page two starts at 1,001.
     row_offset: usize,
+    /// Result column shown at each display position after the row number.
+    /// Pinned columns come first; hidden columns are absent.
+    order: Vec<usize>,
+    /// The result column under the last right-click, for column actions.
+    context_column: Option<usize>,
+    /// The column being resized by the grab handle, and its starting width.
+    resizing: Option<usize>,
     /// The cell currently being edited inline, as (row, data column, editor).
     editing: Option<(usize, usize, Entity<TextEditor>)>,
 }
@@ -166,6 +244,9 @@ impl Default for ResultTableDelegate {
             server_order: None,
             changes: GridChanges::default(),
             row_offset: 0,
+            order: Vec::new(),
+            context_column: None,
+            resizing: None,
             editing: None,
         }
     }
@@ -211,6 +292,105 @@ impl ResultTableDelegate {
 
     pub(super) fn set_row_offset(&mut self, row_offset: usize) {
         self.row_offset = row_offset;
+    }
+
+    /// The result column a grid column shows. Column 0 is the row number.
+    pub(super) fn result_column(&self, col_ix: usize) -> Option<usize> {
+        self.order.get(col_ix.checked_sub(1)?).copied()
+    }
+
+    /// The grid column showing a result column, if it is visible.
+    pub(super) fn grid_column(&self, column: usize) -> Option<usize> {
+        self.order
+            .iter()
+            .position(|shown| *shown == column)
+            .map(|index| index + 1)
+    }
+
+    /// Result columns in display order.
+    pub(super) fn display_order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// Filter, copy, hide and pin actions for the right-clicked cell's column.
+    fn column_menu(
+        &self,
+        mut menu: PopupMenu,
+        app: &WeakEntity<DbxApp>,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        row_ix: usize,
+        column: usize,
+    ) -> PopupMenu {
+        let Some(result) = self.result.as_deref() else {
+            return menu;
+        };
+        let (Some(info), Some(value)) =
+            (result.columns.get(column), self.cell_value(row_ix, column))
+        else {
+            return menu;
+        };
+        let name = info.name.clone();
+        let null = *value == CellValue::Null;
+        let copy = plain_cell_text(value);
+        menu = menu.item(PopupMenuItem::new("Copy cell").on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+        }));
+        let filters: &[(&str, FilterOperator)] = if null {
+            &[
+                ("Filter: is NULL", FilterOperator::IsNull),
+                ("Filter: is not NULL", FilterOperator::IsNotNull),
+            ]
+        } else {
+            &[
+                ("Filter: equals this value", FilterOperator::Equals),
+                ("Filter: not equal", FilterOperator::NotEquals),
+            ]
+        };
+        for (label, operator) in filters.iter().copied() {
+            let app = app.clone();
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                let _ = app.update(cx, |this, cx| {
+                    this.filter_by_cell_for(
+                        session_id,
+                        tab_id,
+                        (row_ix, column),
+                        operator,
+                        window,
+                        cx,
+                    )
+                });
+            }));
+        }
+        let pinned = self
+            .grid_column(column)
+            .and_then(|col_ix| self.columns.get(col_ix))
+            .is_some_and(|column| column.fixed.is_some());
+        let pin_app = app.clone();
+        let hide_app = app.clone();
+        menu.separator()
+            .item(
+                PopupMenuItem::new(if pinned {
+                    format!("Unpin {name}")
+                } else {
+                    format!("Pin {name}")
+                })
+                .on_click(move |_, _, cx| {
+                    let _ = pin_app.update(cx, |this, cx| {
+                        this.toggle_pin_column_for(session_id, tab_id, column, cx)
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new(format!("Hide {name}"))
+                    .disabled(self.order.len() < 2)
+                    .on_click(move |_, _, cx| {
+                        let _ = hide_app.update(cx, |this, cx| {
+                            this.hide_column_for(session_id, tab_id, column, cx)
+                        });
+                    }),
+            )
+            .separator()
     }
 
     fn loaded_rows(&self) -> usize {
@@ -364,18 +544,20 @@ impl ResultTableDelegate {
         let Some(result) = &self.result else {
             return Vec::new();
         };
+        let order = &self.order;
         result
             .rows
             .iter()
             .enumerate()
             .flat_map(|(row_index, row)| {
-                row.values
+                order
                     .iter()
                     .enumerate()
-                    .filter_map(move |(column_index, value)| {
+                    .filter_map(move |(position, column_index)| {
+                        let value = row.values.get(*column_index)?;
                         (!super::find::find_matches(&value.to_string(), needle, case_sensitive)
                             .is_empty())
-                        .then_some((row_index, column_index + 1))
+                        .then_some((row_index, position + 1))
                     })
             })
             .collect()
@@ -464,6 +646,7 @@ impl ResultTableDelegate {
         &mut self,
         result: Option<Arc<QueryResult>>,
         remembered_widths: &HashMap<String, Pixels>,
+        layout: Option<&TableLayout>,
         foreign_keys: &[ForeignKeyInfo],
         tables: &[TableInfo],
     ) {
@@ -481,22 +664,45 @@ impl ResultTableDelegate {
             _ => None,
         };
 
+        self.order = result
+            .as_deref()
+            .map(|result| display_order(&result.columns, layout))
+            .unwrap_or_default();
+        let pinned = layout.map_or(0, |layout| {
+            self.order
+                .iter()
+                .take_while(|index| {
+                    result
+                        .as_deref()
+                        .is_some_and(|result| layout.pinned.contains(&result.columns[**index].name))
+                })
+                .count()
+        });
         if let Some(result) = result.as_deref() {
-            columns.extend(result.columns.iter().enumerate().map(|(index, column)| {
+            columns.extend(self.order.iter().enumerate().map(|(position, &index)| {
+                let column = &result.columns[index];
                 let key = Self::data_column_key(index, column);
                 let width = remembered_widths
                     .get(&key)
                     .copied()
+                    .or_else(|| {
+                        layout
+                            .and_then(|layout| layout.widths.get(&column.name))
+                            .map(|width| px(*width))
+                    })
                     .unwrap_or_else(|| Self::auto_width(result, index, column));
 
                 let mut data_column =
                     DataColumn::new(key, format!("{}  {}", column.name, column.data_type))
                         .width(width)
                         .resizable(true)
-                        .movable(false)
-                        .min_width(80.)
-                        .max_width(600.)
+                        .movable(position >= pinned)
+                        .min_width(MIN_COLUMN_WIDTH)
+                        .max_width(MAX_COLUMN_WIDTH)
                         .p_0();
+                if position < pinned {
+                    data_column = data_column.fixed_left();
+                }
                 data_column.sort = self.column_sort(index);
                 data_column
             }));
@@ -532,25 +738,70 @@ impl ResultTableDelegate {
             .collect();
     }
 
-    pub(super) fn widths_by_key(
-        result: Option<&QueryResult>,
-        widths: &[Pixels],
-    ) -> HashMap<String, Pixels> {
+    /// Remembered widths by column key, from grid widths in display order.
+    pub(super) fn widths_by_key(&self, widths: &[Pixels]) -> HashMap<String, Pixels> {
         let mut remembered = HashMap::new();
 
         if let Some(width) = widths.first().copied() {
             remembered.insert(ROW_NUMBER_COLUMN_KEY.to_owned(), width);
         }
 
-        if let Some(result) = result {
-            for (index, column) in result.columns.iter().enumerate() {
-                if let Some(width) = widths.get(index + 1).copied() {
-                    remembered.insert(Self::data_column_key(index, column), width);
+        if let Some(result) = self.result.as_deref() {
+            for (position, &index) in self.order.iter().enumerate() {
+                if let Some(width) = widths.get(position + 1).copied() {
+                    remembered.insert(Self::data_column_key(index, &result.columns[index]), width);
                 }
             }
         }
 
         remembered
+    }
+
+    /// Current widths by column name, for a persisted table layout.
+    pub(super) fn widths_by_name(&self) -> Vec<(String, f32)> {
+        let Some(result) = self.result.as_deref() else {
+            return Vec::new();
+        };
+        self.order
+            .iter()
+            .zip(self.columns.iter().skip(1))
+            .map(|(&index, column)| (result.columns[index].name.clone(), f32::from(column.width)))
+            .collect()
+    }
+
+    /// Set one grid column's width, clamped to the column limits.
+    fn set_column_width(&mut self, col_ix: usize, width: Pixels) -> bool {
+        let Some(column) = self.columns.get_mut(col_ix) else {
+            return false;
+        };
+        let width = width.clamp(px(MIN_COLUMN_WIDTH), px(MAX_COLUMN_WIDTH));
+        if column.width == width {
+            return false;
+        }
+        column.width = width;
+        true
+    }
+
+    /// The width that fits a column's header and every loaded value.
+    fn fitted_width(&self, col_ix: usize) -> Option<Pixels> {
+        let result = self.result.as_deref()?;
+        let index = self.result_column(col_ix)?;
+        let column = result.columns.get(index)?;
+        let header = format!("{}  {}", column.name, display_type(&column.data_type))
+            .chars()
+            .count() as f32
+            * 7.0
+            + 28.0;
+        let values = result
+            .rows
+            .iter()
+            .filter_map(|row| row.values.get(index))
+            .map(|value| cell_display_text(value).chars().count())
+            .max()
+            .unwrap_or_default() as f32
+            * 7.0
+            + 20.0;
+        Some(px(header.max(values)))
     }
 
     fn foreign_key_for_cell(&self, row_ix: usize, col_ix: usize) -> Option<ForeignKeyInfo> {
@@ -559,7 +810,7 @@ impl ResultTableDelegate {
         }
         let result = self.result.as_ref()?;
         let row = result.rows.get(row_ix)?;
-        let column = result.columns.get(col_ix - 1)?;
+        let column = result.columns.get(self.result_column(col_ix)?)?;
 
         self.foreign_keys
             .iter()
@@ -761,6 +1012,25 @@ impl TableDelegate for ResultTableDelegate {
         self.columns[col_ix].clone()
     }
 
+    fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        let (Some(from), Some(to)) = (col_ix.checked_sub(1), to_ix.checked_sub(1)) else {
+            return;
+        };
+        if from >= self.order.len() || to >= self.order.len() {
+            return;
+        }
+        let index = self.order.remove(from);
+        self.order.insert(to, index);
+        let column = self.columns.remove(col_ix);
+        self.columns.insert(to_ix, column);
+    }
+
     fn render_header(
         &mut self,
         _window: &mut Window,
@@ -776,17 +1046,16 @@ impl TableDelegate for ResultTableDelegate {
         &mut self,
         col_ix: usize,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let column = col_ix
-            .checked_sub(1)
-            .and_then(|index| self.result.as_ref()?.columns.get(index));
-        let numeric = col_ix
-            .checked_sub(1)
+        let index = self.result_column(col_ix);
+        let column = index.and_then(|index| self.result.as_ref()?.columns.get(index));
+        let numeric = index
             .and_then(|index| self.numeric.get(index).copied())
             .unwrap_or(false);
         let cell = div()
             .size_full()
+            .relative()
             .flex()
             .items_center()
             .gap(px(5.))
@@ -799,6 +1068,8 @@ impl TableDelegate for ResultTableDelegate {
                 .text_color(theme().text_muted)
                 .child(self.columns[col_ix].name.clone());
         };
+        let resizing = self.resizing == Some(col_ix);
+        let table = cx.entity().entity_id();
         cell.when(column.primary_key, |cell| {
             cell.child(
                 div()
@@ -826,6 +1097,67 @@ impl TableDelegate for ResultTableDelegate {
                 .text_color(theme().text_muted)
                 .child(display_type(&column.data_type)),
         )
+        // A generous grab zone on the right edge. The table's own handle is
+        // a 2px sliver that is nearly impossible to find.
+        .child(
+            div()
+                .id(("dbx-column-resize", col_ix))
+                .group("dbx-column-resize")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(RESIZE_HANDLE_WIDTH))
+                .flex()
+                .justify_end()
+                .cursor_col_resize()
+                .occlude()
+                .child(
+                    div()
+                        .h_full()
+                        .w(px(2.))
+                        .when(resizing, |line| line.bg(theme().accent))
+                        .when(!resizing, |line| {
+                            line.group_hover("dbx-column-resize", |line| {
+                                line.bg(theme().border_strong)
+                            })
+                        }),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |table, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    if event.click_count() == 2 {
+                        let delegate = table.delegate_mut();
+                        if let Some(width) = delegate.fitted_width(col_ix)
+                            && delegate.set_column_width(col_ix, width)
+                        {
+                            table.refresh(cx);
+                            emit_widths(table, cx);
+                        }
+                    }
+                }))
+                .on_drag(ColumnResize(table, col_ix), |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| *drag)
+                })
+                .on_mouse_up(MouseButton::Left, cx.listener(finish_resize))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(finish_resize)),
+        )
+        .on_drag_move(cx.listener(
+            move |table, event: &DragMoveEvent<ColumnResize>, _, cx| {
+                let ColumnResize(owner, dragged) = *event.drag(cx);
+                if owner != cx.entity().entity_id() || dragged != col_ix {
+                    return;
+                }
+                let width = event.event.position.x - event.bounds.left();
+                let delegate = table.delegate_mut();
+                delegate.resizing = Some(col_ix);
+                if delegate.set_column_width(col_ix, width) {
+                    table.refresh(cx);
+                }
+                cx.notify();
+            },
+        ))
     }
 
     fn render_tr(
@@ -876,7 +1208,7 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        let Some(index) = col_ix.checked_sub(1) else {
+        let Some(index) = self.result_column(col_ix) else {
             return;
         };
         let direction = match sort {
@@ -977,6 +1309,11 @@ impl TableDelegate for ResultTableDelegate {
                     }),
             )
             .separator();
+        if let Some(column) = self.context_column
+            && row_ix < self.loaded_rows()
+        {
+            menu = self.column_menu(menu, &app, session_id, tab_id, row_ix, column);
+        }
         let clicked_row = self
             .result
             .as_ref()
@@ -1069,11 +1406,9 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        if let Some((_, _, editor)) = self
-            .editing
-            .as_ref()
-            .filter(|(row, column, _)| *row == row_ix && Some(*column) == col_ix.checked_sub(1))
-        {
+        if let Some((_, _, editor)) = self.editing.as_ref().filter(|(row, column, _)| {
+            *row == row_ix && Some(*column) == self.result_column(col_ix)
+        }) {
             let focus = editor.read(cx).focus_handle();
             return div()
                 .size_full()
@@ -1093,8 +1428,14 @@ impl TableDelegate for ResultTableDelegate {
                 .into_any_element();
         }
         let deleted = self.changes.deletes.contains(&row_ix);
+        let data_column = self.result_column(col_ix);
+        // The table opens its row menu on right mouse down; note the column
+        // first so the menu can offer column actions.
+        let remember_column = cx.listener(move |table, _: &MouseDownEvent, _, _| {
+            table.delegate_mut().context_column = data_column;
+        });
         if let Some(insert) = self.insert_row(row_ix) {
-            let text = match col_ix.checked_sub(1) {
+            let text = match data_column {
                 None => Some("+".to_owned()),
                 Some(column) => insert
                     .get(column)
@@ -1121,10 +1462,10 @@ impl TableDelegate for ResultTableDelegate {
                         .truncate()
                         .child(text.unwrap_or_else(|| "DEFAULT".into())),
                 )
+                .on_mouse_down(MouseButton::Right, remember_column)
                 .into_any_element();
         }
-        let staged = col_ix
-            .checked_sub(1)
+        let staged = data_column
             .and_then(|column| self.changes.edits.get(&(row_ix, column)))
             .cloned();
         if let Some(value) = staged.filter(|_| !deleted) {
@@ -1144,17 +1485,16 @@ impl TableDelegate for ResultTableDelegate {
                 })
                 .when(muted, |cell| cell.italic())
                 .child(div().min_w_0().truncate().child(staged_text(&value)))
+                .on_mouse_down(MouseButton::Right, remember_column)
                 .into_any_element();
         }
         let mut null = false;
-        let (text, text_color): (SharedString, _) = if col_ix == 0 {
-            (
-                (self.row_offset + row_ix + 1).to_string().into(),
-                theme().text_muted,
-            )
-        } else {
-            let column_count = self.columns.len() - 1;
-            let color = match self.cell_value(row_ix, col_ix - 1) {
+        let (text, text_color): (SharedString, _) = if let Some(data_column) = data_column {
+            let column_count = self
+                .result
+                .as_ref()
+                .map_or(0, |result| result.columns.len());
+            let color = match self.cell_value(row_ix, data_column) {
                 None => None,
                 Some(CellValue::Null) => {
                     null = true;
@@ -1167,12 +1507,12 @@ impl TableDelegate for ResultTableDelegate {
             match color {
                 None => ("—".into(), theme().text_muted),
                 Some(color) => {
-                    let slot = row_ix * column_count + col_ix - 1;
+                    let slot = row_ix * column_count + data_column;
                     let text = match self.cell_text.get(slot).cloned().flatten() {
                         Some(text) => text,
                         None => {
                             let text: SharedString = self
-                                .cell_value(row_ix, col_ix - 1)
+                                .cell_value(row_ix, data_column)
                                 .map(cell_display_text)
                                 .unwrap_or_default()
                                 .into();
@@ -1185,15 +1525,20 @@ impl TableDelegate for ResultTableDelegate {
                     (text, color)
                 }
             }
+        } else {
+            (
+                (self.row_offset + row_ix + 1).to_string().into(),
+                theme().text_muted,
+            )
         };
         let foreign_key = self.foreign_key_for_cell(row_ix, col_ix);
-        let numeric = col_ix
-            .checked_sub(1)
+        let numeric = data_column
             .and_then(|index| self.numeric.get(index).copied())
             .unwrap_or(false);
 
         let mut cell = div()
             .size_full()
+            .on_mouse_down(MouseButton::Right, remember_column)
             .flex()
             .items_center()
             .px(px(8.))
@@ -1280,7 +1625,7 @@ impl TableDelegate for ResultTableDelegate {
         self.result
             .as_ref()
             .and_then(|result| result.rows.get(row_ix))
-            .and_then(|row| row.values.get(col_ix - 1))
+            .and_then(|row| row.values.get(self.result_column(col_ix)?))
             .map(ToString::to_string)
             .unwrap_or_default()
     }
@@ -1333,6 +1678,54 @@ mod tests {
     }
 
     #[test]
+    fn layouts_pin_reorder_and_hide_columns_by_name() {
+        let columns = ["id", "name", "email", "created"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ColumnInfo::result(name, index, "TEXT"))
+            .collect::<Vec<_>>();
+        let layout = TableLayout {
+            pinned: vec!["email".into(), "missing".into()],
+            order: vec!["created".into()],
+            hidden: ["name".to_owned()].into(),
+            ..Default::default()
+        };
+        assert_eq!(display_order(&columns, Some(&layout)), vec![2, 3, 0]);
+        assert_eq!(display_order(&columns, None), vec![0, 1, 2, 3]);
+        let everything_hidden = TableLayout {
+            hidden: columns.iter().map(|column| column.name.clone()).collect(),
+            ..Default::default()
+        };
+        assert_eq!(display_order(&columns, Some(&everything_hidden)), vec![0]);
+
+        let mut delegate = ResultTableDelegate::default();
+        let result = QueryResult {
+            columns,
+            rows: Vec::new(),
+            rows_affected: None,
+            truncated: false,
+            elapsed_ms: 0,
+        };
+        delegate.set_result(
+            Some(Arc::new(result)),
+            &HashMap::new(),
+            Some(&layout),
+            &[],
+            &[],
+        );
+        // Grid column 1 is the pinned email column.
+        assert_eq!(delegate.result_column(1), Some(2));
+        assert_eq!(delegate.grid_column(0), Some(3));
+        assert_eq!(delegate.grid_column(1), None);
+        assert!(delegate.columns[1].fixed.is_some());
+        assert!(delegate.set_column_width(1, px(5_000.)));
+        assert_eq!(
+            delegate.widths_by_name()[0],
+            ("email".to_owned(), MAX_COLUMN_WIDTH)
+        );
+    }
+
+    #[test]
     fn local_sort_orders_numbers_and_nulls_then_restores_original_rows() {
         let mut delegate = ResultTableDelegate {
             sorting: ResultSorting::Local,
@@ -1355,7 +1748,7 @@ mod tests {
             truncated: false,
             elapsed_ms: 0,
         };
-        delegate.set_result(Some(Arc::new(result)), &HashMap::new(), &[], &[]);
+        delegate.set_result(Some(Arc::new(result)), &HashMap::new(), None, &[], &[]);
         let column = |delegate: &ResultTableDelegate| {
             delegate
                 .column_values(0)
@@ -1385,17 +1778,35 @@ mod tests {
                 direction: OrderDirection::Descending,
             }),
         );
-        delegate.set_result(Some(Arc::new(export_result())), &HashMap::new(), &[], &[]);
+        delegate.set_result(
+            Some(Arc::new(export_result())),
+            &HashMap::new(),
+            None,
+            &[],
+            &[],
+        );
         assert_eq!(delegate.column_sort(0), Some(ColumnSort::Descending));
         assert_eq!(delegate.column_sort(1), Some(ColumnSort::Default));
         delegate.set_server_sort(false, None);
-        delegate.set_result(Some(Arc::new(export_result())), &HashMap::new(), &[], &[]);
+        delegate.set_result(
+            Some(Arc::new(export_result())),
+            &HashMap::new(),
+            None,
+            &[],
+            &[],
+        );
         assert_eq!(delegate.column_sort(0), None);
     }
 
     fn delegate_with_export_result() -> ResultTableDelegate {
         let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(Some(Arc::new(export_result())), &HashMap::new(), &[], &[]);
+        delegate.set_result(
+            Some(Arc::new(export_result())),
+            &HashMap::new(),
+            None,
+            &[],
+            &[],
+        );
         delegate
     }
 
@@ -1465,6 +1876,7 @@ mod tests {
         delegate.set_result(
             Some(Arc::new(result)),
             &HashMap::new(),
+            None,
             &[foreign_key],
             &tables,
         );
@@ -1495,6 +1907,7 @@ mod tests {
         delegate.set_result(
             Some(Arc::new(result)),
             &HashMap::new(),
+            None,
             &[foreign_key],
             &tables,
         );
@@ -1633,6 +2046,7 @@ mod tests {
                 elapsed_ms: 0,
             })),
             &HashMap::new(),
+            None,
             &[],
             &[],
         );
@@ -1669,6 +2083,7 @@ mod tests {
                 elapsed_ms: 0,
             })),
             &HashMap::new(),
+            None,
             &[],
             &[],
         );

@@ -120,7 +120,6 @@ impl DataTab {
             .map(|editor| (editor.row, editor.column, editor.editor.clone()));
         self.data_grid.update(cx, |table, cx| {
             table.delegate_mut().set_cell_edits(changes, editing);
-            table.refresh(cx);
             cx.notify();
         });
     }
@@ -340,7 +339,7 @@ impl DbxApp {
         let (row, column) = (cell.row, cell.column);
         let structured = cell.structured;
         let text = cell.editor.read(cx).text(cx);
-        let Some((metadata, was_null, column_count)) = data.result.as_ref().and_then(|result| {
+        let Some((metadata, was_null)) = data.result.as_ref().and_then(|result| {
             let result_column = result.columns.get(column)?;
             let metadata = data
                 .table_columns
@@ -353,7 +352,7 @@ impl DbxApp {
                 StagedCell::Value(MutationValue::Expression(_)) => false,
                 StagedCell::Default => true,
             };
-            Some((metadata, was_null, result.columns.len()))
+            Some((metadata, was_null))
         }) else {
             return;
         };
@@ -386,11 +385,14 @@ impl DbxApp {
         }
         data.cell_editor = None;
         data.sync_cell_edits(cx);
+        // Tab follows the grid's display order, skipping hidden columns.
+        let order = data.data_grid.read(cx).delegate().display_order().to_vec();
         let next = advance.and_then(|forward| {
+            let position = order.iter().position(|shown| *shown == column)?;
             if forward {
-                (column + 1 < column_count).then_some(column + 1)
+                order.get(position + 1).copied()
             } else {
-                column.checked_sub(1)
+                order.get(position.checked_sub(1)?).copied()
             }
         });
         match next {
