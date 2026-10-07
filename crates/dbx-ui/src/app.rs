@@ -2261,55 +2261,71 @@ impl DbxApp {
                 return None;
             };
             let text_revision = query_tab.query_revision;
-            let query_text = query_tab.query_text.read(cx).clone();
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
             let recent_data = session.recent_data();
-            if session.kind.is_sql() {
-                let context = editor::sql_completion_context(&query_text, cursor)?;
-                let items = sql_completion_items(
-                    &query_text,
-                    cursor,
-                    &context,
-                    SqlCompletionRequest {
-                        database_kind: session.kind,
-                        tables: &session.tables,
-                        completion_columns: &session.completion_columns,
-                        selected_table: recent_data.map(|data| &data.table),
-                        active_columns: recent_data
-                            .map(|data| data.table_columns.as_slice())
-                            .unwrap_or_default(),
-                        result: recent_data.and_then(|data| data.result.as_deref()),
-                        active_schema_filter: session.schema_filter.as_deref(),
-                    },
-                );
-                (
-                    tab_id,
-                    context.replacement_range,
-                    items,
-                    CompletionSignature {
-                        text_revision,
-                        cursor,
-                    },
-                )
-            } else if session.kind == DatabaseKind::Redis {
-                let (replacement_range, items) = redis_completion_items(
-                    &query_text,
-                    cursor,
-                    session.redis_command_catalog.as_deref(),
-                    query_tab.result.as_deref(),
-                    recent_data.and_then(|data| data.result.as_deref()),
-                )?;
-                (
-                    tab_id,
-                    replacement_range,
-                    items,
-                    CompletionSignature {
-                        text_revision,
-                        cursor,
-                    },
-                )
+            let signature = CompletionSignature {
+                text_revision,
+                cursor,
+            };
+            let key = CompletionCacheKey {
+                signature,
+                tables: session.tables.len(),
+                columns: session.completion_columns.len(),
+                recent_result: recent_data
+                    .and_then(|data| data.result.as_ref())
+                    .map_or(0, |result| Arc::as_ptr(result) as usize),
+            };
+            if let Some((cached, computed)) = &query_tab.completion_cache
+                && *cached == key
+            {
+                let (replacement_range, items) = computed.clone()?;
+                (tab_id, replacement_range, items, signature)
             } else {
-                return None;
+                let query_text = query_tab.query_text.read(cx).clone();
+                let computed = if session.kind.is_sql() {
+                    editor::sql_completion_context(&query_text, cursor).map(|context| {
+                        let items = sql_completion_items(
+                            &query_text,
+                            cursor,
+                            &context,
+                            SqlCompletionRequest {
+                                database_kind: session.kind,
+                                tables: &session.tables,
+                                completion_columns: &session.completion_columns,
+                                selected_table: recent_data.map(|data| &data.table),
+                                active_columns: recent_data
+                                    .map(|data| data.table_columns.as_slice())
+                                    .unwrap_or_default(),
+                                result: recent_data.and_then(|data| data.result.as_deref()),
+                                active_schema_filter: session.schema_filter.as_deref(),
+                            },
+                        );
+                        (context.replacement_range, items)
+                    })
+                } else if session.kind == DatabaseKind::Redis {
+                    redis_completion_items(
+                        &query_text,
+                        cursor,
+                        session.redis_command_catalog.as_deref(),
+                        query_tab.result.as_deref(),
+                        recent_data.and_then(|data| data.result.as_deref()),
+                    )
+                } else {
+                    None
+                };
+                let session = self.session_mut(session_id)?;
+                if let Some(SecondaryTab {
+                    kind: SecondaryTabKind::Query(query_tab),
+                    ..
+                }) = session
+                    .secondary_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                {
+                    query_tab.completion_cache = Some((key, computed.clone()));
+                }
+                let (replacement_range, items) = computed?;
+                (tab_id, replacement_range, items, signature)
             }
         };
 
