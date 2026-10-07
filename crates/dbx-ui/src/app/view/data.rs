@@ -1084,16 +1084,17 @@ impl DbxApp {
                                             )
                                         })),
                                 )
-                                .child(
-                                    button("edit-row", "Edit row", ButtonKind::Primary)
-                                        .disabled(row_deleted)
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.begin_edit_selected_for(
-                                                session_id, tab_id, window, cx,
-                                            )
-                                        })),
-                                ),
+                                .when(!row_deleted, |actions| {
+                                    actions.child(
+                                        button("edit-row", "Edit row", ButtonKind::Primary)
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.begin_edit_selected_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            })),
+                                    )
+                                }),
                         )
                     }),
             )

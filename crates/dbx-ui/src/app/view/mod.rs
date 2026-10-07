@@ -16,6 +16,18 @@ impl Render for DbxApp {
             window.focus(&self.focus_handle, cx);
         }
         let unlocked = self.vault_state == Some(VaultState::Unlocked);
+        // The vault fields keep focus after unlocking even though they are no
+        // longer drawn, which would leave every shortcut without a target.
+        if unlocked
+            && [
+                &self.vault_editors.passphrase_editor,
+                &self.vault_editors.confirmation_editor,
+            ]
+            .iter()
+            .any(|editor| editor.read(cx).focus_handle().is_focused(window))
+        {
+            window.focus(&self.focus_handle, cx);
+        }
         if unlocked && !self.startup_recovery_started {
             self.startup_recovery_started = true;
             self.restore_startup_workspace(window, cx);

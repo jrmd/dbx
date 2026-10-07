@@ -56,6 +56,10 @@ const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const MIN_COLUMN_WIDTH: f32 = 60.;
 const MAX_COLUMN_WIDTH: f32 = 1_200.;
 const RESIZE_HANDLE_WIDTH: f32 = 7.;
+/// gpui-component's header sort button: a 12px icon with 2px padding.
+const SORT_ICON_WIDTH: f32 = 16.;
+/// The right padding the table adds to headers of zero-padding columns.
+const HEADER_TRAILING_PADDING: f32 = 8.;
 
 /// The drag payload for a header resize: the owning table and grid column.
 #[derive(Clone, Copy)]
@@ -1055,7 +1059,6 @@ impl TableDelegate for ResultTableDelegate {
             .unwrap_or(false);
         let cell = div()
             .size_full()
-            .relative()
             .flex()
             .items_center()
             .gap(px(5.))
@@ -1070,94 +1073,108 @@ impl TableDelegate for ResultTableDelegate {
         };
         let resizing = self.resizing == Some(col_ix);
         let table = cx.entity().entity_id();
-        cell.when(column.primary_key, |cell| {
-            cell.child(
+        // The table draws a sort icon and its cell padding after this header,
+        // so reach past them to sit the handle on the column's real edge.
+        let trailing = HEADER_TRAILING_PADDING
+            + if self.sorting == ResultSorting::Disabled {
+                0.
+            } else {
+                SORT_ICON_WIDTH
+            };
+        let content = cell
+            .when(column.primary_key, |cell| {
+                cell.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(8.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme().warning)
+                        .child("PK"),
+                )
+            })
+            .child(
+                div()
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme().text)
+                    .child(column.name.clone()),
+            )
+            .child(
                 div()
                     .flex_none()
-                    .text_size(px(8.))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme().warning)
-                    .child("PK"),
-            )
-        })
-        .child(
-            div()
-                .flex_shrink(1.)
-                .min_w_0()
-                .truncate()
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme().text)
-                .child(column.name.clone()),
-        )
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(9.))
-                .text_color(theme().text_muted)
-                .child(display_type(&column.data_type)),
-        )
-        // A generous grab zone on the right edge. The table's own handle is
-        // a 2px sliver that is nearly impossible to find.
-        .child(
-            div()
-                .id(("dbx-column-resize", col_ix))
-                .group("dbx-column-resize")
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .w(px(RESIZE_HANDLE_WIDTH))
-                .flex()
-                .justify_end()
-                .cursor_col_resize()
-                .occlude()
-                .child(
-                    div()
-                        .h_full()
-                        .w(px(2.))
-                        .when(resizing, |line| line.bg(theme().accent))
-                        .when(!resizing, |line| {
-                            line.group_hover("dbx-column-resize", |line| {
-                                line.bg(theme().border_strong)
-                            })
-                        }),
-                )
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(move |table, event: &ClickEvent, _, cx| {
-                    cx.stop_propagation();
-                    if event.click_count() == 2 {
-                        let delegate = table.delegate_mut();
-                        if let Some(width) = delegate.fitted_width(col_ix)
-                            && delegate.set_column_width(col_ix, width)
-                        {
-                            table.refresh(cx);
-                            emit_widths(table, cx);
+                    .text_size(px(9.))
+                    .text_color(theme().text_muted)
+                    .child(display_type(&column.data_type)),
+            );
+        // The content clips its labels; the handle sits outside that clip.
+        div()
+            .size_full()
+            .relative()
+            .child(content)
+            // A generous grab zone on the right edge. The table's own handle is
+            // a 2px sliver that is nearly impossible to find.
+            .child(
+                div()
+                    .id(("dbx-column-resize", col_ix))
+                    .group("dbx-column-resize")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(-trailing))
+                    .w(px(RESIZE_HANDLE_WIDTH))
+                    .flex()
+                    .justify_end()
+                    .cursor_col_resize()
+                    .occlude()
+                    .child(
+                        div()
+                            .h_full()
+                            .w(px(2.))
+                            .when(resizing, |line| line.bg(theme().accent))
+                            .when(!resizing, |line| {
+                                line.group_hover("dbx-column-resize", |line| {
+                                    line.bg(theme().border_strong)
+                                })
+                            }),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |table, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        if event.click_count() == 2 {
+                            let delegate = table.delegate_mut();
+                            if let Some(width) = delegate.fitted_width(col_ix)
+                                && delegate.set_column_width(col_ix, width)
+                            {
+                                table.refresh(cx);
+                                emit_widths(table, cx);
+                            }
                         }
+                    }))
+                    .on_drag(ColumnResize(table, col_ix), |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| *drag)
+                    })
+                    .on_mouse_up(MouseButton::Left, cx.listener(finish_resize))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(finish_resize)),
+            )
+            .on_drag_move(
+                cx.listener(move |table, event: &DragMoveEvent<ColumnResize>, _, cx| {
+                    let ColumnResize(owner, dragged) = *event.drag(cx);
+                    if owner != cx.entity().entity_id() || dragged != col_ix {
+                        return;
                     }
-                }))
-                .on_drag(ColumnResize(table, col_ix), |drag, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| *drag)
-                })
-                .on_mouse_up(MouseButton::Left, cx.listener(finish_resize))
-                .on_mouse_up_out(MouseButton::Left, cx.listener(finish_resize)),
-        )
-        .on_drag_move(cx.listener(
-            move |table, event: &DragMoveEvent<ColumnResize>, _, cx| {
-                let ColumnResize(owner, dragged) = *event.drag(cx);
-                if owner != cx.entity().entity_id() || dragged != col_ix {
-                    return;
-                }
-                let width = event.event.position.x - event.bounds.left();
-                let delegate = table.delegate_mut();
-                delegate.resizing = Some(col_ix);
-                if delegate.set_column_width(col_ix, width) {
-                    table.refresh(cx);
-                }
-                cx.notify();
-            },
-        ))
+                    let width = event.event.position.x - event.bounds.left();
+                    let delegate = table.delegate_mut();
+                    delegate.resizing = Some(col_ix);
+                    if delegate.set_column_width(col_ix, width) {
+                        table.refresh(cx);
+                    }
+                    cx.notify();
+                }),
+            )
     }
 
     fn render_tr(
@@ -1431,8 +1448,13 @@ impl TableDelegate for ResultTableDelegate {
         let data_column = self.result_column(col_ix);
         // The table opens its row menu on right mouse down; note the column
         // first so the menu can offer column actions.
-        let remember_column = cx.listener(move |table, _: &MouseDownEvent, _, _| {
+        // With cell selection on, the table's own cell handler clears the
+        // right-clicked row, so its row menu would build empty. Record the row
+        // here, before that handler, and keep it from running.
+        let remember_column = cx.listener(move |table, _: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
             table.delegate_mut().context_column = data_column;
+            table.set_right_clicked_row(Some(row_ix), cx);
         });
         if let Some(insert) = self.insert_row(row_ix) {
             let text = match data_column {
