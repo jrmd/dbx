@@ -188,7 +188,11 @@ impl DbxApp {
                 items.push(Item {
                     label,
                     detail: session.name.clone(),
-                    icon: Icon::Table,
+                    // Views match the explorer's magnifier icon.
+                    icon: match table.kind {
+                        dbx_core::EntityKind::View => Icon::Search,
+                        _ => Icon::Table,
+                    },
                     target: Target::Table(session.id, table.clone()),
                 });
             }

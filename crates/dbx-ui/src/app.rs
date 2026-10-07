@@ -2072,6 +2072,7 @@ impl DbxApp {
         // A page reached by OFFSET continues by OFFSET; keyset paging starts
         // from a fresh first page.
         let keyset = keyset.filter(|_| page == 0 || matches!(start, PageStart::After(_)));
+        let loaded_filters = filters.clone();
         let mut filters = filters;
         let mut offset_page = page;
         if let Some(order_by) = &keyset {
@@ -2099,7 +2100,6 @@ impl DbxApp {
             .map(ToString::to_string)
             .unwrap_or_else(|| "*".into());
         let page_start = start.clone();
-        let loaded_filters = filters.clone();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading page {}…", page + 1);
