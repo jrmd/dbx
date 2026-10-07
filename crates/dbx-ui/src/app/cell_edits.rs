@@ -476,7 +476,9 @@ mod tests {
         let session_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let (app,cx) = cx.add_window_view(|window,cx| {
-            let mut app=DbxApp::new(window,cx); app.vault_state=Some(VaultState::Unlocked);
+            let mut app=DbxApp::new(window,cx);
+            app.runtime=Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+            app.vault_state=Some(VaultState::Unlocked);
             let engine=Arc::new(app.runtime.block_on(DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::SQLite,"sqlite::memory:"))).unwrap());
             app.runtime.block_on(engine.execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, document JSON); INSERT INTO items VALUES(1, '{\"valid\":true}'),(2,NULL)")).unwrap();
             let result=app.runtime.block_on(engine.query("SELECT * FROM items",QueryOptions::default())).unwrap();
