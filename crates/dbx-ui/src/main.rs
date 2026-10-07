@@ -173,6 +173,17 @@ fn main() {
                     app::SetCellNull,
                     Some("DbxCellEditor"),
                 ),
+                KeyBinding::new("cmd-s", app::CommitChanges, Some("DbxDataTab")),
+                KeyBinding::new("ctrl-s", app::CommitChanges, Some("DbxDataTab")),
+                KeyBinding::new("delete", app::DeleteRows, Some("DbxDataGrid")),
+                KeyBinding::new("cmd-backspace", app::DeleteRows, Some("DbxDataGrid")),
+                KeyBinding::new("ctrl-backspace", app::DeleteRows, Some("DbxDataGrid")),
+                KeyBinding::new("cmd-c", app::CopyDataSelection, Some("DbxDataGrid")),
+                KeyBinding::new("ctrl-c", app::CopyDataSelection, Some("DbxDataGrid")),
+                KeyBinding::new("cmd-v", app::PasteRows, Some("DbxDataGrid")),
+                KeyBinding::new("ctrl-v", app::PasteRows, Some("DbxDataGrid")),
+                KeyBinding::new("cmd-p", app::OpenQuickOpen, None),
+                KeyBinding::new("ctrl-p", app::OpenQuickOpen, None),
                 KeyBinding::new("cmd-enter", app::RunQuery, Some(editor::SQL_EDITOR_CONTEXT)),
                 KeyBinding::new(
                     "ctrl-enter",
@@ -264,7 +275,20 @@ fn main() {
                 KeyBinding::new("cmd-m", Minimize, None),
                 KeyBinding::new("ctrl-cmd-f", Zoom, None),
             ]);
-            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.on_action(|_: &Quit, cx| {
+                let confirmed = cx
+                    .windows()
+                    .into_iter()
+                    .filter_map(|window| window.downcast::<DbxApp>())
+                    .all(|window| {
+                        window
+                            .update(cx, |app, window, cx| app.confirm_quit(window, cx))
+                            .unwrap_or(true)
+                    });
+                if confirmed {
+                    cx.quit();
+                }
+            });
             cx.on_action(|_: &Minimize, cx| {
                 if let Some(window) = cx.active_window() {
                     let _ = window.update(cx, |_, window, _| window.minimize_window());
@@ -286,7 +310,14 @@ fn main() {
             cx.set_menus(app_menus());
             cx.open_window(dbx_window_options(), |window, cx| {
                 window.set_window_title(APP_NAME);
-                cx.new(|cx| DbxApp::new(window, cx))
+                let app = cx.new(|cx| DbxApp::new(window, cx));
+                let closing = app.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    closing
+                        .update(cx, |app, cx| app.confirm_quit(window, cx))
+                        .unwrap_or(true)
+                });
+                app
             })
             .expect("open DBX window");
             cx.activate(true);

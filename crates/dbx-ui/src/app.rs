@@ -16,6 +16,7 @@ mod session;
 mod tabs;
 use session::*;
 mod connection;
+mod data_clipboard;
 mod diagnostics;
 mod find;
 mod query_parameters;
@@ -36,8 +37,8 @@ use std::{
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
-    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Order,
-    OrderDirection, Page, QueryCancellation, QueryOptions, QueryResult, QuerySession,
+    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, MutationValue,
+    Order, OrderDirection, Page, QueryCancellation, QueryOptions, QueryResult, QuerySession,
     RedisCommandCatalog, ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo,
     TableRef, UpdateRequest, detect_file_format, export_database, export_table, import_database,
     import_file,
@@ -73,7 +74,9 @@ use crate::{
     query_history::{
         QueryHistoryConnection, QueryHistoryEntry, QueryHistoryOutcome, QueryHistoryStore,
     },
-    row_drafts::{FieldId, FieldRow, FieldValueKind, FieldValueState, RowDraftModel},
+    row_drafts::{
+        FieldId, FieldRow, FieldValueKind, FieldValueState, RowDraftModel, field_editor_text,
+    },
     settings::{Settings, SettingsStore},
     theme::{
         Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS,
@@ -134,6 +137,11 @@ gpui::actions!(
         CommitCellEditPrevious,
         CancelCellEdit,
         SetCellNull,
+        CommitChanges,
+        DeleteRows,
+        CopyDataSelection,
+        PasteRows,
+        OpenQuickOpen,
         SubmitQueryParameters,
         CancelQueryParameters,
         OpenFind,
@@ -523,6 +531,8 @@ struct ConfirmationDialog {
     action: ConfirmationAction,
     focus: FocusHandle,
     return_focus: Option<FocusHandle>,
+    /// SQL shown for review in a scrollable block below the detail.
+    sql: Option<String>,
 }
 
 struct MutationErrorDialog {
@@ -559,12 +569,14 @@ enum ConfirmationAction {
         session_id: SessionId,
         table: TableInfo,
     },
-    DeleteRow {
+    CommitChanges {
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        table: TableRef,
-        filters: Vec<Filter>,
-        originals: Vec<(String, CellValue)>,
+    },
+    Quit,
+    DiscardDataTab {
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
     },
     DatabaseImport {
         session_id: SessionId,
@@ -580,12 +592,13 @@ enum ConfirmationAction {
 impl ConfirmationAction {
     fn session_id(&self) -> Option<SessionId> {
         match self {
-            Self::LockVault => None,
+            Self::LockVault | Self::Quit => None,
             Self::RunQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
             | Self::ClearQueryHistory { session_id }
             | Self::Table { session_id, .. }
-            | Self::DeleteRow { session_id, .. }
+            | Self::CommitChanges { session_id, .. }
+            | Self::DiscardDataTab { session_id, .. }
             | Self::DatabaseImport { session_id, .. }
             | Self::TableImport { session_id, .. } => Some(*session_id),
         }
@@ -1033,6 +1046,7 @@ impl DbxApp {
             action: ConfirmationAction::ClearQueryHistory { session_id },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -1161,6 +1175,40 @@ impl DbxApp {
 
     fn default_query(kind: DatabaseKind) -> &'static str {
         kind.default_query()
+    }
+
+    /// Allow closing the window or quitting, or ask first when a table tab
+    /// holds uncommitted changes.
+    pub(crate) fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let changes = self
+            .sessions
+            .iter()
+            .flat_map(|session| &session.secondary_tabs)
+            .filter_map(|tab| match &tab.kind {
+                SecondaryTabKind::Data(data) => Some(data.change_counts().total()),
+                _ => None,
+            })
+            .sum::<usize>();
+        if changes == 0 {
+            return true;
+        }
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: "Quit without committing?".into(),
+            detail: format!(
+                "{} will be lost.",
+                counted(changes, "staged change", "staged changes")
+            ),
+            confirm_label: "Quit",
+            tone: ConfirmationTone::Danger,
+            action: ConfirmationAction::Quit,
+            focus: focus.clone(),
+            return_focus: window.focused(cx),
+            sql: None,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+        false
     }
 
     fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
@@ -2983,14 +3031,12 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
-            return;
-        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
         let Some(columns) = self
             .data_tab(session_id, tab_id)
+            .filter(|data| data.cell_editor.is_none())
             .map(|data| data.table_columns.clone())
         else {
             return;
@@ -3008,6 +3054,7 @@ impl DbxApp {
             return;
         };
         data.draft_mode = DraftMode::Insert;
+        data.draft_insert = None;
         data.selected_row = None;
         data.inspector_open = true;
         data.clear_grid_selection(cx);
@@ -3250,7 +3297,7 @@ impl DbxApp {
         if data
             .result
             .as_ref()
-            .is_none_or(|result| result.rows.get(row).is_none())
+            .is_none_or(|result| row >= result.rows.len() + data.pending_inserts.len())
         {
             return;
         }
@@ -3270,19 +3317,40 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
-            return;
-        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
         let draft_data = self.data_tab(session_id, tab_id).and_then(|data| {
+            if data.cell_editor.is_some() {
+                return None;
+            }
             let row = data.selected_row?;
+            if data.pending_deletes.contains(&row) {
+                return None;
+            }
             let result = data.result.as_ref()?;
-            let values = result.rows.get(row)?.values.clone();
-            Some((data.table_columns.clone(), result.columns.clone(), values))
+            let insert = data.insert_index(row);
+            let values = match insert {
+                Some(_) => Vec::new(),
+                None => result.rows.get(row)?.values.clone(),
+            };
+            // The inspector opens on what the grid shows: staged values over
+            // the loaded row, or a staged new row's values.
+            let staged = (0..result.columns.len())
+                .map(|column| match insert {
+                    Some(index) => data.pending_inserts[index].values.get(&column).cloned(),
+                    None => data.pending_edits.get(&(row, column)).cloned(),
+                })
+                .collect::<Vec<_>>();
+            Some((
+                data.table_columns.clone(),
+                result.columns.clone(),
+                values,
+                staged,
+                insert,
+            ))
         });
-        let Some((table_columns, result_columns, values)) = draft_data else {
+        let Some((table_columns, result_columns, values, staged, insert)) = draft_data else {
             return;
         };
         let mut draft = RowDraftModel::new();
@@ -3300,10 +3368,47 @@ impl DbxApp {
                 cx.notify();
                 return;
             };
-            let Some(original) = values.get(index).cloned() else {
-                return;
+            let original = match insert {
+                Some(_) => None,
+                None => match values.get(index).cloned() {
+                    Some(original) => Some(original),
+                    None => return,
+                },
             };
-            draft.push(FieldRow::new_update(column, original, window, cx));
+            let field = match staged.get(index).cloned().flatten() {
+                Some(MutationValue::Parameter(CellValue::Null)) => FieldRow::with_state(
+                    column,
+                    original,
+                    String::new(),
+                    FieldValueState::Null,
+                    None,
+                    window,
+                    cx,
+                ),
+                Some(MutationValue::Parameter(value)) => FieldRow::with_state(
+                    column,
+                    original,
+                    field_editor_text(&value),
+                    FieldValueState::Value,
+                    None,
+                    window,
+                    cx,
+                ),
+                Some(MutationValue::Expression(expression)) => FieldRow::with_state(
+                    column,
+                    original,
+                    expression,
+                    FieldValueState::Sql,
+                    None,
+                    window,
+                    cx,
+                ),
+                None => match original {
+                    Some(original) => FieldRow::new_update(column, original, window, cx),
+                    None => FieldRow::new_insert(column, None, window, cx),
+                },
+            };
+            draft.push(field);
         }
         self.watch_draft_fields_for(session_id, tab_id, &draft, window, cx);
         let Some(session) = self.session_mut(session_id) else {
@@ -3313,7 +3418,12 @@ impl DbxApp {
         let Some(data) = session.data_tab_mut(tab_id) else {
             return;
         };
-        data.draft_mode = DraftMode::Update;
+        data.draft_mode = if insert.is_some() {
+            DraftMode::Insert
+        } else {
+            DraftMode::Update
+        };
+        data.draft_insert = insert;
         data.inspector_open = true;
         data.row_draft = Some(draft);
         cx.notify();
@@ -3396,7 +3506,9 @@ impl DbxApp {
         let Some(data) = session.data_tab_mut(tab_id) else {
             return;
         };
-        let was_insert = data.draft_mode == DraftMode::Insert;
+        // Cancelling an edit of a staged new row keeps that row selected.
+        let was_insert = data.draft_mode == DraftMode::Insert && data.draft_insert.is_none();
+        data.draft_insert = None;
         data.row_draft = None;
         data.row_draft_subscriptions.clear();
         if was_insert {
@@ -3407,6 +3519,8 @@ impl DbxApp {
         cx.notify();
     }
 
+    /// Stage the inspector's row: changed fields of a loaded row, or a new
+    /// row. Nothing is written until the changeset is committed.
     fn save_draft_for(
         &mut self,
         session_id: SessionId,
@@ -3438,289 +3552,72 @@ impl DbxApp {
             );
             return;
         }
-        let (Some(engine), Some(table), Some(row_draft)) = (
-            session.engine.clone(),
-            self.editable_table_for(session_id, tab_id).cloned(),
+        let (Some(_), Some(row_draft)) = (
+            self.editable_table_for(session_id, tab_id),
             data.row_draft.as_ref(),
         ) else {
             return;
         };
-        let runtime = self.runtime.clone();
-        let request = match draft_mode {
-            DraftMode::Insert => row_draft
-                .insert_values(cx)
-                .map(|values| {
-                    Some(Mutation::Insert(InsertRequest::from_mutation_row(
-                        table.clone(),
-                        values,
-                    )))
-                })
-                .map_err(|error| (error.to_string(), Some(error.field_id()))),
-            DraftMode::Update => {
-                let Some(row) = data
-                    .selected_row
-                    .and_then(|row| data.result.as_ref()?.rows.get(row))
-                    .cloned()
-                else {
-                    return;
-                };
-                row_draft
-                    .changed_fields(cx)
-                    .map_err(|error| (error.to_string(), Some(error.field_id())))
-                    .and_then(|assignments| {
-                        if assignments.is_empty() {
-                            return Ok(None);
-                        }
-                        self.identity_filters_for(session_id, tab_id, &row)
-                            .map_err(|error| (error, None))
-                            .map(|filters| {
-                                Some(Mutation::Update(UpdateRequest::new_with_mutation_values(
-                                    table.clone(),
-                                    assignments,
-                                    filters,
-                                )))
-                            })
-                    })
-            }
-        };
-        let request = match request {
-            Ok(Some(request)) => request,
-            Ok(None) => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.error = None;
-                }
-                self.show_toast(ToastKind::Info, "No changes to save", cx);
-                return;
-            }
+        let selected_row = data.selected_row;
+        let values = match draft_mode {
+            DraftMode::Insert => row_draft.insert_values(cx),
+            DraftMode::Update => row_draft.changed_fields(cx),
+        }
+        .map_err(|error| (error.to_string(), error.field_id()));
+        let values = match values {
+            Ok(values) => values,
             Err((error, field_id)) => {
                 let return_focus = self
-                    .row_draft_focus_for(session_id, tab_id, field_id, cx)
+                    .row_draft_focus_for(session_id, tab_id, Some(field_id), cx)
                     .or_else(|| window.focused(cx));
                 self.show_mutation_error_for(session_id, tab_id, error, return_focus, window, cx);
                 return;
             }
         };
-        let originals = match &request {
-            Mutation::Update(request) => data
-                .selected_row
-                .and_then(|index| data.result.as_ref()?.rows.get(index))
-                .map(|row| {
-                    data.result
-                        .as_ref()
-                        .unwrap()
-                        .columns
-                        .iter()
-                        .zip(&row.values)
-                        .filter(|(column, _)| {
-                            request
-                                .assignments
-                                .iter()
-                                .any(|(name, _)| *name == column.name)
-                        })
-                        .map(|(column, value)| (column.name.clone(), value.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            Mutation::Insert(_) => Vec::new(),
-        };
-        let error_return_focus = self
-            .row_draft_focus_for(session_id, tab_id, None, cx)
-            .or_else(|| window.focused(cx));
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.error = None;
-        let Some(data) = session.data_tab_mut(tab_id) else {
-            return;
-        };
-        data.busy = true;
-        data.error = None;
-        data.status = "Applying row change…".into();
-        data.request_generation += 1;
-        let generation = data.request_generation;
-        let task = runtime.spawn(async move {
-            match request {
-                Mutation::Insert(request) => engine.insert(&request).await,
-                Mutation::Update(request) => engine.update_checked(&request, &originals).await,
-            }
-        });
         if let Some(session) = self.session_mut(session_id) {
-            session.track_background_task(&task);
+            session.error = None;
         }
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = task
-                .await
-                .map_err(|error| format!("Row mutation task failed: {error}"))
-                .and_then(|outcome| outcome.map_err(|error| error.to_string()));
-            this.update_in(cx, |this, window, cx| {
-                let Some(data) = this.data_tab_mut(session_id, tab_id) else {
-                    return;
-                };
-                if generation != data.request_generation {
+        match (draft_mode, selected_row) {
+            (DraftMode::Insert, _) => self.stage_insert_for(session_id, tab_id, values, cx),
+            (DraftMode::Update, Some(row)) => {
+                // Primary keys must still identify the row when committed.
+                if let Some(row_data) = self
+                    .data_tab(session_id, tab_id)
+                    .and_then(|data| data.result.as_ref()?.rows.get(row).cloned())
+                    && let Err(error) = self.identity_filters_for(session_id, tab_id, &row_data)
+                {
+                    self.show_mutation_error_for(session_id, tab_id, error, None, window, cx);
                     return;
                 }
-                match outcome {
-                    Ok(_) => {
-                        data.busy = false;
-                        data.error = None;
-                        this.refresh_table_for(session_id, tab_id, cx);
-                    }
-                    Err(error) => {
-                        this.show_mutation_error_for(
-                            session_id,
-                            tab_id,
-                            error,
-                            error_return_focus,
-                            window,
-                            cx,
-                        );
-                    }
-                }
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+                self.stage_update_for(session_id, tab_id, row, values, cx)
+            }
+            (DraftMode::Update, None) => {}
+        }
+        if let Some(data) = self.data_tab(session_id, tab_id) {
+            let grid = data.data_grid.read(cx).focus_handle(cx);
+            grid.focus(window, cx);
+        }
     }
 
     fn request_delete_selected_for(
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
+        if self
+            .session(session_id)
+            .is_some_and(|session| !session.kind.is_sql())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Edit Redis keys from the command console",
+                cx,
+            );
             return;
         }
-        let Some((table, selected_row, row)) = self.data_tab(session_id, tab_id).and_then(|data| {
-            let selected_row = data.selected_row?;
-            let row = data.result.as_ref()?.rows.get(selected_row)?.clone();
-            Some((
-                self.editable_table_for(session_id, tab_id)?.clone(),
-                selected_row,
-                row,
-            ))
-        }) else {
-            return;
-        };
-        let filters = match self.identity_filters_for(session_id, tab_id, &row) {
-            Ok(filters) => filters,
-            Err(error) => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.error = Some(error);
-                }
-                cx.notify();
-                return;
-            }
-        };
-        let originals = self
-            .data_tab(session_id, tab_id)
-            .and_then(|data| data.result.as_ref())
-            .map(|result| {
-                result
-                    .columns
-                    .iter()
-                    .zip(&row.values)
-                    .map(|(column, value)| (column.name.clone(), value.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let return_focus = window.focused(cx);
-        let focus = cx.focus_handle();
-        self.confirmation_dialog = Some(ConfirmationDialog {
-            title: format!("Delete row {}?", selected_row + 1),
-            detail: format!(
-                "The row will be permanently deleted from {}.",
-                table_ref_label(&table)
-            ),
-            confirm_label: "Delete row",
-            tone: ConfirmationTone::Danger,
-            action: ConfirmationAction::DeleteRow {
-                session_id,
-                tab_id,
-                table,
-                filters,
-                originals,
-            },
-            focus: focus.clone(),
-            return_focus,
-        });
-        focus.focus(window, cx);
-        cx.notify();
-    }
-
-    fn delete_row_for(
-        &mut self,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        table: TableRef,
-        filters: Vec<Filter>,
-        originals: Vec<(String, CellValue)>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session(session_id) else {
-            return;
-        };
-        let Some(data) = session.data_tab(tab_id) else {
-            return;
-        };
-        if session.busy || data.busy {
-            return;
-        }
-        if !session.kind.is_sql() {
-            if let Some(session) = self.session_mut(session_id) {
-                session.error = Some("Edit Redis keys from the command console.".into());
-            }
-            cx.notify();
-            return;
-        }
-        let Some(engine) = session.engine.clone() else {
-            return;
-        };
-        let runtime = self.runtime.clone();
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.error = None;
-        let Some(data) = session.data_tab_mut(tab_id) else {
-            return;
-        };
-        data.busy = true;
-        data.error = None;
-        data.status = "Deleting row…".into();
-        data.request_generation += 1;
-        let generation = data.request_generation;
-        let task =
-            runtime.spawn(async move { engine.delete_checked(&table, &filters, &originals).await });
-        if let Some(session) = self.session_mut(session_id) {
-            session.track_background_task(&task);
-        }
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let outcome = task.await?;
-            this.update(cx, |this, cx| {
-                let Some(data) = this.data_tab_mut(session_id, tab_id) else {
-                    return;
-                };
-                if generation != data.request_generation {
-                    return;
-                }
-                data.busy = false;
-                match outcome {
-                    Ok(_) => {
-                        data.error = None;
-                        this.refresh_table_for(session_id, tab_id, cx);
-                    }
-                    Err(error) => {
-                        data.error = Some(error.to_string());
-                        cx.notify();
-                    }
-                }
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        self.delete_rows_for(session_id, tab_id, None, cx);
     }
 
     fn open_table_context_menu(
@@ -3782,6 +3679,7 @@ impl DbxApp {
             },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -3865,7 +3763,10 @@ impl DbxApp {
             return;
         };
         let return_focus = dialog.return_focus.clone();
-        let closes_query = matches!(dialog.action, ConfirmationAction::CloseQuery { .. });
+        let closes_query = matches!(
+            dialog.action,
+            ConfirmationAction::CloseQuery { .. } | ConfirmationAction::DiscardDataTab { .. }
+        );
         match dialog.action {
             ConfirmationAction::LockVault => {
                 self.lock_vault(cx);
@@ -3911,13 +3812,17 @@ impl DbxApp {
                 session_id,
                 table,
             } => self.execute_table_action(action, session_id, table, cx),
-            ConfirmationAction::DeleteRow {
-                session_id,
-                tab_id,
-                table,
-                filters,
-                originals,
-            } => self.delete_row_for(session_id, tab_id, table, filters, originals, cx),
+            ConfirmationAction::Quit => {
+                cx.quit();
+                return;
+            }
+            ConfirmationAction::CommitChanges { session_id, tab_id } => {
+                self.save_pending_edits_for(session_id, tab_id, window, cx)
+            }
+            ConfirmationAction::DiscardDataTab { session_id, tab_id } => {
+                self.discard_pending_edits_for(session_id, tab_id, cx);
+                self.close_secondary_tab_for(session_id, tab_id, cx);
+            }
             ConfirmationAction::DatabaseImport { session_id, path } => {
                 self.execute_database_import(session_id, path, cx)
             }
@@ -4142,11 +4047,6 @@ impl DbxApp {
     fn set_error(&mut self, message: String) {
         self.error = Some(message);
     }
-}
-
-enum Mutation {
-    Insert(InsertRequest),
-    Update(UpdateRequest),
 }
 
 fn table_ref(table: &TableInfo) -> TableRef {

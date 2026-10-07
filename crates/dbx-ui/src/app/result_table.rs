@@ -1,7 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use dbx_core::{
-    CellValue, ColumnInfo, ForeignKeyInfo, Order, OrderDirection, QueryResult, TableInfo,
+    CellValue, ColumnInfo, ForeignKeyInfo, MutationValue, Order, OrderDirection, QueryResult,
+    TableInfo,
 };
 use gpui::{
     App, Context, Div, FontWeight, IntoElement, Pixels, SharedString, Stateful, Window, div,
@@ -15,7 +19,7 @@ use gpui_component::{
 
 use super::{DbxApp, SecondaryTabId, SessionId};
 use crate::editor::TextEditor;
-use gpui::{ClipboardItem, Entity, WeakEntity};
+use gpui::{ClipboardItem, Entity, MouseButton, MouseDownEvent, WeakEntity};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use crate::diagram::display_type;
@@ -27,6 +31,19 @@ enum RowAction {
     Inspect,
     Edit,
     Delete,
+    Duplicate,
+    Revert,
+}
+
+/// A data tab's staged changeset as the grid shows it.
+#[derive(Clone, Default)]
+pub(super) struct GridChanges {
+    /// Staged values for loaded rows, keyed by (row, data column).
+    pub(super) edits: HashMap<(usize, usize), MutationValue>,
+    /// New rows, shown after the loaded rows. `None` keeps the column default.
+    pub(super) inserts: Vec<Vec<Option<MutationValue>>>,
+    pub(super) deletes: BTreeSet<usize>,
+    pub(super) marked: BTreeSet<usize>,
 }
 
 const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
@@ -116,8 +133,10 @@ pub(super) struct ResultTableDelegate {
     sort: Option<(usize, OrderDirection)>,
     /// The order a server-sorted data tab requested for its next result.
     server_order: Option<Order>,
-    /// Inline values staged in a data tab, keyed by (row, data column).
-    pending: HashMap<(usize, usize), CellValue>,
+    /// The data tab's staged changeset and Shift/Cmd-marked rows.
+    changes: GridChanges,
+    /// Absolute number of the first loaded row, so page two starts at 1,001.
+    row_offset: usize,
     /// The cell currently being edited inline, as (row, data column, editor).
     editing: Option<(usize, usize, Entity<TextEditor>)>,
 }
@@ -145,7 +164,8 @@ impl Default for ResultTableDelegate {
             unsorted: None,
             sort: None,
             server_order: None,
-            pending: HashMap::new(),
+            changes: GridChanges::default(),
+            row_offset: 0,
             editing: None,
         }
     }
@@ -182,11 +202,26 @@ impl ResultTableDelegate {
 
     pub(super) fn set_cell_edits(
         &mut self,
-        pending: HashMap<(usize, usize), CellValue>,
+        changes: GridChanges,
         editing: Option<(usize, usize, Entity<TextEditor>)>,
     ) {
-        self.pending = pending;
+        self.changes = changes;
         self.editing = editing;
+    }
+
+    pub(super) fn set_row_offset(&mut self, row_offset: usize) {
+        self.row_offset = row_offset;
+    }
+
+    fn loaded_rows(&self) -> usize {
+        self.result.as_ref().map_or(0, |result| result.rows.len())
+    }
+
+    /// The staged new row a grid row shows, if it is one.
+    fn insert_row(&self, row_ix: usize) -> Option<&Vec<Option<MutationValue>>> {
+        self.changes
+            .inserts
+            .get(row_ix.checked_sub(self.loaded_rows())?)
     }
 
     fn column_sort(&self, index: usize) -> Option<ColumnSort> {
@@ -549,6 +584,14 @@ impl ResultTableDelegate {
 
 const NULL_SENTINEL: &str = "NULL";
 
+/// Grid text for a staged value: the literal, or the SQL expression as typed.
+fn staged_text(value: &MutationValue) -> String {
+    match value {
+        MutationValue::Parameter(value) => cell_display_text(value),
+        MutationValue::Expression(expression) => expression.clone(),
+    }
+}
+
 fn plain_cell_text(value: &CellValue) -> String {
     value.to_string()
 }
@@ -711,10 +754,7 @@ impl TableDelegate for ResultTableDelegate {
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.result
-            .as_ref()
-            .map(|result| result.rows.len())
-            .unwrap_or_default()
+        self.loaded_rows() + self.changes.inserts.len()
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> DataColumn {
@@ -794,15 +834,39 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
-        div()
+        let base = if row_ix.is_multiple_of(2) {
+            theme().canvas
+        } else {
+            theme().grid_alternate
+        };
+        let background = if self.changes.marked.contains(&row_ix) && self.changes.marked.len() > 1 {
+            theme().accent.alpha(0.14)
+        } else if self.changes.deletes.contains(&row_ix) {
+            theme().danger.alpha(0.12)
+        } else if self.insert_row(row_ix).is_some() {
+            theme().success.alpha(0.12)
+        } else {
+            base
+        };
+        let row = div()
             .id(("dbx-result-row", row_ix))
             .debug_selector(move || format!("dbx-result-row-{row_ix}"))
             .border_color(theme().border)
-            .bg(if row_ix.is_multiple_of(2) {
-                theme().canvas
-            } else {
-                theme().grid_alternate
-            })
+            .bg(background);
+        let Some((app, session_id, tab_id, true)) = self.row_actions.clone() else {
+            return row;
+        };
+        // Cell clicks select through the table; this only reads the modifiers
+        // so Shift extends and Cmd/Ctrl toggles a multi-row mark.
+        row.on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
+            let (extend, toggle) = (event.modifiers.shift, event.modifiers.secondary());
+            let app = app.clone();
+            cx.defer(move |cx| {
+                let _ = app.update(cx, |this, cx| {
+                    this.mark_row_for(session_id, tab_id, row_ix, extend, toggle, cx);
+                });
+            });
+        })
     }
 
     fn perform_sort(
@@ -921,14 +985,37 @@ impl TableDelegate for ResultTableDelegate {
         let can_edit = app.upgrade().is_some_and(|app| {
             let owner = app.read(cx);
             owner.editable_table_for(session_id, tab_id).is_some()
-                && owner.data_tab(session_id, tab_id).is_some_and(|data| {
-                    !data.busy && data.row_draft.is_none() && !data.has_pending_edits()
-                })
+                && owner
+                    .data_tab(session_id, tab_id)
+                    .is_some_and(|data| !data.busy && data.row_draft.is_none())
         });
+        let is_new = self.insert_row(row_ix).is_some();
+        let has_changes = is_new
+            || self.changes.deletes.contains(&row_ix)
+            || self.changes.edits.keys().any(|(row, _)| *row == row_ix);
+        let marked = self.changes.marked.len().max(1);
+        let delete_label: SharedString = if self.changes.deletes.contains(&row_ix) {
+            "Restore row".into()
+        } else if marked > 1 && self.changes.marked.contains(&row_ix) {
+            format!("Delete {marked} rows").into()
+        } else {
+            "Delete row".into()
+        };
         for (label, action, enabled) in [
-            ("Inspect row", RowAction::Inspect, true),
-            ("Edit row", RowAction::Edit, can_edit),
-            ("Delete row…", RowAction::Delete, can_edit),
+            ("Inspect row".into(), RowAction::Inspect, true),
+            ("Edit row".into(), RowAction::Edit, can_edit),
+            ("Duplicate row".into(), RowAction::Duplicate, can_edit),
+            (delete_label, RowAction::Delete, can_edit),
+            (
+                if is_new {
+                    "Remove new row"
+                } else {
+                    "Revert changes"
+                }
+                .into(),
+                RowAction::Revert,
+                can_edit && has_changes,
+            ),
         ] {
             let app = app.clone();
             let clicked_row = clicked_row.clone();
@@ -940,6 +1027,12 @@ impl TableDelegate for ResultTableDelegate {
                             .and_then(|data| data.result.as_ref()?.rows.get(row_ix))
                             != clicked_row.as_ref()
                         {
+                            return;
+                        }
+                        // Bulk delete keeps the marked rows; other actions
+                        // apply to the clicked row alone.
+                        if matches!(action, RowAction::Delete) {
+                            this.delete_rows_for(session_id, tab_id, Some(row_ix), cx);
                             return;
                         }
                         this.select_row_for(session_id, tab_id, row_ix, cx);
@@ -954,10 +1047,13 @@ impl TableDelegate for ResultTableDelegate {
                             RowAction::Edit => {
                                 this.begin_edit_selected_for(session_id, tab_id, window, cx)
                             }
-                            RowAction::Delete => {
-                                this.request_delete_selected_for(session_id, tab_id, window, cx)
+                            RowAction::Duplicate => {
+                                this.duplicate_row_for(session_id, tab_id, row_ix, cx)
                             }
-                            RowAction::Inspect => {}
+                            RowAction::Revert => {
+                                this.revert_row_for(session_id, tab_id, row_ix, cx)
+                            }
+                            RowAction::Delete | RowAction::Inspect => {}
                         }
                     });
                 },
@@ -996,12 +1092,44 @@ impl TableDelegate for ResultTableDelegate {
                 )
                 .into_any_element();
         }
+        let deleted = self.changes.deletes.contains(&row_ix);
+        if let Some(insert) = self.insert_row(row_ix) {
+            let text = match col_ix.checked_sub(1) {
+                None => Some("+".to_owned()),
+                Some(column) => insert
+                    .get(column)
+                    .cloned()
+                    .flatten()
+                    .map(|value| staged_text(&value)),
+            };
+            let muted = text.is_none() || col_ix == 0;
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .px(px(8.))
+                .text_size(px(11.))
+                .text_color(if muted {
+                    theme().text_muted
+                } else {
+                    theme().text
+                })
+                .when(muted && col_ix > 0, |cell| cell.italic())
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .child(text.unwrap_or_else(|| "DEFAULT".into())),
+                )
+                .into_any_element();
+        }
         let staged = col_ix
             .checked_sub(1)
-            .and_then(|column| self.pending.get(&(row_ix, column)))
+            .and_then(|column| self.changes.edits.get(&(row_ix, column)))
             .cloned();
-        if let Some(value) = staged {
-            let null = value == CellValue::Null;
+        if let Some(value) = staged.filter(|_| !deleted) {
+            let muted =
+                !matches!(&value, MutationValue::Parameter(value) if *value != CellValue::Null);
             return div()
                 .size_full()
                 .flex()
@@ -1009,18 +1137,21 @@ impl TableDelegate for ResultTableDelegate {
                 .px(px(8.))
                 .bg(theme().warning.alpha(0.16))
                 .text_size(px(11.))
-                .text_color(if null {
+                .text_color(if muted {
                     theme().text_muted
                 } else {
                     theme().text
                 })
-                .when(null, |cell| cell.italic())
-                .child(div().min_w_0().truncate().child(cell_display_text(&value)))
+                .when(muted, |cell| cell.italic())
+                .child(div().min_w_0().truncate().child(staged_text(&value)))
                 .into_any_element();
         }
         let mut null = false;
         let (text, text_color): (SharedString, _) = if col_ix == 0 {
-            ((row_ix + 1).to_string().into(), theme().text_muted)
+            (
+                (self.row_offset + row_ix + 1).to_string().into(),
+                theme().text_muted,
+            )
         } else {
             let column_count = self.columns.len() - 1;
             let color = match self.cell_value(row_ix, col_ix - 1) {
@@ -1069,8 +1200,13 @@ impl TableDelegate for ResultTableDelegate {
             .whitespace_nowrap()
             .truncate()
             .text_size(px(11.))
-            .text_color(text_color)
+            .text_color(if deleted {
+                theme().text_muted
+            } else {
+                text_color
+            })
             .when(null, |cell| cell.italic())
+            .when(deleted && col_ix > 0, |cell| cell.line_through())
             .when(numeric && foreign_key.is_none(), |cell| cell.justify_end());
         if foreign_key.is_some() {
             cell = cell
@@ -1138,7 +1274,7 @@ impl TableDelegate for ResultTableDelegate {
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
         if col_ix == 0 {
-            return (row_ix + 1).to_string();
+            return (self.row_offset + row_ix + 1).to_string();
         }
 
         self.result
