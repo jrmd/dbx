@@ -199,8 +199,63 @@ impl RedisEngine {
         options: QueryOptions,
         started: Instant,
     ) -> Result<QueryResult> {
-        let keys = redis_scan_keys(value)?;
+        let (_, keys) = redis_scan_reply(value)?;
         let (keys, truncated) = limit_values(keys, options);
+        self.key_rows(keys, truncated, started).await
+    }
+
+    /// Browse one page of the keyspace. A single `SCAN` step examines only
+    /// about `COUNT` keys, so a selective pattern can return nothing even when
+    /// matches exist; this keeps following the cursor until `target` keys are
+    /// found, the keyspace is exhausted, or the step budget runs out. The
+    /// returned cursor resumes the next page; `0` means the scan is complete.
+    pub async fn scan_page(
+        &self,
+        pattern: &str,
+        cursor: u64,
+        target: usize,
+    ) -> Result<(QueryResult, u64)> {
+        const STEP_COUNT: usize = 1_000;
+        const MAX_STEPS: usize = 256;
+        let started = Instant::now();
+        let mut cursor = cursor;
+        let mut seen = std::collections::HashSet::new();
+        let mut keys = Vec::new();
+        for _ in 0..MAX_STEPS {
+            let value = {
+                let mut connection = self.live_connection().await?;
+                redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(pattern)
+                    .arg("COUNT")
+                    .arg(STEP_COUNT)
+                    .query_async::<Value>(&mut *connection)
+                    .await?
+            };
+            let (next, batch) = redis_scan_reply(value)?;
+            for key in batch {
+                // SCAN may return a key more than once while the table rehashes.
+                if seen.insert(redis_argument(&cell_value(key.clone()))?) {
+                    keys.push(key);
+                }
+            }
+            cursor = next;
+            if cursor == 0 || keys.len() >= target {
+                break;
+            }
+        }
+        let result = self.key_rows(keys, false, started).await?;
+        Ok((result, cursor))
+    }
+
+    /// Fetch TYPE and TTL for scanned keys in one pipeline.
+    async fn key_rows(
+        &self,
+        keys: Vec<Value>,
+        truncated: bool,
+        started: Instant,
+    ) -> Result<QueryResult> {
         let mut rows = Vec::with_capacity(keys.len());
 
         if !keys.is_empty() {
@@ -526,7 +581,7 @@ fn redis_scan_columns() -> Vec<ColumnInfo> {
     ]
 }
 
-fn redis_scan_keys(value: Value) -> Result<Vec<Value>> {
+fn redis_scan_reply(value: Value) -> Result<(u64, Vec<Value>)> {
     let Value::Array(mut values) = unwrap_redis_container(value) else {
         return Err(DbxError::Decode(
             "Redis SCAN response was not an array".into(),
@@ -539,12 +594,17 @@ fn redis_scan_keys(value: Value) -> Result<Vec<Value>> {
         )));
     }
 
-    // The first element is the next cursor. It is deliberately discarded;
-    // showing it as a row makes the keyspace browser look as if a cursor were
-    // an actual key.
-    let _cursor = values.remove(0);
+    // The first element is the next cursor. It is pagination state and must
+    // never be shown as a key row.
+    let cursor = match unwrap_redis_container(values.remove(0)) {
+        Value::BulkString(bytes) => String::from_utf8_lossy(&bytes).parse().ok(),
+        Value::SimpleString(text) => text.parse().ok(),
+        Value::Int(value) => u64::try_from(value).ok(),
+        _ => None,
+    }
+    .ok_or_else(|| DbxError::Decode("Redis SCAN cursor was not a number".into()))?;
     match unwrap_redis_container(values.remove(0)) {
-        Value::Array(keys) | Value::Set(keys) => Ok(keys),
+        Value::Array(keys) | Value::Set(keys) => Ok((cursor, keys)),
         other => Err(DbxError::Decode(format!(
             "Redis SCAN key list was {:?}, expected an array",
             other
@@ -672,7 +732,7 @@ mod tests {
 
     #[test]
     fn scan_discards_cursor_and_keeps_key_values() {
-        let keys = redis_scan_keys(Value::Array(vec![
+        let (cursor, keys) = redis_scan_reply(Value::Array(vec![
             Value::BulkString(b"42".to_vec()),
             Value::Array(vec![
                 Value::BulkString(b"users:1".to_vec()),
@@ -680,6 +740,7 @@ mod tests {
             ]),
         ]))
         .unwrap();
+        assert_eq!(cursor, 42);
         assert_eq!(keys.len(), 2);
         assert_eq!(
             cell_value(keys[0].clone()),

@@ -38,7 +38,8 @@ pub use model::{
     CellValue, CheckConstraintInfo, ColumnInfo, ConnectionConfig, CreateColumn, CreateTableRequest,
     DatabaseKind, EntityKind, ExecResult, Filter, FilterOperator, ForeignKeyInfo, IndexInfo,
     InsertRequest, MutationValue, Order, OrderDirection, Page, QueryResult, ReferentialAction,
-    RelationalSchema, RelationalTable, RowData, TableInfo, TableRef, TableStructure, UpdateRequest,
+    RelationalSchema, RelationalTable, RowChange, RowData, TableInfo, TableRef, TableStructure,
+    UpdateRequest,
 };
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
@@ -53,8 +54,8 @@ pub use transfer::checked_split_sql_for;
 pub use transfer::{
     DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
     FileFormat, ImportReport, TransferControl, detect_file_format, export_database, export_table,
-    import_database, import_file, render_sql_indexes, render_sql_insert, render_sql_schema,
-    split_sql_statements, with_transfer_control,
+    import_database, import_file, render_row_change, render_sql_indexes, render_sql_insert,
+    render_sql_schema, split_sql_statements, with_transfer_control,
 };
 
 #[cfg(test)]
