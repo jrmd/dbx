@@ -722,9 +722,19 @@ pub(super) struct DataTab {
     /// Header sort applied as `ORDER BY` when the engine supports it.
     pub(super) sort: Option<Order>,
     pub(super) sortable: bool,
-    /// Inline cell values staged for the next save, and the open cell editor.
+    /// The changeset staged for the next commit: edited cells of loaded rows,
+    /// new rows, and loaded rows marked for deletion. Nothing reaches the
+    /// database until the user commits the set as a whole.
     pub(super) pending_edits: cell_edits::PendingEdits,
+    pub(super) pending_inserts: Vec<cell_edits::PendingInsert>,
+    pub(super) pending_deletes: std::collections::BTreeSet<usize>,
     pub(super) cell_editor: Option<cell_edits::CellEditor>,
+    /// Rows picked with Shift/Cmd-click for bulk delete and copy, and the
+    /// anchor a Shift-click extends from.
+    pub(super) marked_rows: std::collections::BTreeSet<usize>,
+    pub(super) mark_anchor: Option<usize>,
+    /// The staged new row the open insert draft edits, if it is not new.
+    pub(super) draft_insert: Option<usize>,
     pub(super) selected_row: Option<usize>,
     pub(super) selected_column: usize,
     pub(super) inspector_open: bool,
@@ -781,7 +791,12 @@ impl DataTab {
             sort: None,
             sortable,
             pending_edits: Default::default(),
+            pending_inserts: Vec::new(),
+            pending_deletes: Default::default(),
             cell_editor: None,
+            marked_rows: Default::default(),
+            mark_anchor: None,
+            draft_insert: None,
             selected_row: None,
             selected_column: 0,
             inspector_open: false,
@@ -818,9 +833,11 @@ impl DataTab {
         let foreign_keys = self.foreign_keys.clone();
         let tables = tables.to_vec();
         let (sortable, sort) = (self.sortable, self.sort.clone());
+        let row_offset = self.table_page as usize * TABLE_BROWSE_PAGE_SIZE as usize;
         self.data_grid.update(cx, move |table, cx| {
             let delegate = table.delegate_mut();
             delegate.set_server_sort(sortable, sort.as_ref());
+            delegate.set_row_offset(row_offset);
             delegate.set_result(result, &remembered_widths, &foreign_keys, &tables);
             table.refresh(cx);
             if clear_selection {
@@ -839,6 +856,9 @@ impl DataTab {
     pub(super) fn reset_row_state(&mut self, cx: &mut Context<DbxApp>) {
         self.result_table = None;
         self.selected_row = None;
+        self.marked_rows.clear();
+        self.mark_anchor = None;
+        self.draft_insert = None;
         self.row_draft = None;
         self.row_draft_subscriptions.clear();
         // Reloads are refused while edits are staged, so only an open editor

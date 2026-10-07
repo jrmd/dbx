@@ -94,6 +94,7 @@ impl DbxApp {
             },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
