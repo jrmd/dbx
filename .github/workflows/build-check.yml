@@ -9,6 +9,7 @@ on:
       - 'crates/**'
       - 'scripts/**'
       - 'packaging/**'
+      - 'site/**'
       - '.github/actions/prepare-rust-build/**'
       - '.github/workflows/**'
   pull_request:
@@ -18,6 +19,7 @@ on:
       - 'crates/**'
       - 'scripts/**'
       - 'packaging/**'
+      - 'site/**'
       - '.github/actions/prepare-rust-build/**'
       - '.github/workflows/**'
   workflow_dispatch:
