@@ -1,3 +1,4 @@
+import { Databases } from "@/components/site/databases";
 import { Download } from "@/components/site/download";
 import { Features } from "@/components/site/features";
 import { Footer } from "@/components/site/footer";
@@ -21,6 +22,7 @@ export default async function Home() {
         <Hero release={release} />
         <Statement />
         <Features />
+        <Databases />
         <Query />
         <Safety />
         <Vault />

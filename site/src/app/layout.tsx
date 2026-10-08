@@ -13,7 +13,7 @@ const jetbrains = JetBrains_Mono({
 });
 
 const description =
-  "A free, open-source database client for PostgreSQL, MySQL, SQLite, and Redis. Written in Rust and drawn on the GPU — no Electron, no webview.";
+  "A free, open-source database client for SQL databases, document stores, search, and streams. Written in Rust and drawn on the GPU — no Electron, no webview.";
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://dbx.jrmd.dev"),
@@ -26,6 +26,17 @@ export const metadata: Metadata = {
     "MySQL",
     "SQLite",
     "Redis",
+    "MongoDB",
+    "CockroachDB",
+    "DuckDB",
+    "Elasticsearch",
+    "BigQuery",
+    "Kafka",
+    "Turso",
+    "Cloudflare D1",
+    "ClickHouse",
+    "SQL Server",
+    "Snowflake",
     "Rust",
     "GPUI",
     "open source",

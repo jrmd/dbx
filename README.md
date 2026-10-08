@@ -14,7 +14,7 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 
 ## Inside the workbench
 
-- **Fourteen database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
+- **Fifteen database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
 - **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
 - **Data you can work with:** virtualized grids over bounded row pages, server-side header sorting, structured filters, foreign-key navigation, and an all-field row inspector with JSON and binary previews.
 - **Explicit edits:** typed insert/update drafts, inline cell editing with staged Save/Discard, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.

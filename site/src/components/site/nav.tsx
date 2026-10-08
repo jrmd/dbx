@@ -5,6 +5,7 @@ import { GitHubIcon } from "./icons";
 
 const links = [
   { href: "#features", label: "Features" },
+  { href: "#databases", label: "Databases" },
   { href: "#safety", label: "Safety" },
   { href: "#vault", label: "Vault" },
   { href: "#download", label: "Download" },

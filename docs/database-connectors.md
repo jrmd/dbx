@@ -15,7 +15,6 @@ CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1, Click
 | Cloudflare D1 | `d1://account-id/database-id`, with a Cloudflare API token in the masked field | REST SQL, tables, views, SQLite structure and bound row mutations |
 | ClickHouse | `clickhouse://default@localhost:8123/default` for HTTP; select ClickHouse and use `https://user:password@host:8443/default` for TLS/Cloud | SQL, database switching, tables/views, typed structure, bound filters, sorting and paged results; read-only row grid |
 | SQL Server | `sqlserver://user:password@host:1433/database` or `mssql://...` | SQL, database switching, tables/views, defaults, indexes, checks, bound filters and primary-key-checked row edits |
-
 | Snowflake | `snowflake://user:TOKEN@account.snowflakecomputing.com/database?warehouse=WH&schema=PUBLIC&auth=pat` | SQL API, bound parameters, polling and partitions, databases, tables, views and CREATE definitions; read-only row grid |
 
 API tokens can also be supplied as URL passwords by API callers. DBX stores

@@ -77,8 +77,7 @@ export function Hero({ release }: { release: Release | null }) {
         </h1>
 
         <p className="mx-auto mt-7 max-w-xl text-lg leading-relaxed text-pretty text-muted-foreground">
-          Browse, query, and edit PostgreSQL, MySQL, SQLite, and Redis in one
-          app. Written in Rust and drawn on the GPU. Free and open source.
+          Browse, query, and edit your databases in one app. Written in Rust and drawn on the GPU. Free and open source.
         </p>
 
         <div className="mt-10 flex flex-col items-center justify-center gap-3 sm:flex-row">

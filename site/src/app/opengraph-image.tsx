@@ -43,7 +43,7 @@ export default async function Image() {
         >
           <span>A native database client</span>
           <span style={{ color: "#94a3b8", fontSize: 40, marginTop: 18 }}>
-            PostgreSQL · MySQL · SQLite · Redis
+            SQL · Documents · Search · Streams
           </span>
         </div>
         <div

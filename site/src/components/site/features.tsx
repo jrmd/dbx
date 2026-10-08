@@ -32,26 +32,26 @@ function Tile({
   );
 }
 
-const engines = [
-  { name: "PostgreSQL", detail: "Schemas, types, foreign keys" },
-  { name: "MySQL", detail: "Databases, tables, structure" },
-  { name: "SQLite", detail: "Open any file on disk" },
-  { name: "Redis", detail: "SCAN browsing and a console" },
+const transports = [
+  { name: "SSH tunnel", detail: "Jump hosts, agent or key, checked host keys" },
+  { name: "Unix socket", detail: "Local or through the tunnel" },
+  { name: "TLS", detail: "Certificates verified by default" },
+  { name: "Cloud tokens", detail: "AWS RDS IAM and Azure Entra" },
 ];
 
-function Engines() {
+function Transports() {
   return (
     <ul className="divide-y divide-white/[.06] border-t border-white/[.06]">
-      {engines.map((engine) => (
+      {transports.map((transport) => (
         <li
-          key={engine.name}
+          key={transport.name}
           className="flex items-baseline justify-between gap-4 px-7 py-4 sm:px-8"
         >
           <span className="text-lg font-medium tracking-tight">
-            {engine.name}
+            {transport.name}
           </span>
           <span className="text-right text-sm text-muted-foreground">
-            {engine.detail}
+            {transport.detail}
           </span>
         </li>
       ))}
@@ -203,10 +203,10 @@ export function Features() {
       <ScrollReveal className="grid gap-4 md:grid-cols-6">
         <Tile
           className="md:col-span-3"
-          title="One app, four engines"
-          body="Relational or key-value, local file or remote server. Same keyboard, same grid, same muscle memory."
+          title="Reach it however you can"
+          body="Paste a connection URL or fill in the details. Tunnel through a bastion, use a local socket, or fetch a short-lived token from your cloud CLI."
         >
-          <Engines />
+          <Transports />
         </Tile>
         <Tile
           className="md:col-span-3"
