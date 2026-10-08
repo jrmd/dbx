@@ -90,8 +90,11 @@ def main():
                 raise RuntimeError("Disposable databases did not become ready")
             # TLS identity belongs to the original server, even when the byte
             # transport runs through a local SSH socket. A second CA is untrusted.
-            for stem in ("server", "untrusted"):
-                run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-keyout", str(root / f"{stem}.key"), "-out", str(root / f"{stem}.crt"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for stem in ("ca", "untrusted"):
+                run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", f"/CN=DBX fixture {stem}", "-addext", "basicConstraints=critical,CA:TRUE", "-keyout", str(root / f"{stem}.key"), "-out", str(root / f"{stem}.crt"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run("openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=localhost", "-keyout", str(root / "server.key"), "-out", str(root / "server.csr"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            (root / "server.ext").write_text("basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:localhost\n")
+            run("openssl", "x509", "-req", "-in", str(root / "server.csr"), "-CA", str(root / "ca.crt"), "-CAkey", str(root / "ca.key"), "-CAcreateserial", "-days", "1", "-extfile", str(root / "server.ext"), "-out", str(root / "server.crt"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             for index, destination, owner in [(0, "/var/lib/postgresql/data", "postgres"), (1, "/var/lib/mysql", "mysql")]:
                 run("docker", "cp", str(root / "server.crt"), f"{names[index]}:{destination}/server.crt", stdout=subprocess.DEVNULL)
                 run("docker", "cp", str(root / "server.key"), f"{names[index]}:{destination}/server.key", stdout=subprocess.DEVNULL)
