@@ -2,6 +2,39 @@ use super::*;
 use crate::workspace::{SavedQuery, SavedTab, TableLayout, connection_key, table_layout_key};
 
 impl DbxApp {
+    fn saved_workspace_tab(
+        &self,
+        session: &ConnectionSession,
+        tab: &SecondaryTab,
+        cx: &App,
+    ) -> SavedTab {
+        match &tab.kind {
+            SecondaryTabKind::Query(query) => SavedTab::Query(SavedQuery {
+                name: query.name.read(cx).clone(),
+                sql: query.query_text.read(cx).clone(),
+            }),
+            SecondaryTabKind::Structure(structure) => SavedTab::Structure(structure.table.clone()),
+            SecondaryTabKind::Diagram(_) => SavedTab::Diagram,
+            SecondaryTabKind::Data(data) => {
+                if let Some(recovered) = &data.recovered_changeset {
+                    return SavedTab::RecoveredData(recovered.clone());
+                }
+                match self.snapshot_row_changes_for(session.id, tab.id) {
+                    Ok(changes) if !changes.is_empty() => {
+                        SavedTab::RecoveredData(crate::workspace::SavedChangeset {
+                            connection_identity: session.connection_identity,
+                            table: data.table.clone(),
+                            database: session.current_database.clone(),
+                            columns: data.table_columns.clone(),
+                            changes,
+                        })
+                    }
+                    _ => SavedTab::Data(data.table.clone()),
+                }
+            }
+        }
+    }
+
     pub(super) fn persist_startup_workspace(&mut self, cx: &mut Context<Self>) {
         if self.vault_state != Some(VaultState::Unlocked) {
             return;
@@ -28,21 +61,7 @@ impl DbxApp {
                                 session
                                     .secondary_tabs
                                     .iter()
-                                    .map(|tab| match &tab.kind {
-                                        SecondaryTabKind::Query(query) => {
-                                            SavedTab::Query(SavedQuery {
-                                                name: query.name.read(cx).clone(),
-                                                sql: query.query_text.read(cx).clone(),
-                                            })
-                                        }
-                                        SecondaryTabKind::Data(data) => {
-                                            SavedTab::Data(data.table.clone())
-                                        }
-                                        SecondaryTabKind::Structure(structure) => {
-                                            SavedTab::Structure(structure.table.clone())
-                                        }
-                                        SecondaryTabKind::Diagram(_) => SavedTab::Diagram,
-                                    })
+                                    .map(|tab| self.saved_workspace_tab(session, tab, cx))
                                     .collect(),
                             ),
                             active_tab: session
@@ -135,6 +154,7 @@ impl DbxApp {
                         .await
                         .map_err(|_| "Saved connection load failed".to_owned())?
                         .map_err(|error| error.to_string())?;
+                        let identity = super::backups::native_target_identity(&loaded.config);
                         let engine = Arc::new(
                             DatabaseEngine::connect(loaded.config)
                                 .await
@@ -154,7 +174,7 @@ impl DbxApp {
                             .map_err(|error| error.to_string())?;
                         let databases = engine.list_databases().await.unwrap_or_default();
                         let database = engine.current_database().await.ok();
-                        Ok::<_, String>((engine, tables, databases, database))
+                        Ok::<_, String>((engine, tables, databases, database, identity))
                     });
                     if let Some(session) = this.session_mut(session_id) {
                         session.track_background_task(&task);
@@ -167,7 +187,8 @@ impl DbxApp {
                             };
                             session.busy = false;
                             match result {
-                                Ok((engine, tables, databases, database)) => {
+                                Ok((engine, tables, databases, database, identity)) => {
+                                    session.connection_identity = Some(identity);
                                     session.engine = Some(engine);
                                     session.schema_filter =
                                         default_schema_filter(session.kind, &tables);
@@ -269,17 +290,7 @@ impl DbxApp {
             document.tabs = session
                 .secondary_tabs
                 .iter()
-                .map(|tab| match &tab.kind {
-                    SecondaryTabKind::Query(query) => SavedTab::Query(SavedQuery {
-                        name: query.name.read(cx).clone(),
-                        sql: query.query_text.read(cx).clone(),
-                    }),
-                    SecondaryTabKind::Data(data) => SavedTab::Data(data.table.clone()),
-                    SecondaryTabKind::Structure(structure) => {
-                        SavedTab::Structure(structure.table.clone())
-                    }
-                    SecondaryTabKind::Diagram(_) => SavedTab::Diagram,
-                })
+                .map(|tab| self.saved_workspace_tab(session, tab, cx))
                 .collect();
             document.active_tab = session
                 .secondary_tabs
@@ -670,6 +681,59 @@ impl DbxApp {
                 .map_or(0, |session| session.secondary_tabs.len());
             match tab {
                 SavedTab::Query(query) => self.open_saved_query_for(session_id, query, window, cx),
+                SavedTab::RecoveredData(changeset) => {
+                    if let Some(table) = tables
+                        .iter()
+                        .find(|table| table_ref(table) == changeset.table)
+                        .cloned()
+                    {
+                        self.select_table_with_filters_for(
+                            session_id,
+                            table,
+                            Vec::new(),
+                            window,
+                            cx,
+                        );
+                        if let Some(tab_id) = self
+                            .session(session_id)
+                            .and_then(|session| session.active_secondary_tab)
+                            && let Some(data) = self.data_tab_mut(session_id, tab_id)
+                        {
+                            data.recovered_changeset = Some(changeset);
+                        }
+                    } else {
+                        // Keep a missing table's changes in a query draft so
+                        // recovery cannot silently discard the user's work.
+                        let sql = changeset
+                            .changes
+                            .iter()
+                            .map(|change| {
+                                dbx_core::render_row_change(
+                                    self.session(session_id)
+                                        .map(|session| session.kind)
+                                        .unwrap_or(DatabaseKind::SQLite),
+                                    change,
+                                )
+                            })
+                            .collect::<dbx_core::Result<Vec<_>>>()
+                            .map(|sql| sql.join("\n"))
+                            .unwrap_or_else(|error| {
+                                format!("-- Recovery could not render SQL: {error}")
+                            });
+                        self.open_saved_query_for(
+                            session_id,
+                            SavedQuery {
+                                name: format!(
+                                    "Recovered changes for missing {} (review only)",
+                                    changeset.table.name
+                                ),
+                                sql,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }
                 SavedTab::Data(ref reference) | SavedTab::Structure(ref reference) => {
                     if let Some(table) = tables
                         .iter()

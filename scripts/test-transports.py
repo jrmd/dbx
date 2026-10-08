@@ -88,6 +88,21 @@ def main():
                 time.sleep(1)
             else:
                 raise RuntimeError("Disposable databases did not become ready")
+            # TLS identity belongs to the original server, even when the byte
+            # transport runs through a local SSH socket. A second CA is untrusted.
+            for stem in ("server", "untrusted"):
+                run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-keyout", str(root / f"{stem}.key"), "-out", str(root / f"{stem}.crt"), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for index, destination, owner in [(0, "/var/lib/postgresql/data", "postgres"), (1, "/var/lib/mysql", "mysql")]:
+                run("docker", "cp", str(root / "server.crt"), f"{names[index]}:{destination}/server.crt", stdout=subprocess.DEVNULL)
+                run("docker", "cp", str(root / "server.key"), f"{names[index]}:{destination}/server.key", stdout=subprocess.DEVNULL)
+                run("docker", "exec", "-u", "root", names[index], "sh", "-c", f"chown {owner}:{owner} {destination}/server.* && chmod 600 {destination}/server.key")
+            run("docker", "exec", names[0], "psql", "-U", "dbx_test", "-d", "dbx_test", "-c", "ALTER SYSTEM SET ssl = 'on'", stdout=subprocess.DEVNULL)
+            run("docker", "exec", names[0], "psql", "-U", "dbx_test", "-d", "dbx_test", "-c", "SELECT pg_reload_conf()", stdout=subprocess.DEVNULL)
+            run("docker", "exec", names[1], "sh", "-c", "cp /var/lib/mysql/server.crt /var/lib/mysql/server-cert.pem && cp /var/lib/mysql/server.key /var/lib/mysql/server-key.pem && chown mysql:mysql /var/lib/mysql/server-*.pem")
+            run("docker", "restart", names[1], stdout=subprocess.DEVNULL)
+            for _ in range(60):
+                if subprocess.run(["docker", "exec", names[1], "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0: break
+                time.sleep(1)
             environment = os.environ | {
                 "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
                 "DBX_TEST_TRANSPORT_DIRECTORY": str(root),
@@ -109,9 +124,10 @@ def main():
             with (root / "known_hosts").open("a") as known_hosts:
                 known_hosts.write(f"[127.0.0.1]:{password_port} {host_key[0]} {host_key[1]}\n")
             environment["DBX_TEST_SSH_PASSWORD_PORT"] = password_port
-            run("cargo", "test", "--locked", "-p", "dbx-core", "socket_and_ssh_connections_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
-            run("cargo", "test", "--locked", "-p", "dbx-core", "ssh_tunnel_lifetime_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
-            run("cargo", "test", "--locked", "-p", "dbx-core", "ssh_password_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
+            run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "socket_and_ssh_connections_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
+            run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "ssh_tunnel_lifetime_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
+            run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "ssh_password_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
+            run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "strict_tls_over_ssh_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
         finally:
             for name in names:
                 subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

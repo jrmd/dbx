@@ -8,6 +8,7 @@ mod editor;
 #[allow(dead_code)]
 mod filters;
 mod popups;
+mod profile_transfer;
 mod profiles;
 #[allow(dead_code)]
 mod query_history;
@@ -125,6 +126,15 @@ fn app_menus() -> Vec<Menu> {
 }
 
 fn main() {
+    if std::env::args().any(|argument| argument == "--mcp-stdio") {
+        let runtime = tokio::runtime::Runtime::new().expect("MCP runtime");
+        if let Err(error) = runtime.block_on(dbx_core::mcp::stdio_proxy()) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {

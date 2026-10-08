@@ -16,6 +16,316 @@ async fn database() -> (tempfile::TempDir, Arc<DatabaseEngine>) {
 }
 
 #[tokio::test]
+async fn full_query_export_streams_past_grid_limits_and_refuses_writes() {
+    let (directory, engine) = database().await;
+    let path = directory.path().join("all.jsonl");
+    let sql = "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20001) SELECT x, NULL AS empty FROM n";
+    let report = export_query(&engine, sql, &path, QueryExportFormat::JsonLines)
+        .await
+        .unwrap();
+    assert_eq!(report, 20001);
+    let output = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(output.lines().count(), 20002);
+    assert!(output.contains("20001"));
+    let previous = output.clone();
+    assert!(
+        export_query(
+            &engine,
+            "CREATE TABLE forbidden(id int)",
+            &path,
+            QueryExportFormat::Csv
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+    assert!(
+        export_query(&engine, "SELECT 1; SELECT 2", &path, QueryExportFormat::Csv)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn preview_mapping_preserves_nulls_defaults_and_rolls_back_bad_rows() {
+    use dbx_core::data_import::{ImportData, diff_data, import_data, snapshot_data};
+    let (directory, engine) = database().await;
+    engine
+        .execute_sql(
+            "CREATE TABLE target(id INTEGER PRIMARY KEY, value TEXT, flag INTEGER DEFAULT 7)",
+        )
+        .await
+        .unwrap();
+    let table = TableRef::new("target");
+    let path = directory.path().join("rows.csv");
+    std::fs::write(&path, "key,text\n1,\n2,\"\"\n").unwrap();
+    let data = ImportData::read(&path).unwrap();
+    assert_eq!(data.rows[0][1], CellValue::Null);
+    assert_eq!(data.rows[1][1], CellValue::Text(String::new()));
+    let columns = engine.describe_table(&table).await.unwrap();
+    let database = engine.current_database().await.unwrap();
+    let mapping = vec![Some("id".into()), Some("value".into())];
+    std::fs::write(&path, "key,text\n99,changed after preview\n").unwrap();
+    assert_eq!(
+        import_data(&engine, &table, &data, &mapping, &database, &columns)
+            .await
+            .unwrap(),
+        2
+    );
+    let snapshot = snapshot_data(&engine, &table).await.unwrap();
+    assert_eq!(snapshot.rows.len(), 2);
+    assert!(
+        snapshot
+            .rows
+            .iter()
+            .all(|row| row[2] == CellValue::Integer(7))
+    );
+    let bad = ImportData {
+        headers: data.headers.clone(),
+        rows: vec![
+            vec![CellValue::Integer(3), CellValue::Text("temporary".into())],
+            vec![CellValue::Integer(1), CellValue::Text("duplicate".into())],
+        ],
+    };
+    let error = import_data(&engine, &table, &bad, &mapping, &database, &columns)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Row 2"));
+    let after = snapshot_data(&engine, &table).await.unwrap();
+    assert_eq!(after.rows.len(), 2);
+    assert_eq!(
+        diff_data(&snapshot, &after, &["id".into()]).unwrap().equal,
+        2
+    );
+    engine
+        .execute_sql("ALTER TABLE target ADD COLUMN extra TEXT")
+        .await
+        .unwrap();
+    assert!(
+        import_data(&engine, &table, &data, &mapping, &database, &columns)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("schema changed")
+    );
+}
+
+#[tokio::test]
+async fn mcp_pairing_authenticates_scopes_and_bounds_reads_then_revokes() {
+    let (_directory, engine) = database().await;
+    engine
+        .execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+        .await
+        .unwrap();
+    engine.execute_sql("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<101) INSERT INTO items SELECT x, 'hello' FROM n").await.unwrap();
+    let pairing = mcp::Pairing::start(engine.clone()).await.unwrap();
+    let recipe = pairing.recipe(std::path::Path::new("dbx"));
+    let token = recipe["mcpServers"]["dbx"]["env"]["DBX_MCP_TOKEN"]
+        .as_str()
+        .unwrap();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fixture","version":"1"}}});
+    assert_eq!(
+        client
+            .post(&pairing.url)
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .post(&pairing.url)
+            .bearer_auth(token)
+            .header("Origin", "http://untrusted.test")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let init: serde_json::Value = client
+        .post(&pairing.url)
+        .bearer_auth(token)
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+    let table = engine
+        .list_tables()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|table| table.name == "items")
+        .unwrap();
+    let mut arguments = serde_json::json!({"table":"items","limit":100});
+    if let Some(schema) = table.schema {
+        arguments["schema"] = schema.into();
+    }
+    let request = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"dbx_read_rows","arguments":arguments}});
+    let read: serde_json::Value = client
+        .post(&pairing.url)
+        .bearer_auth(token)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(read["result"]["isError"], false, "{read}");
+    assert_eq!(
+        read["result"]["structuredContent"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        100
+    );
+    assert_eq!(read["result"]["structuredContent"]["truncated"], true);
+    let mut invalid = request.clone();
+    invalid["params"]["arguments"]["sql"] = "DROP TABLE items".into();
+    let denied: serde_json::Value = client
+        .post(&pairing.url)
+        .bearer_auth(token)
+        .header("MCP-Protocol-Version", "2025-11-25")
+        .json(&invalid)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(denied["error"]["code"], -32602);
+    let discover = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}});
+    let discovery: serde_json::Value = client
+        .post(&pairing.url)
+        .bearer_auth(token)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "server/discover")
+        .json(&discover)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "DBX"
+    );
+    assert!(!pairing.activity().join("\n").contains("hello"));
+    let url = pairing.url.clone();
+    drop(pairing);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let revoked = client.post(url).json(&request).send().await;
+    assert!(revoked.is_err() || revoked.unwrap().status() == reqwest::StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn dotted_identifiers_preserve_literal_components_through_browse_and_edits() {
+    let (_directory, engine) = database().await;
+    engine
+        .execute_sql(
+            "CREATE TABLE \"invoices.v2\" (\"id.key\" INTEGER PRIMARY KEY, \"amount.net\" TEXT)",
+        )
+        .await
+        .unwrap();
+    let table = TableRef::new("invoices.v2");
+    engine
+        .insert(&InsertRequest::from_row(
+            table.clone(),
+            vec![
+                ("id.key".into(), CellValue::Integer(1)),
+                ("amount.net".into(), CellValue::Text("original".into())),
+            ],
+        ))
+        .await
+        .unwrap();
+    let rows = engine
+        .query_table(
+            &table,
+            &["amount.net".into()],
+            &[],
+            &[],
+            None,
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0].values[0], CellValue::Text("original".into()));
+    let request = UpdateRequest::for_primary_key(
+        table.clone(),
+        vec![("amount.net".into(), CellValue::Text("updated".into()))],
+        vec![("id.key".into(), CellValue::Integer(1))],
+    );
+    engine
+        .update_checked(
+            &request,
+            &[("amount.net".into(), CellValue::Text("original".into()))],
+        )
+        .await
+        .unwrap();
+    let rows = engine
+        .query_table(
+            &table,
+            &["amount.net".into()],
+            &[],
+            &[],
+            None,
+            QueryOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0].values[0], CellValue::Text("updated".into()));
+    engine
+        .delete_checked(
+            &table,
+            &request.filters,
+            &[("amount.net".into(), CellValue::Text("updated".into()))],
+        )
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .query_table(&table, &[], &[], &[], None, QueryOptions::default())
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+}
+
+#[test]
+fn failed_export_preserves_the_previous_file_and_removes_partial_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("report.csv");
+    std::fs::write(&path, "previous complete report").unwrap();
+    let failure = atomic_export(&path, |output| {
+        output.write_all(b"partial new report").unwrap();
+        Err(DbxError::Io("injected write failure".into()))
+    });
+    assert!(failure.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "previous complete report"
+    );
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    write_atomic_export(&path, b"new complete report").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "new complete report"
+    );
+}
+
+#[tokio::test]
 async fn changed_and_deleted_rows_are_conflicts_without_overwriting_data() {
     let (_directory, engine) = database().await;
     engine
@@ -1109,4 +1419,352 @@ async fn rows_are_counted_with_filters() {
         1
     );
     assert_eq!(engine.estimate_rows(&table).await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable SQL Server integration database"]
+async fn sqlserver_sessions_and_changesets_are_isolated_and_atomic() -> Result<()> {
+    let config = ConnectionConfig::new(
+        DatabaseKind::SqlServer,
+        std::env::var("DBX_TEST_SQLSERVER_URL").expect("fixture URL required"),
+    );
+    let engine = Arc::new(DatabaseEngine::connect(config).await?);
+    let first = QuerySession::new(engine.clone());
+    let second = QuerySession::new(engine.clone());
+    let run = |session: Arc<QuerySession>, sql: &'static str| async move {
+        session
+            .run(
+                sql,
+                QueryOptions::default(),
+                Duration::from_secs(10),
+                QueryCancellation::default(),
+            )
+            .await
+    };
+    let first = Arc::new(first);
+    let second = Arc::new(second);
+    let one = run(first.clone(), "SELECT @@SPID").await?;
+    let two = run(second.clone(), "SELECT @@SPID").await?;
+    assert_ne!(
+        one.statements[0].result.rows[0].values,
+        two.statements[0].result.rows[0].values
+    );
+    let tx = run(first.clone(), "BEGIN; CREATE TABLE #dbx_private(id int)").await?;
+    assert!(tx.in_transaction, "{tx:?}");
+    let isolated = run(second, "SELECT @@TRANCOUNT").await?;
+    assert_eq!(
+        isolated.statements[0].result.rows[0].values[0],
+        CellValue::Integer(0)
+    );
+    let rolled_back = run(first, "ROLLBACK").await?;
+    assert!(!rolled_back.in_transaction);
+    engine
+        .execute_sql("IF OBJECT_ID('dbx_atomic_audit') IS NOT NULL DROP TABLE dbx_atomic_audit")
+        .await?;
+    engine
+        .execute_sql("CREATE TABLE dbx_atomic_audit(id int PRIMARY KEY, value nvarchar(100))")
+        .await?;
+    let table = TableRef::new("dbx_atomic_audit");
+    let changes = [
+        RowChange::Insert(InsertRequest::from_row(
+            table.clone(),
+            vec![
+                ("id".into(), CellValue::Integer(1)),
+                ("value".into(), CellValue::Text("first".into())),
+            ],
+        )),
+        RowChange::Insert(InsertRequest::from_row(
+            table.clone(),
+            vec![
+                ("id".into(), CellValue::Integer(1)),
+                ("value".into(), CellValue::Text("duplicate".into())),
+            ],
+        )),
+    ];
+    assert!(
+        engine
+            .apply_row_changes(
+                &changes,
+                Some((&table, &engine.describe_table(&table).await?))
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.count_rows(&table, &[], None).await?, 0);
+    engine.execute_sql("DROP TABLE dbx_atomic_audit").await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and installed pg_dump/pg_restore"]
+async fn native_postgres_backup_restores_objects_into_a_new_database() -> Result<()> {
+    let config = ConnectionConfig::new(
+        DatabaseKind::PostgreSQL,
+        std::env::var("DBX_TEST_POSTGRES_URL").expect("fixture URL required"),
+    );
+    let engine = DatabaseEngine::connect(config.clone()).await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let source = format!("dbx_backup_{suffix}");
+    let target = format!("dbx_restore_{suffix}");
+    engine
+        .execute_sql(&format!("CREATE DATABASE {source}"))
+        .await?;
+    engine
+        .execute_sql(&format!("CREATE DATABASE {target}"))
+        .await?;
+    let result = async {
+        let mut source_url = url::Url::parse(&config.url).unwrap();
+        source_url.set_path(&format!("/{source}"));
+        let mut source_config = config.clone();
+        source_config.url = source_url.into();
+        let source_engine = DatabaseEngine::connect(source_config.clone()).await?;
+        for sql in [
+            "CREATE TABLE parent(id serial PRIMARY KEY, name text UNIQUE CHECK(length(name)>0))",
+            "CREATE TABLE child(id int PRIMARY KEY, parent_id int REFERENCES parent(id))",
+            "INSERT INTO parent(name) VALUES('round trip')",
+            "INSERT INTO child VALUES(1,1)",
+            "CREATE VIEW names AS SELECT name FROM parent",
+            "CREATE FUNCTION dbx_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42'",
+        ] {
+            source_engine.execute_sql(sql).await?;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native.backup");
+        let control = TransferControl::default();
+        native_backup(source_config, &path, false, control.clone()).await?;
+        assert!(!control.log().contains("dbx_test_password"));
+        let mut target_url = url::Url::parse(&config.url).unwrap();
+        target_url.set_path(&format!("/{target}"));
+        let mut target_config = config.clone();
+        target_config.url = target_url.into();
+        native_backup(
+            target_config.clone(),
+            &path,
+            true,
+            TransferControl::default(),
+        )
+        .await?;
+        let target_engine = DatabaseEngine::connect(target_config).await?;
+        assert_eq!(
+            target_engine
+                .query("SELECT dbx_answer()", QueryOptions::default())
+                .await?
+                .rows[0]
+                .values[0],
+            CellValue::Integer(42)
+        );
+        assert_eq!(
+            target_engine
+                .count_rows(&TableRef::new("child"), &[], None)
+                .await?,
+            1
+        );
+        assert_eq!(
+            target_engine
+                .table_structure(&TableRef::new("child"))
+                .await?
+                .foreign_keys
+                .len(),
+            1
+        );
+        assert!(
+            target_engine
+                .query("SELECT name FROM names", QueryOptions::default())
+                .await?
+                .rows[0]
+                .values[0]
+                .to_string()
+                .contains("round trip")
+        );
+        Ok(())
+    }
+    .await;
+    let _ = engine
+        .execute_sql(&format!("DROP DATABASE {source} WITH (FORCE)"))
+        .await;
+    let _ = engine
+        .execute_sql(&format!("DROP DATABASE {target} WITH (FORCE)"))
+        .await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable MySQL and native client wrappers from test-integration.sh"]
+async fn native_mysql_backup_restores_objects_into_a_new_database() -> Result<()> {
+    let config = ConnectionConfig::new(
+        DatabaseKind::MySQL,
+        std::env::var("DBX_TEST_MYSQL_ADMIN_URL").expect("fixture admin URL required"),
+    );
+    let engine = DatabaseEngine::connect(config.clone()).await?;
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let source = format!("dbx_backup_{suffix}");
+    let target = format!("dbx_restore_{suffix}");
+    engine
+        .execute_sql(&format!("CREATE DATABASE {source}"))
+        .await?;
+    engine
+        .execute_sql(&format!("CREATE DATABASE {target}"))
+        .await?;
+    let result = async {
+        let mut source_url = url::Url::parse(&config.url).unwrap(); source_url.set_path(&format!("/{source}"));
+        let mut source_config = config.clone(); source_config.url = source_url.into();
+        let source_engine = DatabaseEngine::connect(source_config.clone()).await?;
+        for sql in ["CREATE TABLE parent(id int PRIMARY KEY, name varchar(40) UNIQUE CHECK(length(name)>0))", "CREATE TABLE child(id int PRIMARY KEY, parent_id int, FOREIGN KEY(parent_id) REFERENCES parent(id))", "INSERT INTO parent VALUES(1,'round trip')", "INSERT INTO child VALUES(1,1)", "CREATE VIEW names AS SELECT name FROM parent", "CREATE PROCEDURE dbx_answer() SELECT 42 AS answer", "CREATE TRIGGER child_guard BEFORE INSERT ON child FOR EACH ROW SET NEW.id = NEW.id"] { source_engine.execute_sql(sql).await?; }
+        let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("native.sql");
+        native_backup(source_config, &path, false, TransferControl::default()).await?;
+        let mut target_url = url::Url::parse(&config.url).unwrap(); target_url.set_path(&format!("/{target}"));
+        let mut target_config = config.clone(); target_config.url = target_url.into();
+        native_backup(target_config.clone(), &path, true, TransferControl::default()).await?;
+        let target_engine = DatabaseEngine::connect(target_config).await?;
+        assert_eq!(target_engine.query("CALL dbx_answer()", QueryOptions::default()).await?.rows[0].values[0].to_string(), "42");
+        assert_eq!(target_engine.count_rows(&TableRef::new("child"), &[], None).await?, 1);
+        assert_eq!(target_engine.table_structure(&TableRef::new("child")).await?.foreign_keys.len(), 1);
+        assert!(target_engine.query("SELECT name FROM names", QueryOptions::default()).await?.rows[0].values[0].to_string().contains("round trip"));
+        assert_eq!(target_engine.query("SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE()", QueryOptions::default()).await?.rows[0].values[0].to_string(), "1");
+        Ok(())
+    }.await;
+    let _ = engine.execute_sql(&format!("DROP DATABASE {source}")).await;
+    let _ = engine.execute_sql(&format!("DROP DATABASE {target}")).await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and MySQL"]
+async fn postgres_mysql_designer_roundtrip() -> Result<()> {
+    for (kind, variable) in [
+        (DatabaseKind::PostgreSQL, "DBX_TEST_POSTGRES_URL"),
+        (DatabaseKind::MySQL, "DBX_TEST_MYSQL_URL"),
+    ] {
+        let engine = Arc::new(
+            DatabaseEngine::connect(ConnectionConfig::new(
+                kind,
+                std::env::var(variable).unwrap(),
+            ))
+            .await?,
+        );
+        let parent = TableRef::new("designer.parent");
+        let child = TableRef::new("designer.child");
+        let parent_sql = dbx_core::quote_identifier(kind, &parent.name)?;
+        let child_sql = dbx_core::quote_identifier(kind, &child.name)?;
+        engine
+            .execute_sql(&format!("DROP TABLE IF EXISTS {child_sql}"))
+            .await?;
+        engine
+            .execute_sql(&format!("DROP TABLE IF EXISTS {parent_sql}"))
+            .await?;
+        engine
+            .execute_sql(&format!(
+                "CREATE TABLE {parent_sql}(id INTEGER PRIMARY KEY)"
+            ))
+            .await?;
+        engine
+            .execute_sql(&format!(
+                "CREATE TABLE {child_sql}(id INTEGER NOT NULL, parent_id INTEGER, qty INTEGER)"
+            ))
+            .await?;
+        let result: Result<()> = async {
+            for change in [
+                TableAlteration::AlterColumn {
+                    name: "qty".into(),
+                    data_type: "BIGINT".into(),
+                    nullable: false,
+                    default: Some("2".into()),
+                },
+                TableAlteration::AddPrimaryKey {
+                    name: "designer_pk".into(),
+                    columns: vec!["id".into()],
+                },
+                TableAlteration::AddForeignKey {
+                    name: "designer_fk".into(),
+                    columns: vec!["parent_id".into()],
+                    referenced_table: parent.clone(),
+                    referenced_columns: vec!["id".into()],
+                },
+                TableAlteration::AddCheck {
+                    name: "designer_check".into(),
+                    expression: "qty >= 0".into(),
+                },
+            ] {
+                let sql = draft_table_alteration_for(&engine, &child, &change).await?;
+                let run = QuerySession::new(engine.clone())
+                    .run(
+                        &sql,
+                        QueryOptions::default(),
+                        Duration::from_secs(10),
+                        QueryCancellation::default(),
+                    )
+                    .await?;
+                assert!(
+                    run.statements
+                        .iter()
+                        .all(|statement| statement.error.is_none()),
+                    "{kind}: {:?}",
+                    run.statements
+                        .iter()
+                        .filter_map(|statement| statement.error.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            if kind == DatabaseKind::MySQL {
+                engine.execute_sql(&format!("ALTER TABLE {child_sql} MODIFY id INTEGER NOT NULL AUTO_INCREMENT")).await?;
+                let sql = draft_table_alteration_for(&engine, &child, &TableAlteration::AlterColumn { name: "id".into(), data_type: "BIGINT".into(), nullable: false, default: None }).await?;
+                assert!(sql.contains("AUTO_INCREMENT")); engine.execute_sql(&sql).await?;
+                engine.execute_sql(&format!("ALTER TABLE {child_sql} ADD label VARCHAR(40) COLLATE utf8mb4_bin COMMENT 'existing comment'")).await?;
+                let sql = draft_table_alteration_for(&engine, &child, &TableAlteration::AlterColumn { name: "label".into(), data_type: "VARCHAR(80)".into(), nullable: true, default: None }).await?;
+                assert!(sql.contains("COLLATE `utf8mb4_bin`")); assert!(sql.contains("COMMENT 'existing comment'")); engine.execute_sql(&sql).await?;
+                engine.execute_sql(&format!("ALTER TABLE {child_sql} ADD computed BIGINT GENERATED ALWAYS AS (qty*2) STORED")).await?;
+                assert!(draft_table_alteration_for(&engine, &child, &TableAlteration::AlterColumn { name: "computed".into(), data_type: "BIGINT".into(), nullable: true, default: None }).await.is_err());
+            }
+            let structure = engine.table_structure(&child).await?;
+            assert_eq!(structure.foreign_keys.len(), 1);
+            assert_eq!(structure.checks.len(), 1);
+            assert!(
+                structure
+                    .columns
+                    .iter()
+                    .find(|column| column.name == "id")
+                    .unwrap()
+                    .primary_key
+            );
+            let qty = structure
+                .columns
+                .iter()
+                .find(|column| column.name == "qty")
+                .unwrap();
+            assert!(!qty.nullable);
+            assert!(qty.default_value.is_some());
+            engine
+                .execute_sql(&format!("INSERT INTO {parent_sql} VALUES(1)"))
+                .await?;
+            engine
+                .execute_sql(&format!(
+                    "INSERT INTO {child_sql}(id,parent_id) VALUES(1,1)"
+                ))
+                .await?;
+            assert!(
+                engine
+                    .execute_sql(&format!("INSERT INTO {child_sql}(id,parent_id,qty) VALUES(2,1,-1)"))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .execute_sql(&format!("INSERT INTO {child_sql}(id,parent_id,qty) VALUES(2,999,2)"))
+                    .await
+                    .is_err()
+            );
+            Ok(())
+        }
+        .await;
+        let _ = engine.drop_table(&child).await;
+        let _ = engine.drop_table(&parent).await;
+        result?;
+    }
+    Ok(())
 }

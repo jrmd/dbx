@@ -930,3 +930,55 @@ fn integer_value(value: &CellValue) -> i64 {
         other => panic!("expected integer cell value, got {other:?}"),
     }
 }
+
+#[tokio::test]
+#[ignore = "run scripts/test-transports.py for disposable TLS servers and SSH"]
+async fn strict_tls_over_ssh_integration() -> Result<()> {
+    let root = std::path::PathBuf::from(
+        std::env::var("DBX_TEST_TRANSPORT_DIRECTORY").expect("transport fixture required"),
+    );
+    let ssh = dbx_core::SshConfig {
+        host: "127.0.0.1".into(),
+        port: std::env::var("DBX_TEST_SSH_PORT").unwrap().parse().unwrap(),
+        username: std::env::var("DBX_TEST_SSH_USER").unwrap(),
+        identity_file: Some(root.join("identity")),
+        jump_host: None,
+    };
+    for (kind, variable, mode, ca_key) in [
+        (
+            DatabaseKind::PostgreSQL,
+            "POSTGRES",
+            "verify-full",
+            "sslrootcert",
+        ),
+        (DatabaseKind::MySQL, "MYSQL", "verify_identity", "ssl-ca"),
+    ] {
+        let port = std::env::var(format!("DBX_TEST_TRANSPORT_{variable}_PORT")).unwrap();
+        for (host, certificate, should_connect) in [
+            ("localhost", "server.crt", true),
+            ("127.0.0.1", "server.crt", false),
+            ("localhost", "untrusted.crt", false),
+        ] {
+            let mut url = url::Url::parse(&format!(
+                "{}://dbx_test:dbx_test_password@{host}:{port}/dbx_test",
+                kind.scheme()
+            ))
+            .unwrap();
+            url.query_pairs_mut()
+                .append_pair("sslmode", mode)
+                .append_pair(ca_key, root.join(certificate).to_str().unwrap());
+            let mut config = ConnectionConfig::new(kind, url.to_string());
+            config.ssh = Some(ssh.clone());
+            let result = DatabaseEngine::connect(config).await;
+            if should_connect {
+                result?.query("SELECT 42", QueryOptions::default()).await?;
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{kind} must reject wrong identity or CA over SSH"
+                );
+            }
+        }
+    }
+    Ok(())
+}

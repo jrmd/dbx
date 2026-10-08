@@ -109,7 +109,7 @@ The connection form validates the engine-specific fields before attempting a con
 
 Opening a table creates a data-grid model with a stable row identity (primary key where available; an engine-specific fallback otherwise). The grid requests a bounded page and renders only visible rows. A filter builder produces `FilterExpr`; the UI shows the active predicates and offers a SQL/parameter preview. Applying a filter replaces the page request and resets the cursor.
 
-For tables without a primary key, DBX should warn that updates/deletes may be unsafe or unavailable. An offset page is convenient for the MVP but can become slow or unstable on changing tables; connectors should advertise keyset support for a future upgrade.
+For tables without a primary key, DBX should warn that updates/deletes may be unsafe or unavailable. Single-primary-key ascending browsing uses keyset continuation. Composite keys and other sorts use OFFSET and may become slower or less stable as data changes. Connector capabilities are exposed before workflows begin.
 
 ### Edit rows
 

@@ -517,6 +517,9 @@ impl DbxApp {
                 .into_any_element();
         }
 
+        let recovered = self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some());
         let summary = [
             (counts.edited, "edited"),
             (counts.inserted, "new"),
@@ -625,12 +628,13 @@ impl DbxApp {
                         .border_b_1()
                         .border_color(theme().border)
                         .bg(theme().panel)
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme().text)
-                                .child(summary),
-                        )
+                        .child(div().text_size(px(11.)).text_color(theme().text).child(
+                            if recovered {
+                                format!("Recovered draft · {summary} · review required")
+                            } else {
+                                summary
+                            },
+                        ))
                         .child(
                             div()
                                 .flex()

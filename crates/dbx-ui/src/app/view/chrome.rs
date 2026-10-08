@@ -560,6 +560,7 @@ impl DbxApp {
                                         let open_diagram = explorer_actions.clone();
                                         let export_database = explorer_actions.clone();
                                         let import_database = explorer_actions.clone();
+                                        let mcp_active = self.session(session_id).is_some_and(|session| session.mcp_pairing.is_some());
                                         view.child(
                                             Button::new("create-table")
                                                 .with_size(Size::XSmall)
@@ -583,7 +584,13 @@ impl DbxApp {
                                                 .tooltip("Explorer actions")
                                                 .child(icon(Icon::More, theme().text_muted))
                                                 .dropdown_menu(move |menu, _, _| {
+                                                    let backup = export_database.clone();
+                                                    let restore = export_database.clone();
+                                                    let log = export_database.clone();
                                                     let open_diagram = open_diagram.clone();
+                                                    let mcp_toggle = export_database.clone();
+                                                    let mcp_copy = export_database.clone();
+                                                    let mcp_log = export_database.clone();
                                                     let export_database = export_database.clone();
                                                     let import_database = import_database.clone();
                                                     menu.item(
@@ -599,6 +606,46 @@ impl DbxApp {
                                                                 );
                                                             }),
                                                     )
+                                                    .item(
+                                                        PopupMenuItem::new("Native backup…")
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = backup.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        this.choose_native_backup(
+                                                                            session_id, false, cx,
+                                                                        )
+                                                                    },
+                                                                );
+                                                            }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new(
+                                                            "Restore native backup…",
+                                                        )
+                                                        .on_click(move |_, _, cx| {
+                                                            let _ =
+                                                                restore.update(cx, |this, cx| {
+                                                                    this.choose_native_backup(
+                                                                        session_id, true, cx,
+                                                                    )
+                                                                });
+                                                        }),
+                                                    )
+                                                    .item(
+                                                        PopupMenuItem::new("View native job log")
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ =
+                                                                    log.update(cx, |this, cx| {
+                                                                        this.show_transfer_log(
+                                                                            session_id, window, cx,
+                                                                        )
+                                                                    });
+                                                            }),
+                                                    )
+                                                    .item(PopupMenuItem::new(if mcp_active { "Stop MCP sharing" } else { "Share this database read-only via MCP" }).on_click(move |_, _, cx| { let _ = mcp_toggle.update(cx, |this, cx| this.toggle_mcp(session_id, cx)); }))
+                                                    .item(PopupMenuItem::new("Copy private MCP pairing configuration").disabled(!mcp_active).on_click(move |_, _, cx| { let _ = mcp_copy.update(cx, |this, cx| this.copy_mcp_pairing(session_id, cx)); }))
+                                                    .item(PopupMenuItem::new("View MCP activity").disabled(!mcp_active).on_click(move |_, window, cx| { let _ = mcp_log.update(cx, |this, cx| this.show_mcp_activity(session_id, window, cx)); }))
                                                     .separator()
                                                     .item(
                                                         PopupMenuItem::new("Export database…")

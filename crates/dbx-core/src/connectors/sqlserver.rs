@@ -1,5 +1,5 @@
-//! Microsoft SQL Server over TDS. One connection per engine keeps `USE` and
-//! session settings consistent; it reconnects after a transport failure.
+//! Microsoft SQL Server over TDS. Metadata and each query document own
+//! separate clients. Query documents discard failed transports without replay.
 use crate::{
     CellValue, CheckConstraintInfo, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError, Engine,
     EntityKind, ForeignKeyInfo, IndexInfo, QueryOptions, QueryResult, ReferentialAction, Result,
@@ -28,6 +28,7 @@ pub(super) struct SqlServerEngine {
     client: Mutex<Option<SqlServerClient>>,
     connect_timeout: Duration,
     read_only: bool,
+    isolated: bool,
 }
 
 fn invalid(message: &str) -> DbxError {
@@ -266,6 +267,7 @@ impl SqlServerEngine {
             client: Mutex::new(None),
             connect_timeout: Duration::from_millis(config.connect_timeout_ms),
             read_only: config.read_only,
+            isolated: false,
         };
         // Fail Test Connection and Connect on bad credentials immediately.
         engine.query("SELECT 1", QueryOptions::default()).await?;
@@ -312,6 +314,11 @@ impl SqlServerEngine {
             .is_ok_and(|result| result.is_ok());
             if !healthy {
                 guard.take();
+                if self.isolated {
+                    return Err(DbxError::Connection(
+                        "SQL Server query session connection was lost".into(),
+                    ));
+                }
             }
         }
         if guard.is_none() {
@@ -642,6 +649,18 @@ impl Engine for SqlServerEngine {
             checks,
             definition,
         })
+    }
+
+    async fn open_query_session(&self) -> Result<Option<Box<dyn Engine>>> {
+        let engine = Self {
+            config: Mutex::new(self.config.lock().await.clone()),
+            client: Mutex::new(None),
+            connect_timeout: self.connect_timeout,
+            read_only: self.read_only,
+            isolated: true,
+        };
+        *engine.client.lock().await = Some(engine.open().await?);
+        Ok(Some(Box::new(engine)))
     }
 
     async fn query(&self, sql: &str, options: QueryOptions) -> Result<QueryResult> {

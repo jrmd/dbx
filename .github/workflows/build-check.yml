@@ -34,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15]
+        os: [ubuntu-22.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
@@ -52,3 +52,29 @@ jobs:
           cargo clippy --locked --release --workspace --all-targets -- -D warnings
           python3 scripts/test-macos-release.py
           cargo build --locked --release --package dbx-ui
+      - name: Measure disposable workbench workload
+        run: cargo run --locked --release -p dbx-core --example workbench_perf -- workbench-perf.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workbench-perf-${{ runner.os }}-${{ runner.arch }}
+          path: workbench-perf.json
+          if-no-files-found: ignore
+
+  site:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Validate public site
+        working-directory: site
+        run: |
+          npm install --global pnpm@11.22.0
+          pnpm install --frozen-lockfile
+          pnpm lint
+          pnpm build

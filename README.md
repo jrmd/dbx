@@ -120,9 +120,11 @@ or changed host keys and binds forwarding only on loopback. This follows
 The database host/port are interpreted from the SSH server. Enabling both socket
 and SSH modes forwards to a socket on that server. Test Connection, Connect,
 and saved profiles use the same settings; the tunnel closes when its engine is
-released. TLS options are retained. The current SQL drivers cannot preserve TLS
-hostname verification through loopback forwarding, so DBX rejects `verify-full`
-and MySQL `verify_identity` in SSH mode; use a direct connection for those modes.
+released. TLS options are retained. On Unix, strict PostgreSQL/MySQL TLS over SSH
+uses a local socket for forwarding while preserving the original server name for
+certificate verification. Native PostgreSQL tools use libpq host/hostaddr separation.
+Certificates and trusted SSH host keys are still required. See the
+[task guide](docs/user-guide.md) and [capability matrix](docs/capability-matrix.md).
 
 The [release workflow](.github/workflows/release.yml) runs on `vVERSION` tags
 matching the workspace version. It builds Linux x86_64 on Ubuntu 22.04 and signed,
@@ -245,3 +247,7 @@ DBX is a client, not a database privilege boundary. GUI filters and row changes 
 Browsing is paged and bounded; grid virtualization does not imply loading an entire database. Table creation starts from an engine-aware SQL template. Redis mutations use the command console. Migration/schema-diff workflows, server monitoring, and formal audit logs remain outside the current scope.
 
 Never commit real connection strings, passwords, private keys, or local database files. Contributions should preserve native responsiveness and parameterized operations, with connector-level coverage for engine-specific changes.
+
+## Daily workflows
+
+Start with the [user guide](docs/user-guide.md), [connector capability matrix](docs/capability-matrix.md), and [local MCP guide](docs/local-mcp.md). [Unreleased changes](CHANGELOG.md) and [gap verification](docs/gap-fix-verification-2026-10-08.md) distinguish implementation checks from released behavior and device/cloud acceptance.

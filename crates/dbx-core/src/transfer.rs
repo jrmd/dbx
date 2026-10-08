@@ -33,8 +33,37 @@ pub struct TransferControl {
     cancellation: crate::QueryCancellation,
     rows: Arc<AtomicU64>,
     statements: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    log: Arc<std::sync::Mutex<String>>,
 }
 impl TransferControl {
+    pub(crate) async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+    pub(crate) fn set_bytes(&self, bytes: u64) {
+        self.bytes.store(bytes, Ordering::Relaxed);
+    }
+    pub fn byte_progress(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    pub fn log(&self) -> String {
+        self.log
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+    pub(crate) fn add_log(&self, text: &str) {
+        let mut log = self.log.lock().unwrap_or_else(|error| error.into_inner());
+        log.push_str(text);
+        log.push('\n');
+        if log.len() > 64 * 1024 {
+            let mut start = log.len() - 64 * 1024;
+            while !log.is_char_boundary(start) {
+                start += 1;
+            }
+            log.drain(..start);
+        }
+    }
     pub fn cancel(&self) {
         self.cancellation.cancel();
     }
@@ -58,7 +87,7 @@ pub async fn with_transfer_control<T>(
         }
     }).await
 }
-fn report_transfer(rows: u64, statements: u64) {
+pub(crate) fn report_transfer(rows: u64, statements: u64) {
     let _ = TRANSFER_CONTROL.try_with(|control| {
         control.rows.fetch_add(rows, Ordering::Relaxed);
         control.statements.fetch_add(statements, Ordering::Relaxed);
@@ -68,7 +97,7 @@ use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
 use crate::{
     CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Filter, MutationValue, Page,
-    QueryOptions, Result, RowChange, TableRef, TableStructure,
+    QueryOptions, Result, RowChange, RowData, TableRef, TableStructure,
     sql::{build_multi_row_insert_with_columns, quote_identifier, quote_table},
 };
 
@@ -159,6 +188,104 @@ pub struct ExportSummary {
     pub consistent_snapshot: bool,
 }
 
+/// Streaming query export executes exactly one read statement on a fresh snapshot.
+/// It never resumes or executes an editor's pending transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryExportFormat {
+    Csv,
+    Tsv,
+    JsonLines,
+}
+
+pub async fn export_query(
+    engine: &DatabaseEngine,
+    sql: &str,
+    path: &Path,
+    format: QueryExportFormat,
+) -> Result<u64> {
+    let statements = checked_split_sql_for(Some(engine.kind()), sql)?;
+    if statements.len() != 1 {
+        return Err(DbxError::Query(
+            "Full query export requires exactly one read statement".into(),
+        ));
+    }
+    crate::protected::ensure_query(engine.kind(), &statements[0])?;
+    let operation =
+        crate::sqlx_engine::top_level_operation_keyword(&statements[0]).unwrap_or_default();
+    if ![
+        "SELECT", "VALUES", "TABLE", "SHOW", "DESCRIBE", "DESC", "EXPLAIN",
+    ]
+    .contains(&operation.to_ascii_uppercase().as_str())
+    {
+        return Err(DbxError::Query(
+            "Full query export accepts read statements only".into(),
+        ));
+    }
+    let mut transaction = SqlTransaction::begin(engine, true).await?;
+    let mut output = ExportFile::new(path, false)?;
+    let rows = transaction
+        .stream_rows(&statements[0], |columns, values| {
+            match (format, values) {
+                (QueryExportFormat::Csv | QueryExportFormat::Tsv, None) => {
+                    let delimiter = if format == QueryExportFormat::Csv {
+                        ','
+                    } else {
+                        '\t'
+                    };
+                    let header = columns
+                        .iter()
+                        .map(|column| delimited_text(&column.name, delimiter))
+                        .collect::<Vec<_>>()
+                        .join(&delimiter.to_string());
+                    writeln!(output, "{header}").map_err(io_error)?;
+                }
+                (QueryExportFormat::Csv | QueryExportFormat::Tsv, Some(values)) => {
+                    let delimiter = if format == QueryExportFormat::Csv {
+                        ','
+                    } else {
+                        '\t'
+                    };
+                    let fields = values
+                        .iter()
+                        .map(|value| match value {
+                            CellValue::Null => String::new(),
+                            _ => delimited_text(&value.to_string(), delimiter),
+                        })
+                        .collect::<Vec<_>>();
+                    writeln!(output, "{}", fields.join(&delimiter.to_string()))
+                        .map_err(io_error)?;
+                    report_transfer(1, 0);
+                }
+                (QueryExportFormat::JsonLines, Some(values)) => {
+                    // An array retains duplicate column names and exact typed CellValues.
+                    serde_json::to_writer(&mut output, &RowData::new(values))
+                        .map_err(|error| DbxError::Io(error.to_string()))?;
+                    writeln!(output).map_err(io_error)?;
+                    report_transfer(1, 0);
+                }
+                (QueryExportFormat::JsonLines, None) => {
+                    serde_json::to_writer(&mut output, &serde_json::json!({"columns": columns}))
+                        .map_err(|error| DbxError::Io(error.to_string()))?;
+                    writeln!(output).map_err(io_error)?;
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    transaction.commit().await?;
+    output.finish()?;
+    report_transfer(0, 1);
+    Ok(rows)
+}
+
+fn delimited_text(value: &str, delimiter: char) -> String {
+    if value.is_empty() || value.contains([delimiter, '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.into()
+    }
+}
+
 /// A connection-level export request.
 ///
 /// SQL exports are written as one file. CSV and TSV exports write one file per
@@ -246,6 +373,18 @@ impl Write for ExportFile {
             ExportWriter::Gzip(writer) => writer.flush(),
         }
     }
+}
+
+/// Commit an export only after its writer succeeds and its bytes are durable.
+/// Failures leave an existing destination untouched, including partial writes.
+pub fn atomic_export(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<()>) -> Result<()> {
+    let mut output = ExportFile::new(path, false)?;
+    write(&mut output)?;
+    output.finish()
+}
+
+pub fn write_atomic_export(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_export(path, |output| output.write_all(bytes).map_err(io_error))
 }
 
 struct ExportReader<'a> {
@@ -1875,7 +2014,10 @@ async fn import_delimited(
     })
 }
 
-async fn mysql_table_transactional(engine: &DatabaseEngine, table: &TableRef) -> Result<bool> {
+pub(crate) async fn mysql_table_transactional(
+    engine: &DatabaseEngine,
+    table: &TableRef,
+) -> Result<bool> {
     let sql = if table.schema.is_some() {
         "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?"
     } else {

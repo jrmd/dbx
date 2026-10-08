@@ -5,12 +5,16 @@
 //! manager) and exposes database-agnostic metadata, query, and mutation
 //! operations for the GPUI client.
 
+mod native_backup;
+pub use native_backup::{native_backup, native_tool_version};
+mod capabilities;
+pub use capabilities::Capabilities;
 mod cloud_auth;
 pub use cloud_auth::{CloudAuthentication, cloud_database_password};
 mod schema_objects;
 pub use model::{SchemaObject, SchemaObjectKind};
 mod designer;
-pub use designer::{TableAlteration, draft_table_alteration};
+pub use designer::{TableAlteration, draft_table_alteration, draft_table_alteration_for};
 mod connectors;
 mod console;
 mod diagnostics;
@@ -53,9 +57,10 @@ pub use sqlx_engine::SqlxEngine;
 pub use transfer::checked_split_sql_for;
 pub use transfer::{
     DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
-    FileFormat, ImportReport, TransferControl, detect_file_format, export_database, export_table,
-    import_database, import_file, render_row_change, render_sql_indexes, render_sql_insert,
-    render_sql_schema, split_sql_statements, with_transfer_control,
+    FileFormat, ImportReport, QueryExportFormat, TransferControl, atomic_export,
+    detect_file_format, export_database, export_query, export_table, import_database, import_file,
+    render_row_change, render_sql_indexes, render_sql_insert, render_sql_schema,
+    split_sql_statements, with_transfer_control, write_atomic_export,
 };
 
 #[cfg(test)]
@@ -1148,3 +1153,7 @@ mod tests {
         );
     }
 }
+
+pub mod data_import;
+
+pub mod mcp;

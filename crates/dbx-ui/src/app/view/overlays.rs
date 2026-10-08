@@ -767,6 +767,35 @@ impl DbxApp {
                                     }
                                 })),
                         )
+                        .children(
+                            [
+                                (0u8, "Capture table for cross-connection copy"),
+                                (1, "Append captured data…"),
+                                (2, "Compare with captured data…"),
+                            ]
+                            .into_iter()
+                            .map(|(action, label)| {
+                                let table = menu.table.clone();
+                                div()
+                                    .id(("context-data-copy", action as usize))
+                                    .px(px(8.))
+                                    .py(px(7.))
+                                    .rounded(px(5.))
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(theme().accent_soft))
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.table_context_menu = None;
+                                        this.copy_or_compare_table(
+                                            session_id,
+                                            table.clone(),
+                                            action,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            }),
+                        )
                         .child(div().my(px(4.)).border_t_1().border_color(theme().border))
                         .child(
                             div()

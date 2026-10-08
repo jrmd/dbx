@@ -159,6 +159,87 @@ impl DbxApp {
         .detach();
     }
 
+    pub(super) fn refresh_open_structures_for(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        let Some(engine) = session.engine.clone() else {
+            return;
+        };
+        let expected_database = session.current_database.clone();
+        let structures = session
+            .secondary_tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                SecondaryTabKind::Structure(structure) => Some((tab.id, structure.table.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (id, table) in structures {
+            let engine = engine.clone();
+            let expected_engine = engine.clone();
+            let database = expected_database.clone();
+            if let Some(session) = self.session_mut(session_id)
+                && let Some(tab) = session.secondary_tabs.iter_mut().find(|tab| tab.id == id)
+                && let SecondaryTabKind::Structure(structure) = &mut tab.kind
+            {
+                structure.busy = true;
+            }
+            let task = self
+                .runtime
+                .spawn(async move { engine.table_structure(&table).await });
+            if let Some(session) = self.session_mut(session_id) {
+                session.track_background_task(&task);
+            }
+            cx.spawn(async move |this, cx| {
+                let result = task.await?;
+                this.update(cx, |this, cx| {
+                    let Some(session) = this.session_mut(session_id) else {
+                        return;
+                    };
+                    if session.current_database != database
+                        || !session
+                            .engine
+                            .as_ref()
+                            .is_some_and(|engine| Arc::ptr_eq(engine, &expected_engine))
+                    {
+                        return;
+                    }
+                    let Some(tab) = session.secondary_tabs.iter_mut().find(|tab| tab.id == id)
+                    else {
+                        return;
+                    };
+                    let SecondaryTabKind::Structure(structure) = &mut tab.kind else {
+                        return;
+                    };
+                    structure.busy = false;
+                    match result {
+                        Ok(metadata) => {
+                            structure.columns = metadata.columns;
+                            structure.foreign_keys = metadata.foreign_keys;
+                            structure.indexes = metadata.indexes;
+                            structure.checks = metadata.checks;
+                            structure.definition = metadata.definition;
+                            structure.error = None;
+                        }
+                        Err(error) => {
+                            structure.error = Some(format!(
+                                "Structure refresh failed; displayed metadata may be stale: {error}"
+                            ));
+                        }
+                    }
+                    cx.notify();
+                })?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
+        }
+    }
+
     /// Open the one relationship diagram for this connection, or return to it
     /// when it is already open. Redis deliberately has no relational surface.
     pub(super) fn open_diagram_for(

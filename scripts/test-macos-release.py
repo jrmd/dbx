@@ -13,7 +13,7 @@ import json,os,pathlib,sys
 name=pathlib.Path(sys.argv[0]).name
 args=sys.argv[1:]
 with open(os.environ['CALL_LOG'],'a') as log: log.write(name+' '+ ' '.join(args)+'\\n')
-if name=='uname': print('Darwin' if args==['-s'] else 'arm64')
+if name=='uname': print('Darwin' if args==['-s'] else os.environ.get('FIXTURE_ARCH','arm64'))
 elif name=='openssl': print('fixture-keychain-password')
 elif name=='security':
  if args[0]=='create-keychain': pathlib.Path(args[-1]).touch()
@@ -73,6 +73,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertLess(calls.index("spctl --assess"), calls.rindex("ditto"))
         self.assertIn("security delete-keychain", calls)
         self.assertFalse(list(self.root.glob("dbx-release.*")))
+
+    def test_intel_archive_uses_its_own_asset_name(self):
+        self.environment["FIXTURE_ARCH"] = "x86_64"
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([p.name for p in self.archives()], ["DBX-0.1.0-macos-x86_64.zip"])
 
     def test_rejected_notarization_produces_no_download(self):
         self.environment["NOTARY_STATUS"] = "Invalid"
