@@ -120,6 +120,7 @@ impl DbxApp {
     fn connection_fields(&self, cx: &App) -> ConnectionFields {
         let mut fields = ConnectionFields::new(self.draft.kind);
         fields.read_only = self.draft.read_only;
+        fields.cloud_auth = self.draft.cloud_auth;
         fields.host = self.draft.host.read(cx).clone();
         fields.port = self.draft.port.read(cx).clone();
         fields.username = self.draft.username.read(cx).clone();
@@ -201,44 +202,12 @@ impl DbxApp {
         provider: dbx_core::CloudAuthentication,
         cx: &mut Context<Self>,
     ) {
-        let config = match self.connection_fields(cx).config() {
-            Ok(config) => config,
-            Err(error) => {
-                self.show_toast(ToastKind::Error, error, cx);
-                return;
-            }
-        };
-        let requested = self.connection_fields(cx);
-        let runtime = self.runtime.clone();
-        let task = runtime
-            .spawn(async move { dbx_core::cloud_database_password(&config, provider).await });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                if this.vault_state != Some(VaultState::Unlocked)
-                    || this.connection_fields(cx) != requested
-                {
-                    return;
-                }
-                match result {
-                    Ok(Ok(token)) => {
-                        this.draft.password.update(cx, |password, cx| {
-                            password.zeroize();
-                            *password = token;
-                            cx.notify();
-                        });
-                        this.show_toast(
-                            ToastKind::Success,
-                            "Cloud token ready. Connect now; fetch a new token after it expires.",
-                            cx,
-                        );
-                    }
-                    Ok(Err(error)) => this.show_toast(ToastKind::Error, error.to_string(), cx),
-                    Err(_) => this.show_toast(ToastKind::Error, "Cloud token request failed", cx),
-                }
-            });
-        })
-        .detach();
+        self.draft.cloud_auth = Some(provider);
+        self.draft.password.update(cx, |password, cx| {
+            password.zeroize();
+            cx.notify();
+        });
+        self.show_toast(ToastKind::Info, "Cloud authentication selected. DBX obtains a fresh token on connect and refreshes credentials before new sessions. Save to keep this choice.", cx);
     }
 
     fn clear_vault_inputs(&mut self, cx: &mut Context<Self>) {
@@ -433,6 +402,10 @@ impl DbxApp {
         if self.vault_state != Some(VaultState::Unlocked)
             || self.vault_busy
             || self.saving_connection
+            || self
+                .profile_transfer_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.busy)
         {
             return;
         }
@@ -461,7 +434,12 @@ impl DbxApp {
     }
 
     pub(super) fn lock_vault(&mut self, cx: &mut Context<Self>) {
-        if self.saving_connection {
+        if self.saving_connection
+            || self
+                .profile_transfer_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.busy)
+        {
             return;
         }
         let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
@@ -482,6 +460,9 @@ impl DbxApp {
         }
         self.table_context_menu = None;
         self.database_export_dialog = None;
+        self.profile_transfer_dialog = None;
+        self.data_import_dialog = None;
+        self.copied_table_data = None;
         self.confirmation_dialog = None;
         self.mutation_error_dialog = None;
         self.settings_open = false;
@@ -611,6 +592,7 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
         self.hydrate_connection_fields(kind, Self::default_url(kind).to_owned(), cx);
         self.error = None;
@@ -636,6 +618,7 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
         self.hydrate_connection_fields(kind, url.trim().to_owned(), cx);
         self.error = None;
@@ -788,6 +771,7 @@ impl DbxApp {
         });
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
         self.draft.read_only = profile.read_only;
+        self.draft.cloud_auth = profile.cloud_auth;
         self.hydrate_transport(profile.socket, profile.ssh, cx);
         self.error = None;
         if has_saved_password {
@@ -1006,6 +990,114 @@ impl DbxApp {
         .detach();
     }
 
+    pub(super) fn request_delete_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.draft.selected_profile else {
+            return;
+        };
+        if self
+            .sessions
+            .iter()
+            .any(|session| session.profile_id == Some(id))
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Close this profile’s open connections before deleting it",
+                cx,
+            );
+            return;
+        }
+        let name = self
+            .saved_connections
+            .iter()
+            .find(|profile| profile.id == id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default();
+        let focus = cx.focus_handle();
+        let return_focus = window.focused(cx);
+        focus.focus(window, cx);
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: format!("Delete “{name}”?"),
+            detail: "Remove the saved connection and its credentials from the vault. Database data is unaffected.".into(),
+            confirm_label: "Delete connection", tone: ConfirmationTone::Danger,
+            action: ConfirmationAction::DeleteProfile { id }, focus, return_focus, sql: None,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn duplicate_profile(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.draft.selected_profile {
+            self.change_saved_profile(id, false, cx);
+        }
+    }
+
+    pub(super) fn change_saved_profile(
+        &mut self,
+        id: uuid::Uuid,
+        delete: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.saving_connection || self.vault_busy || self.credential_hydrating {
+            return;
+        }
+        if delete
+            && self
+                .sessions
+                .iter()
+                .any(|session| session.profile_id == Some(id))
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Close this profile’s open connections before deleting it",
+                cx,
+            );
+            return;
+        }
+        let Some(store) = self.profile_store.clone() else {
+            return;
+        };
+        self.saving_connection = true;
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn_blocking(move || {
+                    let profile = if delete {
+                        store.delete(id)?;
+                        None
+                    } else {
+                        Some(store.duplicate(id)?)
+                    };
+                    Ok::<_, crate::profiles::ProfileError>((profile, store.list()?))
+                })
+                .await?;
+            this.update(cx, |this, cx| {
+                this.saving_connection = false;
+                match result {
+                    Ok((profile, profiles)) => {
+                        this.saved_connections = profiles;
+                        if let Some(profile) = profile {
+                            this.select_saved_connection(profile, cx);
+                        } else if this.draft.selected_profile == Some(id) {
+                            this.begin_new_connection(cx);
+                        }
+                        this.show_toast(
+                            ToastKind::Success,
+                            if delete {
+                                "Deleted connection"
+                            } else {
+                                "Duplicated connection"
+                            },
+                            cx,
+                        );
+                    }
+                    Err(error) => this.set_error(error.to_string()),
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     pub(super) fn choose_ssh_key(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -1083,6 +1175,51 @@ impl DbxApp {
         self.credential_connect_window = None;
     }
 
+    pub(super) fn create_demo_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vault_state != Some(VaultState::Unlocked) || self.saving_connection {
+            return;
+        }
+        let Some(store) = self.profile_store.clone() else {
+            return;
+        };
+        let Some(directory) = dirs::data_local_dir() else {
+            self.set_error("Application data directory unavailable".into());
+            return;
+        };
+        self.saving_connection = true;
+        let task = self.runtime.spawn(async move {
+            let directory = directory.join("dbx/demos");
+            std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+            let path = directory.join(format!("{}.sqlite", Uuid::new_v4()));
+            let config = ConnectionConfig::new(DatabaseKind::SQLite, format!("sqlite://{}?mode=rwc", path.display()));
+            let engine = DatabaseEngine::connect(config.clone()).await.map_err(|e| e.to_string())?;
+            engine.execute_sql("CREATE TABLE teams(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)").await.map_err(|e| e.to_string())?;
+            engine.execute_sql("CREATE TABLE projects(id INTEGER PRIMARY KEY, team_id INTEGER REFERENCES teams(id), name TEXT NOT NULL, budget NUMERIC, launched_at TEXT, notes TEXT)").await.map_err(|e| e.to_string())?;
+            engine.execute_sql("INSERT INTO teams VALUES(1,'Platform'),(2,'Product'),(3,'Operations')").await.map_err(|e| e.to_string())?;
+            engine.execute_sql("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<250) INSERT INTO projects SELECT x, 1+(x%3), 'Project ' || x, x*12.5, '2026-10-08', CASE WHEN x%5=0 THEN NULL ELSE 'Editable demo data' END FROM n").await.map_err(|e| e.to_string())?;
+            drop(engine);
+            store.save(ConnectionProfileDraft::from_config("DBX demo", config)).map_err(|e| e.to_string())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.saving_connection = false;
+                match result {
+                    Ok(profile) => {
+                        if let Some(store) = &this.profile_store {
+                            this.saved_connections = store.list().unwrap_or_default();
+                        }
+                        this.open_saved_connection(profile, window, cx);
+                    }
+                    Err(error) => this.set_error(error),
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     pub(super) fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.credential_hydrating {
             self.set_error("Saved connection password is still loading".into());
@@ -1103,6 +1240,7 @@ impl DbxApp {
         let tag = self.draft.tag.clone();
         let mut session =
             ConnectionSession::new(session_id, profile_id, name, kind, tag, window, cx);
+        session.connection_identity = Some(super::backups::native_target_identity(&config));
         session.busy = true;
         session.request_generation = 1;
         let generation = session.request_generation;
@@ -1260,6 +1398,7 @@ impl DbxApp {
         self.compact_connection_form_open = true;
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.cloud_auth = None;
         self.draft.tag = Some(default_tags().remove(3));
         self.draft.choosing_kind = true;
         self.settings_open = false;
@@ -1282,6 +1421,7 @@ impl DbxApp {
         self.compact_connection_form_open = false;
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.cloud_auth = None;
         self.draft.password.update(cx, |value, cx| {
             value.zeroize();
             cx.notify();

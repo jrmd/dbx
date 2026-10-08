@@ -109,13 +109,12 @@ pub(crate) fn validate(config: &ConnectionConfig) -> Result<()> {
         {
             return Err(invalid("Enter a valid database host for SSH forwarding."));
         }
-        // SQLx uses one host for both the network address and certificate name.
-        // Never silently weaken TLS when redirecting the connection to loopback.
+        // Unix forwarding separates the dial socket from the original TLS host.
+        // Reject strict TLS elsewhere rather than weakening verification.
         for (key, value) in url.query_pairs() {
-            if matches!(key.as_ref(), "sslmode" | "ssl-mode")
-                && (value.eq_ignore_ascii_case("verify-full")
-                    || value.eq_ignore_ascii_case("verify_identity")
-                    || value.eq_ignore_ascii_case("verify-identity"))
+            if !cfg!(unix)
+                && matches!(key.as_ref(), "sslmode" | "ssl-mode")
+                && strict_tls_mode(&value)
             {
                 return Err(invalid(
                     "SSH forwarding cannot preserve TLS hostname verification in this driver. Use a direct connection for this TLS mode.",
@@ -133,6 +132,7 @@ pub(crate) fn validate(config: &ConnectionConfig) -> Result<()> {
 
 pub(crate) struct Tunnel {
     supervisor: tokio::task::JoinHandle<()>,
+    local_socket: Option<PathBuf>,
     #[cfg(test)]
     initial_pid: u32,
 }
@@ -177,10 +177,81 @@ pub(crate) async fn prepare(
     }
     let (tunnel, local_port) = start(&config, "ssh").await?;
     let mut url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL."))?;
+    if let Some(socket) = &tunnel.local_socket {
+        // SQLx retains url.host as the certificate identity while dialing this
+        // tunnel-owned socket. PostgreSQL derives its socket filename from port.
+        config.socket = Some(if config.kind.dialect() == DatabaseKind::PostgreSQL {
+            socket.parent().expect("tunnel directory").to_path_buf()
+        } else {
+            socket.clone()
+        });
+        if config.kind.dialect() == DatabaseKind::PostgreSQL {
+            url.set_port(Some(local_port))
+                .map_err(|_| invalid("Invalid database port."))?;
+        }
+    } else {
+        url.set_host(Some("127.0.0.1"))
+            .map_err(|_| invalid("Invalid database URL."))?;
+        url.set_port(Some(local_port))
+            .map_err(|_| invalid("Invalid database port."))?;
+        config.socket = None;
+    }
+    config.url = url.into();
+    config.ssh = None;
+    config.ssh_password = None;
+    Ok((config, Some(tunnel)))
+}
+
+fn strict_tls_mode(value: &str) -> bool {
+    ["verify-full", "verify_identity", "verify-identity"]
+        .iter()
+        .any(|mode| value.eq_ignore_ascii_case(mode))
+}
+
+fn tunnel_socket(
+    config: &ConnectionConfig,
+    directory: &std::path::Path,
+    port: u16,
+) -> Result<Option<PathBuf>> {
+    let url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL."))?;
+    let strict = url.query_pairs().any(|(key, value)| {
+        matches!(key.as_ref(), "sslmode" | "ssl-mode") && strict_tls_mode(&value)
+    });
+    if !strict || !cfg!(unix) {
+        return Ok(None);
+    }
+    let filename = if config.kind.dialect() == DatabaseKind::PostgreSQL {
+        format!(".s.PGSQL.{port}")
+    } else {
+        "mysql.sock".into()
+    };
+    let path = directory.join(filename);
+    if path.as_os_str().len() >= 104 {
+        return Err(invalid(
+            "SSH socket path is too long. Use a shorter temporary directory.",
+        ));
+    }
+    Ok(Some(path))
+}
+
+async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)> {
+    start_with_socket(config, program, true).await
+}
+
+/// libpq can separate TCP dial address from TLS identity using hostaddr.
+pub(crate) async fn prepare_native_postgres(
+    mut config: ConnectionConfig,
+) -> Result<(ConnectionConfig, Option<Tunnel>)> {
+    config.validate()?;
+    if config.ssh.is_none() {
+        return Ok((config, None));
+    }
+    let (tunnel, port) = start_with_socket(&config, "ssh", false).await?;
+    let mut url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL"))?;
     url.set_host(Some("127.0.0.1"))
-        .map_err(|_| invalid("Invalid database URL."))?;
-    url.set_port(Some(local_port))
-        .map_err(|_| invalid("Invalid database port."))?;
+        .map_err(|_| invalid("Invalid forwarded host"))?;
+    url.set_port(Some(port))
+        .map_err(|_| invalid("Invalid forwarded port"))?;
     config.url = url.into();
     config.socket = None;
     config.ssh = None;
@@ -188,7 +259,11 @@ pub(crate) async fn prepare(
     Ok((config, Some(tunnel)))
 }
 
-async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)> {
+async fn start_with_socket(
+    config: &ConnectionConfig,
+    program: &str,
+    allow_socket: bool,
+) -> Result<(Tunnel, u16)> {
     let ssh = config.ssh.as_ref().expect("validated SSH configuration");
     let url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL."))?;
     let remote_port = url.port().unwrap_or(match config.kind {
@@ -210,6 +285,15 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
         .prefix("dbx-ssh-")
         .tempdir()
         .map_err(|_| invalid("Cannot create SSH tunnel directory."))?;
+    let local_socket = if allow_socket {
+        tunnel_socket(config, directory.path(), local_port)?
+    } else {
+        None
+    };
+    let forwarding = match &local_socket {
+        Some(socket) => format!("{}:{endpoint}", socket.display()),
+        None => format!("127.0.0.1:{local_port}:{endpoint}"),
+    };
     let control = directory.path().join("control");
     let log = directory.path().join("stderr");
     let log_file =
@@ -252,7 +336,7 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
         .arg("-l")
         .arg(&ssh.username)
         .arg("-L")
-        .arg(format!("127.0.0.1:{local_port}:{endpoint}"));
+        .arg(forwarding);
     if let Some(password) = &config.ssh_password {
         #[cfg(unix)]
         {
@@ -344,6 +428,7 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
             {
                 #[cfg(test)]
                 let initial_pid = child.id().unwrap();
+                let restart_socket = local_socket.clone();
                 let supervisor = tokio::spawn(async move {
                     let _directory = directory;
                     loop {
@@ -353,6 +438,9 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
                         loop {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             let _ = std::fs::remove_file(&control);
+                            if let Some(socket) = &restart_socket {
+                                let _ = std::fs::remove_file(socket);
+                            }
                             match command.spawn() {
                                 Ok(replacement) => {
                                     child = replacement;
@@ -366,6 +454,7 @@ async fn start(config: &ConnectionConfig, program: &str) -> Result<(Tunnel, u16)
                 return Ok((
                     Tunnel {
                         supervisor,
+                        local_socket,
                         #[cfg(test)]
                         initial_pid,
                     },
@@ -523,7 +612,12 @@ mod tests {
         assert!(config.validate().is_err());
         config.ssh.as_mut().unwrap().host = "bastion.example".into();
         config.url = "postgres://db/app?sslmode=verify-full".into();
-        assert!(config.validate().is_err());
+        assert_eq!(config.validate().is_ok(), cfg!(unix));
+        if cfg!(unix) {
+            let socket =
+                tunnel_socket(&config, std::path::Path::new("/tmp/dbx-test"), 5433).unwrap();
+            assert_eq!(socket, Some(PathBuf::from("/tmp/dbx-test/.s.PGSQL.5433")));
+        }
         config.ssh = None;
         config.socket = Some("relative.sock".into());
         assert!(config.validate().is_err());

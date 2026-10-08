@@ -59,6 +59,17 @@ impl DbxApp {
         tab_id: SecondaryTabId,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard recovered changes before pasting",
+                cx,
+            );
+            return;
+        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }

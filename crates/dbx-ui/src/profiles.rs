@@ -158,6 +158,7 @@ pub struct SavedConnection {
     pub id: Uuid,
     pub name: String,
     pub kind: DatabaseKind,
+    pub cloud_auth: Option<dbx_core::CloudAuthentication>,
     /// A normalized connection URL with no password in its userinfo.
     pub url: String,
     pub tag: Option<ConnectionTag>,
@@ -541,6 +542,7 @@ impl ProfileStore {
             id,
             name: std::mem::take(&mut draft.name),
             kind: draft.config.kind,
+            cloud_auth: draft.config.cloud_auth,
             url,
             tag: draft.tag.take(),
             max_connections: draft.config.max_connections,
@@ -644,15 +646,26 @@ impl ProfileStore {
             .with_max_connections(stored.max_connections)
             .with_connect_timeout_ms(stored.connect_timeout_ms);
         config.read_only = stored.read_only;
+        config.cloud_auth = stored.cloud_auth;
         config.socket = stored.socket;
         config.ssh = stored.ssh;
         config.ssh_password = ssh_password;
         Ok(LoadedConnection { profile, config })
     }
 
+    /// Duplicate through the normal vault-backed save path, with a new identity.
+    pub fn duplicate(&self, id: Uuid) -> ProfileResult<SavedConnection> {
+        let loaded = self.load(id)?;
+        let mut draft = ConnectionProfileDraft::from_config(
+            format!("{} copy", loaded.profile.name),
+            loaded.config,
+        );
+        draft.tag = loaded.profile.tag;
+        self.save(draft)
+    }
+
     /// Delete a profile and its associated credential.  Returns `true` when a
     /// profile existed and `false` when the ID was already absent.
-    #[allow(dead_code)] // Retained as a tested profile-store capability for future profile management UI.
     pub fn delete(&self, id: Uuid) -> ProfileResult<bool> {
         let _lock = self.lock()?;
         let mut document = self.read_document()?;
@@ -834,6 +847,8 @@ struct StoredConnection {
     id: Uuid,
     name: String,
     kind: DatabaseKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloud_auth: Option<dbx_core::CloudAuthentication>,
     url: String,
     #[serde(default)]
     tag: Option<ConnectionTag>,
@@ -855,6 +870,7 @@ impl StoredConnection {
             id: self.id,
             name: self.name,
             kind: self.kind,
+            cloud_auth: self.cloud_auth,
             url: self.url,
             tag: self.tag,
             max_connections: self.max_connections,

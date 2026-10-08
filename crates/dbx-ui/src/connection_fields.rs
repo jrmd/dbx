@@ -14,6 +14,7 @@ use zeroize::Zeroize;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionFields {
     pub read_only: bool,
+    pub cloud_auth: Option<dbx_core::CloudAuthentication>,
     pub kind: DatabaseKind,
     pub host: String,
     pub port: String,
@@ -73,6 +74,7 @@ impl ConnectionFields {
             socket_enabled: false,
             ssh: None,
             ssh_password: None,
+            cloud_auth: None,
         }
     }
 
@@ -102,6 +104,7 @@ impl ConnectionFields {
                 socket_enabled: false,
                 ssh: None,
                 ssh_password: None,
+                cloud_auth: None,
             });
         }
 
@@ -129,6 +132,7 @@ impl ConnectionFields {
             socket_enabled: false,
             ssh: None,
             ssh_password: None,
+            cloud_auth: None,
         })
     }
 
@@ -182,6 +186,7 @@ impl ConnectionFields {
         config.socket = self.socket_enabled.then(|| self.socket.trim().into());
         config.ssh = self.ssh.clone();
         config.ssh_password = self.ssh_password.clone();
+        config.cloud_auth = self.cloud_auth;
         config.validate().map_err(|error| error.to_string())?;
         Ok(config)
     }

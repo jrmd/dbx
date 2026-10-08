@@ -254,6 +254,59 @@ impl CredentialVault {
     }
 }
 
+/// A separate authenticated format for portable profile bundles. Fixed KDF
+/// parameters cannot be attacker-controlled by the imported file.
+pub fn seal_bundle(plaintext: &[u8], passphrase: &str) -> VaultResult<Vec<u8>> {
+    if passphrase.chars().count() < 12 || plaintext.len() > 8 * 1024 * 1024 {
+        return Err(VaultError::Invalid);
+    }
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::fill(&mut salt).map_err(|_| VaultError::Invalid)?;
+    getrandom::fill(&mut nonce).map_err(|_| VaultError::Invalid)?;
+    let key = derive_key(passphrase, &salt)?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(key.expose_secret()).map_err(|_| VaultError::Invalid)?;
+    let mut header = b"DBXBNDL1".to_vec();
+    header.extend(salt);
+    header.extend(nonce);
+    let nonce = XNonce::try_from(&nonce[..]).map_err(|_| VaultError::Invalid)?;
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: &header,
+            },
+        )
+        .map_err(|_| VaultError::Invalid)?;
+    header.extend(ciphertext);
+    Ok(header)
+}
+
+pub fn open_bundle(bytes: &[u8], passphrase: &str) -> VaultResult<zeroize::Zeroizing<Vec<u8>>> {
+    if !bytes.starts_with(b"DBXBNDL1") || bytes.len() < 64 || bytes.len() > 8 * 1024 * 1024 + 64 {
+        return Err(VaultError::Authentication);
+    }
+    let salt: [u8; SALT_LEN] = bytes[8..24]
+        .try_into()
+        .map_err(|_| VaultError::Authentication)?;
+    let nonce = XNonce::try_from(&bytes[24..48]).map_err(|_| VaultError::Authentication)?;
+    let key = derive_key(passphrase, &salt)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key.expose_secret())
+        .map_err(|_| VaultError::Authentication)?;
+    cipher
+        .decrypt(
+            &nonce,
+            chacha20poly1305::aead::Payload {
+                msg: &bytes[48..],
+                aad: &bytes[..48],
+            },
+        )
+        .map(zeroize::Zeroizing::new)
+        .map_err(|_| VaultError::Authentication)
+}
+
 fn state_error(state: &Inner) -> VaultError {
     match state {
         Inner::Uninitialized => VaultError::Uninitialized,

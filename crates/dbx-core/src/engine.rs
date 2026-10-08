@@ -33,6 +33,15 @@ pub trait Engine: Send + Sync {
     fn is_read_only(&self) -> bool {
         false
     }
+    fn capabilities(&self) -> crate::Capabilities {
+        self.kind().capabilities(self.is_read_only())
+    }
+
+    /// Connect an independent interactive session when this connector owns a
+    /// stateful protocol outside SQLx. Stateless connectors return None.
+    async fn open_query_session(&self) -> Result<Option<Box<dyn Engine>>> {
+        Ok(None)
+    }
 
     async fn list_tables(&self) -> Result<Vec<TableInfo>>;
 
@@ -184,6 +193,9 @@ impl DatabaseEngine {
             Self::Redis(engine) => engine.is_read_only(),
             Self::Other(engine) => engine.is_read_only(),
         }
+    }
+    pub fn capabilities(&self) -> crate::Capabilities {
+        self.kind().capabilities(self.is_read_only())
     }
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         if self.is_read_only() {
@@ -530,7 +542,7 @@ impl DatabaseEngine {
             };
             statements.push((statement, checked));
         }
-        if !matches!(self, Self::Sql(_)) {
+        if !matches!(self, Self::Sql(_)) && self.kind() != DatabaseKind::SqlServer {
             for (applied, (statement, checked)) in statements.iter().enumerate() {
                 let outcome = self.execute(statement).await.and_then(|result| {
                     if *checked && result.rows_affected != 1 {

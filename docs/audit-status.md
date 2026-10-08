@@ -1,4 +1,8 @@
-# DBX audit completion — 6 October 2026
+# DBX audit status
+
+The October 8 competitor gap work is recorded in [product gap audit](product-gap-audit-2026-10-08.md) and [gap fix verification](gap-fix-verification-2026-10-08.md). The October 6 evidence below is historical; its hosted CI boundary was subsequently verified for v0.5.0, as recorded in the newer audit.
+
+## 6 October 2026 implementation
 
 The interrupted implementation has been completed and checked locally. This
 matrix records the feature scope and the remaining external verification

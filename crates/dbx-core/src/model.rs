@@ -254,6 +254,8 @@ impl fmt::Display for DatabaseKind {
 /// it is safe to log the rest of a connection configuration.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_auth: Option<crate::CloudAuthentication>,
     #[serde(default)]
     pub read_only: bool,
     pub kind: DatabaseKind,
@@ -284,6 +286,7 @@ impl ConnectionConfig {
     pub fn new(kind: DatabaseKind, url: impl Into<String>) -> Self {
         Self {
             kind,
+            cloud_auth: None,
             url: url.into(),
             read_only: false,
             max_connections: default_max_connections(),
@@ -311,6 +314,19 @@ impl ConnectionConfig {
 
     pub fn validate(&self) -> crate::Result<()> {
         crate::transport::validate(self)?;
+        if let Some(provider) = self.cloud_auth {
+            let valid = match provider {
+                crate::CloudAuthentication::AwsRdsIam => {
+                    matches!(self.kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL)
+                }
+                crate::CloudAuthentication::AzureEntra => self.kind == DatabaseKind::PostgreSQL,
+            };
+            if !valid {
+                return Err(crate::DbxError::InvalidConfig(
+                    "Cloud authentication provider does not support this engine".into(),
+                ));
+            }
+        }
         if self.url.trim().is_empty() {
             return Err(crate::DbxError::InvalidConfig("URL cannot be empty".into()));
         }
@@ -811,7 +827,7 @@ impl InsertRequest {
 /// independent of a second metadata round trip.
 /// One staged row change. Updates and deletes carry the values the user saw,
 /// so applying them refuses to overwrite a row that changed underneath.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum RowChange {
     Insert(InsertRequest),
     Update {

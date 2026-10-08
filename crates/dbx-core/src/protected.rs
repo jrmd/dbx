@@ -136,6 +136,13 @@ impl Engine for ProtectedEngine {
     fn is_read_only(&self) -> bool {
         true
     }
+    async fn open_query_session(&self) -> Result<Option<Box<dyn Engine>>> {
+        Ok(self
+            .0
+            .open_query_session()
+            .await?
+            .map(|engine| Box::new(ProtectedEngine(engine)) as Box<dyn Engine>))
+    }
     async fn list_tables(&self) -> Result<Vec<TableInfo>> {
         self.0.list_tables().await
     }

@@ -5,7 +5,8 @@ const links = [
   { href: REPO_URL, label: "GitHub" },
   { href: RELEASES_URL, label: "Releases" },
   { href: `${REPO_URL}/issues`, label: "Issues" },
-  { href: `${REPO_URL}/blob/main/docs/architecture.md`, label: "Architecture" },
+  { href: `${REPO_URL}/blob/main/docs/user-guide.md`, label: "User guide" },
+  { href: `${REPO_URL}/blob/main/docs/capability-matrix.md`, label: "Capabilities" },
 ];
 
 export function Footer() {

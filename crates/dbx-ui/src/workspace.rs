@@ -19,9 +19,51 @@ pub struct SavedQuery {
 pub enum SavedTab {
     Query(SavedQuery),
     Data(dbx_core::TableRef),
+    RecoveredData(SavedChangeset),
     Structure(dbx_core::TableRef),
     Diagram,
 }
+/// Recovery stores identities and originals, never page row indices.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct SavedChangeset {
+    #[serde(default)]
+    pub connection_identity: Option<[u8; 32]>,
+    pub table: dbx_core::TableRef,
+    pub database: Option<String>,
+    pub columns: Vec<dbx_core::ColumnInfo>,
+    pub changes: Vec<dbx_core::RowChange>,
+}
+impl SavedChangeset {
+    pub async fn validate(
+        &self,
+        engine: &dbx_core::DatabaseEngine,
+        current_target: Option<[u8; 32]>,
+    ) -> dbx_core::Result<()> {
+        if self.connection_identity.is_none() || self.connection_identity != current_target {
+            return Err(dbx_core::DbxError::Query("Recovered draft belongs to different connection settings. Review or discard it; it cannot be applied to this target.".into()));
+        }
+        if self
+            .database
+            .as_ref()
+            .is_some_and(|database| database.is_empty())
+        {
+            return Err(dbx_core::DbxError::Query(
+                "Recovered changeset has no database identity".into(),
+            ));
+        }
+        if self.database.as_ref() != Some(&engine.current_database().await?)
+            || engine.describe_table(&self.table).await? != self.columns
+            || self
+                .changes
+                .iter()
+                .any(|change| change.table() != &self.table)
+        {
+            return Err(dbx_core::DbxError::Query("Recovered changeset no longer matches this database and column schema. Review the draft and discard it before editing again.".into()));
+        }
+        Ok(())
+    }
+}
+
 /// How the user arranged one table's grid. Columns are named, so a layout
 /// survives added or dropped columns.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -55,8 +97,13 @@ pub fn table_layout_key(table: &dbx_core::TableRef) -> String {
     }
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct WorkspaceDocument {
+    /// History is plaintext; opt-out and retention are persisted per identity.
+    #[serde(default)]
+    pub history_disabled: bool,
+    #[serde(default = "default_history_retention")]
+    pub history_retention: usize,
     /// Per-table grid layouts and saved filters, keyed by [`table_layout_key`].
     #[serde(default)]
     pub table_layouts: HashMap<String, TableLayout>,
@@ -76,6 +123,27 @@ pub struct WorkspaceDocument {
     #[serde(default)]
     pub current_database: Option<String>,
 }
+impl Default for WorkspaceDocument {
+    fn default() -> Self {
+        Self {
+            history_disabled: false,
+            history_retention: 100,
+            table_layouts: HashMap::new(),
+            schema_baseline: None,
+            drafts: Vec::new(),
+            saved: Vec::new(),
+            closed: Vec::new(),
+            open_tables: Vec::new(),
+            tabs: Vec::new(),
+            active_tab: None,
+            current_database: None,
+        }
+    }
+}
+fn default_history_retention() -> usize {
+    100
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct StartupWorkspace {
     pub connections: Vec<StartupConnection>,
@@ -248,5 +316,71 @@ mod tests {
             store.load("workspace").unwrap().drafts[0].sql,
             "SELECT 'sensitive literal'"
         );
+    }
+}
+
+#[cfg(test)]
+mod changeset_tests {
+    use super::*;
+    #[tokio::test]
+    async fn encrypted_changesets_recover_without_execution_and_reject_schema_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Arc::new(CredentialVault::at(directory.path().join("vault")));
+        vault.create("fixture vault passphrase").unwrap();
+        let store = WorkspaceStore::new(vault.clone());
+        let engine = dbx_core::DatabaseEngine::connect(dbx_core::ConnectionConfig::new(
+            dbx_core::DatabaseKind::SQLite,
+            "sqlite::memory:",
+        ))
+        .await
+        .unwrap();
+        engine
+            .execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+            .await
+            .unwrap();
+        let table = dbx_core::TableRef::new("items");
+        let saved = SavedChangeset {
+            connection_identity: Some([1; 32]),
+            table: table.clone(),
+            database: Some(engine.current_database().await.unwrap()),
+            columns: engine.describe_table(&table).await.unwrap(),
+            changes: vec![dbx_core::RowChange::Insert(
+                dbx_core::InsertRequest::from_row(
+                    table.clone(),
+                    vec![
+                        ("id".into(), dbx_core::CellValue::Integer(1)),
+                        (
+                            "value".into(),
+                            dbx_core::CellValue::Text("private staged data".into()),
+                        ),
+                    ],
+                ),
+            )],
+        };
+        let document = WorkspaceDocument {
+            tabs: vec![SavedTab::RecoveredData(saved.clone())],
+            ..Default::default()
+        };
+        let revision = store.register("fixture");
+        store.save("fixture", revision, &document).unwrap();
+        vault.lock().unwrap();
+        vault.unlock("fixture vault passphrase").unwrap();
+        let recovered = store.load("fixture").unwrap();
+        let SavedTab::RecoveredData(recovered) = &recovered.tabs[0] else {
+            panic!("missing changeset");
+        };
+        assert_eq!(recovered.changes, saved.changes);
+        recovered.validate(&engine, Some([1; 32])).await.unwrap();
+        assert!(recovered.validate(&engine, Some([2; 32])).await.is_err());
+        assert_eq!(engine.count_rows(&table, &[], None).await.unwrap(), 0);
+        assert!(
+            !String::from_utf8_lossy(&std::fs::read(directory.path().join("vault")).unwrap())
+                .contains("private staged data")
+        );
+        engine
+            .execute_sql("ALTER TABLE items ADD COLUMN other TEXT")
+            .await
+            .unwrap();
+        assert!(recovered.validate(&engine, Some([1; 32])).await.is_err());
     }
 }

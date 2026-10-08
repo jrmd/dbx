@@ -9,6 +9,7 @@ on:
       - 'crates/dbx-core/**'
       - 'docker-compose.test.yml'
       - 'scripts/test-integration.sh'
+      - 'scripts/test-transports.py'
       - '.github/workflows/integration.yml'
   pull_request:
     paths:
@@ -17,6 +18,7 @@ on:
       - 'crates/dbx-core/**'
       - 'docker-compose.test.yml'
       - 'scripts/test-integration.sh'
+      - 'scripts/test-transports.py'
       - '.github/workflows/integration.yml'
   schedule:
     # Nightly, to catch new database image releases.
@@ -39,10 +41,15 @@ jobs:
       CARGO_BUILD_JOBS: '2'
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       CXXFLAGS: '-g0'
+      DBX_TEST_CARGO_PROFILE: release
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: ./.github/actions/prepare-rust-build
+      - name: Install disposable SSH fixture tools
+        run: sudo apt-get install -y openssh-server openssl
       - name: Run disposable database suite
         run: bash scripts/test-integration.sh
+      - name: Verify sockets, SSH and strict TLS identity
+        run: python3 scripts/test-transports.py
