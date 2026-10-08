@@ -77,7 +77,6 @@ impl DbxApp {
                         .child(div().flex().items_center().gap(px(8.)).child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Connections")).when(!saved_connections.is_empty(), |view| view.child(badge(saved_connections.len().to_string(), theme().text_muted))))
                         .child(glass_icon_button("new-connection-from-list", Icon::Add, false).tooltip(tip("New connection")).on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx)))))
                     .child(div().id("saved-connections").flex_1().min_h_0().overflow_y_scroll().p(px(8.)).flex().flex_col().gap(px(2.))
-                        .child(button("try-demo", "Try a new demo database", ButtonKind::Quiet).disabled(self.saving_connection).on_click(cx.listener(|this, _, window, cx| this.create_demo_connection(window, cx))))
                         .when(saved_connections.is_empty(), |view| view.child(div().p(px(10.)).text_size(px(12.)).text_color(theme().text_muted).child("No saved connections")))
                         .children(saved_connections.into_iter().map(|profile| {
                             let id = profile.id; let selected = selected_profile == Some(id); let choose = profile.clone();
@@ -109,8 +108,6 @@ impl DbxApp {
                             .when(!choosing, |view| view.child(div().flex_none().flex().items_center().gap(px(8.))
                                 .child(div().flex().items_center().gap(px(6.)).text_size(px(12.)).text_color(theme().text_muted).child(database_logo(kind, theme().text_muted)).child(kind.to_string()))
                                 .when(!editing, |view| view.child(button("change-connection-kind", "Change", ButtonKind::Quiet).h(px(26.)).text_size(px(11.)).cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.change_connection_kind(cx))))))))
-                        .child(div().flex().flex_wrap().gap(px(6.)).children([(0, "Export profiles…"), (1, "Encrypted bundle…"), (2, "Import profiles…")].into_iter().map(|(mode, label)|
-                            button(SharedString::from(format!("profile-portability-{mode}")), label, ButtonKind::Quiet).on_click(cx.listener(move |this, _, window, cx| this.open_profile_transfer(mode, window, cx))))))
                         .when(editing, |view| view.child(div().flex().gap(px(8.))
                             .child(button("duplicate-connection", "Duplicate", ButtonKind::Quiet).disabled(self.saving_connection || self.credential_hydrating).on_click(cx.listener(|this, _, _, cx| this.duplicate_profile(cx))))
                             .child(button("delete-connection", "Delete…", ButtonKind::Quiet).disabled(self.saving_connection || self.credential_hydrating).on_click(cx.listener(|this, _, window, cx| this.request_delete_profile(window, cx))))))
@@ -197,6 +194,35 @@ impl DbxApp {
                                     },
                                 ),
                             ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        button(
+                            "try-demo",
+                            if self.saving_connection {
+                                "Creating demo…"
+                            } else {
+                                "Try a demo database"
+                            },
+                            ButtonKind::Quiet,
+                        )
+                        .debug_selector(|| "try-demo".into())
+                        .disabled(self.saving_connection)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.create_demo_connection(window, cx)
+                        })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme().text_muted)
+                            .child("Explore a local SQLite database with sample data."),
                     ),
             )
             .children(KIND_GROUPS.into_iter().map(|(title, kinds)| {

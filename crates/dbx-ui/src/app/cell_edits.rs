@@ -1507,6 +1507,8 @@ mod tests {
 
     #[gpui::test]
     fn inline_edits_stage_validate_block_navigation_and_discard(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+
         cx.update(gpui_component::init);
         let session_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
@@ -1559,6 +1561,9 @@ mod tests {
             app.active_session_id = Some(session_id);
             app
         });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let text_before = cx.debug_bounds("result-cell-text-0-2").unwrap();
+        let row_before = cx.debug_bounds("dbx-result-row-0").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.on_data_grid_event(
@@ -1568,15 +1573,43 @@ mod tests {
                     window,
                     cx,
                 );
-                let editor = app
-                    .data_tab(session_id, tab_id)
+            });
+        });
+        let editor = app.read_with(cx, |app, _| {
+            app.data_tab(session_id, tab_id)
+                .unwrap()
+                .cell_editor
+                .as_ref()
+                .unwrap()
+                .editor
+                .clone()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("dbx-result-row-0").unwrap(), row_before);
+        cx.update(|window, cx| {
+            let text_editing = editor.update(cx, |editor, cx| {
+                editor
+                    .bounds_for_range(0..0, text_before, window, cx)
                     .unwrap()
-                    .cell_editor
-                    .as_ref()
+            });
+            assert_eq!(
+                text_editing.origin, text_before.origin,
+                "entering inline edit must keep the text in place"
+            );
+            editor.update(cx, |editor, cx| editor.set_text("changed", cx));
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            let text_changed = editor.update(cx, |editor, cx| {
+                editor
+                    .bounds_for_range(0..0, text_before, window, cx)
                     .unwrap()
-                    .editor
-                    .clone();
-                editor.update(cx, |editor, cx| editor.set_text("changed", cx));
+            });
+            assert_eq!(
+                text_changed.origin, text_before.origin,
+                "typing must keep the text in place"
+            );
+            app.update(cx, |app, cx| {
                 app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
                 assert_eq!(
                     app.data_tab(session_id, tab_id)

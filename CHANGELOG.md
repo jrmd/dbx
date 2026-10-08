@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-10-08
+
+- Move profile import/export into Settings and the demo database option into New connection.
+- Keep cell text in place when entering inline edit mode and typing.
+- Read PostgreSQL browser values as text and preserve guarded update behavior.
 
 - Fix literal dotted identifiers and atomic result-file replacement; add explicit loaded/full-query export choices.
 - Add protected profile migration, duplicate/delete management and authenticated encrypted portable bundles, including TablePro v1 imports.
@@ -12,4 +16,4 @@
 - Add searchable history, recording/retention controls, reviewed CSV/JSON mapping, bounded copy and data comparison.
 - Add explicitly paired local read-only MCP access, a disposable demo, task-oriented docs and Intel Mac build/release jobs.
 
-New workflows remain unreleased. See the capability matrix and verification report for connector and environment limits.
+See the capability matrix and verification report for connector and environment limits.

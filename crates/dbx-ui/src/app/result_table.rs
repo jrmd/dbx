@@ -1427,9 +1427,12 @@ impl TableDelegate for ResultTableDelegate {
             *row == row_ix && Some(*column) == self.result_column(col_ix)
         }) {
             let focus = editor.read(cx).focus_handle();
+            // Size the input to its text line and center it just like the
+            // display cell. Its border plus padding keeps the same 8px inset.
             return div()
                 .size_full()
-                .p(px(2.))
+                .flex()
+                .items_center()
                 .child(
                     crate::editor::input_with_key_context(
                         editor.clone(),
@@ -1437,9 +1440,9 @@ impl TableDelegate for ResultTableDelegate {
                         false,
                         super::cell_edits::CELL_EDITOR_CONTEXT,
                     )
-                    .h_full()
+                    .h_auto()
                     .py(px(0.))
-                    .px(px(6.))
+                    .px(px(7.))
                     .text_size(px(11.)),
                 )
                 .into_any_element();
@@ -1615,6 +1618,7 @@ impl TableDelegate for ResultTableDelegate {
         } else {
             cell = cell.child(
                 div()
+                    .debug_selector(move || format!("result-cell-text-{row_ix}-{col_ix}"))
                     .flex_1()
                     .min_w_0()
                     .truncate()

@@ -7,7 +7,7 @@ The connection form shows the connector's workflow capabilities. See the
 
 ## Try a sample
 
-Unlock the vault and choose **Try a new demo database** in Connections. Each
+Unlock the vault, open **New connection**, and choose **Try a demo database**. Each
 click creates a separate local SQLite file with teams and 250 projects; existing
 files are preserved. Browse projects, open a row's team link, filter budgets,
 stage a name change, review the SQL and commit or discard. The demo profile
@@ -16,7 +16,8 @@ profile removes its saved credentials, not its database file.
 
 ## Switch from TablePlus or TablePro
 
-For TablePro, export connections and choose **Import profiles** in DBX. Plaintext
+For TablePro, export connections and choose **Import profiles** in DBX under
+**Settings → Connections**. Plaintext
 JSON and encrypted `TPRO` v1 bundles are accepted; review every host/database,
 TLS/SSH setting and warning. Imported profiles start protected and never connect
 or execute startup commands. Key/certificate paths are references; copy those
@@ -25,8 +26,9 @@ manual review. TablePlus's proprietary `.tableplusconnection` format is not
 parsed: copy its connection URL into DBX and review TLS/SSH details in the form.
 
 Rename a selected profile and Save; Duplicate makes a new identity with its own
-credential entry; Delete is refused while that profile has open sessions. Export
-password-free metadata by default. Use an encrypted DBX bundle only when moving
+credential entry; Delete is refused while that profile has open sessions. In
+**Settings → Connections**, use **Export profiles** for password-free metadata.
+Use **Export encrypted bundle** only when moving
 credentials, with a separate 12-character-or-longer passphrase. Keep both exports
 private; neither includes key/certificate file contents.
 
