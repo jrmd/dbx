@@ -71,8 +71,11 @@ streams CSV/TSV/typed JSONL and atomically replaces the output only on success.
 It cannot share an open transaction and is not a native backup.
 
 Right-click a table and **Import data** for CSV/TSV/JSON/JSONL preview/mapping.
-Unquoted CSV empty is NULL; quoted empty is empty text; JSON null is NULL. Review
-the destination types and first values, omit fields to use database defaults,
+Unquoted CSV empty is NULL; quoted empty is empty text; JSON null is NULL.
+JSON decimals and integers beyond 64 bits retain their original digits as bound
+text for the destination's typed conversion; previews also preserve nested JSON
+number digits. The destination type controls conversion and storage.
+Review the destination types and first values, omit fields to use database defaults,
 then append. A failed row rolls back the whole append. Preview/copy budgets are
 100,000 rows and 64 MiB; SQL/gzip streaming remains available for larger inputs.
 

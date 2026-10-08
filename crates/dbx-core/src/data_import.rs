@@ -282,8 +282,9 @@ fn json_cell(value: &serde_json::Value) -> CellValue {
             .as_i64()
             .map(CellValue::Integer)
             .or_else(|| v.as_u64().map(CellValue::Unsigned))
-            .or_else(|| v.as_f64().map(CellValue::Real))
-            .unwrap_or_else(|| CellValue::Json(value.clone())),
+            // Preserve decimal and oversized integer lexemes for the database's
+            // own typed conversion. An f64 intermediary would lose digits.
+            .unwrap_or_else(|| CellValue::Text(v.to_string())),
         serde_json::Value::String(v) => CellValue::Text(v.clone()),
         _ => CellValue::Json(value.clone()),
     }
