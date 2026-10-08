@@ -55,7 +55,7 @@ use gpui::{
     FocusHandle, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent,
     MouseButton, PathPromptOptions, Pixels, Point, Render, ResizeEdge, Rgba, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement, Subscription, Window, WindowControlArea,
-    WindowHandle, anchored, deferred, div, img, point, prelude::*, px, uniform_list,
+    WindowHandle, anchored, deferred, div, img, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     Disableable as _, FocusTrapElement as _, IndexPath, Selectable as _, Sizable as _, Size,
