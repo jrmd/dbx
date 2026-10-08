@@ -4,13 +4,14 @@ const TAG_PALETTE: [u32; 8] = [
     0xef6b73, 0xe5b567, 0x8fcf9c, 0x82aaff, 0xb48ead, 0x56b6c2, 0xe89bb5, 0xaab2bf,
 ];
 
-const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 4] = [
+const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 5] = [
     (SettingsSection::Appearance, "Appearance", Icon::Appearance),
     (
         SettingsSection::QueryAgent,
         "Query assistant",
         Icon::Sparkles,
     ),
+    (SettingsSection::Connections, "Connections", Icon::Download),
     (SettingsSection::Tags, "Connection tags", Icon::Tag),
     (SettingsSection::Updates, "Updates", Icon::Download),
 ];
@@ -30,6 +31,7 @@ impl DbxApp {
         let content = match selected {
             SettingsSection::Appearance => self.render_settings_appearance(cx).into_any_element(),
             SettingsSection::QueryAgent => self.render_agent_settings(cx).into_any_element(),
+            SettingsSection::Connections => self.render_settings_connections(cx).into_any_element(),
             SettingsSection::Tags => self.render_settings_tags(cx).into_any_element(),
             SettingsSection::Updates => self.render_settings_updates(cx).into_any_element(),
         };
@@ -52,16 +54,22 @@ impl DbxApp {
             .map(|view| {
                 if compact {
                     view.child(
-                        segmented_track().children(SETTINGS_SECTIONS.into_iter().map(
-                            |(section, label, _)| {
-                                segment(label, section == selected)
-                                    .id(SharedString::from(format!("settings-section-{label}")))
-                                    .debug_selector(move || format!("settings-section-{label}"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.show_settings_section(section, cx)
-                                    }))
-                            },
-                        )),
+                        div()
+                            .id("settings-navigation")
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .overflow_x_scroll()
+                            .child(segmented_track().flex_none().children(
+                                SETTINGS_SECTIONS.into_iter().map(|(section, label, _)| {
+                                    segment(label, section == selected)
+                                        .id(SharedString::from(format!("settings-section-{label}")))
+                                        .debug_selector(move || format!("settings-section-{label}"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.show_settings_section(section, cx)
+                                        }))
+                                }),
+                            )),
                     )
                 } else {
                     view.child(
@@ -72,7 +80,7 @@ impl DbxApp {
                     )
                 }
             })
-            .child(div().flex_1())
+            .when(!compact, |view| view.child(div().flex_1()))
             .child(close);
         div()
             .flex_1()
@@ -229,6 +237,50 @@ impl DbxApp {
             );
         }
         div().child(settings_group(rows))
+    }
+
+    fn render_settings_connections(&mut self, cx: &mut Context<Self>) -> Div {
+        let unavailable = self.vault_state != Some(VaultState::Unlocked) || self.vault_busy;
+        div().child(settings_group(
+            [
+                (
+                    0,
+                    "Export profiles",
+                    "Save connection details without passwords.",
+                    "Export…",
+                ),
+                (
+                    1,
+                    "Export encrypted bundle",
+                    "Back up connections and credentials with a separate passphrase.",
+                    "Export…",
+                ),
+                (
+                    2,
+                    "Import profiles",
+                    "Review a DBX or TablePro export before importing.",
+                    "Import…",
+                ),
+            ]
+            .into_iter()
+            .map(|(mode, label, detail, action)| {
+                settings_row(
+                    label,
+                    Some(detail.into()),
+                    button(
+                        SharedString::from(format!("profile-portability-{mode}")),
+                        action,
+                        ButtonKind::Quiet,
+                    )
+                    .debug_selector(move || format!("profile-portability-{mode}"))
+                    .disabled(unavailable)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_profile_transfer(mode, window, cx)
+                    })),
+                )
+                .into_any_element()
+            }),
+        ))
     }
 
     fn render_settings_tags(&mut self, cx: &mut Context<Self>) -> Div {
@@ -548,5 +600,74 @@ fn connection_count(count: usize) -> String {
         0 => "No connections".into(),
         1 => "1 connection".into(),
         count => format!("{count} connections"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn connection_actions_are_available_on_their_own_screens(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.saved_connections.clear();
+            app.begin_new_connection(cx);
+            app
+        });
+        for width in [1200., 720., 480.] {
+            cx.simulate_resize(gpui::size(px(width), px(800.)));
+            cx.update(|_, cx| {
+                app.update(cx, |app, cx| {
+                    app.close_settings(cx);
+                    app.begin_new_connection(cx);
+                })
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let demo = cx
+                .debug_bounds("try-demo")
+                .expect("demo belongs on New connection");
+            assert!(demo.left() >= px(0.) && demo.right() <= px(width));
+            for selector in [
+                "profile-portability-0",
+                "profile-portability-1",
+                "profile-portability-2",
+            ] {
+                assert!(cx.debug_bounds(selector).is_none());
+            }
+            cx.update(|_, cx| app.update(cx, |app, cx| app.select_kind(DatabaseKind::SQLite, cx)));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(
+                cx.debug_bounds("try-demo").is_none(),
+                "demo is only offered when choosing a new connection"
+            );
+
+            cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(cx)));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let connections = cx.debug_bounds("settings-section-Connections").unwrap();
+            assert!(connections.left() >= px(0.) && connections.right() <= px(width));
+            cx.simulate_click(connections.center(), Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("try-demo").is_none());
+            for selector in [
+                "profile-portability-0",
+                "profile-portability-1",
+                "profile-portability-2",
+            ] {
+                let action = cx.debug_bounds(selector).unwrap();
+                assert!(action.left() >= px(0.) && action.right() <= px(width));
+                cx.simulate_click(action.center(), Default::default());
+                assert!(app.read_with(cx, |app, _| app.profile_transfer_dialog.is_some()));
+                cx.update(|_, cx| {
+                    app.update(cx, |app, cx| {
+                        app.profile_transfer_dialog = None;
+                        cx.notify();
+                    })
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        }
     }
 }

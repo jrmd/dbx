@@ -665,6 +665,7 @@ enum SettingsSection {
     #[default]
     Appearance,
     QueryAgent,
+    Connections,
     Tags,
     Updates,
 }
