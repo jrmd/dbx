@@ -5,7 +5,7 @@ fn preview_cell(value: &CellValue) -> String {
     let text = match value {
         CellValue::Text(text) => return text.chars().take(100).collect(),
         CellValue::Json(_) => "[JSON value]".into(),
-        CellValue::Binary(bytes) => format!("[{} bytes]", bytes.len()),
+        CellValue::Bytes(bytes) => format!("[{} bytes]", bytes.len()),
         _ => value.to_string(),
     };
     text.chars().take(100).collect()
