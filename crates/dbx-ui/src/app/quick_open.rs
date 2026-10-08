@@ -19,7 +19,7 @@ enum Target {
     Table(SessionId, TableInfo),
     SavedQuery(SessionId, SavedQuery),
     Session(SessionId),
-    Connection(SavedConnection),
+    Connection(Box<SavedConnection>),
 }
 
 #[derive(Clone)]
@@ -152,7 +152,7 @@ impl DbxApp {
                 self.open_saved_query_for(session_id, saved, window, cx);
             }
             Target::Session(session_id) => self.activate_session(session_id, cx),
-            Target::Connection(profile) => self.open_saved_connection(profile, window, cx),
+            Target::Connection(profile) => self.open_saved_connection(*profile, window, cx),
         }
     }
 
@@ -225,7 +225,7 @@ impl DbxApp {
                 label: profile.name.clone(),
                 detail: "Connect".into(),
                 icon: Icon::Database,
-                target: Target::Connection(profile.clone()),
+                target: Target::Connection(Box::new(profile.clone())),
             });
         }
         let mut scored = items

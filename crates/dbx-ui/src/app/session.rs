@@ -281,6 +281,9 @@ pub(super) struct CompletionCacheKey {
     pub(super) recent_result: usize,
 }
 
+type CompletionResult = Option<(Range<usize>, Vec<SqlCompletionItem>)>;
+type CompletionCache = (CompletionCacheKey, CompletionResult);
+
 #[derive(Default)]
 pub(super) struct AbortOnDrop(Option<tokio::task::AbortHandle>);
 
@@ -382,10 +385,7 @@ pub(super) struct QueryTab {
     pub(super) completion_signature: Option<CompletionSignature>,
     /// The last computed completion and what it was computed from. Rendering
     /// asks for completion every frame; recomputing lexes the whole query.
-    pub(super) completion_cache: Option<(
-        CompletionCacheKey,
-        Option<(Range<usize>, Vec<SqlCompletionItem>)>,
-    )>,
+    pub(super) completion_cache: Option<CompletionCache>,
     pub(super) completion_dismissed_signature: Option<CompletionSignature>,
     pub(super) completion_index: usize,
     pub(super) _subscriptions: Vec<Subscription>,
