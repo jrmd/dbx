@@ -109,11 +109,7 @@ impl Engine for MongoEngine {
     }
     async fn query(&self, command: &str, options: QueryOptions) -> Result<QueryResult> {
         let started = Instant::now();
-        let document: Document = serde_json::from_str(command).map_err(|_| {
-            DbxError::Parse(
-                "Enter a MongoDB JSON command, e.g. {\"find\":\"users\",\"filter\":{}}".into(),
-            )
-        })?;
+        let document = parse_command(command)?;
         let database = self.database.read().await.clone();
         let db = self.client.database(&database);
         let limit = crate::engine::row_limit(options).unwrap_or(usize::MAX);
@@ -141,5 +137,33 @@ impl Engine for MongoEngine {
             ]
         };
         Ok(super::json_rows(values, options, started))
+    }
+}
+
+fn parse_command(command: &str) -> Result<Document> {
+    // Convert Extended JSON explicitly. Deserializing directly into BSON through
+    // deserialize_any would expose serde_json's private precise-number wrapper.
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(command)
+        .ok()
+        .and_then(|object| Document::try_from(object).ok())
+        .ok_or_else(|| {
+            DbxError::Parse(
+                "Enter a MongoDB JSON command, e.g. {\"find\":\"users\",\"filter\":{}}".into(),
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn command_numbers_remain_bson_numbers_with_precise_json_enabled() {
+        let command = parse_command(r#"{"find":"users","limit":100,"filter":{"balance":{"$numberDecimal":"1234567890.1234567890123456789"}}}"#).unwrap();
+        assert_eq!(command.get_i32("limit").unwrap(), 100);
+        assert!(matches!(
+            command.get_document("filter").unwrap().get("balance"),
+            Some(mongodb::bson::Bson::Decimal128(_))
+        ));
+        assert!(parse_command("[]").is_err());
     }
 }

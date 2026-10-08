@@ -793,6 +793,14 @@ mod tests {
         let key = connection_key(&QueryHistoryConnection::profile(profile_id));
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = DbxApp::new(window, cx);
+            // Real Tokio workers cannot wake GPUI's deterministic test scheduler
+            // after it has shut down. Drive database I/O on the test thread.
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
             app.profile_store = Some(store);
             app.workspace_store = Some(workspace.clone());
             app.workspace_documents
@@ -884,6 +892,35 @@ mod tests {
                 };
                 assert_eq!(query.sql, "SELECT 42");
             })
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let runtime = cx.update(|_, cx| app.read(cx).runtime.clone());
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            });
+            cx.run_until_parked();
+            if cx.update(|_, cx| {
+                !app.read(cx)
+                    .session(session_id)
+                    .unwrap()
+                    .background_tasks
+                    .has_pending()
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workspace metadata did not finish"
+            );
+        }
+        cx.update(|_, cx| {
+            let session = app.read(cx).session(session_id).unwrap();
+            let SecondaryTabKind::Structure(structure) = &session.secondary_tabs[0].kind else {
+                panic!("structure tab")
+            };
+            assert!(!structure.busy);
+            assert_eq!(structure.columns.len(), 1);
         });
     }
 }
