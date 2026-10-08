@@ -71,7 +71,7 @@ def main():
                 names.append(container)
                 container_port = port.split(":")[1]
                 ssh_binding = ["-p", "127.0.0.1::2222"] if name == "redis" else []
-                run("docker", "run", "-d", "--name", container, "-p", f"127.0.0.1::{container_port}", "-v", f"{sockets}:/sockets", *ssh_binding, *environment, image, *command, stdout=subprocess.DEVNULL)
+                run("docker", "run", "-d", "--name", container, "-p", f"127.0.0.1::{container_port}", "-v", f"{sockets}:/sockets", "-v", f"{sockets}:{sockets}", *ssh_binding, *environment, image, *command, stdout=subprocess.DEVNULL)
             for _ in range(120):
                 for name in names:
                     state = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture_output=True, text=True, check=True)
@@ -108,6 +108,8 @@ def main():
                 time.sleep(1)
             environment = os.environ | {
                 "PATH": str(root / "bin") + os.pathsep + os.environ["PATH"],
+                # Native socket jobs must not inherit a TCP destination override.
+                "PGHOSTADDR": "192.0.2.1",
                 "DBX_TEST_TRANSPORT_DIRECTORY": str(root),
                 "DBX_TEST_SSH_PORT": str(ssh_port), "DBX_TEST_SSH_USER": username,
             }
@@ -127,7 +129,40 @@ def main():
             with (root / "known_hosts").open("a") as known_hosts:
                 known_hosts.write(f"[127.0.0.1]:{password_port} {host_key[0]} {host_key[1]}\n")
             environment["DBX_TEST_SSH_PASSWORD_PORT"] = password_port
+            # Real libpq tools use the exact same socket path inside the fixture.
+            # Copy only the private job password file; never expose the host /tmp.
+            native_wrapper = '''#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, uuid
+container = CONTAINER
+program = pathlib.Path(sys.argv[0]).name
+credential = "/tmp/dbx-native-" + uuid.uuid4().hex
+options = []
+try:
+    if "PGPASSFILE" in os.environ:
+        subprocess.run(["docker", "exec", "-i", container, "sh", "-c", "umask 077; cat > " + credential], input=pathlib.Path(os.environ["PGPASSFILE"]).read_bytes(), check=True)
+        options += ["--env", "PGPASSFILE=" + credential]
+    for key in ["PGHOST", "PGHOSTADDR", "PGPORT", "PGDATABASE", "PGUSER", "PGCONNECT_TIMEOUT", "PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"]:
+        if key in os.environ:
+            options += ["--env", key + "=" + os.environ[key]]
+    arguments = list(sys.argv[1:])
+    if program == "pg_restore" and arguments and not arguments[-1].startswith("-"):
+        # Restore reads the archive from stdin rather than a host file path.
+        with open(arguments.pop(), "rb") as archive:
+            result = subprocess.run(["docker", "exec", "-i", *options, container, program, *arguments], stdin=archive)
+    else:
+        result = subprocess.run(["docker", "exec", *options, container, program, *arguments])
+    sys.exit(result.returncode)
+finally:
+    subprocess.run(["docker", "exec", container, "rm", "-f", credential], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+'''.replace("CONTAINER", repr(names[0]))
+            for program in ["pg_dump", "pg_restore"]:
+                wrapper = root / "bin" / program
+                wrapper.write_text(native_wrapper)
+                wrapper.chmod(0o700)
+            run("docker", "exec", names[0], "sh", "-c", "sed -i 's/^local[[:space:]].*/local all all scram-sha-256/' /var/lib/postgresql/data/pg_hba.conf")
+            run("docker", "exec", names[0], "psql", "-U", "dbx_test", "-d", "dbx_test", "-c", "SELECT pg_reload_conf()", stdout=subprocess.DEVNULL)
             run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "socket_and_ssh_connections_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
+            run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "native_postgres_backup_over_password_socket", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
             run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "ssh_tunnel_lifetime_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
             run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "ssh_password_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)
             run("cargo", "test", "--locked", *(["--release"] if os.environ.get("DBX_TEST_CARGO_PROFILE") == "release" else []), "-p", "dbx-core", "strict_tls_over_ssh_integration", "--", "--ignored", "--nocapture", env=environment, cwd=repo)

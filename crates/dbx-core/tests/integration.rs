@@ -112,6 +112,55 @@ async fn socket_and_ssh_connections_integration() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "run scripts/test-transports.py for password-authenticated socket and native tools"]
+async fn native_postgres_backup_over_password_socket() -> Result<()> {
+    let root = std::path::PathBuf::from(
+        std::env::var("DBX_TEST_TRANSPORT_DIRECTORY").expect("transport fixtures required"),
+    );
+    let mut source = ConnectionConfig::new(
+        DatabaseKind::PostgreSQL,
+        "postgres://dbx_test:dbx_test_password@127.0.0.1:5432/dbx_test",
+    );
+    source.socket = Some(root.join("sockets/pg"));
+    let engine = DatabaseEngine::connect(source.clone()).await?;
+    engine
+        .execute_sql("CREATE TABLE native_socket_probe (id integer PRIMARY KEY)")
+        .await?;
+    engine
+        .execute_sql("INSERT INTO native_socket_probe VALUES (42)")
+        .await?;
+    engine
+        .execute_sql("CREATE DATABASE dbx_native_socket_restore")
+        .await?;
+    let path = root.join("socket.backup");
+    dbx_core::native_backup(
+        source.clone(),
+        &path,
+        false,
+        dbx_core::TransferControl::default(),
+    )
+    .await?;
+    source.url =
+        "postgres://dbx_test:dbx_test_password@127.0.0.1:5432/dbx_native_socket_restore".into();
+    dbx_core::native_backup(
+        source.clone(),
+        &path,
+        true,
+        dbx_core::TransferControl::default(),
+    )
+    .await?;
+    let restored = DatabaseEngine::connect(source).await?;
+    let rows = restored
+        .query(
+            "SELECT id FROM native_socket_probe",
+            QueryOptions::default(),
+        )
+        .await?;
+    assert_eq!(rows.rows[0].values[0], CellValue::Integer(42));
+    Ok(())
+}
+
+#[tokio::test]
 #[ignore = "requires the disposable integration databases"]
 async fn postgresql_crud_integration() -> Result<()> {
     run_sql_scenario(DatabaseKind::PostgreSQL, "DBX_TEST_POSTGRES_URL").await
