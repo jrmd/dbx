@@ -97,7 +97,10 @@ and use a new empty target. PostgreSQL restore is transactional; MySQL DDL can
 already be committed if cancellation or an error occurs. A backup can contain
 executable database functions and triggers: restore only trusted input. Use
 **View native job log** for diagnostics; credentials are delivered privately.
-PostgreSQL's native tools preserve TLS identity over TCP SSH forwarding. Native
+PostgreSQL's native tools preserve TLS identity over TCP SSH forwarding. Local
+socket backup/restore supports password authentication; a local socket profile
+that requires TLS is rejected because libpq ignores that requirement on sockets.
+Use verified TCP or SSH for that native job. Native
 MySQL clients skip TLS on Unix sockets, so a required/verified TLS native job
 needs a direct TCP profile; DBX query sessions still verify TLS over SSH.
 

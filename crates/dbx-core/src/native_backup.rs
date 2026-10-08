@@ -71,6 +71,17 @@ pub async fn native_backup(
     if restore && config.read_only {
         return Err(invalid("Protected connection: restore is disabled"));
     }
+    if config.kind == DatabaseKind::PostgreSQL && config.socket.is_some() && config.ssh.is_none() {
+        let url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL"))?;
+        if url.query_pairs().any(|(key, mode)| {
+            key == "sslmode"
+                && !matches!(mode.to_lowercase().as_str(), "disable" | "allow" | "prefer")
+        }) {
+            return Err(invalid(
+                "The native PostgreSQL client ignores TLS on local Unix sockets. Use a verified TCP or SSH profile for native backup/restore when TLS is required.",
+            ));
+        }
+    }
     if config.kind == DatabaseKind::MySQL && (config.ssh.is_some() || config.socket.is_some()) {
         let url = Url::parse(&config.url).map_err(|_| invalid("Invalid database URL"))?;
         if url.query_pairs().any(|(key, mode)| {
@@ -178,10 +189,16 @@ pub async fn native_backup(
         .env_remove("PGSERVICEFILE");
     if kind == DatabaseKind::PostgreSQL {
         let port = url.port().unwrap_or(5432);
+        let password_host = match &config.socket {
+            Some(socket) => socket
+                .to_str()
+                .ok_or_else(|| invalid("Native PostgreSQL socket paths must be UTF-8"))?,
+            None => &host,
+        };
         writeln!(
             secret_file,
             "{}:{}:{}:{}:{}",
-            pg_escape(&host),
+            pg_escape(password_host),
             port,
             pg_escape(&database),
             pg_escape(&user),
@@ -189,6 +206,7 @@ pub async fn native_backup(
         )
         .map_err(io)?;
         command
+            .env_remove("PGHOSTADDR")
             .env("PGPASSFILE", &credentials)
             .env("PGHOST", &host)
             .env("PGPORT", port.to_string())
@@ -202,8 +220,6 @@ pub async fn native_backup(
             command.env("PGHOSTADDR", "127.0.0.1");
         } else if let Some(socket) = &config.socket {
             command.env("PGHOST", socket);
-        } else {
-            command.env_remove("PGHOSTADDR");
         }
         for (key, variable) in [
             ("sslmode", "PGSSLMODE"),
@@ -387,5 +403,36 @@ fn redact_diagnostic(line: &[u8], password: &str) -> String {
         line.into_owned()
     } else {
         line.replace(password, "<redacted>")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_postgres_sockets_reject_required_tls_before_starting_tools() {
+        for mode in ["require", "verify-ca", "verify-full"] {
+            for restore in [false, true] {
+                let mut config = ConnectionConfig::new(
+                    DatabaseKind::PostgreSQL,
+                    format!("postgres://localhost/dbx_test?sslmode={mode}"),
+                );
+                config.socket = Some("/nonexistent/dbx-fixture-socket".into());
+                let error = native_backup(
+                    config,
+                    Path::new("/nonexistent/dbx-fixture.backup"),
+                    restore,
+                    TransferControl::default(),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("ignores TLS on local Unix sockets")
+                );
+            }
+        }
     }
 }

@@ -239,6 +239,10 @@ Backups replace a destination only after success. PostgreSQL custom-archive
 restore uses one transaction; MySQL DDL may commit before failure/cancellation,
 so restore into a new empty database and inspect before retrying. The tool version,
 progress, cancellation and retained log are available in the database menu.
+Native PostgreSQL socket jobs match the actual socket directory in their private
+password file and clear ambient TCP host overrides. Local sockets with required
+TLS are rejected; use verified TCP or PostgreSQL SSH for those native jobs.
+Native MySQL required/verified TLS jobs require direct TCP.
 
 History is local **plaintext JSON**, separate from encrypted drafts. Use the
 query menu to pause recording, retain 10/30/100 entries, search by date/outcome/
