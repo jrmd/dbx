@@ -38,23 +38,24 @@ pub use model::{
     CellValue, CheckConstraintInfo, ColumnInfo, ConnectionConfig, CreateColumn, CreateTableRequest,
     DatabaseKind, EntityKind, ExecResult, Filter, FilterOperator, ForeignKeyInfo, IndexInfo,
     InsertRequest, MutationValue, Order, OrderDirection, Page, QueryResult, ReferentialAction,
-    RelationalSchema, RelationalTable, RowData, TableInfo, TableRef, TableStructure, UpdateRequest,
+    RelationalSchema, RelationalTable, RowChange, RowData, TableInfo, TableRef, TableStructure,
+    UpdateRequest,
 };
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
 pub use sql::{
-    SqlStatement, build_create_table, build_delete, build_delete_with_columns, build_drop_table,
-    build_insert, build_insert_with_columns, build_multi_row_insert, build_select,
-    build_select_with_columns, build_truncate_table, build_update, build_update_with_columns,
-    quote_identifier, validate_sql_expression,
+    SqlStatement, build_count, build_create_table, build_delete, build_delete_with_columns,
+    build_drop_table, build_insert, build_insert_with_columns, build_multi_row_insert,
+    build_row_estimate, build_select, build_select_with_columns, build_truncate_table,
+    build_update, build_update_with_columns, quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::checked_split_sql_for;
 pub use transfer::{
     DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
     FileFormat, ImportReport, TransferControl, detect_file_format, export_database, export_table,
-    import_database, import_file, render_sql_indexes, render_sql_insert, render_sql_schema,
-    split_sql_statements, with_transfer_control,
+    import_database, import_file, render_row_change, render_sql_indexes, render_sql_insert,
+    render_sql_schema, split_sql_statements, with_transfer_control,
 };
 
 #[cfg(test)]

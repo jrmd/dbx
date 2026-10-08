@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::app::row_count::{RowCount, approximate, grouped};
 use crate::popups::DropdownMenu as _;
 use gpui_component::menu::PopupMenuItem;
 
@@ -831,6 +832,7 @@ impl DbxApp {
                                 data.table_page,
                                 data.table_has_next_page,
                                 data.busy,
+                                session.kind.is_sql().then_some(data.row_count),
                             ));
                             let status = if data.busy {
                                 data.status.clone()
@@ -923,19 +925,34 @@ impl DbxApp {
         let result_summary = result
             .as_ref()
             .map(|result| {
-                if let Some((_, _, page, _, _)) = table_pagination {
+                if let Some((_, _, page, _, _, count)) = table_pagination {
                     let page_number = page.saturating_add(1);
+                    let exact = match count {
+                        Some(RowCount::Exact(total)) => Some(total),
+                        _ => None,
+                    };
+                    let pages = exact
+                        .map(|total| {
+                            format!(
+                                " of {}",
+                                total.div_ceil(u64::from(TABLE_BROWSE_PAGE_SIZE)).max(1)
+                            )
+                        })
+                        .unwrap_or_default();
                     if result.rows.is_empty() {
-                        format!(
-                            "No rows · page {page_number} · {TABLE_BROWSE_PAGE_SIZE}/page"
-                        )
+                        format!("No rows · page {page_number}{pages}")
                     } else {
                         let first_row = page
                             .saturating_mul(u64::from(TABLE_BROWSE_PAGE_SIZE))
                             .saturating_add(1);
                         let last_row = first_row + result.rows.len() as u64 - 1;
+                        let total = exact
+                            .map(|total| format!(" of {}", grouped(total)))
+                            .unwrap_or_default();
                         format!(
-                            "Rows {first_row}–{last_row} · page {page_number} · {TABLE_BROWSE_PAGE_SIZE}/page"
+                            "Rows {}–{}{total} · page {page_number}{pages}",
+                            grouped(first_row),
+                            grouped(last_row)
                         )
                     }
                 } else {
@@ -944,11 +961,39 @@ impl DbxApp {
             })
             .unwrap_or(summary);
         let pagination_controls =
-            table_pagination.map(|(session_id, tab_id, page, has_next_page, busy)| {
+            table_pagination.map(|(session_id, tab_id, page, has_next_page, busy, count)| {
+                let count_button = match count {
+                    Some(RowCount::Unknown) => Some(("Count rows".to_owned(), true)),
+                    Some(RowCount::Estimate(estimate)) => {
+                        Some((format!("{} rows", approximate(estimate)), true))
+                    }
+                    Some(RowCount::Counting) => Some(("Counting…".to_owned(), false)),
+                    Some(RowCount::Exact(_)) | None => None,
+                };
+                let estimated = matches!(count, Some(RowCount::Estimate(_)));
                 div()
                     .flex()
                     .items_center()
                     .gap(px(4.))
+                    .when_some(count_button, |view, (label, enabled)| {
+                        view.child(
+                            div()
+                                .id("table-row-count")
+                                .tooltip(tip(if estimated {
+                                    "Estimated from table statistics. Click for an exact count."
+                                } else {
+                                    "Count every matching row"
+                                }))
+                                .child(self.small_button_state(
+                                    "table-row-count-button",
+                                    label,
+                                    enabled && !busy,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.count_rows_for(session_id, tab_id, cx)
+                                    }),
+                                )),
+                        )
+                    })
                     .child(self.small_button_state(
                         "table-page-previous",
                         "Previous",

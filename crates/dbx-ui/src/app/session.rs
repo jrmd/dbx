@@ -271,6 +271,19 @@ pub(super) struct CompletionSignature {
     pub(super) cursor: usize,
 }
 
+/// Everything a completion result depends on: the query text and caret,
+/// plus a cheap stamp of the schema metadata and recently browsed result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CompletionCacheKey {
+    pub(super) signature: CompletionSignature,
+    pub(super) tables: usize,
+    pub(super) columns: usize,
+    pub(super) recent_result: usize,
+}
+
+type CompletionResult = Option<(Range<usize>, Vec<SqlCompletionItem>)>;
+type CompletionCache = (CompletionCacheKey, CompletionResult);
+
 #[derive(Default)]
 pub(super) struct AbortOnDrop(Option<tokio::task::AbortHandle>);
 
@@ -370,6 +383,9 @@ pub(super) struct QueryTab {
     pub(super) request_generation: u64,
     pub(super) query_revision: u64,
     pub(super) completion_signature: Option<CompletionSignature>,
+    /// The last computed completion and what it was computed from. Rendering
+    /// asks for completion every frame; recomputing lexes the whole query.
+    pub(super) completion_cache: Option<CompletionCache>,
     pub(super) completion_dismissed_signature: Option<CompletionSignature>,
     pub(super) completion_index: usize,
     pub(super) _subscriptions: Vec<Subscription>,
@@ -476,6 +492,7 @@ impl QueryTab {
             request_generation: 0,
             query_revision: 0,
             completion_signature: None,
+            completion_cache: None,
             completion_dismissed_signature: None,
             completion_index: 0,
             _subscriptions: vec![
@@ -495,7 +512,7 @@ impl QueryTab {
         self.result_grid.update(cx, move |table, cx| {
             table
                 .delegate_mut()
-                .set_result(result, &remembered_widths, &[], &[]);
+                .set_result(result, &remembered_widths, None, &[], &[]);
             table.clear_selection(cx);
             table.refresh(cx);
         });
@@ -686,12 +703,27 @@ impl Drop for DiagramTab {
     }
 }
 
+/// Where a browsed page begins. Keyset and Redis starts are only known after
+/// the previous page loads, so a data tab remembers the start of every page it
+/// has visited to make Previous exact.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum PageStart {
+    Offset,
+    /// Rows strictly after (or before, when descending) this primary key.
+    After(CellValue),
+    /// A Redis `SCAN` cursor.
+    RedisCursor(u64),
+}
+
 /// One open table. Each tab owns its grid, filters, page, and row draft, so
 /// switching between tables keeps every view exactly where the user left it.
 pub(super) struct DataTab {
     pub(super) table: TableRef,
     pub(super) data_grid: Entity<TableState<ResultTableDelegate>>,
     pub(super) result_column_widths: HashMap<String, Pixels>,
+    /// Column widths, order, pins, hidden columns and saved filters, persisted
+    /// per table in the connection's workspace.
+    pub(super) layout: crate::workspace::TableLayout,
     pub(super) _data_grid_subscription: Subscription,
     pub(super) filters: FilterModel,
     pub(super) filter_subscriptions: Vec<Subscription>,
@@ -703,12 +735,29 @@ pub(super) struct DataTab {
     pub(super) result_table: Option<TableRef>,
     pub(super) table_page: u64,
     pub(super) table_has_next_page: bool,
+    /// `page_starts[p]` is how page `p` began; `next_page_start` continues
+    /// after the current page.
+    pub(super) page_starts: Vec<PageStart>,
+    pub(super) next_page_start: Option<PageStart>,
+    pub(super) row_count: super::row_count::RowCount,
+    /// The filters the loaded pages and `row_count` reflect.
+    pub(super) counted_filters: Vec<Filter>,
     /// Header sort applied as `ORDER BY` when the engine supports it.
     pub(super) sort: Option<Order>,
     pub(super) sortable: bool,
-    /// Inline cell values staged for the next save, and the open cell editor.
+    /// The changeset staged for the next commit: edited cells of loaded rows,
+    /// new rows, and loaded rows marked for deletion. Nothing reaches the
+    /// database until the user commits the set as a whole.
     pub(super) pending_edits: cell_edits::PendingEdits,
+    pub(super) pending_inserts: Vec<cell_edits::PendingInsert>,
+    pub(super) pending_deletes: std::collections::BTreeSet<usize>,
     pub(super) cell_editor: Option<cell_edits::CellEditor>,
+    /// Rows picked with Shift/Cmd-click for bulk delete and copy, and the
+    /// anchor a Shift-click extends from.
+    pub(super) marked_rows: std::collections::BTreeSet<usize>,
+    pub(super) mark_anchor: Option<usize>,
+    /// The staged new row the open insert draft edits, if it is not new.
+    pub(super) draft_insert: Option<usize>,
     pub(super) selected_row: Option<usize>,
     pub(super) selected_column: usize,
     pub(super) inspector_open: bool,
@@ -736,8 +785,9 @@ impl DataTab {
             ResultTableDelegate::with_row_actions(cx.entity().downgrade(), session_id, id, true);
         let data_grid = cx.new(|cx| {
             TableState::new(row_actions, window, cx)
-                .col_resizable(true)
-                .col_movable(false)
+                // The header draws its own, wider resize handle.
+                .col_resizable(false)
+                .col_movable(true)
                 .sortable(sortable)
                 .row_selectable(true)
                 .col_selectable(true)
@@ -751,6 +801,7 @@ impl DataTab {
             table,
             data_grid,
             result_column_widths: HashMap::new(),
+            layout: Default::default(),
             _data_grid_subscription: data_grid_subscription,
             filters: FilterModel::new(),
             filter_subscriptions: Vec::new(),
@@ -760,10 +811,19 @@ impl DataTab {
             result_table: None,
             table_page: 0,
             table_has_next_page: false,
+            page_starts: Vec::new(),
+            next_page_start: None,
+            row_count: Default::default(),
+            counted_filters: Vec::new(),
             sort: None,
             sortable,
             pending_edits: Default::default(),
+            pending_inserts: Vec::new(),
+            pending_deletes: Default::default(),
             cell_editor: None,
+            marked_rows: Default::default(),
+            mark_anchor: None,
+            draft_insert: None,
             selected_row: None,
             selected_column: 0,
             inspector_open: false,
@@ -797,13 +857,22 @@ impl DataTab {
     ) {
         let result = self.result.clone();
         let remembered_widths = self.result_column_widths.clone();
+        let layout = self.layout.clone();
         let foreign_keys = self.foreign_keys.clone();
         let tables = tables.to_vec();
         let (sortable, sort) = (self.sortable, self.sort.clone());
+        let row_offset = self.table_page as usize * TABLE_BROWSE_PAGE_SIZE as usize;
         self.data_grid.update(cx, move |table, cx| {
             let delegate = table.delegate_mut();
             delegate.set_server_sort(sortable, sort.as_ref());
-            delegate.set_result(result, &remembered_widths, &foreign_keys, &tables);
+            delegate.set_row_offset(row_offset);
+            delegate.set_result(
+                result,
+                &remembered_widths,
+                Some(&layout),
+                &foreign_keys,
+                &tables,
+            );
             table.refresh(cx);
             if clear_selection {
                 table.clear_selection(cx);
@@ -821,6 +890,9 @@ impl DataTab {
     pub(super) fn reset_row_state(&mut self, cx: &mut Context<DbxApp>) {
         self.result_table = None;
         self.selected_row = None;
+        self.marked_rows.clear();
+        self.mark_anchor = None;
+        self.draft_insert = None;
         self.row_draft = None;
         self.row_draft_subscriptions.clear();
         // Reloads are refused while edits are staged, so only an open editor

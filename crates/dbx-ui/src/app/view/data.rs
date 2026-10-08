@@ -1,5 +1,7 @@
 use super::super::*;
 use crate::diagram::display_type;
+use crate::popups::DropdownMenu as _;
+use gpui_component::menu::PopupMenuItem;
 
 fn row_field_heading(
     field_id: FieldId,
@@ -64,7 +66,16 @@ impl DbxApp {
                 .child("Select a table to browse rows")
                 .into_any_element();
         };
-        let Some((kind, redis_filter_editor, can_mutate, filter_rows, inspector_open)) = self
+        let Some((
+            kind,
+            redis_filter_editor,
+            can_mutate,
+            filter_rows,
+            inspector_open,
+            column_names,
+            hidden_columns,
+            saved_filters,
+        )) = self
             .session(session_id)
             .zip(self.data_tab(session_id, tab_id))
             .map(|(session, data)| {
@@ -86,14 +97,37 @@ impl DbxApp {
                         })
                         .collect::<Vec<_>>(),
                     data.inspector_open,
+                    data.result
+                        .as_ref()
+                        .map(|result| {
+                            result
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    data.layout.hidden.clone(),
+                    data.layout
+                        .saved_filters
+                        .iter()
+                        .map(|saved| saved.name.clone())
+                        .collect::<Vec<_>>(),
                 )
             })
         else {
             return div().into_any_element();
         };
         let has_filter_rows = !filter_rows.is_empty();
+        let app = cx.entity().downgrade();
+        let columns_app = app.clone();
+        let saved_app = app.clone();
         let redis_filter_focus = redis_filter_editor.read(cx).focus_handle();
         div()
+            .key_context("DbxDataTab")
+            .on_action(cx.listener(move |this, _: &CommitChanges, window, cx| {
+                this.request_commit_changes_for(session_id, tab_id, window, cx)
+            }))
             .flex_1()
             .min_h_0()
             .flex()
@@ -159,6 +193,115 @@ impl DbxApp {
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.clear_filters_for(session_id, tab_id, cx)
                                                 })),
+                                        )
+                                    })
+                                    .when(
+                                        kind.is_sql()
+                                            && (has_filter_rows || !saved_filters.is_empty()),
+                                        move |view| {
+                                            view.child(
+                                                button(
+                                                    "saved-filters",
+                                                    "Saved",
+                                                    ButtonKind::Quiet,
+                                                )
+                                                .cursor_pointer()
+                                                .dropdown_menu(move |mut menu, _, _| {
+                                                    for (index, name) in
+                                                        saved_filters.iter().enumerate()
+                                                    {
+                                                        let app = saved_app.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(name.clone())
+                                                                .on_click(move |_, window, cx| {
+                                                                    let _ = app.update(cx, |this, cx| {
+                                                                        this.apply_saved_filter_for(
+                                                                            session_id, tab_id,
+                                                                            index, window, cx,
+                                                                        )
+                                                                    });
+                                                                }),
+                                                        );
+                                                    }
+                                                    if !saved_filters.is_empty() {
+                                                        menu = menu.separator();
+                                                    }
+                                                    let app = saved_app.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new("Save current filters")
+                                                            .disabled(!has_filter_rows)
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = app.update(cx, |this, cx| {
+                                                                    this.save_current_filters_for(
+                                                                        session_id, tab_id, cx,
+                                                                    )
+                                                                });
+                                                            }),
+                                                    );
+                                                    for (index, name) in
+                                                        saved_filters.iter().enumerate()
+                                                    {
+                                                        let app = saved_app.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(format!(
+                                                                "Delete “{name}”"
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ = app.update(cx, |this, cx| {
+                                                                    this.delete_saved_filter_for(
+                                                                        session_id, tab_id, index,
+                                                                        cx,
+                                                                    )
+                                                                });
+                                                            }),
+                                                        );
+                                                    }
+                                                    menu
+                                                }),
+                                            )
+                                        },
+                                    )
+                                    .when(kind.is_sql() && !column_names.is_empty(), move |view| {
+                                        view.child(
+                                            button("table-columns", "Columns", ButtonKind::Quiet)
+                                                .cursor_pointer()
+                                                .dropdown_menu(move |mut menu, _, _| {
+                                                    let visible = column_names.len()
+                                                        - hidden_columns.len().min(column_names.len());
+                                                    for name in &column_names {
+                                                        let shown = !hidden_columns.contains(name);
+                                                        let app = columns_app.clone();
+                                                        let toggled = name.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new(name.clone())
+                                                                .checked(shown)
+                                                                // Keep at least one column.
+                                                                .disabled(shown && visible < 2)
+                                                                .on_click(move |_, _, cx| {
+                                                                    let _ = app.update(cx, |this, cx| {
+                                                                        this.toggle_column_for(
+                                                                            session_id,
+                                                                            tab_id,
+                                                                            toggled.clone(),
+                                                                            cx,
+                                                                        )
+                                                                    });
+                                                                }),
+                                                        );
+                                                    }
+                                                    let app = columns_app.clone();
+                                                    menu.separator().item(
+                                                        PopupMenuItem::new("Reset layout").on_click(
+                                                            move |_, _, cx| {
+                                                                let _ = app.update(cx, |this, cx| {
+                                                                    this.reset_table_layout_for(
+                                                                        session_id, tab_id, cx,
+                                                                    )
+                                                                });
+                                                            },
+                                                        ),
+                                                    )
+                                                }),
                                         )
                                     })
                                     .when(kind == DatabaseKind::Redis || has_filter_rows, |view| {
@@ -346,19 +489,13 @@ impl DbxApp {
         tab_id: SecondaryTabId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some((result_grid, has_result, busy, pending)) =
+        let Some((result_grid, has_result, busy, counts)) =
             self.data_tab(session_id, tab_id).map(|data| {
-                let rows = data
-                    .pending_edits
-                    .keys()
-                    .map(|(row, _)| *row)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len();
                 (
                     data.data_grid.clone(),
                     data.result.is_some(),
                     data.busy,
-                    (data.pending_edits.len(), rows),
+                    data.change_counts(),
                 )
             })
         else {
@@ -380,9 +517,19 @@ impl DbxApp {
                 .into_any_element();
         }
 
-        let (pending_cells, pending_rows) = pending;
+        let summary = [
+            (counts.edited, "edited"),
+            (counts.inserted, "new"),
+            (counts.deleted, "deleted"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
         div()
             .id("grid")
+            .key_context("DbxDataGrid")
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -456,7 +603,16 @@ impl DbxApp {
                     )
                 },
             )
-            .when(pending_cells > 0, |view| {
+            .on_action(cx.listener(move |this, _: &DeleteRows, _, cx| {
+                this.delete_rows_for(session_id, tab_id, None, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &CopyDataSelection, _, cx| {
+                this.copy_data_selection_for(session_id, tab_id, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &PasteRows, _, cx| {
+                this.paste_rows_for(session_id, tab_id, cx)
+            }))
+            .when(counts.total() > 0, |view| {
                 view.child(
                     div()
                         .flex_none()
@@ -473,11 +629,7 @@ impl DbxApp {
                             div()
                                 .text_size(px(11.))
                                 .text_color(theme().text)
-                                .child(format!(
-                                    "{} in {}",
-                                    counted(pending_cells, "staged change", "staged changes"),
-                                    counted(pending_rows, "row", "rows")
-                                )),
+                                .child(summary),
                         )
                         .child(
                             div()
@@ -493,11 +645,24 @@ impl DbxApp {
                                         })),
                                 )
                                 .child(
-                                    button("save-cell-edits", "Save changes", ButtonKind::Primary)
+                                    button("review-cell-edits", "Review SQL", ButtonKind::Quiet)
                                         .cursor_pointer()
                                         .disabled(busy)
                                         .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.save_pending_edits_for(
+                                            this.review_changes_for(session_id, tab_id, window, cx)
+                                        })),
+                                )
+                                .child(
+                                    button("save-cell-edits", "Commit", ButtonKind::Primary)
+                                        .cursor_pointer()
+                                        .disabled(busy)
+                                        .tooltip(if cfg!(target_os = "macos") {
+                                            "⌘S"
+                                        } else {
+                                            "Ctrl+S"
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.request_commit_changes_for(
                                                 session_id, tab_id, window, cx,
                                             )
                                         })),
@@ -531,6 +696,7 @@ impl DbxApp {
             draft_mode,
             draft_fields,
             static_fields,
+            row_deleted,
         )) = self.data_tab(session_id, tab_id).map(|data| {
             let can_mutate = self.editable_table_for(session_id, tab_id).is_some();
             let draft_fields = data
@@ -561,7 +727,6 @@ impl DbxApp {
                 .unwrap_or_default();
             let static_fields = data
                 .selected_row
-                .and_then(|row_index| data.result.as_ref()?.rows.get(row_index))
                 .and_then(|row| {
                     data.result.as_ref().map(|result| {
                         result
@@ -572,13 +737,16 @@ impl DbxApp {
                                 (
                                     column.name.clone(),
                                     column.data_type.clone(),
-                                    row.values.get(index).cloned(),
+                                    data.shown_value(row, index),
                                 )
                             })
                             .collect::<Vec<_>>()
                     })
                 })
                 .unwrap_or_default();
+            let row_deleted = data
+                .selected_row
+                .is_some_and(|row| data.pending_deletes.contains(&row));
             (
                 data.result.is_some() && data.result_table.is_none(),
                 can_mutate,
@@ -587,6 +755,7 @@ impl DbxApp {
                 data.draft_mode,
                 draft_fields,
                 static_fields,
+                row_deleted,
             )
         })
         else {
@@ -874,9 +1043,9 @@ impl DbxApp {
                                     button(
                                         "save-row",
                                         if draft_mode == DraftMode::Insert {
-                                            "Insert row"
+                                            "Stage row"
                                         } else {
-                                            "Save changes"
+                                            "Stage changes"
                                         },
                                         ButtonKind::Primary,
                                     )
@@ -899,7 +1068,11 @@ impl DbxApp {
                                 .justify_between()
                                 .child(
                                     Button::new("delete-row")
-                                        .label("Delete row")
+                                        .label(if row_deleted {
+                                            "Restore row"
+                                        } else {
+                                            "Delete row"
+                                        })
                                         .with_size(Size::XSmall)
                                         .compact()
                                         .ghost()
@@ -911,15 +1084,17 @@ impl DbxApp {
                                             )
                                         })),
                                 )
-                                .child(
-                                    button("edit-row", "Edit row", ButtonKind::Primary)
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.begin_edit_selected_for(
-                                                session_id, tab_id, window, cx,
-                                            )
-                                        })),
-                                ),
+                                .when(!row_deleted, |actions| {
+                                    actions.child(
+                                        button("edit-row", "Edit row", ButtonKind::Primary)
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.begin_edit_selected_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            })),
+                                    )
+                                }),
                         )
                     }),
             )

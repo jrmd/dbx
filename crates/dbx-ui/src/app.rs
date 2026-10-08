@@ -16,12 +16,16 @@ mod session;
 mod tabs;
 use session::*;
 mod connection;
+mod data_clipboard;
 mod diagnostics;
 mod find;
 mod query_parameters;
+mod quick_open;
 mod redis_completion;
 mod result_table;
+mod row_count;
 mod sql_completion;
+mod table_layout;
 mod transfer;
 mod value_view;
 mod view;
@@ -36,10 +40,11 @@ use std::{
 
 use dbx_core::{
     CellValue, ColumnInfo, ConnectionConfig, DatabaseEngine, DatabaseExportRequest, DatabaseKind,
-    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, Order, Page,
-    QueryCancellation, QueryOptions, QueryResult, QuerySession, RedisCommandCatalog,
-    ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo, TableRef,
-    UpdateRequest, detect_file_format, export_database, export_table, import_database, import_file,
+    DumpFormat, EntityKind, Filter, FilterOperator, ForeignKeyInfo, InsertRequest, MutationValue,
+    Order, OrderDirection, Page, QueryCancellation, QueryOptions, QueryResult, QuerySession,
+    RedisCommandCatalog, ReferentialAction, RelationalSchema, RowData, StatementResult, TableInfo,
+    TableRef, UpdateRequest, detect_file_format, export_database, export_table, import_database,
+    import_file,
 };
 use gpui::{
     AnyElement, App, ClipboardItem, Context, CursorStyle, Decorations, Div, ElementId, Entity,
@@ -72,7 +77,9 @@ use crate::{
     query_history::{
         QueryHistoryConnection, QueryHistoryEntry, QueryHistoryOutcome, QueryHistoryStore,
     },
-    row_drafts::{FieldId, FieldRow, FieldValueKind, FieldValueState, RowDraftModel},
+    row_drafts::{
+        FieldId, FieldRow, FieldValueKind, FieldValueState, RowDraftModel, field_editor_text,
+    },
     settings::{Settings, SettingsStore},
     theme::{
         Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS,
@@ -133,6 +140,14 @@ gpui::actions!(
         CommitCellEditPrevious,
         CancelCellEdit,
         SetCellNull,
+        CommitChanges,
+        DeleteRows,
+        CopyDataSelection,
+        PasteRows,
+        OpenQuickOpen,
+        QuickOpenNext,
+        QuickOpenPrevious,
+        QuickOpenConfirm,
         SubmitQueryParameters,
         CancelQueryParameters,
         OpenFind,
@@ -225,6 +240,56 @@ fn table_browse_page(page: u64) -> Page {
 pub(crate) fn counted(count: impl TryInto<u64>, singular: &str, plural: &str) -> String {
     let count = count.try_into().unwrap_or(u64::MAX);
     format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// The primary key to page by, when keyset paging can replace OFFSET: a
+/// single-column key on a native SQL engine, with no sort or a sort on that
+/// key. Composite keys and other sorts keep exact OFFSET paging.
+fn keyset_column(
+    kind: DatabaseKind,
+    columns: &[ColumnInfo],
+    sort: Option<&Order>,
+) -> Option<Order> {
+    if !supports_keyset_paging(kind) {
+        return None;
+    }
+    let mut keys = columns.iter().filter(|column| column.primary_key);
+    let key = keys.next()?;
+    if keys.next().is_some() {
+        return None;
+    }
+    match sort {
+        None => Some(Order {
+            column: key.name.clone(),
+            direction: OrderDirection::Ascending,
+        }),
+        Some(order) if order.column == key.name => Some(order.clone()),
+        Some(_) => None,
+    }
+}
+
+fn supports_keyset_paging(kind: DatabaseKind) -> bool {
+    matches!(
+        kind,
+        DatabaseKind::PostgreSQL
+            | DatabaseKind::MySQL
+            | DatabaseKind::SQLite
+            | DatabaseKind::CockroachDB
+            | DatabaseKind::DuckDB
+            | DatabaseKind::Turso
+            | DatabaseKind::CloudflareD1
+            | DatabaseKind::SqlServer
+    )
+}
+
+/// The seek position after a keyset-ordered page: its last primary key.
+fn keyset_start(result: &QueryResult, order_by: &Order) -> Option<PageStart> {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == order_by.column)?;
+    let value = result.rows.last()?.values.get(index)?.clone();
+    (value != CellValue::Null).then_some(PageStart::After(value))
 }
 
 fn trim_table_browse_result(result: &mut QueryResult) -> bool {
@@ -472,6 +537,8 @@ struct ConfirmationDialog {
     action: ConfirmationAction,
     focus: FocusHandle,
     return_focus: Option<FocusHandle>,
+    /// SQL shown for review in a scrollable block below the detail.
+    sql: Option<String>,
 }
 
 struct MutationErrorDialog {
@@ -508,12 +575,14 @@ enum ConfirmationAction {
         session_id: SessionId,
         table: TableInfo,
     },
-    DeleteRow {
+    CommitChanges {
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        table: TableRef,
-        filters: Vec<Filter>,
-        originals: Vec<(String, CellValue)>,
+    },
+    Quit,
+    DiscardDataTab {
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
     },
     DatabaseImport {
         session_id: SessionId,
@@ -529,12 +598,13 @@ enum ConfirmationAction {
 impl ConfirmationAction {
     fn session_id(&self) -> Option<SessionId> {
         match self {
-            Self::LockVault => None,
+            Self::LockVault | Self::Quit => None,
             Self::RunQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
             | Self::ClearQueryHistory { session_id }
             | Self::Table { session_id, .. }
-            | Self::DeleteRow { session_id, .. }
+            | Self::CommitChanges { session_id, .. }
+            | Self::DiscardDataTab { session_id, .. }
             | Self::DatabaseImport { session_id, .. }
             | Self::TableImport { session_id, .. } => Some(*session_id),
         }
@@ -617,6 +687,7 @@ pub struct DbxApp {
     table_context_menu: Option<TableContextMenu>,
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
+    quick_open: Option<quick_open::QuickOpen>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     settings_open: bool,
     settings_section: SettingsSection,
@@ -743,6 +814,7 @@ impl DbxApp {
             table_context_menu: None,
             database_export_dialog: None,
             confirmation_dialog: None,
+            quick_open: None,
             mutation_error_dialog: None,
             settings_open: false,
             settings_section: SettingsSection::Appearance,
@@ -982,6 +1054,7 @@ impl DbxApp {
             action: ConfirmationAction::ClearQueryHistory { session_id },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -1091,7 +1164,10 @@ impl DbxApp {
         if event.keystroke.modifiers.modified() || event.keystroke.key.as_str() != "escape" {
             return;
         }
-        let dismissed = if self.dismiss_mutation_error_dialog(window, cx) {
+        let dismissed = if self.quick_open.is_some() {
+            self.close_quick_open(window, cx);
+            true
+        } else if self.dismiss_mutation_error_dialog(window, cx) {
             true
         } else if self.confirmation_dialog.is_some() {
             self.cancel_confirmation(window, cx);
@@ -1110,6 +1186,40 @@ impl DbxApp {
 
     fn default_query(kind: DatabaseKind) -> &'static str {
         kind.default_query()
+    }
+
+    /// Allow closing the window or quitting, or ask first when a table tab
+    /// holds uncommitted changes.
+    pub(crate) fn confirm_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let changes = self
+            .sessions
+            .iter()
+            .flat_map(|session| &session.secondary_tabs)
+            .filter_map(|tab| match &tab.kind {
+                SecondaryTabKind::Data(data) => Some(data.change_counts().total()),
+                _ => None,
+            })
+            .sum::<usize>();
+        if changes == 0 {
+            return true;
+        }
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: "Quit without committing?".into(),
+            detail: format!(
+                "{} will be lost.",
+                counted(changes, "staged change", "staged changes")
+            ),
+            confirm_label: "Quit",
+            tone: ConfirmationTone::Danger,
+            action: ConfirmationAction::Quit,
+            focus: focus.clone(),
+            return_focus: window.focused(cx),
+            sql: None,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+        false
     }
 
     fn close_session(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
@@ -1356,14 +1466,10 @@ impl DbxApp {
         }
 
         let tab_id = Uuid::new_v4();
-        let data = DataTab::new(
-            session_id,
-            tab_id,
-            table_ref,
-            session.kind.is_sql(),
-            window,
-            cx,
-        );
+        let sortable = session.kind.is_sql();
+        let layout = self.table_layout_for(session_id, &table_ref);
+        let mut data = DataTab::new(session_id, tab_id, table_ref, sortable, window, cx);
+        data.layout = layout;
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
@@ -1416,16 +1522,19 @@ impl DbxApp {
         let runtime = self.runtime.clone();
         let mut filter_model = FilterModel::new();
         for filter in &filters {
-            if let Some(value) = filter.value.as_ref() {
-                filter_model.add_row_with_value_and_columns(
-                    filter.column.clone(),
-                    filter.operator,
-                    value.to_string(),
-                    &filter_columns,
-                    window,
-                    cx,
-                );
-            }
+            // IS NULL and IS NOT NULL carry no value but are still filters.
+            filter_model.add_row_with_value_and_columns(
+                filter.column.clone(),
+                filter.operator,
+                filter
+                    .value
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                &filter_columns,
+                window,
+                cx,
+            );
         }
         let filter_row_ids = filter_model
             .rows()
@@ -1446,7 +1555,13 @@ impl DbxApp {
         data.reset_row_state(cx);
         data.filters = filter_model;
         data.filter_subscriptions.clear();
-        let order = data.sort.clone().into_iter().collect::<Vec<_>>();
+        let sort = data.sort.clone();
+        let keyset = keyset_column(kind, &filter_columns, sort.as_ref());
+        let order = sort
+            .clone()
+            .or_else(|| keyset.clone())
+            .into_iter()
+            .collect::<Vec<_>>();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading {}…", table_ref.name);
@@ -1457,33 +1572,61 @@ impl DbxApp {
         for row_id in filter_row_ids {
             self.watch_filter_row_for(session_id, tab_id, row_id, window, cx);
         }
+        let keyset_capable = filter_columns.is_empty() && supports_keyset_paging(kind);
+        let loaded_filters = filters.clone();
         let task = runtime.spawn(async move {
-            // Structure and the first page are independent, so overlap them
-            // instead of paying two sequential round trips.
-            let first_page = async {
-                if kind != DatabaseKind::Redis {
-                    let mut result = engine
-                        .query_table(
-                            &table_ref,
-                            &[],
-                            &filters,
-                            &order,
-                            Some(table_browse_page(0)),
-                            QueryOptions::default(),
-                        )
-                        .await?;
-                    let has_next_page = trim_table_browse_result(&mut result);
-                    Ok::<_, dbx_core::DbxError>((result, has_next_page))
-                } else {
-                    let result = engine
-                        .query("SCAN 0 COUNT 100", QueryOptions::default())
-                        .await?;
-                    Ok((result, false))
+            let first_page = |order: Vec<Order>| {
+                let (engine, table_ref, filters) = (&engine, &table_ref, &filters);
+                async move {
+                    if kind != DatabaseKind::Redis {
+                        let mut result = engine
+                            .query_table(
+                                table_ref,
+                                &[],
+                                filters,
+                                &order,
+                                Some(table_browse_page(0)),
+                                QueryOptions::default(),
+                            )
+                            .await?;
+                        let has_next_page = trim_table_browse_result(&mut result);
+                        Ok::<_, dbx_core::DbxError>((
+                            result,
+                            has_next_page.then_some(PageStart::Offset),
+                        ))
+                    } else {
+                        let (result, next) = engine
+                            .redis_scan_page("*", 0, TABLE_BROWSE_PAGE_SIZE as usize)
+                            .await?;
+                        Ok((result, (next != 0).then_some(PageStart::RedisCursor(next))))
+                    }
                 }
             };
-            let (structure, (result, has_next_page)) =
-                tokio::try_join!(engine.table_structure(&table_ref), first_page)?;
-            Ok::<_, dbx_core::DbxError>((structure, result, has_next_page))
+            let (structure, (result, next), keyset) = if keyset.is_none() && keyset_capable {
+                // The key is unknown until the structure arrives; reading it
+                // first lets even the first visit page by key.
+                let structure = engine.table_structure(&table_ref).await?;
+                let keyset = keyset_column(kind, &structure.columns, sort.as_ref());
+                let order = sort
+                    .clone()
+                    .or_else(|| keyset.clone())
+                    .into_iter()
+                    .collect();
+                (structure, first_page(order).await?, keyset)
+            } else {
+                // Structure and the first page are independent, so overlap
+                // them instead of paying two sequential round trips.
+                let (structure, page) =
+                    tokio::try_join!(engine.table_structure(&table_ref), first_page(order))?;
+                let confirmed = keyset_column(kind, &structure.columns, sort.as_ref());
+                let keyset = keyset.filter(|keyset| confirmed.as_ref() == Some(keyset));
+                (structure, page, keyset)
+            };
+            let next = match (&keyset, next) {
+                (Some(order_by), Some(_)) => keyset_start(&result, order_by),
+                (_, next) => next,
+            };
+            Ok::<_, dbx_core::DbxError>((structure, result, next))
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
@@ -1510,8 +1653,9 @@ impl DbxApp {
                 data.busy = false;
                 data.abort_handle.clear();
                 let mut referenced_row_missing = false;
+                let loaded = result.is_ok();
                 match result {
-                    Ok((structure, result, has_next_page)) => {
+                    Ok((structure, result, next)) => {
                         let has_rows = !result.rows.is_empty();
                         data.table_columns = structure.columns;
                         session.completion_columns.insert(
@@ -1520,7 +1664,12 @@ impl DbxApp {
                         );
                         data.foreign_keys = structure.foreign_keys;
                         data.table_page = 0;
-                        data.table_has_next_page = has_next_page;
+                        data.table_has_next_page = next.is_some();
+                        data.next_page_start = next;
+                        data.page_starts = vec![match kind {
+                            DatabaseKind::Redis => PageStart::RedisCursor(0),
+                            _ => PageStart::Offset,
+                        }];
                         data.set_result(Some(result), &session.tables, cx);
                         data.result_table = Some(result_table.clone());
                         referenced_row_missing = row_navigation && !has_rows;
@@ -1533,6 +1682,9 @@ impl DbxApp {
                     Err(error) => {
                         data.error = Some(error.to_string());
                     }
+                }
+                if loaded {
+                    this.page_loaded_for(session_id, tab_id, loaded_filters, cx);
                 }
                 if referenced_row_missing {
                     this.show_toast(ToastKind::Info, "Referenced row not found", cx);
@@ -1591,7 +1743,12 @@ impl DbxApp {
                 let data = session.data_tab(tab_id)?;
                 let result = data.result.as_ref()?;
                 let row = result.rows.get(row_index)?;
-                let local_column = result.columns.get(column_index.checked_sub(1)?)?;
+                let local_column = result.columns.get(
+                    data.data_grid
+                        .read(cx)
+                        .delegate()
+                        .result_column(column_index)?,
+                )?;
                 let foreign_key = data
                     .foreign_keys
                     .iter()
@@ -1864,15 +2021,23 @@ impl DbxApp {
         if self.pending_edits_block(session_id, tab_id, cx) {
             return;
         }
-        let Some((engine, table, kind, busy, known_columns)) =
+        let Some((engine, table, kind, busy, known_columns, start)) =
             self.session(session_id).and_then(|session| {
                 let data = session.data_tab(tab_id)?;
+                let start = if page == 0 {
+                    None
+                } else if page == data.table_page + 1 {
+                    data.next_page_start.clone()
+                } else {
+                    data.page_starts.get(page as usize).cloned()
+                };
                 Some((
                     session.engine.clone(),
                     data.table.clone(),
                     session.kind,
                     data.busy,
                     data.table_columns.clone(),
+                    start,
                 ))
             })
         else {
@@ -1898,7 +2063,43 @@ impl DbxApp {
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
-        let order = data.sort.clone().into_iter().collect::<Vec<_>>();
+        let keyset = keyset_column(kind, &known_columns, data.sort.as_ref());
+        let start = start.unwrap_or(match (kind, &keyset) {
+            (DatabaseKind::Redis, _) => PageStart::RedisCursor(0),
+            _ => PageStart::Offset,
+        });
+        let mut order = data.sort.clone().into_iter().collect::<Vec<_>>();
+        // A page reached by OFFSET continues by OFFSET; keyset paging starts
+        // from a fresh first page.
+        let keyset = keyset.filter(|_| page == 0 || matches!(start, PageStart::After(_)));
+        let loaded_filters = filters.clone();
+        let mut filters = filters;
+        let mut offset_page = page;
+        if let Some(order_by) = &keyset {
+            // Seeking by primary key keeps every page as fast as the first,
+            // where OFFSET rescans all earlier rows.
+            if order.is_empty() {
+                order.push(order_by.clone());
+            }
+            if let PageStart::After(value) = &start {
+                let operator = match order_by.direction {
+                    OrderDirection::Ascending => FilterOperator::GreaterThan,
+                    OrderDirection::Descending => FilterOperator::LessThan,
+                };
+                filters.push(Filter::new(
+                    order_by.column.clone(),
+                    operator,
+                    Some(value.clone()),
+                ));
+            }
+            offset_page = 0;
+        }
+        let pattern = filters
+            .first()
+            .and_then(|filter| filter.value.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "*".into());
+        let page_start = start.clone();
         data.busy = true;
         data.error = None;
         data.status = format!("Loading page {}…", page + 1);
@@ -1916,27 +2117,27 @@ impl DbxApp {
                         &[],
                         &filters,
                         &order,
-                        Some(table_browse_page(page)),
+                        Some(table_browse_page(offset_page)),
                         QueryOptions::default(),
                         Some(&known_columns),
                     )
                     .await?;
                 let has_next_page = trim_table_browse_result(&mut result);
-                Ok::<_, dbx_core::DbxError>((result, has_next_page))
+                let next = match &keyset {
+                    Some(order_by) if has_next_page => keyset_start(&result, order_by),
+                    None if has_next_page => Some(PageStart::Offset),
+                    _ => None,
+                };
+                Ok::<_, dbx_core::DbxError>((result, next))
             } else {
-                let pattern = filters
-                    .first()
-                    .and_then(|filter| filter.value.as_ref())
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "*".into());
-                let pattern = redis_command_word(&pattern);
-                let result = engine
-                    .query(
-                        &format!("SCAN 0 MATCH {pattern} COUNT 100"),
-                        QueryOptions::default(),
-                    )
+                let cursor = match start {
+                    PageStart::RedisCursor(cursor) => cursor,
+                    _ => 0,
+                };
+                let (result, next) = engine
+                    .redis_scan_page(&pattern, cursor, TABLE_BROWSE_PAGE_SIZE as usize)
                     .await?;
-                Ok((result, false))
+                Ok((result, (next != 0).then_some(PageStart::RedisCursor(next))))
             }
         });
         if let Some(session) = self.session_mut(session_id) {
@@ -1964,12 +2165,16 @@ impl DbxApp {
                 data.busy = false;
                 data.abort_handle.clear();
                 match result {
-                    Ok((result, has_next_page)) => {
+                    Ok((result, next)) => {
                         data.table_page = page;
-                        data.table_has_next_page = has_next_page;
+                        data.table_has_next_page = next.is_some();
+                        data.next_page_start = next;
+                        data.page_starts.truncate(page as usize);
+                        data.page_starts.push(page_start);
                         data.set_result(Some(result), &session.tables, cx);
                         data.result_table = Some(result_table.clone());
                         data.error = None;
+                        this.page_loaded_for(session_id, tab_id, loaded_filters, cx);
                     }
                     Err(error) => {
                         data.error = Some(error.to_string());
@@ -2073,55 +2278,71 @@ impl DbxApp {
                 return None;
             };
             let text_revision = query_tab.query_revision;
-            let query_text = query_tab.query_text.read(cx).clone();
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
             let recent_data = session.recent_data();
-            if session.kind.is_sql() {
-                let context = editor::sql_completion_context(&query_text, cursor)?;
-                let items = sql_completion_items(
-                    &query_text,
-                    cursor,
-                    &context,
-                    SqlCompletionRequest {
-                        database_kind: session.kind,
-                        tables: &session.tables,
-                        completion_columns: &session.completion_columns,
-                        selected_table: recent_data.map(|data| &data.table),
-                        active_columns: recent_data
-                            .map(|data| data.table_columns.as_slice())
-                            .unwrap_or_default(),
-                        result: recent_data.and_then(|data| data.result.as_deref()),
-                        active_schema_filter: session.schema_filter.as_deref(),
-                    },
-                );
-                (
-                    tab_id,
-                    context.replacement_range,
-                    items,
-                    CompletionSignature {
-                        text_revision,
-                        cursor,
-                    },
-                )
-            } else if session.kind == DatabaseKind::Redis {
-                let (replacement_range, items) = redis_completion_items(
-                    &query_text,
-                    cursor,
-                    session.redis_command_catalog.as_deref(),
-                    query_tab.result.as_deref(),
-                    recent_data.and_then(|data| data.result.as_deref()),
-                )?;
-                (
-                    tab_id,
-                    replacement_range,
-                    items,
-                    CompletionSignature {
-                        text_revision,
-                        cursor,
-                    },
-                )
+            let signature = CompletionSignature {
+                text_revision,
+                cursor,
+            };
+            let key = CompletionCacheKey {
+                signature,
+                tables: session.tables.len(),
+                columns: session.completion_columns.len(),
+                recent_result: recent_data
+                    .and_then(|data| data.result.as_ref())
+                    .map_or(0, |result| Arc::as_ptr(result) as usize),
+            };
+            if let Some((cached, computed)) = &query_tab.completion_cache
+                && *cached == key
+            {
+                let (replacement_range, items) = computed.clone()?;
+                (tab_id, replacement_range, items, signature)
             } else {
-                return None;
+                let query_text = query_tab.query_text.read(cx).clone();
+                let computed = if session.kind.is_sql() {
+                    editor::sql_completion_context(&query_text, cursor).map(|context| {
+                        let items = sql_completion_items(
+                            &query_text,
+                            cursor,
+                            &context,
+                            SqlCompletionRequest {
+                                database_kind: session.kind,
+                                tables: &session.tables,
+                                completion_columns: &session.completion_columns,
+                                selected_table: recent_data.map(|data| &data.table),
+                                active_columns: recent_data
+                                    .map(|data| data.table_columns.as_slice())
+                                    .unwrap_or_default(),
+                                result: recent_data.and_then(|data| data.result.as_deref()),
+                                active_schema_filter: session.schema_filter.as_deref(),
+                            },
+                        );
+                        (context.replacement_range, items)
+                    })
+                } else if session.kind == DatabaseKind::Redis {
+                    redis_completion_items(
+                        &query_text,
+                        cursor,
+                        session.redis_command_catalog.as_deref(),
+                        query_tab.result.as_deref(),
+                        recent_data.and_then(|data| data.result.as_deref()),
+                    )
+                } else {
+                    None
+                };
+                let session = self.session_mut(session_id)?;
+                if let Some(SecondaryTab {
+                    kind: SecondaryTabKind::Query(query_tab),
+                    ..
+                }) = session
+                    .secondary_tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == tab_id)
+                {
+                    query_tab.completion_cache = Some((key, computed.clone()));
+                }
+                let (replacement_range, items) = computed?;
+                (tab_id, replacement_range, items, signature)
             }
         };
 
@@ -2848,14 +3069,12 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
-            return;
-        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
         let Some(columns) = self
             .data_tab(session_id, tab_id)
+            .filter(|data| data.cell_editor.is_none())
             .map(|data| data.table_columns.clone())
         else {
             return;
@@ -2873,6 +3092,7 @@ impl DbxApp {
             return;
         };
         data.draft_mode = DraftMode::Insert;
+        data.draft_insert = None;
         data.selected_row = None;
         data.inspector_open = true;
         data.clear_grid_selection(cx);
@@ -2990,8 +3210,33 @@ impl DbxApp {
         match event {
             TableEvent::ColumnWidthsChanged(widths) => {
                 if let Some(data) = self.data_tab_mut(session_id, tab_id) {
-                    data.result_column_widths =
-                        ResultTableDelegate::widths_by_key(data.result.as_deref(), widths);
+                    let delegate = data.data_grid.read(cx).delegate();
+                    data.result_column_widths = delegate.widths_by_key(widths);
+                    let widths = delegate.widths_by_name();
+                    data.layout.widths.extend(widths);
+                    self.store_table_layout_for(session_id, tab_id, cx);
+                }
+            }
+            TableEvent::MoveColumn(..) => {
+                if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+                    let names = data
+                        .result
+                        .as_deref()
+                        .map(|result| {
+                            data.data_grid
+                                .read(cx)
+                                .delegate()
+                                .display_order()
+                                .iter()
+                                .map(|index| result.columns[*index].name.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    data.layout.order = names
+                        .into_iter()
+                        .filter(|name| !data.layout.pinned.contains(name))
+                        .collect();
+                    self.store_table_layout_for(session_id, tab_id, cx);
                 }
             }
             TableEvent::SelectRow(row_index) => {
@@ -3000,17 +3245,19 @@ impl DbxApp {
             // Selecting a cell also selects its row for the inspector.
             TableEvent::SelectCell(row_index, column_index) => {
                 self.select_row_for(session_id, tab_id, *row_index, cx);
-                if let Some(column) = column_index.checked_sub(1) {
+                if let Some(column) = self.data_grid_column(session_id, tab_id, *column_index, cx) {
                     self.select_column_for(session_id, tab_id, column, cx);
                 }
             }
             TableEvent::DoubleClickedCell(row_index, column_index) => {
-                if let Some(column) = column_index.checked_sub(1) {
+                if let Some(column) = self.data_grid_column(session_id, tab_id, *column_index, cx) {
                     self.begin_cell_edit_for(session_id, tab_id, *row_index, column, window, cx);
                 }
             }
-            TableEvent::SelectColumn(column_index) if *column_index > 0 => {
-                self.select_column_for(session_id, tab_id, *column_index - 1, cx);
+            TableEvent::SelectColumn(column_index) => {
+                if let Some(column) = self.data_grid_column(session_id, tab_id, *column_index, cx) {
+                    self.select_column_for(session_id, tab_id, column, cx);
+                }
             }
             TableEvent::ClearSelection => {
                 if let Some(data) = self.data_tab_mut(session_id, tab_id)
@@ -3024,6 +3271,21 @@ impl DbxApp {
             }
             _ => {}
         }
+    }
+
+    /// The result column a data grid column shows.
+    pub(super) fn data_grid_column(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        col_ix: usize,
+        cx: &App,
+    ) -> Option<usize> {
+        self.data_tab(session_id, tab_id)?
+            .data_grid
+            .read(cx)
+            .delegate()
+            .result_column(col_ix)
     }
 
     fn on_query_grid_event(
@@ -3053,12 +3315,23 @@ impl DbxApp {
                     .result_grid
                     .read(cx)
                     .delegate()
-                    .cell_value(*row, *column - 1)
+                    .cell_value(
+                        *row,
+                        query_tab
+                            .result_grid
+                            .read(cx)
+                            .delegate()
+                            .result_column(*column)
+                            .unwrap_or_default(),
+                    )
                     .cloned();
             }
             TableEvent::ColumnWidthsChanged(widths) => {
-                query_tab.result_column_widths =
-                    ResultTableDelegate::widths_by_key(query_tab.result.as_deref(), widths);
+                query_tab.result_column_widths = query_tab
+                    .result_grid
+                    .read(cx)
+                    .delegate()
+                    .widths_by_key(widths);
             }
             TableEvent::SelectCell(..) => {
                 query_tab.result_selection = QueryResultSelection::Cell;
@@ -3115,7 +3388,7 @@ impl DbxApp {
         if data
             .result
             .as_ref()
-            .is_none_or(|result| result.rows.get(row).is_none())
+            .is_none_or(|result| row >= result.rows.len() + data.pending_inserts.len())
         {
             return;
         }
@@ -3135,19 +3408,40 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
-            return;
-        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
         let draft_data = self.data_tab(session_id, tab_id).and_then(|data| {
+            if data.cell_editor.is_some() {
+                return None;
+            }
             let row = data.selected_row?;
+            if data.pending_deletes.contains(&row) {
+                return None;
+            }
             let result = data.result.as_ref()?;
-            let values = result.rows.get(row)?.values.clone();
-            Some((data.table_columns.clone(), result.columns.clone(), values))
+            let insert = data.insert_index(row);
+            let values = match insert {
+                Some(_) => Vec::new(),
+                None => result.rows.get(row)?.values.clone(),
+            };
+            // The inspector opens on what the grid shows: staged values over
+            // the loaded row, or a staged new row's values.
+            let staged = (0..result.columns.len())
+                .map(|column| match insert {
+                    Some(index) => data.pending_inserts[index].values.get(&column).cloned(),
+                    None => data.pending_edits.get(&(row, column)).cloned(),
+                })
+                .collect::<Vec<_>>();
+            Some((
+                data.table_columns.clone(),
+                result.columns.clone(),
+                values,
+                staged,
+                insert,
+            ))
         });
-        let Some((table_columns, result_columns, values)) = draft_data else {
+        let Some((table_columns, result_columns, values, staged, insert)) = draft_data else {
             return;
         };
         let mut draft = RowDraftModel::new();
@@ -3165,10 +3459,47 @@ impl DbxApp {
                 cx.notify();
                 return;
             };
-            let Some(original) = values.get(index).cloned() else {
-                return;
+            let original = match insert {
+                Some(_) => None,
+                None => match values.get(index).cloned() {
+                    Some(original) => Some(original),
+                    None => return,
+                },
             };
-            draft.push(FieldRow::new_update(column, original, window, cx));
+            let field = match staged.get(index).cloned().flatten() {
+                Some(MutationValue::Parameter(CellValue::Null)) => FieldRow::with_state(
+                    column,
+                    original,
+                    String::new(),
+                    FieldValueState::Null,
+                    None,
+                    window,
+                    cx,
+                ),
+                Some(MutationValue::Parameter(value)) => FieldRow::with_state(
+                    column,
+                    original,
+                    field_editor_text(&value),
+                    FieldValueState::Value,
+                    None,
+                    window,
+                    cx,
+                ),
+                Some(MutationValue::Expression(expression)) => FieldRow::with_state(
+                    column,
+                    original,
+                    expression,
+                    FieldValueState::Sql,
+                    None,
+                    window,
+                    cx,
+                ),
+                None => match original {
+                    Some(original) => FieldRow::new_update(column, original, window, cx),
+                    None => FieldRow::new_insert(column, None, window, cx),
+                },
+            };
+            draft.push(field);
         }
         self.watch_draft_fields_for(session_id, tab_id, &draft, window, cx);
         let Some(session) = self.session_mut(session_id) else {
@@ -3178,7 +3509,12 @@ impl DbxApp {
         let Some(data) = session.data_tab_mut(tab_id) else {
             return;
         };
-        data.draft_mode = DraftMode::Update;
+        data.draft_mode = if insert.is_some() {
+            DraftMode::Insert
+        } else {
+            DraftMode::Update
+        };
+        data.draft_insert = insert;
         data.inspector_open = true;
         data.row_draft = Some(draft);
         cx.notify();
@@ -3261,7 +3597,9 @@ impl DbxApp {
         let Some(data) = session.data_tab_mut(tab_id) else {
             return;
         };
-        let was_insert = data.draft_mode == DraftMode::Insert;
+        // Cancelling an edit of a staged new row keeps that row selected.
+        let was_insert = data.draft_mode == DraftMode::Insert && data.draft_insert.is_none();
+        data.draft_insert = None;
         data.row_draft = None;
         data.row_draft_subscriptions.clear();
         if was_insert {
@@ -3272,6 +3610,8 @@ impl DbxApp {
         cx.notify();
     }
 
+    /// Stage the inspector's row: changed fields of a loaded row, or a new
+    /// row. Nothing is written until the changeset is committed.
     fn save_draft_for(
         &mut self,
         session_id: SessionId,
@@ -3303,289 +3643,72 @@ impl DbxApp {
             );
             return;
         }
-        let (Some(engine), Some(table), Some(row_draft)) = (
-            session.engine.clone(),
-            self.editable_table_for(session_id, tab_id).cloned(),
+        let (Some(_), Some(row_draft)) = (
+            self.editable_table_for(session_id, tab_id),
             data.row_draft.as_ref(),
         ) else {
             return;
         };
-        let runtime = self.runtime.clone();
-        let request = match draft_mode {
-            DraftMode::Insert => row_draft
-                .insert_values(cx)
-                .map(|values| {
-                    Some(Mutation::Insert(InsertRequest::from_mutation_row(
-                        table.clone(),
-                        values,
-                    )))
-                })
-                .map_err(|error| (error.to_string(), Some(error.field_id()))),
-            DraftMode::Update => {
-                let Some(row) = data
-                    .selected_row
-                    .and_then(|row| data.result.as_ref()?.rows.get(row))
-                    .cloned()
-                else {
-                    return;
-                };
-                row_draft
-                    .changed_fields(cx)
-                    .map_err(|error| (error.to_string(), Some(error.field_id())))
-                    .and_then(|assignments| {
-                        if assignments.is_empty() {
-                            return Ok(None);
-                        }
-                        self.identity_filters_for(session_id, tab_id, &row)
-                            .map_err(|error| (error, None))
-                            .map(|filters| {
-                                Some(Mutation::Update(UpdateRequest::new_with_mutation_values(
-                                    table.clone(),
-                                    assignments,
-                                    filters,
-                                )))
-                            })
-                    })
-            }
-        };
-        let request = match request {
-            Ok(Some(request)) => request,
-            Ok(None) => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.error = None;
-                }
-                self.show_toast(ToastKind::Info, "No changes to save", cx);
-                return;
-            }
+        let selected_row = data.selected_row;
+        let values = match draft_mode {
+            DraftMode::Insert => row_draft.insert_values(cx),
+            DraftMode::Update => row_draft.changed_fields(cx),
+        }
+        .map_err(|error| (error.to_string(), error.field_id()));
+        let values = match values {
+            Ok(values) => values,
             Err((error, field_id)) => {
                 let return_focus = self
-                    .row_draft_focus_for(session_id, tab_id, field_id, cx)
+                    .row_draft_focus_for(session_id, tab_id, Some(field_id), cx)
                     .or_else(|| window.focused(cx));
                 self.show_mutation_error_for(session_id, tab_id, error, return_focus, window, cx);
                 return;
             }
         };
-        let originals = match &request {
-            Mutation::Update(request) => data
-                .selected_row
-                .and_then(|index| data.result.as_ref()?.rows.get(index))
-                .map(|row| {
-                    data.result
-                        .as_ref()
-                        .unwrap()
-                        .columns
-                        .iter()
-                        .zip(&row.values)
-                        .filter(|(column, _)| {
-                            request
-                                .assignments
-                                .iter()
-                                .any(|(name, _)| *name == column.name)
-                        })
-                        .map(|(column, value)| (column.name.clone(), value.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default(),
-            Mutation::Insert(_) => Vec::new(),
-        };
-        let error_return_focus = self
-            .row_draft_focus_for(session_id, tab_id, None, cx)
-            .or_else(|| window.focused(cx));
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.error = None;
-        let Some(data) = session.data_tab_mut(tab_id) else {
-            return;
-        };
-        data.busy = true;
-        data.error = None;
-        data.status = "Applying row change…".into();
-        data.request_generation += 1;
-        let generation = data.request_generation;
-        let task = runtime.spawn(async move {
-            match request {
-                Mutation::Insert(request) => engine.insert(&request).await,
-                Mutation::Update(request) => engine.update_checked(&request, &originals).await,
-            }
-        });
         if let Some(session) = self.session_mut(session_id) {
-            session.track_background_task(&task);
+            session.error = None;
         }
-        cx.notify();
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = task
-                .await
-                .map_err(|error| format!("Row mutation task failed: {error}"))
-                .and_then(|outcome| outcome.map_err(|error| error.to_string()));
-            this.update_in(cx, |this, window, cx| {
-                let Some(data) = this.data_tab_mut(session_id, tab_id) else {
-                    return;
-                };
-                if generation != data.request_generation {
+        match (draft_mode, selected_row) {
+            (DraftMode::Insert, _) => self.stage_insert_for(session_id, tab_id, values, cx),
+            (DraftMode::Update, Some(row)) => {
+                // Primary keys must still identify the row when committed.
+                if let Some(row_data) = self
+                    .data_tab(session_id, tab_id)
+                    .and_then(|data| data.result.as_ref()?.rows.get(row).cloned())
+                    && let Err(error) = self.identity_filters_for(session_id, tab_id, &row_data)
+                {
+                    self.show_mutation_error_for(session_id, tab_id, error, None, window, cx);
                     return;
                 }
-                match outcome {
-                    Ok(_) => {
-                        data.busy = false;
-                        data.error = None;
-                        this.refresh_table_for(session_id, tab_id, cx);
-                    }
-                    Err(error) => {
-                        this.show_mutation_error_for(
-                            session_id,
-                            tab_id,
-                            error,
-                            error_return_focus,
-                            window,
-                            cx,
-                        );
-                    }
-                }
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+                self.stage_update_for(session_id, tab_id, row, values, cx)
+            }
+            (DraftMode::Update, None) => {}
+        }
+        if let Some(data) = self.data_tab(session_id, tab_id) {
+            let grid = data.data_grid.read(cx).focus_handle(cx);
+            grid.focus(window, cx);
+        }
     }
 
     fn request_delete_selected_for(
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
+        if self
+            .session(session_id)
+            .is_some_and(|session| !session.kind.is_sql())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Edit Redis keys from the command console",
+                cx,
+            );
             return;
         }
-        let Some((table, selected_row, row)) = self.data_tab(session_id, tab_id).and_then(|data| {
-            let selected_row = data.selected_row?;
-            let row = data.result.as_ref()?.rows.get(selected_row)?.clone();
-            Some((
-                self.editable_table_for(session_id, tab_id)?.clone(),
-                selected_row,
-                row,
-            ))
-        }) else {
-            return;
-        };
-        let filters = match self.identity_filters_for(session_id, tab_id, &row) {
-            Ok(filters) => filters,
-            Err(error) => {
-                if let Some(session) = self.session_mut(session_id) {
-                    session.error = Some(error);
-                }
-                cx.notify();
-                return;
-            }
-        };
-        let originals = self
-            .data_tab(session_id, tab_id)
-            .and_then(|data| data.result.as_ref())
-            .map(|result| {
-                result
-                    .columns
-                    .iter()
-                    .zip(&row.values)
-                    .map(|(column, value)| (column.name.clone(), value.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let return_focus = window.focused(cx);
-        let focus = cx.focus_handle();
-        self.confirmation_dialog = Some(ConfirmationDialog {
-            title: format!("Delete row {}?", selected_row + 1),
-            detail: format!(
-                "The row will be permanently deleted from {}.",
-                table_ref_label(&table)
-            ),
-            confirm_label: "Delete row",
-            tone: ConfirmationTone::Danger,
-            action: ConfirmationAction::DeleteRow {
-                session_id,
-                tab_id,
-                table,
-                filters,
-                originals,
-            },
-            focus: focus.clone(),
-            return_focus,
-        });
-        focus.focus(window, cx);
-        cx.notify();
-    }
-
-    fn delete_row_for(
-        &mut self,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
-        table: TableRef,
-        filters: Vec<Filter>,
-        originals: Vec<(String, CellValue)>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.session(session_id) else {
-            return;
-        };
-        let Some(data) = session.data_tab(tab_id) else {
-            return;
-        };
-        if session.busy || data.busy {
-            return;
-        }
-        if !session.kind.is_sql() {
-            if let Some(session) = self.session_mut(session_id) {
-                session.error = Some("Edit Redis keys from the command console.".into());
-            }
-            cx.notify();
-            return;
-        }
-        let Some(engine) = session.engine.clone() else {
-            return;
-        };
-        let runtime = self.runtime.clone();
-        let Some(session) = self.session_mut(session_id) else {
-            return;
-        };
-        session.error = None;
-        let Some(data) = session.data_tab_mut(tab_id) else {
-            return;
-        };
-        data.busy = true;
-        data.error = None;
-        data.status = "Deleting row…".into();
-        data.request_generation += 1;
-        let generation = data.request_generation;
-        let task =
-            runtime.spawn(async move { engine.delete_checked(&table, &filters, &originals).await });
-        if let Some(session) = self.session_mut(session_id) {
-            session.track_background_task(&task);
-        }
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let outcome = task.await?;
-            this.update(cx, |this, cx| {
-                let Some(data) = this.data_tab_mut(session_id, tab_id) else {
-                    return;
-                };
-                if generation != data.request_generation {
-                    return;
-                }
-                data.busy = false;
-                match outcome {
-                    Ok(_) => {
-                        data.error = None;
-                        this.refresh_table_for(session_id, tab_id, cx);
-                    }
-                    Err(error) => {
-                        data.error = Some(error.to_string());
-                        cx.notify();
-                    }
-                }
-            })?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        self.delete_rows_for(session_id, tab_id, None, cx);
     }
 
     fn open_table_context_menu(
@@ -3647,6 +3770,7 @@ impl DbxApp {
             },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -3730,7 +3854,10 @@ impl DbxApp {
             return;
         };
         let return_focus = dialog.return_focus.clone();
-        let closes_query = matches!(dialog.action, ConfirmationAction::CloseQuery { .. });
+        let closes_query = matches!(
+            dialog.action,
+            ConfirmationAction::CloseQuery { .. } | ConfirmationAction::DiscardDataTab { .. }
+        );
         match dialog.action {
             ConfirmationAction::LockVault => {
                 self.lock_vault(cx);
@@ -3776,13 +3903,17 @@ impl DbxApp {
                 session_id,
                 table,
             } => self.execute_table_action(action, session_id, table, cx),
-            ConfirmationAction::DeleteRow {
-                session_id,
-                tab_id,
-                table,
-                filters,
-                originals,
-            } => self.delete_row_for(session_id, tab_id, table, filters, originals, cx),
+            ConfirmationAction::Quit => {
+                cx.quit();
+                return;
+            }
+            ConfirmationAction::CommitChanges { session_id, tab_id } => {
+                self.save_pending_edits_for(session_id, tab_id, window, cx)
+            }
+            ConfirmationAction::DiscardDataTab { session_id, tab_id } => {
+                self.discard_pending_edits_for(session_id, tab_id, cx);
+                self.close_secondary_tab_for(session_id, tab_id, cx);
+            }
             ConfirmationAction::DatabaseImport { session_id, path } => {
                 self.execute_database_import(session_id, path, cx)
             }
@@ -4007,11 +4138,6 @@ impl DbxApp {
     fn set_error(&mut self, message: String) {
         self.error = Some(message);
     }
-}
-
-enum Mutation {
-    Insert(InsertRequest),
-    Update(UpdateRequest),
 }
 
 fn table_ref(table: &TableInfo) -> TableRef {
@@ -4299,10 +4425,6 @@ fn table_click_action(event: &gpui::ClickEvent) -> TableClickAction {
     } else {
         TableClickAction::Select
     }
-}
-
-fn redis_command_word(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 const DIAGRAM_MINIMAP_MAX_WIDTH: f32 = 188.0;
@@ -4902,12 +5024,6 @@ mod tests {
 
         let written = QueryResult::empty(Some(1), 4);
         assert_eq!(query_result_status(&written), "1 row affected · 4 ms");
-    }
-
-    #[test]
-    fn redis_filter_stays_one_command_argument() {
-        assert_eq!(redis_command_word("user:* archive"), "\"user:* archive\"");
-        assert_eq!(redis_command_word("a\"b"), "\"a\\\"b\"");
     }
 
     #[test]

@@ -446,6 +446,7 @@ impl DbxApp {
                 action: ConfirmationAction::LockVault,
                 focus: focus.clone(),
                 return_focus: window.focused(cx),
+                sql: None,
             });
             focus.focus(window, cx);
             cx.notify();

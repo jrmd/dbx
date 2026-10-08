@@ -365,6 +365,7 @@ impl DbxApp {
         };
         let title = dialog.title.clone();
         let detail = dialog.detail.clone();
+        let sql = dialog.sql.clone();
         let confirm_label = dialog.confirm_label;
         let tone = dialog.tone;
         let priority = if matches!(dialog.action, ConfirmationAction::LockVault) {
@@ -395,7 +396,10 @@ impl DbxApp {
                 div()
                     .id("confirmation-dialog")
                     .debug_selector(|| "confirmation-dialog".into())
-                    .w(px(420.))
+                    .w(px(if sql.is_some() { 640. } else { 420. }))
+                    .max_h(px(560.))
+                    .flex()
+                    .flex_col()
                     .rounded(px(RADIUS_GLASS))
                     .border_1()
                     .border_color(theme().hairline)
@@ -433,15 +437,40 @@ impl DbxApp {
                                     })),
                             ),
                     )
-                    .child(
-                        div()
-                            .px(px(16.))
-                            .py(px(16.))
-                            .text_size(px(12.))
-                            .text_color(theme().text_muted)
-                            .line_height(gpui::relative(1.5))
-                            .child(detail),
-                    )
+                    .when(!detail.is_empty(), |dialog| {
+                        dialog.child(
+                            div()
+                                .px(px(16.))
+                                .py(px(16.))
+                                .text_size(px(12.))
+                                .text_color(theme().text_muted)
+                                .line_height(gpui::relative(1.5))
+                                .child(detail),
+                        )
+                    })
+                    .when_some(sql, |dialog, sql| {
+                        dialog.child(
+                            div()
+                                .id("confirmation-sql")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_scroll()
+                                .px(px(16.))
+                                .py(px(12.))
+                                .bg(theme().canvas)
+                                .font_family("monospace")
+                                .text_size(px(11.))
+                                .text_color(theme().text)
+                                .line_height(gpui::relative(1.5))
+                                .children(
+                                    sql.lines()
+                                        .map(|line| {
+                                            div().whitespace_nowrap().child(line.to_owned())
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .px(px(16.))
