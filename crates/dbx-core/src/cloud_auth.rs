@@ -2,7 +2,8 @@
 use crate::{ConnectionConfig, DatabaseKind, DbxError, Result};
 use std::process::Stdio;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CloudAuthentication {
     AwsRdsIam,
     AzureEntra,

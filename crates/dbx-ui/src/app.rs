@@ -15,10 +15,14 @@ mod schema_objects;
 mod session;
 mod tabs;
 use session::*;
+mod backups;
 mod connection;
 mod data_clipboard;
+mod data_import;
 mod diagnostics;
 mod find;
+mod mcp;
+mod profile_transfer;
 mod query_parameters;
 mod quick_open;
 mod redis_completion;
@@ -51,7 +55,7 @@ use gpui::{
     FocusHandle, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent,
     MouseButton, PathPromptOptions, Pixels, Point, Render, ResizeEdge, Rgba, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement, Subscription, Window, WindowControlArea,
-    WindowHandle, anchored, deferred, div, img, point, prelude::*, px, uniform_list,
+    WindowHandle, anchored, deferred, div, img, point, prelude::*, px, relative, uniform_list,
 };
 use gpui_component::{
     Disableable as _, FocusTrapElement as _, IndexPath, Selectable as _, Sizable as _, Size,
@@ -318,6 +322,7 @@ const MAX_TOASTS: usize = 3;
 
 struct ConnectionDraft {
     read_only: bool,
+    cloud_auth: Option<dbx_core::CloudAuthentication>,
     kind: DatabaseKind,
     mode: ConnectionFormMode,
     selected_profile: Option<Uuid>,
@@ -484,6 +489,7 @@ impl ConnectionDraft {
         Self {
             kind: DatabaseKind::SQLite,
             read_only: false,
+            cloud_auth: None,
             mode: ConnectionFormMode::Details,
             selected_profile: None,
             choosing_kind: true,
@@ -557,6 +563,9 @@ enum ConfirmationTone {
 
 enum ConfirmationAction {
     LockVault,
+    DeleteProfile {
+        id: uuid::Uuid,
+    },
     RunQuery {
         session_id: SessionId,
         tab_id: SecondaryTabId,
@@ -584,6 +593,11 @@ enum ConfirmationAction {
         session_id: SessionId,
         tab_id: SecondaryTabId,
     },
+    NativeRestore {
+        session_id: SessionId,
+        path: PathBuf,
+        database: Option<String>,
+    },
     DatabaseImport {
         session_id: SessionId,
         path: PathBuf,
@@ -598,13 +612,14 @@ enum ConfirmationAction {
 impl ConfirmationAction {
     fn session_id(&self) -> Option<SessionId> {
         match self {
-            Self::LockVault | Self::Quit => None,
+            Self::LockVault | Self::Quit | Self::DeleteProfile { .. } => None,
             Self::RunQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
             | Self::ClearQueryHistory { session_id }
             | Self::Table { session_id, .. }
             | Self::CommitChanges { session_id, .. }
             | Self::DiscardDataTab { session_id, .. }
+            | Self::NativeRestore { session_id, .. }
             | Self::DatabaseImport { session_id, .. }
             | Self::TableImport { session_id, .. } => Some(*session_id),
         }
@@ -688,6 +703,9 @@ pub struct DbxApp {
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
     quick_open: Option<quick_open::QuickOpen>,
+    copied_table_data: Option<Arc<dbx_core::data_import::ImportData>>,
+    data_import_dialog: Option<data_import::DataImportDialog>,
+    profile_transfer_dialog: Option<profile_transfer::ProfileTransferDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     settings_open: bool,
     settings_section: SettingsSection,
@@ -770,7 +788,7 @@ impl DbxApp {
             Ok(store) => {
                 let entries = store
                     .load()
-                    .map(|entries| entries.into_iter().rev().take(500).collect())
+                    .map(|entries| entries.into_iter().rev().collect())
                     .unwrap_or_default();
                 (Some(store), entries)
             }
@@ -815,6 +833,9 @@ impl DbxApp {
             database_export_dialog: None,
             confirmation_dialog: None,
             quick_open: None,
+            profile_transfer_dialog: None,
+            data_import_dialog: None,
+            copied_table_data: None,
             mutation_error_dialog: None,
             settings_open: false,
             settings_section: SettingsSection::Appearance,
@@ -988,6 +1009,16 @@ impl DbxApp {
         let Some(connection) = connection else {
             return;
         };
+        let policy = self
+            .workspace_documents
+            .get(&crate::workspace::connection_key(&connection));
+        if policy.is_some_and(|document| document.history_disabled) {
+            return;
+        }
+        let retention = policy
+            .map(|document| document.history_retention)
+            .filter(|limit| *limit > 0)
+            .unwrap_or(100);
         let Some(store) = self.query_history_store.clone() else {
             return;
         };
@@ -995,13 +1026,14 @@ impl DbxApp {
         cx.spawn(async move |this, cx| {
             let entries = runtime
                 .spawn_blocking(move || {
-                    store.record(connection, query, outcome)?;
+                    store.record(connection.clone(), query, outcome)?;
+                    store.retain(&connection, retention)?;
                     store.load()
                 })
                 .await;
             if let Ok(Ok(entries)) = entries {
                 this.update(cx, |this, _| {
-                    this.recent_query_history = entries.into_iter().rev().take(500).collect();
+                    this.recent_query_history = entries.into_iter().rev().collect();
                 })?;
             }
             Ok::<(), anyhow::Error>(())
@@ -1164,7 +1196,23 @@ impl DbxApp {
         if event.keystroke.modifiers.modified() || event.keystroke.key.as_str() != "escape" {
             return;
         }
-        let dismissed = if self.quick_open.is_some() {
+        let dismissed = if self
+            .data_import_dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.busy)
+        {
+            self.data_import_dialog = None;
+            self.focus_handle.focus(window, cx);
+            true
+        } else if self
+            .profile_transfer_dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.busy)
+        {
+            self.profile_transfer_dialog = None;
+            self.focus_handle.focus(window, cx);
+            true
+        } else if self.quick_open.is_some() {
             self.close_quick_open(window, cx);
             true
         } else if self.dismiss_mutation_error_dialog(window, cx) {
@@ -1207,7 +1255,7 @@ impl DbxApp {
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: "Quit without committing?".into(),
             detail: format!(
-                "{} will be lost.",
+                "{} remain in encrypted recovery. They will require review next time.",
                 counted(changes, "staged change", "staged changes")
             ),
             confirm_label: "Quit",
@@ -2654,6 +2702,27 @@ impl DbxApp {
                 cx.notify();
                 this.load_schema_objects_for(session_id, cx);
                 this.prefetch_completion_columns_for(session_id, cx);
+                this.refresh_open_structures_for(session_id, cx);
+                let data_tabs = this
+                    .session(session_id)
+                    .map(|session| {
+                        session
+                            .secondary_tabs
+                            .iter()
+                            .filter_map(|tab| match &tab.kind {
+                                SecondaryTabKind::Data(data)
+                                    if !data.has_unsaved_cell_work() && !data.busy =>
+                                {
+                                    Some(tab.id)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for tab_id in data_tabs {
+                    this.refresh_table_for(session_id, tab_id, cx);
+                }
                 if diagram_open {
                     this.refresh_diagram_for(session_id, cx);
                 }
@@ -3859,6 +3928,7 @@ impl DbxApp {
             ConfirmationAction::CloseQuery { .. } | ConfirmationAction::DiscardDataTab { .. }
         );
         match dialog.action {
+            ConfirmationAction::DeleteProfile { id } => self.change_saved_profile(id, true, cx),
             ConfirmationAction::LockVault => {
                 self.lock_vault(cx);
                 self.vault_editors
@@ -3913,6 +3983,20 @@ impl DbxApp {
             ConfirmationAction::DiscardDataTab { session_id, tab_id } => {
                 self.discard_pending_edits_for(session_id, tab_id, cx);
                 self.close_secondary_tab_for(session_id, tab_id, cx);
+            }
+            ConfirmationAction::NativeRestore {
+                session_id,
+                path,
+                database,
+            } => {
+                if self
+                    .session(session_id)
+                    .is_some_and(|session| session.current_database == database)
+                {
+                    self.run_native_backup(session_id, path, true, cx);
+                } else {
+                    self.show_toast(ToastKind::Info, "Restore target changed. Choose the backup again and review the new target.", cx);
+                }
             }
             ConfirmationAction::DatabaseImport { session_id, path } => {
                 self.execute_database_import(session_id, path, cx)

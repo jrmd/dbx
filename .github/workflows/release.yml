@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15]
+        os: [ubuntu-22.04, macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
@@ -72,7 +72,7 @@ jobs:
       - name: Verify signed Mac updater installation
         if: runner.os == 'macOS'
         run: |
-          export DBX_MACOS_UPDATE_ARCHIVE="$(pwd)/$(echo target/macos/DBX-*-macos-arm64.zip)"
+          export DBX_MACOS_UPDATE_ARCHIVE="$(pwd)/$(echo target/macos/DBX-*-macos-$(uname -m).zip)"
           cargo test --locked --release -p dbx-ui signed_macos_archive_installs_and_preserves_app_on_rejection -- --ignored --nocapture
       - uses: actions/upload-artifact@v4
         with:

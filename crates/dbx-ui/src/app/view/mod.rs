@@ -81,6 +81,8 @@ impl Render for DbxApp {
             .when(unlocked, |view| {
                 view.child(self.render_quick_open(cx))
                     .child(self.render_confirmation_dialog(cx))
+                    .child(self.render_profile_transfer(cx))
+                    .child(self.render_data_import(cx))
             })
             .children(resize_edges(window))
     }

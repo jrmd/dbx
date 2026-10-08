@@ -53,6 +53,10 @@ impl DataTab {
         !self.pending_edits.is_empty()
             || !self.pending_inserts.is_empty()
             || !self.pending_deletes.is_empty()
+            || self
+                .recovered_changeset
+                .as_ref()
+                .is_some_and(|saved| !saved.changes.is_empty())
     }
 
     pub(super) fn has_unsaved_cell_work(&self) -> bool {
@@ -60,6 +64,17 @@ impl DataTab {
     }
 
     pub(super) fn change_counts(&self) -> ChangeCounts {
+        if let Some(saved) = &self.recovered_changeset {
+            let mut counts = ChangeCounts::default();
+            for change in &saved.changes {
+                match change {
+                    RowChange::Insert(_) => counts.inserted += 1,
+                    RowChange::Update { .. } => counts.edited += 1,
+                    RowChange::Delete { .. } => counts.deleted += 1,
+                }
+            }
+            return counts;
+        }
         let edited = self
             .pending_edits
             .keys()
@@ -122,6 +137,12 @@ impl DataTab {
             table.delegate_mut().set_cell_edits(changes, editing);
             cx.notify();
         });
+        let grid_id = self.data_grid.entity_id();
+        let app = cx.entity();
+        cx.defer(move |cx| app.update(cx, |this, cx| {
+            let owner = this.sessions.iter().find(|session| session.secondary_tabs.iter().any(|tab| matches!(&tab.kind, SecondaryTabKind::Data(data) if data.data_grid.entity_id() == grid_id))).map(|session| session.id);
+            if let Some(session_id) = owner { this.persist_query_workspace_for(session_id, cx); }
+        }));
     }
 
     /// The value a cell currently shows: staged, or as loaded.
@@ -241,6 +262,18 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard the recovered changes before editing",
+                cx,
+            );
+            return;
+        }
+
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
@@ -432,6 +465,18 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard the recovered changes before editing",
+                cx,
+            );
+            return;
+        }
+
         let Some(data) = self.data_tab(session_id, tab_id) else {
             return;
         };
@@ -474,6 +519,7 @@ impl DbxApp {
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
+        data.recovered_changeset = None;
         let had_inserts = !data.pending_inserts.is_empty();
         data.pending_edits.clear();
         data.pending_inserts.clear();
@@ -556,6 +602,18 @@ impl DbxApp {
         row: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard the recovered changes before editing",
+                cx,
+            );
+            return;
+        }
+
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
@@ -622,6 +680,18 @@ impl DbxApp {
         row: usize,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard the recovered changes before editing",
+                cx,
+            );
+            return;
+        }
+
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
@@ -687,6 +757,18 @@ impl DbxApp {
         values: Vec<(String, MutationValue)>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard the recovered changes before editing",
+                cx,
+            );
+            return;
+        }
+
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
@@ -732,6 +814,18 @@ impl DbxApp {
         assignments: Vec<(String, MutationValue)>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.recovered_changeset.is_some())
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Review and commit or discard the recovered changes before editing",
+                cx,
+            );
+            return;
+        }
+
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
@@ -757,13 +851,23 @@ impl DbxApp {
         session_id: SessionId,
         tab_id: SecondaryTabId,
     ) -> Result<Vec<RowChange>, String> {
-        let table = self
-            .editable_table_for(session_id, tab_id)
-            .cloned()
+        self.editable_table_for(session_id, tab_id)
             .ok_or("This table cannot be edited")?;
+        self.snapshot_row_changes_for(session_id, tab_id)
+    }
+
+    pub(super) fn snapshot_row_changes_for(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+    ) -> Result<Vec<RowChange>, String> {
         let data = self
             .data_tab(session_id, tab_id)
             .ok_or("No table is open")?;
+        let table = data.table.clone();
+        if let Some(saved) = &data.recovered_changeset {
+            return Ok(saved.changes.clone());
+        }
         let result = data.result.clone().ok_or("No rows are loaded")?;
         let originals = |row: &RowData, columns: &mut dyn Iterator<Item = usize>| {
             columns
@@ -866,7 +970,14 @@ impl DbxApp {
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: format!("Commit {}?", counted(counts.total(), "change", "changes")),
-            detail: String::new(),
+            detail: if self
+                .data_tab(session_id, tab_id)
+                .is_some_and(|data| data.recovered_changeset.is_some())
+            {
+                "Recovered draft: schema and original values will be checked before applying. Nothing has run automatically.".into()
+            } else {
+                String::new()
+            },
             confirm_label: "Commit",
             tone: if counts.deleted > 0 {
                 ConfirmationTone::Danger
@@ -891,10 +1002,9 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .data_tab(session_id, tab_id)
-            .is_some_and(|data| !data.pending_deletes.is_empty())
-        {
+        if self.data_tab(session_id, tab_id).is_some_and(|data| {
+            !data.pending_deletes.is_empty() || data.recovered_changeset.is_some()
+        }) {
             self.review_changes_for(session_id, tab_id, window, cx);
         } else {
             self.save_pending_edits_for(session_id, tab_id, window, cx);
@@ -953,6 +1063,10 @@ impl DbxApp {
         if data.busy || !data.has_pending_edits() {
             return;
         }
+        let recovered = data.recovered_changeset.clone();
+        let current_target = self
+            .session(session_id)
+            .and_then(|session| session.connection_identity);
         let known = (data.table.clone(), data.table_columns.clone());
         let changes = match self.row_changes_for(session_id, tab_id) {
             Ok(changes) => changes,
@@ -972,6 +1086,9 @@ impl DbxApp {
         data.request_generation += 1;
         let generation = data.request_generation;
         let task = runtime.spawn(async move {
+            if let Some(saved) = recovered {
+                saved.validate(&engine, current_target).await?;
+            }
             engine
                 .apply_row_changes(&changes, Some((&known.0, &known.1)))
                 .await
@@ -995,6 +1112,7 @@ impl DbxApp {
                 data.busy = false;
                 match outcome {
                     Ok(saved) => {
+                        data.recovered_changeset = None;
                         data.pending_edits.clear();
                         data.pending_inserts.clear();
                         data.pending_deletes.clear();

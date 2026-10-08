@@ -18,6 +18,7 @@ pub(super) struct QuickOpen {
 enum Target {
     Table(SessionId, TableInfo),
     SavedQuery(SessionId, SavedQuery),
+    History(SessionId, QueryHistoryEntry),
     Session(SessionId),
     Connection(Box<SavedConnection>),
 }
@@ -74,6 +75,11 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     }
     // Prefer shorter names when the match quality is otherwise equal.
     Some(score * 100 - candidate.chars().count() as i64)
+}
+
+fn history_date(value: &str) -> Option<u64> {
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    u64::try_from(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis()).ok()
 }
 
 impl DbxApp {
@@ -151,6 +157,11 @@ impl DbxApp {
                 self.activate_session(session_id, cx);
                 self.open_saved_query_for(session_id, saved, window, cx);
             }
+            Target::History(session_id, entry) => {
+                self.activate_session(session_id, cx);
+                self.add_query_tab_for(session_id, window, cx);
+                self.load_query_history_entry_for(session_id, &entry, window, cx);
+            }
             Target::Session(session_id) => self.activate_session(session_id, cx),
             Target::Connection(profile) => self.open_saved_connection(*profile, window, cx),
         }
@@ -163,6 +174,9 @@ impl DbxApp {
             return Vec::new();
         };
         let query = open.query.read(cx).text(cx);
+        if let Some(search) = query.strip_prefix("history:") {
+            return self.history_search_items(search);
+        }
         let active = self.active_session_id();
         let mut sessions = self.sessions.iter().collect::<Vec<_>>();
         sessions.sort_by_key(|session| Some(session.id) != active);
@@ -243,6 +257,124 @@ impl DbxApp {
             .take(MAX_RESULTS)
             .map(|(_, _, item)| item)
             .collect()
+    }
+
+    pub(super) fn search_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_quick_open_action(&OpenQuickOpen, window, cx);
+        if let Some(open) = &self.quick_open {
+            open.query
+                .update(cx, |editor, cx| editor.set_text("history:", cx));
+        }
+    }
+
+    fn history_search_items(&self, search: &str) -> Vec<Item> {
+        let mut text = Vec::new();
+        let mut success = None;
+        let mut after = None;
+        let mut before = None;
+        let mut connection = None;
+        for token in search.split_whitespace() {
+            match token {
+                "success:true" => success = Some(true),
+                "success:false" => success = Some(false),
+                _ if token.starts_with("after:") => {
+                    let Some(date) = history_date(&token[6..]) else {
+                        return Vec::new();
+                    };
+                    after = Some(date);
+                }
+                _ if token.starts_with("before:") => {
+                    let Some(date) = history_date(&token[7..]) else {
+                        return Vec::new();
+                    };
+                    before = Some(date);
+                }
+                _ if token.starts_with("connection:") => {
+                    connection = Some(token[11..].to_lowercase())
+                }
+                _ => text.push(token.to_lowercase()),
+            }
+        }
+        self.recent_query_history
+            .iter()
+            .filter_map(|entry| {
+                let session = self.sessions.iter().find(|session| {
+                    query_history_connection(session).as_ref() == Some(&entry.connection)
+                })?;
+                let succeeded = matches!(entry.outcome, QueryHistoryOutcome::Success(_));
+                if success.is_some_and(|value| value != succeeded)
+                    || after.is_some_and(|date| entry.executed_at_ms < date)
+                    || before.is_some_and(|date| entry.executed_at_ms >= date)
+                    || connection
+                        .as_ref()
+                        .is_some_and(|name| !session.name.to_lowercase().contains(name))
+                    || !text
+                        .iter()
+                        .all(|word| entry.sql.to_lowercase().contains(word))
+                {
+                    return None;
+                }
+                let timestamp =
+                    chrono::DateTime::from_timestamp_millis(entry.executed_at_ms as i64)
+                        .map(|time| time.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_default();
+                Some(Item {
+                    label: entry.sql.split_whitespace().collect::<Vec<_>>().join(" "),
+                    detail: format!(
+                        "{} · {} · {timestamp}",
+                        session.name,
+                        if succeeded { "Success" } else { "Failed" }
+                    ),
+                    icon: Icon::Query,
+                    target: Target::History(session.id, entry.clone()),
+                })
+            })
+            .take(MAX_RESULTS)
+            .collect()
+    }
+
+    pub(super) fn set_history_policy(
+        &mut self,
+        session_id: SessionId,
+        disabled: Option<bool>,
+        retention: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(identity) = self.session(session_id).and_then(query_history_connection) else {
+            return;
+        };
+        let key = crate::workspace::connection_key(&identity);
+        let document = self.workspace_documents.entry(key).or_default();
+        if let Some(value) = disabled {
+            document.history_disabled = value;
+        }
+        if let Some(value) = retention {
+            document.history_retention = value.clamp(1, 100);
+        }
+        self.persist_query_workspace_for(session_id, cx);
+        if let Some(limit) = retention {
+            let Some(store) = self.query_history_store.clone() else {
+                return;
+            };
+            let runtime = self.runtime.clone();
+            cx.spawn(async move |this, cx| {
+                let entries = runtime
+                    .spawn_blocking(move || {
+                        store.retain(&identity, limit)?;
+                        store.load()
+                    })
+                    .await?;
+                if let Ok(entries) = entries {
+                    this.update(cx, |this, cx| {
+                        this.recent_query_history = entries.into_iter().rev().collect();
+                        cx.notify();
+                    })?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     pub(super) fn render_quick_open(&mut self, cx: &mut Context<Self>) -> AnyElement {

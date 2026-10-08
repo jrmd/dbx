@@ -749,6 +749,7 @@ pub(super) struct DataTab {
     /// new rows, and loaded rows marked for deletion. Nothing reaches the
     /// database until the user commits the set as a whole.
     pub(super) pending_edits: cell_edits::PendingEdits,
+    pub(super) recovered_changeset: Option<crate::workspace::SavedChangeset>,
     pub(super) pending_inserts: Vec<cell_edits::PendingInsert>,
     pub(super) pending_deletes: std::collections::BTreeSet<usize>,
     pub(super) cell_editor: Option<cell_edits::CellEditor>,
@@ -818,6 +819,7 @@ impl DataTab {
             sort: None,
             sortable,
             pending_edits: Default::default(),
+            recovered_changeset: None,
             pending_inserts: Vec::new(),
             pending_deletes: Default::default(),
             cell_editor: None,
@@ -960,8 +962,11 @@ pub(super) fn find_data_tab_mut(
 pub(super) struct ConnectionSession {
     pub(super) schema_baseline: Option<RelationalSchema>,
     pub(super) transfer_control: Option<dbx_core::TransferControl>,
+    pub(super) transfer_log: String,
+    pub(super) mcp_pairing: Option<dbx_core::mcp::Pairing>,
     pub(super) id: SessionId,
     pub(super) profile_id: Option<Uuid>,
+    pub(super) connection_identity: Option<[u8; 32]>,
     pub(super) name: String,
     pub(super) kind: DatabaseKind,
     pub(super) tag: Option<ConnectionTag>,
@@ -1023,6 +1028,7 @@ impl ConnectionSession {
         Self {
             id,
             profile_id,
+            connection_identity: None,
             name,
             kind,
             tag,
@@ -1051,6 +1057,8 @@ impl ConnectionSession {
             request_generation: 0,
             background_tasks: BackgroundTaskSet::default(),
             transfer_control: None,
+            transfer_log: String::new(),
+            mcp_pairing: None,
             schema_baseline: None,
         }
     }

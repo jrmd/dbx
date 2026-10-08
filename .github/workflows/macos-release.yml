@@ -17,7 +17,11 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     env:
       CARGO_INCREMENTAL: '0'
@@ -44,7 +48,7 @@ jobs:
       - name: Upload candidate
         uses: actions/upload-artifact@v4
         with:
-          name: DBX-macos-${{ inputs.signed && 'notarized' || 'unsigned' }}
+          name: DBX-macos-${{ runner.arch }}-${{ inputs.signed && 'notarized' || 'unsigned' }}
           path: |
             target/macos/DBX-*.zip
             target/macos/DBX-*.zip.sha256

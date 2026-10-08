@@ -94,6 +94,8 @@ pub struct SqlxEngine {
     /// query, so in-flight queries never block a database switch for long.
     pool: RwLock<SqlxPool>,
     _tunnel: Option<crate::transport::Tunnel>,
+    cloud_source: Option<Box<ConnectionConfig>>,
+    cloud_refreshed: tokio::sync::Mutex<Instant>,
 }
 
 /// Native SQLx pools for the supported SQL drivers.
@@ -131,7 +133,7 @@ impl std::fmt::Debug for SqlxEngine {
 }
 
 impl SqlxEngine {
-    pub async fn connect(config: ConnectionConfig) -> Result<Self> {
+    pub async fn connect(mut config: ConnectionConfig) -> Result<Self> {
         if !config.kind.is_sql() {
             return Err(DbxError::InvalidConfig(format!(
                 "SQLx cannot open a {} connection",
@@ -139,6 +141,19 @@ impl SqlxEngine {
             )));
         }
         config.validate()?;
+        let cloud_source = if let Some(provider) = config.cloud_auth {
+            let source = config.clone();
+            let token =
+                zeroize::Zeroizing::new(crate::cloud_database_password(&source, provider).await?);
+            let mut url = url::Url::parse(&config.url)
+                .map_err(|_| DbxError::InvalidConfig("Invalid database URL".into()))?;
+            url.set_password(Some(&token.replace('%', "%25")))
+                .map_err(|_| DbxError::InvalidConfig("Invalid credential URL".into()))?;
+            config.url = url.into();
+            Some(Box::new(source))
+        } else {
+            None
+        };
         let (config, tunnel) = crate::transport::prepare(config).await?;
         let timeout = std::time::Duration::from_millis(config.connect_timeout_ms);
         // Every connection to `sqlite::memory:` owns a different database.
@@ -207,6 +222,8 @@ impl SqlxEngine {
             config,
             pool: RwLock::new(pool),
             _tunnel: tunnel,
+            cloud_source,
+            cloud_refreshed: tokio::sync::Mutex::new(Instant::now()),
         })
     }
 
@@ -223,8 +240,43 @@ impl SqlxEngine {
 
     /// Snapshot the current pool handle. `SqlxPool` clones are cheap and stay
     /// valid even if a later `use_database` swaps the pool underneath.
-    pub(crate) async fn pool_snapshot(&self) -> SqlxPool {
-        self.pool.read().await.clone()
+    pub(crate) async fn pool_snapshot(&self) -> Result<SqlxPool> {
+        if let Some(source) = &self.cloud_source {
+            let mut refreshed = self.cloud_refreshed.lock().await;
+            if refreshed.elapsed() >= std::time::Duration::from_secs(300) {
+                let token = zeroize::Zeroizing::new(
+                    crate::cloud_database_password(
+                        source,
+                        source.cloud_auth.expect("configured provider"),
+                    )
+                    .await?,
+                );
+                match &*self.pool.read().await {
+                    SqlxPool::Postgres(pool) => {
+                        pool.set_connect_options((*pool.connect_options()).clone().password(&token))
+                    }
+                    SqlxPool::MySql(pool) => {
+                        pool.set_connect_options((*pool.connect_options()).clone().password(&token))
+                    }
+                    SqlxPool::SQLite(_) => unreachable!("cloud auth validated"),
+                }
+                *refreshed = Instant::now();
+            }
+        }
+        Ok(self.pool.read().await.clone())
+    }
+
+    /// A fixed pool for an explicitly scoped consumer. The caller retains the
+    /// source engine to own its tunnel; UI database switches cannot move this pool.
+    pub(crate) async fn frozen_pool(&self) -> Result<Self> {
+        Ok(Self {
+            kind: self.kind,
+            config: self.config.clone(),
+            pool: RwLock::new(self.pool_snapshot().await?),
+            _tunnel: None,
+            cloud_source: self.cloud_source.clone(),
+            cloud_refreshed: tokio::sync::Mutex::new(*self.cloud_refreshed.lock().await),
+        })
     }
 
     async fn query_with_statement(
@@ -264,7 +316,7 @@ impl SqlxEngine {
         let mut columns = Vec::new();
         let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
         let mut truncated = false;
-        match &self.pool_snapshot().await {
+        match &self.pool_snapshot().await? {
             SqlxPool::Postgres(pool) => {
                 let mut rows = bind_postgres_query(statement).fetch(pool);
                 while let Some(row) = rows.try_next().await? {
@@ -333,7 +385,7 @@ impl SqlxEngine {
         let mut statement_index = 0usize;
         let mut statement_returned_rows = false;
 
-        match &self.pool_snapshot().await {
+        match &self.pool_snapshot().await? {
             SqlxPool::Postgres(pool) => {
                 let mut events = sqlx::raw_sql(sql).fetch_many(pool);
                 while let Some(event) = events.try_next().await? {
@@ -445,7 +497,7 @@ impl SqlxEngine {
     /// result shape. It is still valuable for zero-row SELECTs, where rows do
     /// not otherwise expose their columns.
     async fn describe_columns(&self, sql: &str) -> Vec<ColumnInfo> {
-        match &self.pool_snapshot().await {
+        match &*self.pool.read().await {
             SqlxPool::Postgres(pool) => pool
                 .describe(sql)
                 .await
@@ -471,13 +523,19 @@ impl SqlxEngine {
             ));
         }
         let started = Instant::now();
-        let (rows_affected, last_insert_id) = match &self.pool_snapshot().await {
+        let (rows_affected, last_insert_id) = match &self.pool_snapshot().await? {
             SqlxPool::Postgres(pool) => {
                 let result = bind_postgres_query(statement).execute(pool).await?;
                 (result.rows_affected(), None)
             }
             SqlxPool::MySql(pool) => {
-                let result = bind_mysql_query(statement).execute(pool).await?;
+                // MySQL cannot prepare some DDL, including CREATE TRIGGER.
+                // Values remain bound whenever the caller supplied parameters.
+                let result = if statement.params.is_empty() {
+                    sqlx::raw_sql(&statement.sql).execute(pool).await?
+                } else {
+                    bind_mysql_query(statement).execute(pool).await?
+                };
                 // MySQL exposes this as u64. Going through AnyPool converted
                 // it to i64 first, which silently lost IDs above i64::MAX.
                 (result.rows_affected(), Some(result.last_insert_id()))
@@ -491,7 +549,7 @@ impl SqlxEngine {
     }
 
     pub async fn execute_transaction(&self, statements: &[String]) -> Result<()> {
-        match self.pool_snapshot().await {
+        match self.pool_snapshot().await? {
             SqlxPool::Postgres(pool) => {
                 let mut transaction = pool.begin().await?;
                 for statement in statements {
@@ -1204,6 +1262,9 @@ impl SqlxEngine {
 
     async fn use_sql_database(&self, name: &str) -> Result<()> {
         validate_database_name(name)?;
+        // Switching creates a new connection. Use refreshed pool options,
+        // retaining the tunnel and TLS identity rather than the original token.
+        let snapshot = self.pool_snapshot().await?;
         match self.kind.dialect() {
             DatabaseKind::SQLite => Err(DbxError::Unsupported {
                 operation: "use_database".to_owned(),
@@ -1214,14 +1275,10 @@ impl SqlxEngine {
                 // and changing only one pooled connection leaves the others
                 // on the old database. Rebuild the pool on the same transport.
                 let timeout = std::time::Duration::from_millis(self.config.connect_timeout_ms);
-                let options = mysql_options(&self.config)
-                    .map_err(|error| {
-                        DbxError::Connection(crate::error::connection_message(
-                            &self.config.url,
-                            error,
-                        ))
-                    })?
-                    .database(name);
+                let SqlxPool::MySql(current) = &snapshot else {
+                    unreachable!("matching pool")
+                };
+                let options = (*current.connect_options()).clone().database(name);
                 let pool = pool_options::<MySql>(
                     self.config.max_connections,
                     timeout,
@@ -1241,14 +1298,15 @@ impl SqlxEngine {
                 // keep using the same engine object.
                 let url = with_database_path(&self.config.url, name)?;
                 let timeout = std::time::Duration::from_millis(self.config.connect_timeout_ms);
+                let SqlxPool::Postgres(current) = &snapshot else {
+                    unreachable!("matching pool")
+                };
                 let pool = pool_options::<Postgres>(
                     self.config.max_connections,
                     timeout,
                     Some(IDLE_CONNECTION_TIMEOUT),
                 )
-                .connect_with(postgres_options(&self.config, &url).map_err(|error| {
-                    DbxError::Connection(crate::error::connection_message(&url, error))
-                })?)
+                .connect_with((*current.connect_options()).clone().database(name))
                 .await
                 .map_err(|error| {
                     DbxError::Connection(crate::error::connection_message(&url, error))
@@ -2480,7 +2538,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        let SqlxPool::SQLite(pool) = engine.pool_snapshot().await else {
+        let SqlxPool::SQLite(pool) = engine.pool_snapshot().await.unwrap() else {
             unreachable!()
         };
         pool.close().await;

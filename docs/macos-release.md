@@ -1,6 +1,6 @@
 # macOS release candidates
 
-DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The manual candidate workflow produces **Apple Silicon (arm64)** candidates. The tag-triggered release workflow produces the same Apple Silicon bundle alongside Linux x86_64. Intel Macs are not supported.
+DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The manual candidate and tag-triggered release workflows now target **Apple Silicon (arm64)** and **Intel (x86_64)**. The release workflow also builds Linux x86_64. The published v0.5.0 Mac asset is Apple Silicon only; this expanded matrix remains unreleased pending candidate and release validation.
 
 ## Signing setup
 
@@ -46,6 +46,7 @@ The workflow installs the Rust/native toolchain, runs workspace tests, and build
 Downloads are Actions artifacts, retained for 14 days:
 
 - `DBX-VERSION-macos-arm64.zip`, containing `DBX.app` with its stapled ticket.
+- `DBX-VERSION-macos-x86_64.zip`, containing the corresponding Intel bundle.
 - A corresponding SHA-256 checksum file.
 - Unsigned candidates have `-unsigned` in their filenames and are not notarized releases.
 
@@ -60,14 +61,15 @@ one version tag. Set the workspace version in `Cargo.toml`, update `Cargo.lock`,
 commit the release changes, and push a matching `vVERSION` tag. A manual workflow
 rerun must also select that tag. All five Apple secrets above must be available.
 The workflow rejects mismatched tags and prerelease versions, runs tests and
-Clippy, builds Linux x86_64 plus Apple Silicon, and requires successful
+Clippy, builds Linux x86_64 plus Apple Silicon and Intel macOS, and requires successful
 notarization for both Mac bundles. It verifies archive checksums, uploads all
 assets to a draft release, then publishes it as latest. A failed build publishes
 nothing. If upload fails after draft creation, inspect/remove that draft before
 retrying; existing published releases are never overwritten by this workflow.
 
 Each release supplies `DBX-VERSION-linux-x86_64.AppImage`,
-`DBX-VERSION-linux-x86_64.tar.gz`, and `DBX-VERSION-macos-arm64.zip`, each with its own
+`DBX-VERSION-linux-x86_64.tar.gz`, `DBX-VERSION-macos-arm64.zip`, and
+`DBX-VERSION-macos-x86_64.zip`, each with its own
 `.sha256` file. The updater accepts only exact platform/version filenames from
 `jrmd/dbx`, stable versions newer than the running version, and checksum-matching
 downloads. Unsigned candidate filenames cannot be selected.
@@ -83,7 +85,7 @@ with an atomic rename; root-owned installations require manual/package updates.
 An AppImage (detected through `APPIMAGE`) downloads the new AppImage and replaces
 that file the same way.
 Neither platform replaces the vault or user configuration. Restart is explicit;
-DBX does not save or restore open queries when restarting.
+DBX saves encrypted query drafts, ordered workspace tabs and staged changesets. Recovery reopens profiles after vault unlock, requires review for recovered changes, and never executes saved SQL or restores transaction state.
 
 macOS uses opaque surfaces and an opaque window backdrop. Light/dark/system
 appearance remains available, while the transparency toggle is hidden on Mac.
@@ -92,8 +94,9 @@ before calling them device-verified.
 
 ## Build reuse
 
-Both release workflows run tests and Clippy in the release profile, matching
-the packaging scripts. This avoids compiling the shared dependencies once in
+Both workflows run tests in the release profile, matching the packaging scripts.
+The tag-triggered release and separate build check also run strict Clippy.
+This avoids compiling the shared dependencies once in
 debug mode and again in release mode. GPUI's test-support feature still needs
 a separate test variant; the distributed binary keeps its production features.
 
