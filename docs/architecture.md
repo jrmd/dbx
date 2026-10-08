@@ -4,7 +4,7 @@ This document describes the intended architecture for DBX, a native Rust/GPUI da
 
 ## Goals and boundaries
 
-DBX should provide a responsive desktop surface for browsing and changing PostgreSQL, MySQL, SQLite, and Redis data. The common path is schema discovery → paged browsing → GUI filtering → reviewed CRUD or SQL execution.
+DBX should provide a responsive desktop surface for browsing and changing PostgreSQL, MySQL, SQLite, and Redis data, plus the provider connectors listed in [database-connectors.md](database-connectors.md). The common path is schema discovery → paged browsing → GUI filtering → reviewed CRUD or SQL execution.
 
 The UI must never block on network or disk I/O. Database-specific syntax and metadata must stay behind connectors. The shared application layer owns product behaviour (selection, drafts, paging, errors, and history), while each connector owns capabilities and translation to its engine.
 
@@ -72,7 +72,7 @@ GPUI models and views should receive small, immutable result snapshots or stream
 
 The exact Rust module names may change, but the seam should remain close to these concepts:
 
-- `EngineKind`: PostgreSQL, MySQL, SQLite, or Redis.
+- `DatabaseKind`: the four core engines (PostgreSQL, MySQL, SQLite, Redis) and the provider connectors (MongoDB, CockroachDB, DuckDB, Elasticsearch, BigQuery, Kafka, Turso, Cloudflare D1, ClickHouse, SQL Server, Snowflake).
 - `ConnectionConfig`: a redacted/display-safe description plus secret material held separately. Variants should make engine differences explicit (for example, SQLite path versus host/port/database).
 - `Capabilities`: whether the engine supports schemas, transactions, prepared parameters, offset/keyset paging, table DDL, row updates, and cancellation.
 - `DatabaseConnector`: connect/close, ping, discover metadata, fetch a page, execute a parameterized statement, and expose engine-specific operations through capability-checked methods.
