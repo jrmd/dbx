@@ -111,6 +111,57 @@ async fn preview_mapping_preserves_nulls_defaults_and_rolls_back_bad_rows() {
 }
 
 #[tokio::test]
+async fn json_preview_and_append_preserve_decimal_large_integer_and_nested_digits() {
+    use dbx_core::data_import::{ImportData, import_data};
+    let (directory, engine) = database().await;
+    engine
+        .execute_sql("CREATE TABLE exact_numbers(amount TEXT, huge TEXT, nested TEXT)")
+        .await
+        .unwrap();
+    let table = TableRef::new("exact_numbers");
+    let columns = engine.describe_table(&table).await.unwrap();
+    let database = engine.current_database().await.unwrap();
+    for extension in ["json", "jsonl"] {
+        let path = directory.path().join(format!("numbers.{extension}"));
+        let object = r#"{"amount":1234567890.1234567890123456789,"huge":184467440737095516160,"nested":{"value":0.1234567890123456789}}"#;
+        std::fs::write(
+            &path,
+            if extension == "json" {
+                format!("[{object}]")
+            } else {
+                object.into()
+            },
+        )
+        .unwrap();
+        let data = ImportData::read(&path).unwrap();
+        let mapping = data.default_mapping(&columns);
+        import_data(&engine, &table, &data, &mapping, &database, &columns)
+            .await
+            .unwrap();
+    }
+    let rows = engine
+        .query("SELECT * FROM exact_numbers", QueryOptions::default())
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(
+            row.values[0],
+            CellValue::Text("1234567890.1234567890123456789".into())
+        );
+        assert_eq!(
+            row.values[1],
+            CellValue::Text("184467440737095516160".into())
+        );
+        assert_eq!(
+            row.values[2].to_string(),
+            r#"{"value":0.1234567890123456789}"#
+        );
+    }
+}
+
+#[tokio::test]
 async fn mcp_pairing_authenticates_scopes_and_bounds_reads_then_revokes() {
     let (_directory, engine) = database().await;
     engine
@@ -1632,6 +1683,76 @@ async fn native_mysql_backup_restores_objects_into_a_new_database() -> Result<()
     let _ = engine.execute_sql(&format!("DROP DATABASE {source}")).await;
     let _ = engine.execute_sql(&format!("DROP DATABASE {target}")).await;
     result
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and MySQL"]
+async fn postgres_mysql_json_import_preserves_decimal_and_large_integer_columns() -> Result<()> {
+    use dbx_core::data_import::{ImportData, import_data};
+    for (kind, variable) in [
+        (DatabaseKind::PostgreSQL, "DBX_TEST_POSTGRES_URL"),
+        (DatabaseKind::MySQL, "DBX_TEST_MYSQL_URL"),
+    ] {
+        let engine = DatabaseEngine::connect(ConnectionConfig::new(
+            kind,
+            std::env::var(variable).unwrap(),
+        ))
+        .await?;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = TableRef::new(format!("dbx_exact_import_{suffix}"));
+        let name = quote_identifier(kind, &table.name)?;
+        engine
+            .execute_sql(&format!(
+                "CREATE TABLE {name}(amount DECIMAL(40,19), huge DECIMAL(30,0))"
+            ))
+            .await?;
+        let result: Result<()> = async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("numbers.json");
+            std::fs::write(
+                &path,
+                r#"[{"amount":1234567890.1234567890123456789,"huge":184467440737095516160}]"#,
+            )
+            .unwrap();
+            let data = ImportData::read(&path)?;
+            let columns = engine.describe_table(&table).await?;
+            let mapping = data.default_mapping(&columns);
+            import_data(
+                &engine,
+                &table,
+                &data,
+                &mapping,
+                &engine.current_database().await?,
+                &columns,
+            )
+            .await?;
+            let rows = engine
+                .query(
+                    &format!("SELECT amount, huge FROM {name}"),
+                    QueryOptions::default(),
+                )
+                .await?
+                .rows;
+            assert_eq!(
+                rows[0].values[0].to_string(),
+                "1234567890.1234567890123456789",
+                "{kind}"
+            );
+            assert_eq!(
+                rows[0].values[1].to_string(),
+                "184467440737095516160",
+                "{kind}"
+            );
+            Ok(())
+        }
+        .await;
+        let _ = engine.execute_sql(&format!("DROP TABLE {name}")).await;
+        result?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
