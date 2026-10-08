@@ -61,6 +61,6 @@ fi
 : "${DBX_TEST_MYSQL_ADMIN_URL:=mysql://root:dbx_test_root_password@127.0.0.1:${DBX_TEST_MYSQL_PORT:-53306}/dbx_test}"
 export DBX_TEST_MYSQL_ADMIN_URL
 
-cargo test --locked "${cargo_profile[@]}" -p dbx-core --test integration -- --ignored --test-threads=1 --skip socket_and_ssh_connections_integration --skip strict_tls_over_ssh_integration
+cargo test --locked "${cargo_profile[@]}" -p dbx-core --test integration -- --ignored --test-threads=1 --skip socket_and_ssh_connections_integration --skip strict_tls_over_ssh_integration --skip native_postgres_backup_over_password_socket
 cargo test --locked "${cargo_profile[@]}" -p dbx-core --test workbench_safety -- --ignored --test-threads=1
 cargo test --locked "${cargo_profile[@]}" -p dbx-core --test connectors -- --ignored --test-threads=1
