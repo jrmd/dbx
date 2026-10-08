@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     CellValue, ColumnInfo, ConnectionConfig, CreateTableRequest, DatabaseKind, DbxError,
     ExecResult, Filter, InsertRequest, Order, Page, QueryResult, RelationalSchema, Result,
-    SqlStatement, TableInfo, TableRef, TableStructure, UpdateRequest, build_create_table,
-    build_delete_with_columns, build_drop_table, build_insert_with_columns,
-    build_select_with_columns, build_truncate_table, build_update_with_columns,
+    RowChange, SqlStatement, TableInfo, TableRef, TableStructure, UpdateRequest, build_count,
+    build_create_table, build_delete_with_columns, build_drop_table, build_insert_with_columns,
+    build_row_estimate, build_select_with_columns, build_truncate_table, build_update_with_columns,
 };
 use crate::{RedisEngine, SqlxEngine};
 
@@ -194,6 +194,23 @@ impl DatabaseEngine {
         Ok(())
     }
 
+    /// Browse one page of the Redis keyspace from `cursor`. Returns the key
+    /// grid and the cursor for the next page (`0` when complete).
+    pub async fn redis_scan_page(
+        &self,
+        pattern: &str,
+        cursor: u64,
+        target: usize,
+    ) -> Result<(QueryResult, u64)> {
+        match self {
+            Self::Redis(engine) => engine.scan_page(pattern, cursor, target).await,
+            _ => Err(DbxError::Unsupported {
+                operation: "redis_scan_page".into(),
+                kind: self.kind(),
+            }),
+        }
+    }
+
     /// Discover the Redis commands available on this connected server.
     pub async fn redis_command_catalog(&self) -> Result<crate::RedisCommandCatalog> {
         match self {
@@ -342,6 +359,42 @@ impl DatabaseEngine {
         Ok(result)
     }
 
+    /// Count the rows matching `filters` exactly.
+    pub async fn count_rows(
+        &self,
+        table: &TableRef,
+        filters: &[Filter],
+        known_columns: Option<&[ColumnInfo]>,
+    ) -> Result<u64> {
+        ensure_sql(self.kind(), "count_rows")?;
+        let metadata = self.filter_metadata(table, filters, known_columns).await?;
+        let statement = build_count(
+            self.kind(),
+            table,
+            filters,
+            metadata.as_deref().unwrap_or_default(),
+        )?;
+        let result = self
+            .query_statement(&statement, QueryOptions::default())
+            .await?;
+        first_count(&result).ok_or_else(|| DbxError::Query("COUNT(*) returned no number".into()))
+    }
+
+    /// The catalog's row estimate for `table`, when the engine keeps one.
+    /// Never scans the table.
+    pub async fn estimate_rows(&self, table: &TableRef) -> Result<Option<u64>> {
+        if !self.kind().is_sql() {
+            return Ok(None);
+        }
+        let Some(statement) = build_row_estimate(self.kind(), table)? else {
+            return Ok(None);
+        };
+        let result = self
+            .query_statement(&statement, QueryOptions::default())
+            .await?;
+        Ok(first_count(&result))
+    }
+
     /// PostgreSQL needs column types to cast text filter parameters (for
     /// example, to `uuid`); other dialects coerce them implicitly.
     async fn filter_metadata(
@@ -397,48 +450,108 @@ impl DatabaseEngine {
     }
 
     /// Apply several checked updates as one unit. Each must still match its
-    /// original values and affect exactly one row. Native SQL engines run them
-    /// in one transaction, so a conflict rolls every update back; other
-    /// writable engines apply them in order and stop at the first failure.
+    /// original values and affect exactly one row.
     pub async fn update_checked_batch(
         &self,
         updates: &[(UpdateRequest, Vec<(String, CellValue)>)],
     ) -> Result<u64> {
-        ensure_clickhouse_sql_writes(self.kind(), "update")?;
-        ensure_sql(self.kind(), "update")?;
-        if !matches!(self, Self::Sql(_)) {
-            for (applied, (request, originals)) in updates.iter().enumerate() {
-                self.update_checked(request, originals)
-                    .await
-                    .map_err(|error| match applied {
-                        0 => error,
-                        applied => DbxError::Query(format!(
-                            "{error}; {applied} earlier row update(s) were already applied"
-                        )),
-                    })?;
-            }
-            return Ok(updates.len() as u64);
-        }
-        let mut described: Vec<(TableRef, Vec<ColumnInfo>)> = Vec::new();
-        let mut statements = Vec::with_capacity(updates.len());
-        for (request, originals) in updates {
-            let columns = match described.iter().find(|(table, _)| *table == request.table) {
+        let changes = updates
+            .iter()
+            .map(|(request, originals)| RowChange::Update {
+                request: request.clone(),
+                originals: originals.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.apply_row_changes(&changes, None).await
+    }
+
+    /// Apply a staged changeset as one unit. Every update and delete must
+    /// still match its original values and affect exactly one row. Native SQL
+    /// engines run the whole set in one transaction, so any conflict or error
+    /// rolls every change back; other writable engines apply changes in order
+    /// and stop at the first failure, reporting how many were already applied.
+    ///
+    /// `known` supplies already-described columns for one table, saving a
+    /// metadata round trip per save.
+    pub async fn apply_row_changes(
+        &self,
+        changes: &[RowChange],
+        known: Option<(&TableRef, &[ColumnInfo])>,
+    ) -> Result<u64> {
+        ensure_clickhouse_sql_writes(self.kind(), "change rows")?;
+        ensure_sql(self.kind(), "change rows")?;
+        let mut described: Vec<(TableRef, Vec<ColumnInfo>)> = known
+            .filter(|(_, columns)| !columns.is_empty())
+            .map(|(table, columns)| vec![(table.clone(), columns.to_vec())])
+            .unwrap_or_default();
+        let mut statements = Vec::with_capacity(changes.len());
+        for change in changes {
+            let table = change.table();
+            let columns = match described.iter().find(|(known, _)| known == table) {
                 Some((_, columns)) => columns.clone(),
                 None => {
-                    let columns = self.describe_table(&request.table).await?;
-                    described.push((request.table.clone(), columns.clone()));
+                    let columns = self.describe_table(table).await?;
+                    described.push((table.clone(), columns.clone()));
                     columns
                 }
             };
-            ensure_primary_key_filters(&columns, &request.filters)?;
-            let mut statement = build_update_with_columns(self.kind(), request, &columns)?;
-            crate::sql::guard_original_values(self.kind(), &mut statement, originals, &columns)?;
-            statements.push(statement);
+            let (statement, checked) = match change {
+                RowChange::Insert(request) => (
+                    build_insert_with_columns(self.kind(), request, &columns)?,
+                    false,
+                ),
+                RowChange::Update { request, originals } => {
+                    ensure_primary_key_filters(&columns, &request.filters)?;
+                    let mut statement = build_update_with_columns(self.kind(), request, &columns)?;
+                    crate::sql::guard_original_values(
+                        self.kind(),
+                        &mut statement,
+                        originals,
+                        &columns,
+                    )?;
+                    (statement, true)
+                }
+                RowChange::Delete {
+                    table,
+                    filters,
+                    originals,
+                } => {
+                    ensure_primary_key_filters(&columns, filters)?;
+                    let mut statement =
+                        build_delete_with_columns(self.kind(), table, filters, &columns)?;
+                    crate::sql::guard_original_values(
+                        self.kind(),
+                        &mut statement,
+                        originals,
+                        &columns,
+                    )?;
+                    (statement, true)
+                }
+            };
+            statements.push((statement, checked));
+        }
+        if !matches!(self, Self::Sql(_)) {
+            for (applied, (statement, checked)) in statements.iter().enumerate() {
+                let outcome = self.execute(statement).await.and_then(|result| {
+                    if *checked && result.rows_affected != 1 {
+                        Err(DbxError::Conflict)
+                    } else {
+                        Ok(result)
+                    }
+                });
+                outcome.map_err(|error| match applied {
+                    0 => error,
+                    applied => DbxError::Query(format!(
+                        "{error}; {applied} earlier row change(s) were already applied"
+                    )),
+                })?;
+            }
+            return Ok(statements.len() as u64);
         }
         let mut transaction = crate::console::SqlTransaction::begin(self, false).await?;
-        for statement in &statements {
+        for (statement, checked) in &statements {
             let result = transaction.query(statement).await?;
-            if result.rows_affected != Some(1) {
+            if *checked && result.rows_affected != Some(1) {
                 // Dropping the transaction closes its connection and rolls back.
                 return Err(DbxError::Conflict);
             }
@@ -686,5 +799,17 @@ pub(crate) fn query_result(
         rows_affected,
         truncated,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    }
+}
+
+/// The first cell of a one-row numeric result. Negative values (PostgreSQL's
+/// "never analyzed" `-1`) count as unknown.
+fn first_count(result: &QueryResult) -> Option<u64> {
+    match result.rows.first()?.values.first()? {
+        CellValue::Integer(value) => u64::try_from(*value).ok(),
+        CellValue::Unsigned(value) => Some(*value),
+        CellValue::Real(value) if *value >= 0.0 => Some(*value as u64),
+        CellValue::Text(value) => value.trim().parse().ok(),
+        _ => None,
     }
 }

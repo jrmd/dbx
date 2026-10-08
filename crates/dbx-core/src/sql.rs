@@ -146,6 +146,58 @@ pub fn build_select_with_columns(
     Ok(SqlStatement::new(statement, params))
 }
 
+/// Count the rows of `table` that match `filters`.
+pub fn build_count(
+    kind: DatabaseKind,
+    table: &TableRef,
+    filters: &[Filter],
+    metadata: &[ColumnInfo],
+) -> Result<SqlStatement> {
+    let mut statement = String::from("SELECT COUNT(*) FROM ");
+    statement.push_str(&quote_table(kind, table)?);
+    let mut params = Vec::new();
+    append_filters(kind, &mut statement, &mut params, filters, metadata)?;
+    Ok(SqlStatement::new(statement, params))
+}
+
+/// A cheap row count from the catalog's statistics, where the engine keeps
+/// one. The figure may be stale; `None` means no estimate is available.
+pub fn build_row_estimate(kind: DatabaseKind, table: &TableRef) -> Result<Option<SqlStatement>> {
+    let quoted = quote_table(kind, table)?;
+    let statement = match kind {
+        DatabaseKind::PostgreSQL => SqlStatement::new(
+            "SELECT c.reltuples::bigint FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = $1 AND n.nspname = COALESCE($2::text, current_schema())",
+            vec![
+                CellValue::Text(table.name.clone()),
+                table
+                    .schema
+                    .clone()
+                    .map_or(CellValue::Null, CellValue::Text),
+            ],
+        ),
+        DatabaseKind::SqlServer => SqlStatement::new(
+            "SELECT SUM(rows) FROM sys.partitions \
+             WHERE object_id = OBJECT_ID(@P1) AND index_id IN (0, 1)",
+            vec![CellValue::Text(quoted)],
+        ),
+        kind if kind.dialect() == DatabaseKind::MySQL => SqlStatement::new(
+            "SELECT table_rows FROM information_schema.tables \
+             WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ?",
+            vec![
+                table
+                    .schema
+                    .clone()
+                    .map_or(CellValue::Null, CellValue::Text),
+                CellValue::Text(table.name.clone()),
+            ],
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(statement))
+}
+
 pub fn build_insert(kind: DatabaseKind, request: &InsertRequest) -> Result<SqlStatement> {
     build_insert_with_columns(kind, request, &[])
 }

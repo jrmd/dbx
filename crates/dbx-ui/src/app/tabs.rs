@@ -850,7 +850,34 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pending_edits_block(session_id, tab_id, cx) {
+        if let Some((table, counts, editing)) = self.data_tab(session_id, tab_id).map(|data| {
+            (
+                table_ref_label(&data.table),
+                data.change_counts(),
+                data.cell_editor.is_some(),
+            )
+        }) && (counts.total() > 0 || editing)
+        {
+            let focus = cx.focus_handle();
+            self.confirmation_dialog = Some(ConfirmationDialog {
+                title: format!("Discard changes to {table}?"),
+                detail: if counts.total() > 0 {
+                    format!(
+                        "{} will be lost.",
+                        counted(counts.total(), "staged change", "staged changes")
+                    )
+                } else {
+                    "The open cell edit will be lost.".into()
+                },
+                confirm_label: "Discard",
+                tone: ConfirmationTone::Danger,
+                action: ConfirmationAction::DiscardDataTab { session_id, tab_id },
+                focus: focus.clone(),
+                return_focus: window.focused(cx),
+                sql: None,
+            });
+            focus.focus(window, cx);
+            cx.notify();
             return;
         }
         let Some((kind, text, return_focus)) = self.session(session_id).and_then(|session| {
@@ -882,6 +909,7 @@ impl DbxApp {
             action: ConfirmationAction::CloseQuery { session_id, tab_id },
             focus: focus.clone(),
             return_focus: Some(return_focus),
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();

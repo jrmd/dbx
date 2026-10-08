@@ -162,6 +162,98 @@ async fn staged_row_updates_commit_or_roll_back_together() {
 }
 
 #[tokio::test]
+async fn mixed_changesets_commit_or_roll_back_together() {
+    let (_directory, engine) = database().await;
+    engine
+        .execute_sql(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); \
+             INSERT INTO items VALUES (1, 'one'), (2, 'two');",
+        )
+        .await
+        .unwrap();
+    let table = TableRef::new("items");
+    let rows = || async {
+        engine
+            .query(
+                "SELECT id, value FROM items ORDER BY id",
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|row| row.values)
+            .collect::<Vec<_>>()
+    };
+    let delete = |id: i64, value: &str| RowChange::Delete {
+        table: table.clone(),
+        filters: vec![Filter::new(
+            "id",
+            FilterOperator::Equals,
+            Some(CellValue::Integer(id)),
+        )],
+        originals: vec![("value".into(), CellValue::Text(value.into()))],
+    };
+    let update = |value: &str, original: &str| RowChange::Update {
+        request: UpdateRequest::for_primary_key(
+            table.clone(),
+            vec![("value".into(), CellValue::Text(value.into()))],
+            vec![("id".into(), CellValue::Integer(1))],
+        ),
+        originals: vec![("value".into(), CellValue::Text(original.into()))],
+    };
+    let insert = RowChange::Insert(InsertRequest::from_row(
+        table.clone(),
+        vec![("value".into(), CellValue::Text("three".into()))],
+    ));
+    let columns = engine.describe_table(&table).await.unwrap();
+
+    // A stale delete rejects the whole set, including the valid update and insert.
+    assert!(matches!(
+        engine
+            .apply_row_changes(
+                &[update("uno", "one"), delete(2, "stale"), insert.clone()],
+                Some((&table, &columns)),
+            )
+            .await,
+        Err(DbxError::Conflict)
+    ));
+    assert_eq!(
+        rows().await,
+        vec![
+            vec![CellValue::Integer(1), CellValue::Text("one".into())],
+            vec![CellValue::Integer(2), CellValue::Text("two".into())],
+        ]
+    );
+
+    assert_eq!(
+        engine
+            .apply_row_changes(
+                &[update("uno", "one"), delete(2, "two"), insert.clone()],
+                None
+            )
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        rows().await,
+        vec![
+            vec![CellValue::Integer(1), CellValue::Text("uno".into())],
+            vec![CellValue::Integer(2), CellValue::Text("three".into())],
+        ]
+    );
+    assert_eq!(
+        render_row_change(DatabaseKind::SQLite, &delete(2, "two")).unwrap(),
+        "DELETE FROM \"items\" WHERE \"id\" = 2;"
+    );
+    assert_eq!(
+        render_row_change(DatabaseKind::SQLite, &insert).unwrap(),
+        "INSERT INTO \"items\" (\"value\") VALUES ('three');"
+    );
+}
+
+#[tokio::test]
 async fn query_documents_keep_transactions_and_separate_result_shapes() {
     let (_directory, engine) = database().await;
     let session = QuerySession::new(engine.clone());
@@ -991,4 +1083,30 @@ async fn postgres_schema_objects_dump_restore_round_trip() {
         .execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn rows_are_counted_with_filters() {
+    let (_directory, engine) = database().await;
+    engine
+        .execute_sql(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT); \
+             INSERT INTO items VALUES (1, 'one'), (2, NULL), (3, 'three');",
+        )
+        .await
+        .unwrap();
+    let table = TableRef::new("items");
+    assert_eq!(engine.count_rows(&table, &[], None).await.unwrap(), 3);
+    assert_eq!(
+        engine
+            .count_rows(
+                &table,
+                &[Filter::new("value", FilterOperator::IsNull, None)],
+                None
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(engine.estimate_rows(&table).await.unwrap(), None);
 }

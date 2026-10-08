@@ -427,6 +427,7 @@ impl DbxApp {
             action: ConfirmationAction::DatabaseImport { session_id, path },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -743,6 +744,7 @@ impl DbxApp {
             },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();

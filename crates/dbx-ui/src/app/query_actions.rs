@@ -94,6 +94,7 @@ impl DbxApp {
             },
             focus: focus.clone(),
             return_focus,
+            sql: None,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -496,7 +497,7 @@ impl DbxApp {
                     let text = if column == 0 {
                         Some((row + 1).to_string())
                     } else {
-                        delegate.cell_as_plain_text(row, column - 1)
+                        delegate.cell_as_plain_text(row, delegate.result_column(column)?)
                     }?;
                     Some((text, "cell"))
                 }
@@ -506,7 +507,7 @@ impl DbxApp {
                     .map(|text| (text, "row")),
                 QueryResultSelection::Column => grid.selected_col().and_then(|column| {
                     (column > 0)
-                        .then(|| delegate.column_as_tsv(column - 1))
+                        .then(|| delegate.column_as_tsv(delegate.result_column(column)?))
                         .flatten()
                         .map(|text| (text, "column"))
                 }),
