@@ -556,6 +556,99 @@ mod tests {
     }
 
     #[test]
+    fn postgres_browse_reads_undecodable_types_as_text_and_sorts_natively() {
+        let columns = vec![
+            typed_column("id", "integer"),
+            typed_column("span", "int4range"),
+            typed_column("at", "time(3) with time zone"),
+            typed_column("seen", "timestamp(3) without time zone"),
+            typed_column("tags", "text[]"),
+        ];
+        let table = TableRef::in_schema("public", "events");
+        let order = [Order {
+            column: "span".into(),
+            direction: OrderDirection::Descending,
+        }];
+        let statement = build_select_with_columns(
+            DatabaseKind::PostgreSQL,
+            &table,
+            &[],
+            &[],
+            &order,
+            None,
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            statement.sql,
+            "SELECT \"id\", CAST(\"span\" AS text) AS \"span\", CAST(\"at\" AS text) AS \"at\", \"seen\", CAST(\"tags\" AS text) AS \"tags\" FROM \"public\".\"events\" ORDER BY \"public\".\"events\".\"span\" DESC"
+        );
+
+        // Tables of natively decoded types keep the plain projection.
+        let plain = build_select_with_columns(
+            DatabaseKind::PostgreSQL,
+            &table,
+            &[],
+            &[],
+            &order,
+            None,
+            &columns[..1],
+        )
+        .unwrap();
+        assert_eq!(
+            plain.sql,
+            "SELECT * FROM \"public\".\"events\" ORDER BY \"span\" DESC"
+        );
+    }
+
+    #[test]
+    fn guarded_changes_compare_postgres_text_reads_and_mysql_json_by_value() {
+        let columns = vec![
+            typed_column("id", "integer"),
+            typed_column("spot", "point"),
+            typed_column("at", "time with time zone"),
+        ];
+        let mut statement = SqlStatement::new("DELETE FROM \"t\" WHERE \"id\" = $1", vec![]);
+        statement.params.push(CellValue::Integer(1));
+        crate::sql::guard_original_values(
+            DatabaseKind::PostgreSQL,
+            &mut statement,
+            &[
+                ("spot".into(), CellValue::Text("(1,2)".into())),
+                ("at".into(), CellValue::Bytes(vec![0, 1])),
+            ],
+            &columns,
+        )
+        .unwrap();
+        assert_eq!(
+            statement.sql,
+            "DELETE FROM \"t\" WHERE \"id\" = $1 AND CAST(\"spot\" AS text) = $2"
+        );
+
+        let mut statement = SqlStatement::new("DELETE FROM `t` WHERE `id` = ?", vec![]);
+        crate::sql::guard_original_values(
+            DatabaseKind::MySQL,
+            &mut statement,
+            &[
+                ("doc".into(), CellValue::Json(serde_json::json!({"a": 1}))),
+                (
+                    "area".into(),
+                    CellValue::Text("<unsupported SQL type `geometry`>".into()),
+                ),
+            ],
+            &[
+                typed_column("doc", "json"),
+                typed_column("area", "geometry"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            statement.sql,
+            "DELETE FROM `t` WHERE `id` = ? AND `doc` = CAST(? AS JSON)"
+        );
+    }
+
+    #[test]
     fn equality_filters_parameterize_null_as_is_null() {
         let statement = build_select(
             DatabaseKind::SQLite,

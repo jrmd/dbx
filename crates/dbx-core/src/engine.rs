@@ -340,7 +340,15 @@ impl DatabaseEngine {
             }
         }
         ensure_sql(self.kind(), "query_table")?;
-        let metadata = self.filter_metadata(table, filters, known_columns).await?;
+        // PostgreSQL also needs the column types to choose which columns to
+        // read as text; see `postgres_reads_as_text`.
+        let metadata = match known_columns {
+            _ if self.kind() != DatabaseKind::PostgreSQL => {
+                self.filter_metadata(table, filters, known_columns).await?
+            }
+            Some(columns) if !columns.is_empty() => Some(columns.to_vec()),
+            _ => Some(self.describe_table(table).await?),
+        };
         let statement = build_select_with_columns(
             self.kind(),
             table,
@@ -358,6 +366,18 @@ impl DatabaseEngine {
             }
             _ => self.query_statement(&statement, options).await?,
         };
+        // A column read as text reports `text`; keep its declared type.
+        if self.kind() == DatabaseKind::PostgreSQL
+            && let Some(metadata) = &metadata
+        {
+            for column in &mut result.columns {
+                if let Some(declared) = metadata.iter().find(|known| known.name == column.name)
+                    && crate::sql::postgres_reads_as_text(&declared.data_type)
+                {
+                    column.data_type = declared.data_type.clone();
+                }
+            }
+        }
         // An empty `SELECT` exposes no result-set metadata. Fall back to the
         // table schema (already known to many callers) so an empty table still
         // has usable headers in the grid, without sqlx's costly describe.

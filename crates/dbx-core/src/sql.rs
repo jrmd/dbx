@@ -80,6 +80,18 @@ pub fn build_select_with_columns(
     metadata: &[ColumnInfo],
 ) -> Result<SqlStatement> {
     let table = quote_table(kind, table)?;
+    let reads_as_text = |name: &str| {
+        kind == DatabaseKind::PostgreSQL
+            && column_metadata(metadata, name)
+                .is_some_and(|column| postgres_reads_as_text(&column.data_type))
+    };
+    let columns = if columns.is_empty() && metadata.iter().any(|column| reads_as_text(&column.name))
+    {
+        metadata.iter().map(|column| column.name.clone()).collect()
+    } else {
+        columns.to_vec()
+    };
+    let cast_any = columns.iter().any(|column| reads_as_text(column));
     let projection = if columns.is_empty() {
         "*".to_owned()
     } else {
@@ -88,7 +100,13 @@ pub fn build_select_with_columns(
             if index > 0 {
                 projection.push_str(", ");
             }
-            projection.push_str(&quote_identifier(kind, column)?);
+            let quoted = quote_identifier(kind, column)?;
+            if reads_as_text(column) {
+                write!(projection, "CAST({quoted} AS text) AS {quoted}")
+                    .map_err(|error| DbxError::Parse(error.to_string()))?;
+            } else {
+                projection.push_str(&quoted);
+            }
         }
         projection
     };
@@ -99,9 +117,61 @@ pub fn build_select_with_columns(
     statement.push_str(&table);
     let mut params = Vec::new();
     append_filters(kind, &mut statement, &mut params, filters, metadata)?;
-    append_order(kind, &mut statement, order)?;
+    // An output alias shadows its column in ORDER BY; qualify so a text
+    // projection still sorts by the stored value.
+    append_order(kind, &mut statement, order, cast_any.then_some(&table))?;
     append_page(kind, &mut statement, &mut params, page)?;
     Ok(SqlStatement::new(statement, params))
+}
+
+/// Whether a PostgreSQL column (named as `format_type` prints it) is read
+/// through its text output. The driver decodes only the binary formats of
+/// common built-in types; ranges, geometry, arrays, enums, domains and
+/// extension types would otherwise arrive as raw wire bytes, so the table
+/// browser reads them exactly as psql and the SQL console show them.
+pub fn postgres_reads_as_text(data_type: &str) -> bool {
+    let mut base = String::with_capacity(data_type.len());
+    let mut depth = 0usize;
+    for character in data_type.trim().chars() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            character if depth == 0 => base.push(character.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    !matches!(
+        base.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_str(),
+        "smallint"
+            | "integer"
+            | "bigint"
+            | "text"
+            | "character varying"
+            | "character"
+            | "numeric"
+            | "real"
+            | "double precision"
+            | "boolean"
+            | "bytea"
+            | "json"
+            | "jsonb"
+            | "uuid"
+            | "date"
+            | "time without time zone"
+            | "timestamp without time zone"
+            | "timestamp with time zone"
+            | "interval"
+            | "money"
+            | "inet"
+            | "cidr"
+            | "bit"
+            | "bit varying"
+            | "\"char\""
+            | "name"
+    )
 }
 
 /// Count the rows of `table` that match `filters`.
@@ -356,13 +426,16 @@ pub(crate) fn guard_original_values(
             .iter()
             .find(|column| column.name == *name)
             .ok_or_else(|| DbxError::Parse(format!("unknown original column `{name}`")))?;
+        if !is_comparable_original(kind, column, value) {
+            continue;
+        }
         statement.sql.push_str(" AND ");
         let identifier = quote_identifier(kind, name)?;
+        let postgres = kind.dialect() == DatabaseKind::PostgreSQL;
+        let data_type = column.data_type.trim();
         if matches!(value, CellValue::Null) {
             statement.sql.push_str(&format!("{identifier} IS NULL"));
-        } else if kind.dialect() == DatabaseKind::PostgreSQL
-            && column.data_type.eq_ignore_ascii_case("json")
-        {
+        } else if postgres && data_type.eq_ignore_ascii_case("json") {
             // PostgreSQL json has no equality operator, but jsonb does.
             statement
                 .sql
@@ -374,6 +447,32 @@ pub(crate) fn guard_original_values(
                 &value.clone().into(),
             )?;
             statement.sql.push_str(" AS jsonb)");
+        } else if kind == DatabaseKind::PostgreSQL
+            && matches!(value, CellValue::Text(_))
+            && postgres_reads_as_text(data_type)
+        {
+            // The browser read this column as text, and several such types
+            // (xml, point, ...) have no equality operator.
+            statement
+                .sql
+                .push_str(&format!("CAST({identifier} AS text) = "));
+            append_mutation_value(
+                kind,
+                &mut statement.sql,
+                &mut statement.params,
+                &value.clone().into(),
+            )?;
+        } else if kind == DatabaseKind::MySQL && data_type.eq_ignore_ascii_case("json") {
+            // A string compares to MySQL JSON as a JSON string scalar, never
+            // as a parsed document, so the original must be cast first.
+            statement.sql.push_str(&format!("{identifier} = CAST("));
+            append_mutation_value(
+                kind,
+                &mut statement.sql,
+                &mut statement.params,
+                &value.clone().into(),
+            )?;
+            statement.sql.push_str(" AS JSON)");
         } else {
             statement.sql.push_str(&format!("{identifier} = "));
             append_column_value(
@@ -386,6 +485,20 @@ pub(crate) fn guard_original_values(
         }
     }
     Ok(())
+}
+
+/// Whether a value read back from the grid can be compared against the
+/// stored column. Types without a native decoder arrive as raw wire bytes or
+/// an `<unsupported SQL type>` placeholder; comparing those would report a
+/// conflict for every row, so the guard relies on the remaining columns.
+fn is_comparable_original(kind: DatabaseKind, column: &ColumnInfo, value: &CellValue) -> bool {
+    match value {
+        CellValue::Text(text) => !text.starts_with("<unsupported SQL type `"),
+        CellValue::Bytes(_) if kind.dialect() == DatabaseKind::PostgreSQL => {
+            column.data_type.trim().eq_ignore_ascii_case("bytea")
+        }
+        _ => true,
+    }
 }
 
 /// Append one assignment/insert value, casting text and NULL parameters to
@@ -852,7 +965,12 @@ fn push_like_predicate(
     Ok(())
 }
 
-fn append_order(kind: DatabaseKind, statement: &mut String, order: &[Order]) -> Result<()> {
+fn append_order(
+    kind: DatabaseKind,
+    statement: &mut String,
+    order: &[Order],
+    qualifier: Option<&str>,
+) -> Result<()> {
     if order.is_empty() {
         return Ok(());
     }
@@ -860,6 +978,10 @@ fn append_order(kind: DatabaseKind, statement: &mut String, order: &[Order]) -> 
     for (index, item) in order.iter().enumerate() {
         if index > 0 {
             statement.push_str(", ");
+        }
+        if let Some(qualifier) = qualifier {
+            statement.push_str(qualifier);
+            statement.push('.');
         }
         statement.push_str(&quote_identifier(kind, &item.column)?);
         statement.push_str(match item.direction {
