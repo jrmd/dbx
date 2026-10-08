@@ -402,18 +402,18 @@ async fn read_tool(state: &ServerState, name: &str, arguments: Value) -> Result<
             direction: crate::OrderDirection::Ascending,
         })
         .collect::<Vec<_>>();
-    let sql = crate::build_select_with_columns(
+    let mut sql = crate::build_select_with_columns(
         state.engine.kind(),
         &table,
         &names,
         &[],
         &order,
-        Some(crate::Page {
-            limit: limit as u32 + 1,
-            offset: 0,
-        }),
+        None,
         &columns,
     )?;
+    // Streaming accepts SQL without parameters. This numeric limit is bounded
+    // by valid_arguments; identifiers still go through the dialect's quoting.
+    sql.sql.push_str(&format!(" LIMIT {}", limit + 1));
     let mut transaction = crate::console::SqlTransaction::begin(&state.engine, true).await?;
     let mut rows = Vec::new();
     let mut bytes = 0;
