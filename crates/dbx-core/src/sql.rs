@@ -22,78 +22,36 @@ impl SqlStatement {
     }
 }
 
-/// Quote a table/column identifier for a SQL dialect. Dotted identifiers are
-/// quoted segment-by-segment so `public.users` remains addressable.
+/// Quote one literal identifier component. Qualification is represented by
+/// `TableRef`, never inferred from dots inside a database object's name.
 pub fn quote_identifier(kind: DatabaseKind, identifier: &str) -> Result<String> {
-    if identifier.trim().is_empty() {
-        return Err(DbxError::Parse("identifier cannot be empty".into()));
-    }
-    if kind == DatabaseKind::ClickHouse {
-        if identifier.contains('\0') || identifier.split('.').any(str::is_empty) {
-            return Err(DbxError::Parse("Invalid ClickHouse identifier".into()));
-        }
-        return Ok(identifier
-            .split('.')
-            .map(|part| format!("`{}`", part.replace('\\', "\\\\").replace('`', "\\`")))
-            .collect::<Vec<_>>()
-            .join("."));
-    }
-    if kind == DatabaseKind::BigQuery {
-        if identifier.contains('\0') || identifier.split('.').any(str::is_empty) {
-            return Err(DbxError::Parse("Invalid BigQuery identifier".into()));
-        }
-        return Ok(format!(
-            "`{}`",
-            identifier.replace('\\', "\\\\").replace('`', "\\`")
+    if identifier.is_empty() || identifier.contains('\0') {
+        return Err(DbxError::Parse(
+            "identifier cannot be empty or contain NUL".into(),
         ));
     }
-    if kind == DatabaseKind::SqlServer {
-        let mut output = String::new();
-        for (index, part) in identifier.split('.').enumerate() {
-            if part.is_empty() || part.contains('\0') {
-                return Err(DbxError::Parse(format!(
-                    "invalid identifier `{identifier}`"
-                )));
-            }
-            if index > 0 {
-                output.push('.');
-            }
-            output.push('[');
-            output.push_str(&part.replace(']', "]]"));
-            output.push(']');
-        }
-        return Ok(output);
+    match kind {
+        DatabaseKind::SqlServer => Ok(format!("[{}]", identifier.replace(']', "]]"))),
+        DatabaseKind::ClickHouse | DatabaseKind::BigQuery => Ok(format!(
+            "`{}`",
+            identifier.replace('\\', "\\\\").replace('`', "\\`")
+        )),
+        DatabaseKind::MySQL => Ok(format!("`{}`", identifier.replace('`', "``"))),
+        _ => Ok(format!("\"{}\"", identifier.replace('"', "\"\""))),
     }
-    let quote = if kind == DatabaseKind::MySQL {
-        '`'
-    } else {
-        '"'
-    };
-    let mut output = String::new();
-    for (index, part) in identifier.split('.').enumerate() {
-        if part.is_empty() || part.contains('\0') {
-            return Err(DbxError::Parse(format!(
-                "invalid identifier `{identifier}`"
-            )));
-        }
-        if index > 0 {
-            output.push('.');
-        }
-        output.push(quote);
-        for character in part.chars() {
-            if character == quote {
-                output.push(quote);
-            }
-            output.push(character);
-        }
-        output.push(quote);
-    }
-    Ok(output)
 }
 
 pub fn quote_table(kind: DatabaseKind, table: &TableRef) -> Result<String> {
     match &table.schema {
-        Some(schema) => quote_identifier(kind, &format!("{schema}.{}", table.name)),
+        // GoogleSQL quotes the complete project.dataset.table path.
+        Some(schema) if kind == DatabaseKind::BigQuery => {
+            quote_identifier(kind, &format!("{schema}.{}", table.name))
+        }
+        Some(schema) => Ok(format!(
+            "{}.{}",
+            quote_identifier(kind, schema)?,
+            quote_identifier(kind, &table.name)?
+        )),
         None => quote_identifier(kind, &table.name),
     }
 }

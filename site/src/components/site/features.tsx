@@ -211,14 +211,14 @@ export function Features() {
         <Tile
           className="md:col-span-3"
           title="Keep everything open"
-          body="Connect to several databases at once. Every connection gets its own tables, queries, and structure tabs."
+          body="Connect to several databases at once. Jump between tables with quick open, keep named queries, and recover encrypted query drafts."
         >
           <Tabs />
         </Tile>
         <Tile
           className="md:col-span-2"
           title="Filters, not WHERE clauses"
-          body="Stack structured filters on any table. They run as bound parameters, never string-pasted SQL."
+          body="Save structured filters on relational tables. They run as bound parameters, so your values stay separate from SQL."
         >
           <Filters />
         </Tile>
@@ -242,6 +242,17 @@ export function Features() {
           body="Export a table or a whole database with gzip and schema-only options. Import SQL dumps, CSV, and TSV."
         >
           <Transfer />
+        </Tile>
+        <Tile
+          className="md:col-span-3"
+          title="Review changes before saving"
+          body="Stage inserts, edits and deletes together. Review the SQL, check for conflicting changes, and protect connections you only need to read."
+        >
+          <div className="flex flex-wrap gap-2 px-7 pb-7 sm:px-8 sm:pb-8">
+            {["Stage", "Review SQL", "Save or discard"].map((step) => (
+              <span key={step} className="rounded-full border border-white/[.08] px-4 py-2 text-sm">{step}</span>
+            ))}
+          </div>
         </Tile>
         <Tile
           className="md:col-span-3"

@@ -83,7 +83,7 @@ with an atomic rename; root-owned installations require manual/package updates.
 An AppImage (detected through `APPIMAGE`) downloads the new AppImage and replaces
 that file the same way.
 Neither platform replaces the vault or user configuration. Restart is explicit;
-DBX does not save or restore open queries when restarting.
+DBX saves encrypted query drafts, ordered workspace tabs and staged changesets. Recovery reopens profiles after vault unlock, requires review for recovered changes, and never executes saved SQL or restores transaction state.
 
 macOS uses opaque surfaces and an opaque window backdrop. Light/dark/system
 appearance remains available, while the transparency toggle is hidden on Mac.

@@ -88,6 +88,7 @@ fn client() -> Result<Client> {
 fn platform() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("macos-arm64.zip"),
+        ("macos", "x86_64") => Ok("macos-x86_64.zip"),
         ("linux", "x86_64") if appimage().is_some() => Ok("linux-x86_64.AppImage"),
         ("linux", "x86_64") => Ok("linux-x86_64.tar.gz"),
         _ => bail!("Updates are not available for this platform yet."),

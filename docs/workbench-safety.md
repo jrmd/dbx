@@ -47,7 +47,11 @@ The encrypted workspace recovers query, data, structure and diagram tabs in
 their saved order after reconnecting, retaining the selected tab. Missing tables
 are skipped. After vault unlock, recovery reopens saved connections and their selected databases.
 Each connection instance retains its own tab layout. Recovery never executes saved queries.
-Pending cell edits, query results and transactions are not persisted.
+Staged inserts, updates and deletes now recover as encrypted changesets, with
+table/database identity, column metadata and original values. Reopening requires
+review and fresh schema/conflict checks; recovery never applies writes. Query
+results and transaction state are not persisted. Workspaces have a 2 MiB budget;
+recovery errors are surfaced and large scripts should be saved to files.
 
 Grid updates and deletes match the primary key plus the original displayed
 values. A changed or deleted row reports a conflict rather than overwriting the
@@ -202,6 +206,42 @@ No submitted database write is automatically replayed.
 
 AWS RDS IAM uses the existing `aws` CLI login, default profile and region. Azure
 PostgreSQL Entra uses the existing `az` login and the `oss-rdbms` audience. Token
-buttons populate the masked password field; fetch a new token when it expires.
+buttons select automatic authentication. DBX obtains a token on connect and
+refreshes connection options after five minutes before acquiring a new session.
+Tokens are transient and are not saved as profile passwords. CLI login, provider
+permissions and the original database hostname remain required.
 See [AWS token command](https://docs.aws.amazon.com/cli/latest/reference/rds/generate-db-auth-token.html)
 and [Azure PostgreSQL Entra authentication](https://learn.microsoft.com/en-us/azure/postgresql/security/security-entra-configure).
+
+
+## Reviewed interchange and native recovery
+
+CSV/TSV/JSON/JSONL previews own the exact selected values (64 MiB and 100,000
+rows), support explicit source-to-destination mapping, preserve NULL/empty text,
+and recheck database and column metadata before a transactional append. A failed
+row reports its index and rolls back the whole import. Unmapped columns use
+server defaults; date strings remain text; binary and engine-specific types use
+the existing typed parameter rules. Larger SQL/gzip imports retain streaming.
+Cross-connection copy captures one consistent bounded source snapshot and uses
+the same review/append workflow. Data comparison reports counts by destination
+primary key and exact typed values; it never synchronizes or overwrites rows.
+
+Loaded query-result exports use atomic destination replacement and explicitly
+show truncation. Full-query export is a separate fresh read-only snapshot,
+streamed as CSV, TSV or typed JSONL. It reruns one read query and does not share
+an open interactive transaction. Database permissions remain the authority for
+functions with external side effects.
+
+Native PostgreSQL/MySQL backup and restore invoke installed client tools without
+a shell or credential arguments. Private temporary credential files are removed
+on completion; diagnostic logs are bounded and redact database passwords.
+Backups replace a destination only after success. PostgreSQL custom-archive
+restore uses one transaction; MySQL DDL may commit before failure/cancellation,
+so restore into a new empty database and inspect before retrying. The tool version,
+progress, cancellation and retained log are available in the database menu.
+
+History is local **plaintext JSON**, separate from encrypted drafts. Use the
+query menu to pause recording, retain 10/30/100 entries, search by date/outcome/
+connection, or clear it. Search results open new query drafts without execution.
+MCP pairing is explicitly enabled per open native SQL connection, read-only,
+loopback-only and revoked on close/lock/exit. See [local automation](local-mcp.md).

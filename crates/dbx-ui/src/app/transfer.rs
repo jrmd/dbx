@@ -13,7 +13,7 @@ impl DbxApp {
         }
         supported
     }
-    fn start_transfer_progress(
+    pub(super) fn start_transfer_progress(
         &mut self,
         session_id: SessionId,
         generation: u64,
@@ -43,8 +43,16 @@ impl DbxApp {
                         return false;
                     }
                     let (rows, statements) = progress.progress();
-                    session.status =
-                        format!("{label} · {rows} rows · {statements} statements processed");
+                    let log = progress.log();
+                    session.status = if log.is_empty() {
+                        format!("{label} · {rows} rows · {statements} statements processed")
+                    } else {
+                        format!(
+                            "{label} · {} bytes · {}",
+                            progress.byte_progress(),
+                            log.lines().last().unwrap_or_default()
+                        )
+                    };
                     cx.notify();
                     true
                 })?;
@@ -62,7 +70,7 @@ impl DbxApp {
             && let Some(control) = &session.transfer_control
         {
             control.cancel();
-            session.status = "Cancelling transfer and rolling back uncommitted work…".into();
+            session.status = "Cancelling transfer…".into();
             cx.notify();
         }
     }
@@ -694,6 +702,19 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "csv" | "tsv" | "json" | "jsonl" | "ndjson"
+                )
+            })
+        {
+            self.preview_data_import(session_id, table, path, window, cx);
+            return;
+        }
         let file_format = match detect_file_format(&path) {
             Ok(file_format) => file_format,
             Err(error) => {

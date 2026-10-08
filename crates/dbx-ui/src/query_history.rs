@@ -200,6 +200,27 @@ impl QueryHistoryStore {
         self.write_document(&document)
     }
 
+    pub fn retain(
+        &self,
+        connection: &QueryHistoryConnection,
+        limit: usize,
+    ) -> QueryHistoryResult<()> {
+        connection.validate()?;
+        let _lock = self.lock()?;
+        let mut document = self.read_document()?;
+        let mut count = 0;
+        document.entries.reverse();
+        document.entries.retain(|entry| {
+            if &entry.connection != connection {
+                return true;
+            }
+            count += 1;
+            count <= limit.min(MAX_QUERY_HISTORY_ENTRIES_PER_CONNECTION)
+        });
+        document.entries.reverse();
+        self.write_document(&document)
+    }
+
     /// Return up to `limit` newest entries for one connection.
     pub fn recent(
         &self,
@@ -954,5 +975,45 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    #[test]
+    fn reduced_retention_keeps_newest_and_preserves_other_identities() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = QueryHistoryStore::at(directory.path().join("history.json"));
+        let one = QueryHistoryConnection::profile(Uuid::new_v4());
+        let other = QueryHistoryConnection::profile(Uuid::new_v4());
+        for timestamp in 1..=15 {
+            store
+                .record_at(
+                    one.clone(),
+                    format!("SELECT {timestamp}"),
+                    timestamp,
+                    QueryHistoryOutcome::success("one row"),
+                )
+                .unwrap();
+        }
+        store
+            .record_at(
+                other.clone(),
+                "SELECT 42",
+                20,
+                QueryHistoryOutcome::success("one row"),
+            )
+            .unwrap();
+        store.retain(&one, 10).unwrap();
+        let reopened = QueryHistoryStore::at(directory.path().join("history.json"));
+        assert_eq!(
+            reopened.recent(&one, 100).unwrap().last().unwrap().sql,
+            "SELECT 6"
+        );
+        assert_eq!(reopened.recent(&other, 100).unwrap().len(), 1);
+        reopened.retain(&one, 0).unwrap();
+        assert!(reopened.recent(&one, 100).unwrap().is_empty());
+        assert_eq!(reopened.recent(&other, 100).unwrap().len(), 1);
     }
 }

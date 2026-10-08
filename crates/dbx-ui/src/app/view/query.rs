@@ -515,6 +515,22 @@ impl DbxApp {
                                         let reopen_last = app.clone();
                                         let clear_history = app.clone();
                                         let mut menu = menu;
+                                        let history_search = app.clone();
+                                        menu = menu.item(PopupMenuItem::new("Search local plaintext history… (history: SQL success:true after:YYYY-MM-DD)").on_click(move |_, window, cx| {
+                                            let _ = history_search.update(cx, |this, cx| this.search_history(window, cx));
+                                        }));
+                                        for (label, disabled) in [("Pause history recording for this connection", true), ("Resume history recording for this connection", false)] {
+                                            let policy = app.clone();
+                                            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                                                let _ = policy.update(cx, |this, cx| this.set_history_policy(session_id, Some(disabled), None, cx));
+                                            }));
+                                        }
+                                        for limit in [10, 30, 100] {
+                                            let policy = app.clone();
+                                            menu = menu.item(PopupMenuItem::new(format!("Keep {limit} history entries for this connection")).on_click(move |_, _, cx| {
+                                                let _ = policy.update(cx, |this, cx| this.set_history_policy(session_id, None, Some(limit), cx));
+                                            }));
+                                        }
                                         if sql_dialect {
                                             for (index, label) in ["Explain query", "Capture plan", "Compare plans", "Server sessions", "Lock waits", "Capture schema baseline", "Compare schema / draft migration"].into_iter().enumerate() {
                                                 let action = app.clone();
@@ -528,6 +544,14 @@ impl DbxApp {
                                                         5 => this.inspect_schema_for(session_id, true, window, cx),
                                                         _ => this.inspect_schema_for(session_id, false, window, cx),
                                                     });
+                                                }));
+                                            }
+                                        }
+                                        if sql_dialect {
+                                            for (label, format) in [("Export full query as CSV…", dbx_core::QueryExportFormat::Csv), ("Export full query as TSV…", dbx_core::QueryExportFormat::Tsv), ("Export full query as typed JSONL…", dbx_core::QueryExportFormat::JsonLines)] {
+                                                let action = app.clone();
+                                                menu = menu.item(PopupMenuItem::new(label).disabled(busy).on_click(move |_, _, cx| {
+                                                    let _ = action.update(cx, |this, cx| this.export_full_query_for(session_id, format, cx));
                                                 }));
                                             }
                                         }
@@ -634,13 +658,13 @@ impl DbxApp {
                                                 .disabled(!has_rowset).on_click(move |_, _, cx| {
                                                     let _ = copy_insert.update(cx, |this, cx| this.copy_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
                                                 }))
-                                            .item(PopupMenuItem::new("Export INSERT statements…")
+                                            .item(PopupMenuItem::new("Export loaded rows as INSERT statements…")
                                                 .disabled(!has_rowset).on_click(move |_, _, cx| {
                                                     let _ = export_insert.update(cx, |this, cx| this.export_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
                                                 }))
                                             .separator()
                                             .item(
-                                                PopupMenuItem::new("Export TSV…")
+                                                PopupMenuItem::new("Export loaded rows as TSV…")
                                                     .disabled(!has_rowset)
                                                     .on_click(move |_, _, cx| {
                                                         let _ =
@@ -654,7 +678,7 @@ impl DbxApp {
                                                     }),
                                             )
                                             .item(
-                                                PopupMenuItem::new("Export CSV…")
+                                                PopupMenuItem::new("Export loaded rows as CSV…")
                                                     .disabled(!has_rowset)
                                                     .on_click(move |_, _, cx| {
                                                         let _ =
@@ -668,7 +692,7 @@ impl DbxApp {
                                                     }),
                                             )
                                             .item(
-                                                PopupMenuItem::new("Export JSON…")
+                                                PopupMenuItem::new("Export loaded rows as JSON…")
                                                     .disabled(!has_rowset)
                                                     .on_click(move |_, _, cx| {
                                                         let _ =

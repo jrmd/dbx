@@ -1292,12 +1292,25 @@ fn push_table_candidates(
         } else {
             format!("{}.{}", schema.unwrap_or_default(), table.name)
         };
-        let raw_insert_text = if context.qualifier.is_some() || !qualified {
-            table.name.clone()
+        let insert_text = if context.qualifier.is_some() || !qualified {
+            completion_identifier(database_kind, &table.name, context.quote)
         } else {
-            format!("{}.{}", schema.unwrap_or_default(), table.name)
+            // Schema and table are separate literal components; dots in either
+            // object's name must not become qualification separators.
+            if database_kind == DatabaseKind::BigQuery {
+                completion_identifier(
+                    database_kind,
+                    &format!("{}.{}", schema.unwrap_or_default(), table.name),
+                    context.quote,
+                )
+            } else {
+                format!(
+                    "{}.{}",
+                    completion_identifier(database_kind, schema.unwrap_or_default(), context.quote),
+                    completion_identifier(database_kind, &table.name, context.quote)
+                )
+            }
         };
-        let insert_text = completion_identifier(database_kind, &raw_insert_text, context.quote);
         let entity = match table.kind {
             EntityKind::View => "view",
             _ => "table",

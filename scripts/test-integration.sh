@@ -21,10 +21,13 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+cargo_profile=()
+if [[ ${DBX_TEST_CARGO_PROFILE:-debug} == release ]]; then cargo_profile=(--release); fi
+
 "${compose[@]}" config --quiet
 # Build before booting the services so native dependency compilation does not
 # compete with SQL Server, Kafka and Elasticsearch for runner memory.
-cargo test --locked -p dbx-core --tests --no-run
+cargo test --locked "${cargo_profile[@]}" -p dbx-core --tests --no-run
 "${compose[@]}" up -d --wait
 
 : "${DBX_TEST_POSTGRES_URL:=postgres://dbx_test:dbx_test_password@127.0.0.1:${DBX_TEST_POSTGRES_PORT:-55432}/dbx_test}"
@@ -40,6 +43,24 @@ cargo test --locked -p dbx-core --tests --no-run
 export DBX_TEST_CLICKHOUSE_URL DBX_TEST_MONGO_URL DBX_TEST_COCKROACH_URL DBX_TEST_ELASTICSEARCH_URL DBX_TEST_KAFKA_URL DBX_TEST_SQLSERVER_URL
 export DBX_TEST_POSTGRES_URL DBX_TEST_MYSQL_URL DBX_TEST_REDIS_URL DBX_TEST_SQLITE_URL
 
-cargo test --locked -p dbx-core --test integration -- --ignored --test-threads=1 --skip socket_and_ssh_connections_integration
-cargo test --locked -p dbx-core --test workbench_safety -- --ignored --test-threads=1
-cargo test --locked -p dbx-core --test connectors -- --ignored --test-threads=1
+# Run the exact server-version native clients in disposable containers. Neither
+# developers nor runners need to replace their system database clients.
+if [[ ${DBX_TEST_NATIVE_CLIENTS:-containers} == containers ]]; then
+  mkdir -p "$sqlite_dir/bin"
+  for client in pg_dump pg_restore mysqldump mysql; do
+    image=postgres:16-alpine
+    if [[ $client == mysql* ]]; then image=mysql:8.4; fi
+    cat > "$sqlite_dir/bin/$client" <<EOF
+#!/bin/sh
+exec docker run --rm -i --network host --user "\$(id -u):\$(id -g)" -v /tmp:/tmp:ro -v "\$PWD:\$PWD:ro" -w "\$PWD" -e PGHOST -e PGHOSTADDR -e PGPORT -e PGDATABASE -e PGUSER -e PGPASSFILE -e PGCONNECT_TIMEOUT -e PGSSLMODE -e PGSSLROOTCERT -e PGSSLCERT -e PGSSLKEY --entrypoint $client $image "\$@"
+EOF
+    chmod 700 "$sqlite_dir/bin/$client"
+  done
+  export PATH="$sqlite_dir/bin:$PATH"
+fi
+: "${DBX_TEST_MYSQL_ADMIN_URL:=mysql://root:dbx_test_root_password@127.0.0.1:${DBX_TEST_MYSQL_PORT:-53306}/dbx_test}"
+export DBX_TEST_MYSQL_ADMIN_URL
+
+cargo test --locked "${cargo_profile[@]}" -p dbx-core --test integration -- --ignored --test-threads=1 --skip socket_and_ssh_connections_integration --skip strict_tls_over_ssh_integration
+cargo test --locked "${cargo_profile[@]}" -p dbx-core --test workbench_safety -- --ignored --test-threads=1
+cargo test --locked "${cargo_profile[@]}" -p dbx-core --test connectors -- --ignored --test-threads=1

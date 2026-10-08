@@ -56,6 +56,7 @@ enum SqlConnection {
     SQLite(sqlx::SqliteConnection),
     Memory(sqlx::pool::PoolConnection<sqlx::Sqlite>),
     MemoryTransaction(sqlx::Transaction<'static, sqlx::Sqlite>),
+    External(Box<dyn crate::Engine>),
 }
 enum CancelTarget {
     Postgres(Arc<sqlx::postgres::PgConnectOptions>, i32),
@@ -312,7 +313,7 @@ async fn prepare_session(
 ) -> Result<CancelTarget> {
     Ok::<_, DbxError>(if let DatabaseEngine::Sql(engine) = engine {
         if state.connection.is_none() {
-            state.connection = Some(open_connection(engine.pool_snapshot().await).await?);
+            state.connection = Some(open_connection(engine.pool_snapshot().await?).await?);
             if engine.is_read_only() {
                 let protection = match engine.kind().dialect() {
                     DatabaseKind::MySQL => "SET SESSION TRANSACTION READ ONLY",
@@ -332,10 +333,18 @@ async fn prepare_session(
         }
         cancel_target(
             state.connection.as_mut().unwrap(),
-            engine.pool_snapshot().await,
+            engine.pool_snapshot().await?,
         )
         .await?
     } else {
+        if state.connection.is_none()
+            && let DatabaseEngine::Other(engine) = engine
+        {
+            state.connection = engine
+                .open_query_session()
+                .await?
+                .map(SqlConnection::External);
+        }
         CancelTarget::Local
     })
 }
@@ -426,7 +435,8 @@ async fn execute_script(
             output.statements.push(StatementResult { statement, result: QueryResult::empty(None, 0), error: Some("Use BEGIN, COMMIT and ROLLBACK instead of changing autocommit for a query document".into()) });
             break;
         }
-        if !matches!(engine, DatabaseEngine::Sql(_))
+        if state.connection.is_none()
+            && !matches!(engine, DatabaseEngine::Sql(_))
             && matches!(
                 keyword.as_str(),
                 "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
@@ -448,7 +458,7 @@ async fn execute_script(
         if state.connection.is_none()
             && let DatabaseEngine::Sql(engine) = engine
         {
-            state.connection = Some(open_connection(engine.pool_snapshot().await).await?);
+            state.connection = Some(open_connection(engine.pool_snapshot().await?).await?);
         }
         match state.connection.as_mut() {
             Some(SqlConnection::SQLite(connection)) => {
@@ -589,6 +599,29 @@ async fn execute_script(
                     }
                     _ => {}
                 }
+                // SQL Server supports nested and named transactions. Grammar
+                // guesses cannot establish whether COMMIT actually closed one.
+                if engine.kind() == DatabaseKind::SqlServer
+                    && let Some(connection) = state.connection.as_mut()
+                {
+                    let transaction = connection
+                        .query(
+                            &SqlStatement::new("SELECT @@TRANCOUNT", Vec::new()),
+                            QueryOptions { max_rows: Some(1) },
+                        )
+                        .await?;
+                    let count = transaction
+                        .rows
+                        .first()
+                        .and_then(|row| row.values.first())
+                        .map(ToString::to_string)
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            DbxError::Query("Cannot determine SQL Server transaction state".into())
+                        })?;
+                    state.in_transaction = count > 0;
+                    state.explicit_transaction = count > 0;
+                }
                 output.statements.push(StatementResult {
                     statement,
                     result,
@@ -693,6 +726,15 @@ impl SqlConnection {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
+        if let Self::External(engine) = self {
+            let mut statement = statement.clone();
+            if engine.kind() == DatabaseKind::SqlServer
+                && statement.sql.trim().eq_ignore_ascii_case("BEGIN")
+            {
+                statement.sql = "BEGIN TRANSACTION".into();
+            }
+            return engine.query_statement(&statement, options).await;
+        }
         let started = Instant::now();
         let mut output = QueryResult::empty(None, 0);
         let mut bytes = 0usize;
@@ -742,6 +784,7 @@ impl SqlConnection {
             }};
         }
         match self {
+            Self::External(_) => unreachable!("handled above"),
             Self::Postgres(connection) => {
                 fetch!(connection, bind_postgres_query, decode_postgres_row)
             }
@@ -767,6 +810,7 @@ impl SqlConnection {
                 }};
             }
             match self {
+                Self::External(_) => unreachable!("handled above"),
                 Self::Postgres(connection) => describe!(connection),
                 Self::MySql(connection) => describe!(connection),
                 Self::SQLite(connection) => describe!(connection),
@@ -797,13 +841,36 @@ impl SqlTransaction {
         if !read_only {
             engine.ensure_writable()?;
         }
+        if let DatabaseEngine::Other(inner) = engine
+            && engine.kind() == DatabaseKind::SqlServer
+            && !read_only
+        {
+            let connection =
+                inner
+                    .open_query_session()
+                    .await?
+                    .ok_or_else(|| DbxError::Unsupported {
+                        operation: "atomic SQL Server session".into(),
+                        kind: engine.kind(),
+                    })?;
+            let mut transaction = Self {
+                connection: Some(SqlConnection::External(connection)),
+            };
+            transaction
+                .query(&SqlStatement::new(
+                    "SET XACT_ABORT ON; BEGIN TRANSACTION",
+                    Vec::new(),
+                ))
+                .await?;
+            return Ok(transaction);
+        }
         let DatabaseEngine::Sql(engine) = engine else {
             return Err(DbxError::Unsupported {
                 operation: "atomic transfer transaction".into(),
                 kind: engine.kind(),
             });
         };
-        let mut connection = open_connection(engine.pool_snapshot().await).await?;
+        let mut connection = open_connection(engine.pool_snapshot().await?).await?;
         if let SqlConnection::Memory(connection) = connection {
             let transaction = sqlx::Transaction::begin(connection, None).await?;
             return Ok(Self {
@@ -848,6 +915,44 @@ impl SqlTransaction {
         }
         Ok(result)
     }
+    pub(crate) async fn stream_rows(
+        &mut self,
+        sql: &str,
+        mut consume: impl FnMut(&[crate::ColumnInfo], Option<Vec<CellValue>>) -> Result<()> + Send,
+    ) -> Result<u64> {
+        let mut count = 0u64;
+        macro_rules! stream {
+            ($connection:expr, $decode:ident) => {{
+                let columns = $connection
+                    .describe(sql)
+                    .await
+                    .map(|description| result_columns(description.columns()))?;
+                consume(&columns, None)?;
+                let mut rows = sqlx::query(sql).fetch(&mut *$connection);
+                while let Some(row) = rows.try_next().await? {
+                    consume(&columns, Some($decode(&row)?))?;
+                    count += 1;
+                }
+            }};
+        }
+        match self.connection.as_mut().expect("active transaction") {
+            SqlConnection::External(engine) => {
+                return Err(DbxError::Unsupported {
+                    operation: "streaming query export".into(),
+                    kind: engine.kind(),
+                });
+            }
+            SqlConnection::Postgres(connection) => stream!(connection, decode_postgres_row),
+            SqlConnection::MySql(connection) => stream!(connection, decode_mysql_row),
+            SqlConnection::SQLite(connection) => stream!(connection, decode_sqlite_row),
+            SqlConnection::Memory(connection) => stream!(&mut **connection, decode_sqlite_row),
+            SqlConnection::MemoryTransaction(connection) => {
+                stream!(&mut **connection, decode_sqlite_row)
+            }
+        }
+        Ok(count)
+    }
+
     pub(crate) async fn commit(mut self) -> Result<()> {
         if matches!(self.connection, Some(SqlConnection::MemoryTransaction(_))) {
             if let Some(SqlConnection::MemoryTransaction(transaction)) = self.connection.take() {

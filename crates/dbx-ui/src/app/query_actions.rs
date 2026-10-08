@@ -534,6 +534,20 @@ impl DbxApp {
         let Some(text) = self.query_result_text_for(session_id, format, cx) else {
             return;
         };
+        let (rows, truncated) = self
+            .active_query_tab(session_id)
+            .and_then(|query| query.result.as_ref())
+            .map(|result| (result.rows.len(), result.truncated))
+            .unwrap_or_default();
+        if truncated {
+            self.show_toast(
+                ToastKind::Info,
+                format!(
+                    "Only the {rows} loaded rows are included. The query result was truncated."
+                ),
+                cx,
+            );
+        }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.show_toast(
             ToastKind::Success,
@@ -545,6 +559,96 @@ impl DbxApp {
         );
     }
 
+    pub(super) fn export_full_query_for(
+        &mut self,
+        session_id: SessionId,
+        format: dbx_core::QueryExportFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, sql, busy, in_transaction)) =
+            self.session(session_id).and_then(|session| {
+                let query = self.active_query_tab(session_id)?;
+                Some((
+                    session.engine.clone()?,
+                    query.query_text.read(cx).clone(),
+                    session.busy || query.busy,
+                    query.in_transaction,
+                ))
+            })
+        else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        if in_transaction {
+            self.show_toast(
+                ToastKind::Info,
+                "Commit or roll back the query transaction before exporting a fresh snapshot",
+                cx,
+            );
+            return;
+        }
+        let extension = match format {
+            dbx_core::QueryExportFormat::Csv => "csv",
+            dbx_core::QueryExportFormat::Tsv => "tsv",
+            dbx_core::QueryExportFormat::JsonLines => "jsonl",
+        };
+        let directory = dirs::download_dir().unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some(&format!("full-query.{extension}")));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return Ok::<(), anyhow::Error>(());
+            };
+            let task = this.update(cx, |this, cx| {
+                let session = this.session_mut(session_id)?;
+                if session.busy {
+                    return None;
+                }
+                session.busy = true;
+                session.request_generation += 1;
+                let generation = session.request_generation;
+                session.status = "Exporting full query from a fresh read-only snapshot…".into();
+                let control = this.start_transfer_progress(session_id, generation, cx);
+                let task = this.runtime.spawn(async move {
+                    dbx_core::with_transfer_control(
+                        control,
+                        dbx_core::export_query(&engine, &sql, &path, format),
+                    )
+                    .await
+                });
+                if let Some(session) = this.session_mut(session_id) {
+                    session.track_background_task(&task);
+                }
+                Some((task, generation))
+            })?;
+            if let Some((task, generation)) = task {
+                let result = task.await?;
+                this.update(cx, |this, cx| {
+                    let Some(session) = this.session_mut(session_id) else {
+                        return;
+                    };
+                    if session.request_generation != generation {
+                        return;
+                    }
+                    session.busy = false;
+                    session.transfer_control = None;
+                    match result {
+                        Ok(rows) => this.show_toast(
+                            ToastKind::Success,
+                            format!("Exported all {rows} query rows"),
+                            cx,
+                        ),
+                        Err(error) => this.show_toast(ToastKind::Error, error.to_string(), cx),
+                    }
+                    cx.notify();
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     pub(super) fn export_query_result_for(
         &mut self,
         session_id: SessionId,
@@ -554,6 +658,20 @@ impl DbxApp {
         let Some(text) = self.query_result_text_for(session_id, format, cx) else {
             return;
         };
+        let (rows, truncated) = self
+            .active_query_tab(session_id)
+            .and_then(|query| query.result.as_ref())
+            .map(|result| (result.rows.len(), result.truncated))
+            .unwrap_or_default();
+        if truncated {
+            self.show_toast(
+                ToastKind::Info,
+                format!(
+                    "Only the {rows} loaded rows are included. The query result was truncated."
+                ),
+                cx,
+            );
+        }
         let directory = dirs::download_dir()
             .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("."));
@@ -565,13 +683,18 @@ impl DbxApp {
                 Ok(Ok(Some(path))) => {
                     let destination = path.display().to_string();
                     let result = runtime
-                        .spawn_blocking(move || std::fs::write(path, text))
+                        .spawn_blocking(move || {
+                            dbx_core::write_atomic_export(&path, text.as_bytes())
+                        })
                         .await;
                     this.update(cx, |this, cx| {
                         let (kind, message) = match result {
                             Ok(Ok(())) => (
                                 ToastKind::Success,
-                                format!("Exported result to {destination}"),
+                                format!(
+                                    "Exported {rows} loaded rows to {destination}{}",
+                                    if truncated { " (partial result)" } else { "" }
+                                ),
                             ),
                             Ok(Err(error)) => (
                                 ToastKind::Error,
