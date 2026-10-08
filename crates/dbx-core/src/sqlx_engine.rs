@@ -529,7 +529,13 @@ impl SqlxEngine {
                 (result.rows_affected(), None)
             }
             SqlxPool::MySql(pool) => {
-                let result = bind_mysql_query(statement).execute(pool).await?;
+                // MySQL cannot prepare some DDL, including CREATE TRIGGER.
+                // Values remain bound whenever the caller supplied parameters.
+                let result = if statement.params.is_empty() {
+                    sqlx::raw_sql(&statement.sql).execute(pool).await?
+                } else {
+                    bind_mysql_query(statement).execute(pool).await?
+                };
                 // MySQL exposes this as u64. Going through AnyPool converted
                 // it to i64 first, which silently lost IDs above i64::MAX.
                 (result.rows_affected(), Some(result.last_insert_id()))

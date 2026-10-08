@@ -247,10 +247,10 @@ pub async fn draft_table_alteration_for(
         return Ok(sql);
     }
     let metadata = engine
-        .query(
-            &format!(
-                "SHOW FULL COLUMNS FROM {}",
-                quote_table(engine.kind(), table)?
+        .query_statement(
+            &crate::SqlStatement::new(
+                "SELECT COLUMN_NAME AS Field, EXTRA AS Extra, COLLATION_NAME AS Collation, CAST(COLUMN_COMMENT AS CHAR) AS Comment FROM information_schema.columns WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ?",
+                vec![table.schema.clone().map(crate::CellValue::Text).unwrap_or(crate::CellValue::Null), crate::CellValue::Text(table.name.clone())],
             ),
             crate::QueryOptions::default(),
         )
