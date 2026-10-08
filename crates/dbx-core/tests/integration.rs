@@ -955,8 +955,8 @@ async fn strict_tls_over_ssh_integration() -> Result<()> {
     ] {
         let port = std::env::var(format!("DBX_TEST_TRANSPORT_{variable}_PORT")).unwrap();
         for (host, certificate, should_connect) in [
-            ("localhost", "server.crt", true),
-            ("127.0.0.1", "server.crt", false),
+            ("localhost", "ca.crt", true),
+            ("127.0.0.1", "ca.crt", false),
             ("localhost", "untrusted.crt", false),
         ] {
             let mut url = url::Url::parse(&format!(
