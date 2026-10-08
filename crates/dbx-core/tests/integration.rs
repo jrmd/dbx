@@ -224,6 +224,100 @@ async fn mysql_typed_mutation_round_trip() -> Result<()> {
     .await
 }
 
+/// Deleting a loaded row guards every column with the value the grid read.
+/// Types without an equality operator or a native decoder must not turn
+/// every guarded change into a false conflict, while a real concurrent
+/// change to a comparable column must still be caught.
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn postgresql_guarded_changes_accept_every_column_type() -> Result<()> {
+    guarded_changes_accept_every_column_type(
+        DatabaseKind::PostgreSQL,
+        "DBX_TEST_POSTGRES_URL",
+        "CREATE TABLE dbx_integration_guards (id integer PRIMARY KEY, doc json, docb jsonb, at timetz, spot point, markup xml, words tsvector, raw bytea, span int4range, places point[], tags text[])",
+        "INSERT INTO dbx_integration_guards VALUES (1, '{\"a\": [1, 2]}', '{\"a\": 1}', '04:05:06+02', point(1.5, 2), '<a>x</a>', 'a fat cat', '\\xdeadbeef', '[1,5)', ARRAY[point(1, 2)], '{a,\"b c\"}')",
+        "UPDATE dbx_integration_guards SET doc = '{\"a\": [3]}'",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn mysql_guarded_changes_accept_every_column_type() -> Result<()> {
+    guarded_changes_accept_every_column_type(
+        DatabaseKind::MySQL,
+        "DBX_TEST_MYSQL_URL",
+        "CREATE TABLE dbx_integration_guards (id int PRIMARY KEY, doc json NULL, area geometry NULL, raw blob NULL)",
+        "INSERT INTO dbx_integration_guards VALUES (1, '{\"a\": [1, 2]}', ST_GeomFromText('POINT(1 2)'), x'deadbeef')",
+        "UPDATE dbx_integration_guards SET doc = '{\"a\": [3]}'",
+    )
+    .await
+}
+
+async fn guarded_changes_accept_every_column_type(
+    kind: DatabaseKind,
+    variable: &str,
+    create: &str,
+    insert: &str,
+    concurrent_change: &str,
+) -> Result<()> {
+    let Some(url) = integration_url(variable) else {
+        return Ok(());
+    };
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(kind, url)).await?;
+    engine
+        .execute_sql("DROP TABLE IF EXISTS dbx_integration_guards")
+        .await?;
+    engine.execute_sql(create).await?;
+    engine.execute_sql(insert).await?;
+    let table = table_ref_named(kind, "dbx_integration_guards");
+    let loaded = engine
+        .query_table(&table, &[], &[], &[], None, QueryOptions::default())
+        .await?;
+    for (column, value) in loaded.columns.iter().zip(&loaded.rows[0].values) {
+        assert!(
+            column.name == "raw" || !matches!(value, CellValue::Bytes(_)),
+            "{} read as raw bytes",
+            column.name
+        );
+    }
+    let originals = |result: &dbx_core::QueryResult| {
+        result
+            .columns
+            .iter()
+            .zip(&result.rows[0].values)
+            .map(|(column, value)| (column.name.clone(), value.clone()))
+            .collect::<Vec<_>>()
+    };
+    let identity = vec![Filter::new(
+        "id",
+        FilterOperator::Equals,
+        Some(CellValue::Integer(1)),
+    )];
+    let touch = UpdateRequest::for_primary_key(
+        table.clone(),
+        vec![("id".into(), CellValue::Integer(1))],
+        vec![("id".into(), CellValue::Integer(1))],
+    );
+    engine.update_checked(&touch, &originals(&loaded)).await?;
+
+    engine.execute_sql(concurrent_change).await?;
+    assert!(matches!(
+        engine
+            .delete_checked(&table, &identity, &originals(&loaded))
+            .await,
+        Err(dbx_core::DbxError::Conflict)
+    ));
+    let current = engine
+        .query_table(&table, &[], &[], &[], None, QueryOptions::default())
+        .await?;
+    engine
+        .delete_checked(&table, &identity, &originals(&current))
+        .await?;
+    engine.drop_table(&table).await?;
+    Ok(())
+}
+
 async fn typed_mutation_round_trip(
     kind: DatabaseKind,
     variable: &str,
