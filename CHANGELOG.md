@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.2 - 2026-10-09
+
+MariaDB fixes:
+
+- Open MariaDB tables again. Loading a table's indexes failed with `Unknown column 'EXPRESSION'`, as did MySQL releases before 8.0.13.
+- Read MariaDB column defaults correctly: nullable columns no longer show a `'NULL'` default, and string and function defaults keep their SQL form.
+- Show only a table's own check constraints on MariaDB, where constraint names are only unique per table.
+- Show MariaDB JSON columns, and any MySQL text column with a binary collation such as `utf8mb4_bin`, as text instead of raw bytes.
+- Back up MariaDB databases with either MariaDB's or MySQL's client tools, including installs that only provide `mariadb-dump` and `mariadb`.
+- Export MySQL string defaults containing an apostrophe; they previously failed with "invalid metadata expression".
+
 ## 0.7.1 - 2026-10-09
 
 - Show schema objects as compact sidebar rows: names truncate cleanly, the object type sits on the right, and hovering shows the full signature.
