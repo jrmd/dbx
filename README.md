@@ -128,9 +128,7 @@ Certificates and trusted SSH host keys are still required. See the
 
 The [release workflow](.github/workflows/release.yml) runs on `vVERSION` tags
 matching the workspace version. It builds Linux x86_64 on Ubuntu 22.04 and signed,
-notarized macOS Apple Silicon and Intel bundles. The published v0.5.0 Mac asset
-is Apple Silicon only; Intel distribution remains unreleased pending candidate
-and release validation. All tests and platform builds
+notarized macOS Apple Silicon bundles; Intel Macs are not supported. All tests and platform builds
 must succeed; assets are uploaded to a draft before the complete release is
 published. The existing Mac candidate workflow remains available for testing.
 See [release setup](docs/macos-release.md) for the required Apple secrets.

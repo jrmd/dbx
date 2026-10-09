@@ -23,7 +23,5 @@ copy currently support PostgreSQL, MySQL, SQLite and CockroachDB. The designer
 creates SQL drafts and never automatically executes them.
 
 Linux x86_64 and Apple Silicon macOS are the published platforms. Intel macOS
-build/test and signed-package jobs are added to the release matrix, with a matching
-updater asset selector; a published Intel release and physical Mac acceptance
-still require release evidence. Windows is tracked separately: dependencies,
+is not supported. Windows is tracked separately: dependencies,
 packaging, signing, updater validation and physical QA are not established.
