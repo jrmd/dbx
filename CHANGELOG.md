@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1 - 2026-10-09
+
+- Show schema objects as compact sidebar rows: names truncate cleanly, the object type sits on the right, and hovering shows the full signature.
+- Stop building Intel macOS packages; Apple Silicon is the supported Mac platform.
+
 ## 0.7.0 - 2026-10-09
 
 A much stronger SQL editor:
