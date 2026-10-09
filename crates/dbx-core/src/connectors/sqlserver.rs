@@ -733,7 +733,7 @@ mod tests {
     fn scripts_split_on_go_and_keep_module_bodies_whole() {
         let script = "SELECT * FROM #staging; SELECT 2\nGO\nCREATE OR ALTER PROCEDURE dbo.p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\ngo\n-- note\nUPDATE t SET a = 1";
         assert_eq!(
-            crate::transfer::checked_split_sql_for(Some(DatabaseKind::SqlServer), script).unwrap(),
+            crate::script::checked_split_sql_for(Some(DatabaseKind::SqlServer), script).unwrap(),
             [
                 "SELECT * FROM #staging",
                 "SELECT 2",

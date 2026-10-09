@@ -351,7 +351,7 @@ pub(super) struct QueryTab {
     pub(super) statement_results: Vec<StatementResult>,
     pub(super) active_result: usize,
     pub(super) in_transaction: bool,
-    pub(super) execution_override: Option<String>,
+    pub(super) execution_override: Option<super::query_actions::ExecutionSource>,
     pub(super) prepared_parameters: Option<Vec<dbx_core::SqlStatement>>,
     pub(super) export_target: Entity<TextEditor>,
     pub(super) inspected_value: Option<CellValue>,
@@ -388,6 +388,8 @@ pub(super) struct QueryTab {
     pub(super) completion_cache: Option<CompletionCache>,
     pub(super) completion_dismissed_signature: Option<CompletionSignature>,
     pub(super) completion_index: usize,
+    /// Live diagnostics from the SQL language service.
+    pub(super) language: super::query_language::LanguageState,
     pub(super) _subscriptions: Vec<Subscription>,
 }
 
@@ -402,8 +404,15 @@ impl QueryTab {
         let name = cx.new(|_| "Untitled".to_owned());
         let name_editor = cx.new(|cx| TextEditor::new(name.clone(), false, window, cx));
         let query_text = cx.new(|_| DbxApp::default_query(kind).to_owned());
+        let app = cx.entity().downgrade();
         let query_editor = cx.new(|cx| match query_editor_language(kind) {
-            editor::EditorLanguage::Sql => TextEditor::new_sql(query_text.clone(), window, cx),
+            editor::EditorLanguage::Sql(dialect) => {
+                let mut editor = TextEditor::new_sql(query_text.clone(), dialect, window, cx);
+                editor.set_language_host(std::rc::Rc::new(
+                    super::query_language::QueryLanguageHost { app, session_id },
+                ));
+                editor
+            }
             editor::EditorLanguage::Redis => TextEditor::new_redis(query_text.clone(), window, cx),
             editor::EditorLanguage::Json => TextEditor::new_json(query_text.clone(), window, cx),
             editor::EditorLanguage::PlainText => {
@@ -495,6 +504,7 @@ impl QueryTab {
             completion_cache: None,
             completion_dismissed_signature: None,
             completion_index: 0,
+            language: Default::default(),
             _subscriptions: vec![
                 text_subscription,
                 name_subscription,
@@ -534,7 +544,7 @@ impl QueryTab {
 
 pub(super) fn query_editor_language(kind: DatabaseKind) -> editor::EditorLanguage {
     if kind.is_sql() {
-        editor::EditorLanguage::Sql
+        editor::EditorLanguage::Sql(Some(kind))
     } else {
         match kind {
             DatabaseKind::Redis => editor::EditorLanguage::Redis,

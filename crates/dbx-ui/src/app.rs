@@ -23,6 +23,7 @@ mod diagnostics;
 mod find;
 mod mcp;
 mod profile_transfer;
+mod query_language;
 mod query_parameters;
 mod quick_open;
 mod redis_completion;
@@ -98,7 +99,8 @@ use crate::{
 use redis_completion::redis_completion_items;
 use result_table::{ResultTableDelegate, foreign_key_target_table};
 use sql_completion::{
-    SqlCompletionItem, SqlCompletionRequest, completion_table_key, sql_completion_items,
+    SqlCompletionItem, SqlCompletionRequest, StatementSource, completion_table_key,
+    sql_completion_items, statement_sources,
 };
 
 const DIAGRAM_SCENE_PADDING: f32 = 24.0;
@@ -570,7 +572,7 @@ enum ConfirmationAction {
         session_id: SessionId,
         tab_id: SecondaryTabId,
         run_all: bool,
-        query: String,
+        query: query_actions::ExecutionSource,
     },
     CloseQuery {
         session_id: SessionId,
@@ -2349,25 +2351,27 @@ impl DbxApp {
             } else {
                 let query_text = query_tab.query_text.read(cx).clone();
                 let computed = if session.kind.is_sql() {
-                    editor::sql_completion_context(&query_text, cursor).map(|context| {
-                        let items = sql_completion_items(
-                            &query_text,
-                            cursor,
-                            &context,
-                            SqlCompletionRequest {
-                                database_kind: session.kind,
-                                tables: &session.tables,
-                                completion_columns: &session.completion_columns,
-                                selected_table: recent_data.map(|data| &data.table),
-                                active_columns: recent_data
-                                    .map(|data| data.table_columns.as_slice())
-                                    .unwrap_or_default(),
-                                result: recent_data.and_then(|data| data.result.as_deref()),
-                                active_schema_filter: session.schema_filter.as_deref(),
-                            },
-                        );
-                        (context.replacement_range, items)
-                    })
+                    editor::sql_completion_context_for(&query_text, cursor, Some(session.kind)).map(
+                        |context| {
+                            let items = sql_completion_items(
+                                &query_text,
+                                cursor,
+                                &context,
+                                SqlCompletionRequest {
+                                    database_kind: session.kind,
+                                    tables: &session.tables,
+                                    completion_columns: &session.completion_columns,
+                                    selected_table: recent_data.map(|data| &data.table),
+                                    active_columns: recent_data
+                                        .map(|data| data.table_columns.as_slice())
+                                        .unwrap_or_default(),
+                                    result: recent_data.and_then(|data| data.result.as_deref()),
+                                    active_schema_filter: session.schema_filter.as_deref(),
+                                },
+                            );
+                            (context.replacement_range, items)
+                        },
+                    )
                 } else if session.kind == DatabaseKind::Redis {
                     redis_completion_items(
                         &query_text,

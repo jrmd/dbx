@@ -22,7 +22,7 @@ pub fn monitor_query(kind: DatabaseKind, monitor: Monitor) -> Result<String> {
     })
 }
 pub fn execution_plan_query(kind: DatabaseKind, sql: &str) -> Result<String> {
-    let statements = crate::transfer::checked_split_sql_for(Some(kind), sql)?;
+    let statements = crate::script::checked_split_sql_for(Some(kind), sql)?;
     if statements.len() != 1 {
         return Err(DbxError::Parse("Select one statement to explain".into()));
     }

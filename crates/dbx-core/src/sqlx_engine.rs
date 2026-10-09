@@ -18,7 +18,7 @@ use crate::{
     CellValue, CheckConstraintInfo, ColumnInfo, ConnectionConfig, DatabaseKind, DbxError,
     EntityKind, ExecResult, ForeignKeyInfo, IndexInfo, QueryOptions, QueryResult,
     ReferentialAction, RelationalSchema, RelationalTable, Result, RowData, SqlStatement, TableInfo,
-    TableRef, TableStructure, split_sql_statements,
+    TableRef, TableStructure,
 };
 use async_trait::async_trait;
 
@@ -381,7 +381,7 @@ impl SqlxEngine {
         let mut output = Vec::with_capacity(limit.unwrap_or(64).min(1024));
         let mut rows_affected = None;
         let mut truncated = false;
-        let statements = split_sql_statements(sql);
+        let statements = crate::script::split_sql_statements_for(self.kind, sql);
         let mut statement_index = 0usize;
         let mut statement_returned_rows = false;
 

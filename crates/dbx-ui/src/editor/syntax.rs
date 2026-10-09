@@ -1,5 +1,10 @@
 //! Syntax, statement selection, formatting and completion analysis.
 use super::*;
+use dbx_core::DatabaseKind;
+
+/// The connected engine whose comment, quoting and statement rules apply.
+/// `None` is permissive: it accepts every dialect's comments and quotes.
+pub type SqlDialect = Option<DatabaseKind>;
 
 /// The language used when painting an editor's text.
 ///
@@ -10,7 +15,8 @@ use super::*;
 pub enum EditorLanguage {
     #[default]
     PlainText,
-    Sql,
+    /// SQL lexed with the connection's dialect rules.
+    Sql(SqlDialect),
     Redis,
     Json,
 }
@@ -49,6 +55,7 @@ pub fn execution_range(
     selection: Range<usize>,
     cursor: usize,
     scope: QueryExecutionScope,
+    dialect: SqlDialect,
 ) -> Range<usize> {
     let selection = clamp_range(text, selection);
     if !selection.is_empty() {
@@ -56,7 +63,7 @@ pub fn execution_range(
     }
     match scope {
         QueryExecutionScope::Document => 0..text.len(),
-        QueryExecutionScope::SelectionOrStatement => sql_statement_range(text, cursor),
+        QueryExecutionScope::SelectionOrStatement => sql_statement_range(text, cursor, dialect),
         QueryExecutionScope::SelectionOrCurrentLine => {
             let cursor = clamp_boundary(text, cursor);
             line_start(text, cursor)..line_end(text, cursor)
@@ -64,40 +71,52 @@ pub fn execution_range(
     }
 }
 
-/// Return the SQL statement surrounding `cursor`, ignoring terminators in
-/// quoted strings, comments, and PostgreSQL dollar-quoted bodies.
+/// Return the SQL statement surrounding `cursor`. Statements are the
+/// engine's own spans for `dialect`, so the range is exactly what it runs.
 #[allow(dead_code)]
-pub fn sql_statement_range(text: &str, cursor: usize) -> Range<usize> {
+pub fn sql_statement_range(text: &str, cursor: usize, dialect: SqlDialect) -> Range<usize> {
     let cursor = clamp_boundary(text, cursor);
-    let boundaries = sql_statement_boundaries(text);
+    let spans = dbx_core::sql_statement_spans(dialect, text);
     // A caret immediately after a terminator belongs to the next statement;
     // a caret on the terminator itself remains with the preceding statement.
     // If there is no next statement (only trailing whitespace), keep the last
     // executable statement active instead of returning an empty range.
-    let end_index = boundaries.partition_point(|boundary| *boundary <= cursor);
-    let start = boundaries[end_index.saturating_sub(1)];
-    let end = boundaries.get(end_index).copied().unwrap_or(text.len());
-    let candidate = start..end;
+    let index = spans
+        .iter()
+        .position(|span| cursor < span.range.end)
+        .unwrap_or(spans.len().saturating_sub(1));
+    let candidate = spans
+        .get(index)
+        .map_or(0..text.len(), |span| span.range.clone());
     if !text[candidate.clone()].trim().is_empty() {
         return candidate;
     }
-
-    boundaries[..end_index]
-        .windows(2)
+    spans[..index]
+        .iter()
         .rev()
-        .map(|pair| pair[0]..pair[1])
+        .map(|span| span.range.clone())
         .find(|range| !text[range.clone()].trim().is_empty())
         .unwrap_or(candidate)
+}
+
+/// The statement delimiter in force at `position`: `;` unless a MySQL
+/// `DELIMITER` directive changed it. Running a statement from inside such a
+/// block needs the directive repeated in front of it.
+pub fn sql_statement_delimiter(text: &str, position: usize, dialect: SqlDialect) -> String {
+    dbx_core::sql_statement_spans(dialect, text)
+        .into_iter()
+        .find(|span| position < span.range.end)
+        .map_or_else(|| ";".to_owned(), |span| span.delimiter)
 }
 
 /// Count non-empty SQL statements while ignoring semicolons in lexical
 /// regions such as quoted strings, comments, and dollar-quoted bodies.
 #[allow(dead_code)]
-pub fn sql_statement_count(text: &str) -> usize {
-    sql_statement_ranges(text)
+pub fn sql_statement_count(text: &str, dialect: SqlDialect) -> usize {
+    sql_statement_ranges(text, dialect)
         .into_iter()
         .filter(|range| {
-            lex_sql(&text[range.clone()])
+            lex_sql_for(&text[range.clone()], dialect)
                 .iter()
                 .any(|token| token.kind != SqlTokenKind::Comment)
         })
@@ -108,10 +127,10 @@ pub fn sql_statement_count(text: &str) -> usize {
 /// script's result; unfamiliar syntax is deliberately treated as mutation
 /// risk rather than read-only.
 #[allow(dead_code)]
-pub fn sql_execution_kind(text: &str) -> SqlExecutionKind {
-    sql_statement_ranges(text)
+pub fn sql_execution_kind(text: &str, dialect: SqlDialect) -> SqlExecutionKind {
+    sql_statement_ranges(text, dialect)
         .into_iter()
-        .filter_map(|range| sql_statement_kind(&text[range]))
+        .filter_map(|range| sql_statement_kind(&text[range], dialect))
         .max()
         .unwrap_or(SqlExecutionKind::MutationRisk)
 }
@@ -123,37 +142,40 @@ pub fn sql_execution_kind(text: &str) -> SqlExecutionKind {
 /// dollar-quoted bodies, so examples or procedure bodies do not spuriously
 /// invalidate an open database diagram.
 #[allow(dead_code)]
-pub fn sql_may_change_schema(text: &str) -> bool {
-    sql_statement_ranges(text).into_iter().any(|range| {
-        sql_words_with_depth(&text[range]).iter().any(|(word, _)| {
-            matches!(
-                word.as_str(),
-                "CREATE"
-                    | "ALTER"
-                    | "DROP"
-                    | "RENAME"
-                    | "ATTACH"
-                    | "DETACH"
-                    | "DO"
-                    | "CALL"
-                    | "EXEC"
-                    | "EXECUTE"
-            )
+pub fn sql_may_change_schema(text: &str, dialect: SqlDialect) -> bool {
+    sql_statement_ranges(text, dialect)
+        .into_iter()
+        .any(|range| {
+            sql_words_with_depth(&text[range], dialect)
+                .iter()
+                .any(|(word, _)| {
+                    matches!(
+                        word.as_str(),
+                        "CREATE"
+                            | "ALTER"
+                            | "DROP"
+                            | "RENAME"
+                            | "ATTACH"
+                            | "DETACH"
+                            | "DO"
+                            | "CALL"
+                            | "EXEC"
+                            | "EXECUTE"
+                    )
+                })
         })
-    })
 }
 
-pub(super) fn sql_statement_ranges(text: &str) -> Vec<Range<usize>> {
-    let boundaries = sql_statement_boundaries(text);
-    boundaries
-        .windows(2)
-        .map(|pair| pair[0]..pair[1])
+pub(super) fn sql_statement_ranges(text: &str, dialect: SqlDialect) -> Vec<Range<usize>> {
+    dbx_core::sql_statement_spans(dialect, text)
+        .into_iter()
+        .map(|span| span.range)
         .filter(|range| !text[range.clone()].trim().is_empty())
         .collect()
 }
 
-pub(super) fn sql_statement_kind(text: &str) -> Option<SqlExecutionKind> {
-    let words = sql_words_with_depth(text);
+pub(super) fn sql_statement_kind(text: &str, dialect: SqlDialect) -> Option<SqlExecutionKind> {
+    let words = sql_words_with_depth(text, dialect);
     let top_level_words: Vec<_> = words
         .iter()
         .filter(|(_, depth)| *depth == 0)
@@ -206,154 +228,27 @@ pub(super) fn sql_statement_kind(text: &str) -> Option<SqlExecutionKind> {
     Some(SqlExecutionKind::MutationRisk)
 }
 
-/// Return identifier-like tokens with their parenthesis depth. `lex_sql` has
-/// already protected strings, comments, and dollar-quoted bodies; the depth
-/// pass applies the same protection while tracking only real SQL grouping.
-pub(super) fn sql_words_with_depth(text: &str) -> Vec<(String, usize)> {
-    lex_sql(text)
-        .into_iter()
-        .filter(|token| token.kind != SqlTokenKind::Comment)
-        .map(|token| {
-            (
-                text[token.range.clone()].to_ascii_uppercase(),
-                sql_parenthesis_depth_at(text, token.range.start),
-            )
-        })
-        .collect()
-}
-
-pub(super) fn sql_parenthesis_depth_at(text: &str, target: usize) -> usize {
-    let bytes = text.as_bytes();
-    let target = clamp_boundary(text, target);
+/// Return identifier-like tokens with their parenthesis depth. Parentheses
+/// only count between tokens, so strings, comments, quoted identifiers and
+/// dollar-quoted bodies never change the depth.
+pub(super) fn sql_words_with_depth(text: &str, dialect: SqlDialect) -> Vec<(String, usize)> {
     let mut depth = 0usize;
-    let mut index = 0;
-    while index < target {
-        match bytes[index] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[index];
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'\\' {
-                        index = (index + 2).min(bytes.len());
-                    } else if bytes[index] == quote {
-                        index += 1;
-                        if index < bytes.len() && bytes[index] == quote {
-                            index += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        index += 1;
-                    }
-                }
+    let mut previous_end = 0;
+    let mut words = Vec::new();
+    for token in lex_sql_for(text, dialect) {
+        for byte in text[previous_end..token.range.start].bytes() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => depth = depth.saturating_sub(1),
+                _ => {}
             }
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
-                    index += 1;
-                }
-                index = (index + 2).min(bytes.len());
-            }
-            b'$' => {
-                index = dollar_quoted_end(text, index).unwrap_or(index + 1);
-            }
-            b'(' => {
-                depth += 1;
-                index += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                index += 1;
-            }
-            _ => index += 1,
+        }
+        previous_end = token.range.end;
+        if token.kind != SqlTokenKind::Comment {
+            words.push((text[token.range].to_ascii_uppercase(), depth));
         }
     }
-    depth
-}
-
-pub(super) fn sql_statement_boundaries(text: &str) -> Vec<usize> {
-    let mut boundaries = vec![0];
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[index];
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'\\' {
-                        index = (index + 2).min(bytes.len());
-                    } else if bytes[index] == quote {
-                        index += 1;
-                        if index < bytes.len() && bytes[index] == quote {
-                            index += 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        index += 1;
-                    }
-                }
-            }
-            b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
-                    index += 1;
-                }
-                index = (index + 2).min(bytes.len());
-            }
-            b'$' => {
-                if let Some(end) = dollar_quoted_end(text, index) {
-                    index = end;
-                } else {
-                    index += 1;
-                }
-            }
-            b';' => {
-                boundaries.push(index + 1);
-                index += 1;
-            }
-            _ => index += 1,
-        }
-    }
-    if boundaries.last().copied() != Some(text.len()) {
-        boundaries.push(text.len());
-    }
-    boundaries
-}
-
-#[allow(dead_code)]
-pub(super) fn dollar_quoted_end(text: &str, start: usize) -> Option<usize> {
-    let remainder = &text[start..];
-    let tag_end = remainder[1..].find('$')? + 1;
-    let delimiter = &remainder[..=tag_end];
-    let tag = &delimiter[1..delimiter.len() - 1];
-    if !tag.is_empty()
-        && !(tag.starts_with(|character: char| character == '_' || character.is_ascii_alphabetic())
-            && tag
-                .chars()
-                .all(|character| character == '_' || character.is_ascii_alphanumeric()))
-    {
-        return None;
-    }
-    remainder[delimiter.len()..]
-        .find(delimiter)
-        .map(|offset| start + delimiter.len() + offset + delimiter.len())
-        .or(Some(text.len()))
+    words
 }
 
 /// The lexical categories understood by the built-in SQL highlighter.
@@ -495,7 +390,16 @@ pub struct SqlCompletionContext {
 /// query editor useful while a statement is being written.  Whitespace and
 /// punctuation are omitted from the result and should use the editor's base
 /// color.
+#[cfg(test)]
 pub fn lex_sql(text: &str) -> Vec<SqlToken> {
+    lex_sql_for(text, None)
+}
+
+/// Lex SQL using `dialect`'s comment and string rules, so `#` is an operator
+/// in PostgreSQL and `$$` is a MySQL `DELIMITER` rather than a string.
+pub fn lex_sql_for(text: &str, dialect: SqlDialect) -> Vec<SqlToken> {
+    let hash_comments = dbx_core::sql_hash_comments(dialect);
+    let dollar_quotes = dbx_core::sql_dollar_quotes(dialect);
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -524,9 +428,7 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
             continue;
         }
 
-        // MySQL also accepts # comments.  Keeping this here is harmless for
-        // the other dialects and makes the editor useful across all engines.
-        if character == '#' {
+        if character == '#' && hash_comments {
             let mut end = index + 1;
             while end < chars.len() && chars[end].1 != '\n' {
                 end += 1;
@@ -562,7 +464,8 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
         }
 
         if character == '\'' {
-            let end = consume_quoted(&chars, index, character);
+            let escapes = dbx_core::sql_backslash_escapes(dialect, &text[..start]);
+            let end = consume_quoted(&chars, index, character, escapes);
             push_sql_token(
                 &mut tokens,
                 SqlTokenKind::String,
@@ -574,7 +477,11 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
         }
 
         if character == '"' || character == '`' {
-            let end = consume_quoted(&chars, index, character);
+            // MySQL reads double quotes as escaped strings unless ANSI_QUOTES
+            // is set; either way a backslash cannot end the quoted run there.
+            let escapes = character == '"'
+                && dialect.is_some_and(|kind| kind.dialect() == DatabaseKind::MySQL);
+            let end = consume_quoted(&chars, index, character, escapes);
             push_sql_token(
                 &mut tokens,
                 SqlTokenKind::Identifier,
@@ -586,7 +493,7 @@ pub fn lex_sql(text: &str) -> Vec<SqlToken> {
         }
 
         if character == '$' {
-            if let Some(end) = consume_dollar_quoted(&chars, text, index) {
+            if dollar_quotes && let Some(end) = consume_dollar_quoted(&chars, text, index) {
                 push_sql_token(
                     &mut tokens,
                     SqlTokenKind::String,
@@ -862,13 +769,23 @@ pub fn lex_json(text: &str) -> Vec<JsonToken> {
 /// understands the contexts that matter most for a database workbench:
 /// tables after `FROM`/`JOIN`/`UPDATE`/`INTO`, columns after projection and
 /// predicate keywords, and qualified names after a dot.
+#[cfg(test)]
 pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletionContext> {
+    sql_completion_context_for(text, cursor, None)
+}
+
+/// [`sql_completion_context`] with `dialect`'s comment and string rules.
+pub fn sql_completion_context_for(
+    text: &str,
+    cursor: usize,
+    dialect: SqlDialect,
+) -> Option<SqlCompletionContext> {
     let cursor = clamp_boundary(text, cursor);
     if cursor == 0 {
         return None;
     }
 
-    let tokens = lex_sql(text);
+    let tokens = lex_sql_for(text, dialect);
     if tokens.iter().any(|token| {
         matches!(token.kind, SqlTokenKind::String | SqlTokenKind::Comment)
             && token.range.start <= cursor
@@ -1199,18 +1116,24 @@ pub(super) fn expand_to_identifier(text: &str, at: usize) -> Option<Range<usize>
 /// identifier casing. It uppercases keywords and types, breaks major clauses
 /// onto indented lines, puts top-level projection/VALUES list items on their
 /// own lines, and separates statements with a blank line.
+#[cfg(test)]
 pub fn format_sql(text: &str) -> String {
-    SqlFormatter::new(text).run()
+    format_sql_for(text, None)
+}
+
+/// [`format_sql`] with `dialect`'s comment and string rules.
+pub fn format_sql_for(text: &str, dialect: SqlDialect) -> String {
+    SqlFormatter::new(text, dialect).run()
 }
 
 /// Format `text` and map `cursor` to the equivalent offset in the output.
 ///
 /// The formatter preserves every token exactly once and in order, so offsets
 /// are remapped by aligning the two lexings instead of diffing strings.
-pub fn format_sql_at_cursor(text: &str, cursor: usize) -> (String, usize) {
-    let formatted = format_sql(text);
-    let old_tokens = lex_sql(text);
-    let new_tokens = lex_sql(&formatted);
+pub fn format_sql_at_cursor(text: &str, cursor: usize, dialect: SqlDialect) -> (String, usize) {
+    let formatted = format_sql_for(text, dialect);
+    let old_tokens = lex_sql_for(text, dialect);
+    let new_tokens = lex_sql_for(&formatted, dialect);
     let cursor = clamp_boundary(text, cursor);
 
     let mapped = match old_tokens
@@ -1304,10 +1227,10 @@ pub(super) struct SqlFormatter<'a> {
 }
 
 impl<'a> SqlFormatter<'a> {
-    pub(super) fn new(text: &'a str) -> Self {
+    pub(super) fn new(text: &'a str, dialect: SqlDialect) -> Self {
         let mut atoms = Vec::new();
         let mut previous_end = 0;
-        for token in lex_sql(text) {
+        for token in lex_sql_for(text, dialect) {
             push_gap_atoms(&mut atoms, &text[previous_end..token.range.start]);
             atoms.push((AtomKind::Token(token.kind), &text[token.range.clone()]));
             previous_end = token.range.end;
@@ -1995,13 +1918,16 @@ pub(super) fn consume_json_number(chars: &[(usize, char)], mut index: usize) -> 
     Some(index)
 }
 
-pub(super) fn consume_quoted(chars: &[(usize, char)], mut index: usize, quote: char) -> usize {
+pub(super) fn consume_quoted(
+    chars: &[(usize, char)],
+    mut index: usize,
+    quote: char,
+    escapes: bool,
+) -> usize {
     index += 1;
     while index < chars.len() {
         let character = chars[index].1;
-        if character == '\\' {
-            // Backslash escaping is accepted by SQLite/MySQL and is also a
-            // useful tolerant fallback for an unfinished query.
+        if character == '\\' && escapes {
             index = (index + 2).min(chars.len());
             continue;
         }

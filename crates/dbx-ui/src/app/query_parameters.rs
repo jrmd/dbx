@@ -11,8 +11,8 @@ pub(super) struct ParameterPrompt {
 
 /// Byte ranges and keys of `:name`/`$1` placeholders outside strings, comments,
 /// and `::` casts.
-fn named_parameter_tokens(sql: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    editor::lex_sql(sql)
+fn named_parameter_tokens(sql: &str, kind: DatabaseKind) -> Vec<(std::ops::Range<usize>, String)> {
+    editor::lex_sql_for(sql, Some(kind))
         .into_iter()
         .filter(|token| token.kind == editor::SqlTokenKind::Parameter)
         .filter_map(|token| {
@@ -38,9 +38,9 @@ fn parameter_label(name: &str) -> String {
 }
 
 /// Distinct parameter names in first-use order.
-pub(super) fn named_parameters(sql: &str) -> Vec<String> {
+pub(super) fn named_parameters(sql: &str, kind: DatabaseKind) -> Vec<String> {
     let mut seen = HashSet::new();
-    named_parameter_tokens(sql)
+    named_parameter_tokens(sql, kind)
         .into_iter()
         .filter_map(|(_, name)| seen.insert(name.clone()).then_some(name))
         .collect()
@@ -72,7 +72,7 @@ fn prepare_parameters(
         .map_err(|error| error.to_string())?
         .into_iter()
         .map(|sql| {
-            let tokens = named_parameter_tokens(&sql);
+            let tokens = named_parameter_tokens(&sql, kind);
             let mut params = Vec::new();
             let mut output = String::new();
             let mut cursor = 0;
@@ -108,7 +108,10 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let names = named_parameters(query);
+        let kind = self
+            .session(session_id)
+            .map_or(DatabaseKind::SQLite, |session| session.kind);
+        let names = named_parameters(query, kind);
         if names.is_empty() {
             return false;
         }
@@ -186,11 +189,11 @@ impl DbxApp {
         session_id: SessionId,
         query: &str,
     ) -> Result<String, String> {
-        let names = named_parameters(query);
         let kind = self
             .session(session_id)
             .map(|session| session.kind)
             .unwrap_or(DatabaseKind::SQLite);
+        let names = named_parameters(query, kind);
         let Some(tab) = self.active_query_tab_mut(session_id) else {
             return Ok(query.to_owned());
         };
@@ -376,7 +379,8 @@ mod tests {
     fn parameters_skip_casts_strings_comments_and_dollar_quotes() {
         assert_eq!(
             named_parameters(
-                "SELECT :id::int, ':skip', $1, $$ :skip $$ -- :comment\nWHERE a=:name OR b=:id"
+                "SELECT :id::int, ':skip', $1, $$ :skip $$ -- :comment\nWHERE a=:name OR b=:id",
+                DatabaseKind::PostgreSQL
             ),
             ["id", "$1", "name"]
         );

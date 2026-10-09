@@ -1,6 +1,95 @@
 //! Workbench query actions.
 use super::*;
 
+/// The exact text a run executes and where it came from in the editor.
+#[derive(Clone, Debug)]
+pub(super) struct ExecutionSource {
+    /// Trimmed statement text, with a repeated `DELIMITER` directive when it
+    /// was taken from inside a MySQL delimiter block.
+    pub(super) text: String,
+    /// Bytes of `text` added in front of the editor's own text.
+    prefix_len: usize,
+    /// The editor offset of `text[prefix_len..]`; `None` for generated SQL.
+    editor_offset: Option<usize>,
+}
+
+impl ExecutionSource {
+    pub(super) fn detached(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            prefix_len: 0,
+            editor_offset: None,
+        }
+    }
+
+    /// Resolve the part of the editor's text the user chose to run.
+    pub(super) fn from_editor(
+        text: &str,
+        range: Range<usize>,
+        dialect: Option<editor::SqlDialect>,
+    ) -> Option<Self> {
+        let selected = &text[range.clone()];
+        let trimmed = selected.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let start = range.start + (selected.len() - selected.trim_start().len());
+        let delimiter = dialect
+            .map(|dialect| editor::sql_statement_delimiter(text, start, dialect))
+            .filter(|delimiter| delimiter != ";")
+            .filter(|_| {
+                !trimmed
+                    .get(..9)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("delimiter"))
+            });
+        let prefix =
+            delimiter.map_or_else(String::new, |delimiter| format!("DELIMITER {delimiter}\n"));
+        Some(Self {
+            prefix_len: prefix.len(),
+            text: prefix + trimmed,
+            editor_offset: Some(start),
+        })
+    }
+
+    /// Map a range in `text` back to the editor, if it lies in editor text.
+    pub(super) fn editor_range(&self, range: Range<usize>) -> Option<Range<usize>> {
+        let offset = self.editor_offset?;
+        (range.start >= self.prefix_len)
+            .then(|| range.start - self.prefix_len + offset..range.end - self.prefix_len + offset)
+    }
+}
+
+/// The selection, current statement (SQL), current line (Redis), or whole
+/// document a run should execute.
+fn editor_execution_source(
+    query_editor: &Entity<TextEditor>,
+    run_all: bool,
+    cx: &App,
+) -> Option<ExecutionSource> {
+    let editor = query_editor.read(cx);
+    let text = editor.text(cx);
+    let sql = matches!(editor.language(), editor::EditorLanguage::Sql(_));
+    let scope = if run_all {
+        editor::QueryExecutionScope::Document
+    } else if sql {
+        editor::QueryExecutionScope::SelectionOrStatement
+    } else if editor.language() == editor::EditorLanguage::Redis {
+        editor::QueryExecutionScope::SelectionOrCurrentLine
+    } else {
+        editor::QueryExecutionScope::Document
+    };
+    let range = if run_all {
+        0..text.len()
+    } else {
+        editor.execution_range(scope, cx)
+    };
+    ExecutionSource::from_editor(
+        &text,
+        range,
+        (sql && !run_all).then(|| editor.sql_dialect()),
+    )
+}
+
 impl DbxApp {
     pub(super) fn request_run_query_for(
         &mut self,
@@ -27,45 +116,34 @@ impl DbxApp {
             self.run_query_for_execution(session_id, false, cx);
             return;
         }
-        let text = query_editor.read(cx).text(cx);
-        let scope = if run_all {
-            editor::QueryExecutionScope::Document
-        } else {
-            editor::QueryExecutionScope::SelectionOrStatement
+        let Some(source) = editor_execution_source(&query_editor, run_all, cx) else {
+            return;
         };
-        let range = if run_all {
-            0..text.len()
-        } else {
-            query_editor.read(cx).execution_range(scope, cx)
-        };
-        let query = text[range].trim();
-        if query.is_empty() {
+        if self.prompt_query_parameters_for(session_id, &source.text, run_all, window, cx) {
             return;
         }
-        if self.prompt_query_parameters_for(session_id, query, run_all, window, cx) {
+        if let Err(error) = self.bind_query_parameters_for(session_id, &source.text) {
+            self.show_toast(ToastKind::Error, error, cx);
             return;
         }
-        let query = match self.bind_query_parameters_for(session_id, query) {
-            Ok(query) => query,
-            Err(error) => {
-                self.show_toast(ToastKind::Error, error, cx);
-                return;
-            }
-        };
+        let dialect = Some(kind);
         let Some(tab_id) = self
             .session(session_id)
             .and_then(|session| session.active_secondary_tab)
         else {
             return;
         };
-        let (title, detail, confirm_label, tone) = match editor::sql_execution_kind(&query) {
+        let (title, detail, confirm_label, tone) = match editor::sql_execution_kind(
+            &source.text,
+            dialect,
+        ) {
             editor::SqlExecutionKind::Destructive => (
                 "Run destructive query?",
                 "This statement can permanently change or delete data.",
                 "Run query",
                 ConfirmationTone::Danger,
             ),
-            _ if editor::sql_statement_count(&query) > 1 => (
+            _ if editor::sql_statement_count(&source.text, dialect) > 1 => (
                 "Run multiple statements?",
                 "Statements run in order without a transaction. If one fails, earlier changes stay.",
                 "Run statements",
@@ -73,7 +151,7 @@ impl DbxApp {
             ),
             _ => {
                 if let Some(tab) = self.active_query_tab_mut(session_id) {
-                    tab.execution_override = Some(query);
+                    tab.execution_override = Some(source);
                 }
                 self.run_query_for_execution(session_id, run_all, cx);
                 return;
@@ -90,7 +168,7 @@ impl DbxApp {
                 session_id,
                 tab_id,
                 run_all,
-                query,
+                query: source,
             },
             focus: focus.clone(),
             return_focus,
@@ -147,44 +225,21 @@ impl DbxApp {
                 SecondaryTabKind::Query(query) => query.execution_override.take(),
                 _ => None,
             });
-        let full_query = override_query
-            .clone()
-            .unwrap_or_else(|| query_editor.read(cx).text(cx));
-        let scope = if run_all {
-            editor::QueryExecutionScope::Document
-        } else if kind.is_sql() {
-            editor::QueryExecutionScope::SelectionOrStatement
-        } else if kind == DatabaseKind::Redis {
-            editor::QueryExecutionScope::SelectionOrCurrentLine
-        } else {
-            editor::QueryExecutionScope::Document
+        let bind = kind.is_sql() && override_query.is_none();
+        let Some(source) =
+            override_query.or_else(|| editor_execution_source(&query_editor, run_all, cx))
+        else {
+            return;
         };
-        let range = if run_all || override_query.is_some() {
-            0..full_query.len()
-        } else {
-            query_editor.read(cx).execution_range(scope, cx)
-        };
-        let selected_query = &full_query[range.clone()];
-        let executed_leading_whitespace = selected_query.len() - selected_query.trim_start().len();
-        let query = selected_query.trim().to_owned();
-        if query.is_empty() {
+        if bind && let Err(error) = self.bind_query_parameters_for(session_id, &source.text) {
+            self.show_toast(ToastKind::Error, error, cx);
             return;
         }
-        let query = if kind.is_sql() && override_query.is_none() {
-            match self.bind_query_parameters_for(session_id, &query) {
-                Ok(query) => query,
-                Err(error) => {
-                    self.show_toast(ToastKind::Error, error, cx);
-                    return;
-                }
-            }
-        } else {
-            query
-        };
+        let query = source.text.clone();
         let prepared_parameters = self
             .active_query_tab_mut(session_id)
             .and_then(|tab| tab.prepared_parameters.take());
-        let may_change_schema = kind.is_sql() && editor::sql_may_change_schema(&query);
+        let may_change_schema = kind.is_sql() && editor::sql_may_change_schema(&query, Some(kind));
         let runtime = self.runtime.clone();
         let Some(session) = self.session_mut(session_id) else {
             return;
@@ -302,13 +357,10 @@ impl DbxApp {
                             query_tab.plan_pending = false;
                             query_tab.in_transaction = false;
                             let message = error.to_string();
-                            // Positions reported against the trimmed statement
-                            // shift by the trimmed leading whitespace.
-                            let lead = range.start + executed_leading_whitespace;
                             query_tab.error_highlight =
                                 if query_tab.query_revision == query_revision {
                                     editor::sql_error_range(&message, &query)
-                                        .map(|range| range.start + lead..range.end + lead)
+                                        .and_then(|range| source.editor_range(range))
                                 } else {
                                     None
                                 };
@@ -364,7 +416,7 @@ impl DbxApp {
             && let SecondaryTabKind::Query(query) = &mut tab.kind
             && !query.busy
         {
-            query.execution_override = Some(command.to_owned());
+            query.execution_override = Some(ExecutionSource::detached(command));
             self.run_query_for_execution(session_id, true, cx);
         }
     }
@@ -436,7 +488,11 @@ impl DbxApp {
         let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
             return;
         };
+        // Then to extra carets, while nothing is running.
         if !query_tab.busy {
+            query_tab
+                .query_editor
+                .update(cx, |editor, cx| editor.collapse_selections(cx));
             return;
         }
         if let Some(cancellation) = &query_tab.cancellation {
@@ -794,14 +850,15 @@ impl DbxApp {
             return;
         };
 
-        let (text, cursor, focus_handle) = query_editor.update(cx, |editor, cx| {
+        let (text, cursor, dialect, focus_handle) = query_editor.update(cx, |editor, cx| {
             (
                 editor.text(cx),
                 editor.cursor_offset(),
+                editor.sql_dialect(),
                 editor.focus_handle(),
             )
         });
-        let (formatted, mapped_cursor) = editor::format_sql_at_cursor(&text, cursor);
+        let (formatted, mapped_cursor) = editor::format_sql_at_cursor(&text, cursor, dialect);
         if formatted != text {
             let length = text.len();
             query_editor.update(cx, |editor, cx| {

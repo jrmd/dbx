@@ -786,6 +786,30 @@ fn append_filters(
             _ => None,
         };
         if let Some(operator) = comparison {
+            // Geometric types, xml and json have no equality operator; match
+            // them by their text form, as the browser displays them.
+            let by_text = kind.dialect() == DatabaseKind::PostgreSQL
+                && matches!(
+                    filter.operator,
+                    FilterOperator::Equals | FilterOperator::NotEquals
+                )
+                && column.is_some_and(|column| postgres_lacks_equality(&column.data_type))
+                && filter
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| !matches!(value, CellValue::Null));
+            if by_text {
+                write!(statement, "CAST({identifier} AS text){operator}")
+                    .map_err(|error| DbxError::Parse(error.to_string()))?;
+                statement.push_str(&placeholder(kind, params.len() + 1));
+                params.push(match filter.value.clone() {
+                    Some(CellValue::Text(text)) => CellValue::Text(text),
+                    Some(CellValue::Json(value)) => CellValue::Text(value.to_string()),
+                    Some(value) => CellValue::Text(value.to_string()),
+                    None => CellValue::Null,
+                });
+                continue;
+            }
             statement.push_str(&identifier);
             push_value_predicate(kind, statement, params, filter, operator, column)?;
             continue;
@@ -841,6 +865,16 @@ fn append_filters(
         }
     }
     Ok(())
+}
+
+/// Whether a PostgreSQL type (or an array of it) has no `=` operator.
+fn postgres_lacks_equality(data_type: &str) -> bool {
+    let data_type = data_type.trim().to_ascii_lowercase();
+    let base = data_type.trim_end_matches("[]");
+    matches!(
+        base,
+        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" | "xml" | "json"
+    )
 }
 
 /// Whether a PostgreSQL catalog type is a character type that compares
@@ -935,14 +969,23 @@ fn push_like_predicate(
     // Without metadata the cast is still safe because text-to-text is a no-op.
     let cast_to_text = kind.dialect() == DatabaseKind::PostgreSQL
         && column.is_none_or(|column| !is_postgres_text_type(&column.data_type));
-    if cast_to_text {
-        write!(statement, "CAST({identifier} AS text)")
-            .map_err(|error| DbxError::Parse(error.to_string()))?;
+    let subject = if cast_to_text {
+        format!("CAST({identifier} AS text)")
     } else {
-        statement.push_str(identifier);
+        identifier.to_owned()
+    };
+    // Text filters match case-insensitively everywhere, as MySQL, SQLite and
+    // SQL Server's default collations already do.
+    let placeholder = placeholder(kind, params.len() + 1);
+    match kind.dialect() {
+        DatabaseKind::PostgreSQL
+        | DatabaseKind::DuckDB
+        | DatabaseKind::Snowflake
+        | DatabaseKind::ClickHouse => write!(statement, "{subject} ILIKE {placeholder}"),
+        DatabaseKind::BigQuery => write!(statement, "LOWER({subject}) LIKE LOWER({placeholder})"),
+        _ => write!(statement, "{subject} LIKE {placeholder}"),
     }
-    statement.push_str(" LIKE ");
-    statement.push_str(&placeholder(kind, params.len() + 1));
+    .map_err(|error| DbxError::Parse(error.to_string()))?;
     let escaped = if matches!(kind, DatabaseKind::BigQuery | DatabaseKind::ClickHouse) {
         value
             .replace('\\', "\\\\")
