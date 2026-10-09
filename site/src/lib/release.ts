@@ -5,7 +5,7 @@ export const RELEASES_URL = `${REPO_URL}/releases`;
 export type Download = {
   name: string;
   url: string;
-  size: number;
+  size?: number;
   checksumUrl?: string;
 };
 
@@ -49,6 +49,10 @@ function pick(assets: GitHubAsset[], pattern: RegExp): Download | undefined {
  * page. Revalidated hourly so a new release shows up without a redeploy.
  */
 export async function getLatestRelease(): Promise<Release | null> {
+  return (await fromApi()) ?? (await fromRedirect());
+}
+
+async function fromApi(): Promise<Release | null> {
   try {
     const headers: HeadersInit = { Accept: "application/vnd.github+json" };
     if (process.env.GITHUB_TOKEN) {
@@ -68,6 +72,36 @@ export async function getLatestRelease(): Promise<Release | null> {
       linux:
         pick(release.assets, /linux-x86_64\.AppImage$/) ??
         pick(release.assets, /linux.*\.tar\.gz$/),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The unauthenticated API allows 60 requests an hour per IP, which shared
+ * hosting exhausts. The web `latest` redirect is not rate limited the same
+ * way and names the tag, from which the release workflow's asset names follow.
+ */
+async function fromRedirect(): Promise<Release | null> {
+  try {
+    const response = await fetch(`${RELEASES_URL}/latest`, {
+      redirect: "manual",
+      next: { revalidate: 3600 },
+    });
+    const tag = response.headers.get("location")?.match(/\/tag\/([^/?#]+)$/)?.[1];
+    if (!tag) return null;
+    const version = tag.replace(/^v/, "");
+    const asset = (name: string): Download => {
+      const url = `${RELEASES_URL}/download/${tag}/${name}`;
+      return { name, url, checksumUrl: `${url}.sha256` };
+    };
+    return {
+      version,
+      url: `${RELEASES_URL}/tag/${tag}`,
+      publishedAt: "",
+      macos: asset(`DBX-${version}-macos-arm64.zip`),
+      linux: asset(`DBX-${version}-linux-x86_64.AppImage`),
     };
   } catch {
     return null;

@@ -59,7 +59,8 @@ export function Download({ release }: { release: Release | null }) {
               <p className="mt-4 text-sm text-muted-foreground">
                 {mac ? (
                   <>
-                    {mac.name} · {formatSize(mac.size)}
+                    {mac.name}
+                    {mac.size !== undefined && ` · ${formatSize(mac.size)}`}
                     {mac.checksumUrl && (
                       <>
                         {" · "}
@@ -98,7 +99,8 @@ export function Download({ release }: { release: Release | null }) {
                     Download DBX {version}
                   </a>
                   <p className="mt-4 text-sm text-muted-foreground">
-                    {linux.name} · {formatSize(linux.size)}
+                    {linux.name}
+                    {linux.size !== undefined && ` · ${formatSize(linux.size)}`}
                     {linux.name.endsWith(".AppImage") &&
                       " · Mark it executable, then run it."}
                   </p>
