@@ -1,4 +1,5 @@
 use super::super::*;
+use super::{GRID_MIN_WIDTH, INSPECTOR_MIN_WIDTH, PaneResize};
 use crate::diagram::display_type;
 use crate::popups::DropdownMenu as _;
 use gpui_component::menu::PopupMenuItem;
@@ -534,7 +535,7 @@ impl DbxApp {
             .id("grid")
             .key_context("DbxDataGrid")
             .flex_1()
-            .min_w_0()
+            .min_w(px(GRID_MIN_WIDTH))
             .min_h_0()
             .flex()
             .flex_col()
@@ -767,8 +768,11 @@ impl DbxApp {
         };
         let has_draft = !draft_fields.is_empty();
         div()
-            .w(px(330.))
-            .flex_none()
+            .relative()
+            .w(px(self.inspector_width()))
+            // Give way to the grid when the window narrows after a drag.
+            .flex_shrink_1()
+            .min_w(px(INSPECTOR_MIN_WIDTH))
             .flex()
             .flex_col()
             .min_h_0()
@@ -1101,6 +1105,12 @@ impl DbxApp {
                                 }),
                         )
                     }),
+            )
+            .child(self.pane_resize_handle(PaneResize::Inspector, cx))
+            .on_drag_move(
+                cx.listener(|this, event, _, cx| {
+                    this.resize_pane(PaneResize::Inspector, event, cx)
+                }),
             )
             .into_any_element()
     }

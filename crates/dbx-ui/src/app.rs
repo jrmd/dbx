@@ -720,6 +720,11 @@ pub struct DbxApp {
     compact_layout: bool,
     narrow_workspace: bool,
     sidebar_hidden: bool,
+    /// Widths the user dragged the explorer and row inspector to; `None`
+    /// keeps the defaults.
+    explorer_width: Option<f32>,
+    inspector_width: Option<f32>,
+    pane_resizing: Option<view::PaneResize>,
     /// Owns keyboard focus whenever no control does, so app shortcuts keep
     /// working after the focused element (e.g. a closed tab's editor) is gone.
     focus_handle: FocusHandle,
@@ -801,6 +806,7 @@ impl DbxApp {
             }
         };
 
+        let saved_settings = SettingsStore::new().and_then(|store| store.load()).ok();
         let mut this = Self {
             runtime: Arc::new(tokio::runtime::Runtime::new().expect("create DBX Tokio runtime")),
             update_state: crate::updater::UpdateState::Idle,
@@ -809,9 +815,9 @@ impl DbxApp {
             vault_editors,
             vault_state,
             vault_busy: false,
-            remember_device: SettingsStore::new()
-                .and_then(|store| store.load())
-                .map_or(true, |settings| settings.remember_device),
+            remember_device: saved_settings
+                .as_ref()
+                .is_none_or(|settings| settings.remember_device),
             saving_connection: false,
             vault_generation: 0,
             credential_hydrating: false,
@@ -850,6 +856,15 @@ impl DbxApp {
             compact_layout: false,
             narrow_workspace: false,
             sidebar_hidden: false,
+            explorer_width: saved_settings
+                .as_ref()
+                .and_then(|settings| settings.explorer_width)
+                .map(|width| width as f32),
+            inspector_width: saved_settings
+                .as_ref()
+                .and_then(|settings| settings.inspector_width)
+                .map(|width| width as f32),
+            pane_resizing: None,
             focus_handle: cx.focus_handle(),
             toasts: Vec::new(),
             next_toast_id: 0,
@@ -1175,6 +1190,8 @@ impl DbxApp {
             .with_reduce_transparency(self.reduce_transparency)
             .with_remember_device(self.remember_device);
         settings.agents = self.agent_setup.preferences.clone();
+        settings.explorer_width = self.explorer_width.map(|width| width.round() as u32);
+        settings.inspector_width = self.inspector_width.map(|width| width.round() as u32);
         let failure = match &self.settings_store {
             Some(store) => store
                 .save(settings)

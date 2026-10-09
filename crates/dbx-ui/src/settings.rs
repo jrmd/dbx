@@ -31,6 +31,11 @@ pub struct Settings {
     pub remember_device: bool,
     #[serde(default)]
     pub agents: crate::agents::AgentPreferences,
+    /// Dragged widths of the explorer sidebar and row inspector, in pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explorer_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspector_width: Option<u32>,
 }
 
 fn remember_device_default() -> bool {
@@ -51,6 +56,8 @@ impl Settings {
             reduce_transparency: false,
             remember_device: true,
             agents: crate::agents::AgentPreferences::default(),
+            explorer_width: None,
+            inspector_width: None,
         }
     }
 

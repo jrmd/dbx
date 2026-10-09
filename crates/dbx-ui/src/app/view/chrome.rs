@@ -1,4 +1,5 @@
 use super::super::*;
+use super::PaneResize;
 use crate::app::row_count::{RowCount, approximate, grouped};
 use crate::popups::DropdownMenu as _;
 use gpui_component::menu::PopupMenuItem;
@@ -19,7 +20,17 @@ impl DbxApp {
             .pb(px(GLASS_INSET))
             .gap(px(GLASS_INSET))
             .when(sidebar_visible, |view| {
-                view.child(self.render_sidebar(window, cx))
+                view.child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .flex()
+                        .child(self.render_sidebar(window, cx))
+                        .child(self.pane_resize_handle(PaneResize::Explorer, cx))
+                        .on_drag_move(cx.listener(|this, event, _, cx| {
+                            this.resize_pane(PaneResize::Explorer, event, cx)
+                        })),
+                )
             })
             .child(
                 // The content sheet: the one opaque surface, so data never
@@ -493,11 +504,7 @@ impl DbxApp {
         let explorer_actions = cx.entity().downgrade();
         let table_count = visible_tables.len();
         glass(div(), RADIUS_GLASS, 8.)
-            .w(if self.compact_layout {
-                px(188.)
-            } else {
-                px(236.)
-            })
+            .w(px(self.explorer_width()))
             .flex_none()
             .flex()
             .flex_col()
