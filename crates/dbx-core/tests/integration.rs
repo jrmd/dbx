@@ -172,6 +172,135 @@ async fn mysql_crud_integration() -> Result<()> {
     run_sql_scenario(DatabaseKind::MySQL, "DBX_TEST_MYSQL_URL").await
 }
 
+/// MariaDB speaks the MySQL protocol but has a different catalog: no index
+/// expressions, defaults reported as SQL, JSON stored as `utf8mb4_bin` text,
+/// and check constraint names that are only unique per table.
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn mysql_table_details_match_the_server() -> Result<()> {
+    let Some(url) = integration_url("DBX_TEST_MYSQL_URL") else {
+        return Ok(());
+    };
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::MySQL, url)).await?;
+    let columns = "id int PRIMARY KEY, doc json NULL, note varchar(20) NULL, quoted varchar(20) NOT NULL DEFAULT 'it''s \\\\ x', stamp timestamp NULL DEFAULT CURRENT_TIMESTAMP, code varchar(10) COLLATE utf8mb4_bin NULL";
+    for table in [
+        "dbx_integration_variant",
+        "dbx_integration_variant_twin",
+        "dbx_integration_variant_copy",
+    ] {
+        engine
+            .execute_sql(&format!("DROP TABLE IF EXISTS {table}"))
+            .await?;
+    }
+    for table in ["dbx_integration_variant", "dbx_integration_variant_twin"] {
+        engine
+            .execute_sql(&format!("CREATE TABLE {table} ({columns})"))
+            .await?;
+    }
+    engine
+        .execute_sql("CREATE INDEX dbx_integration_variant_code ON dbx_integration_variant (code)")
+        .await?;
+    engine
+        .execute_sql(
+            "INSERT INTO dbx_integration_variant (id, doc, code) VALUES (1, '{\"a\": 1}', 'Bin')",
+        )
+        .await?;
+
+    let table = TableRef::new("dbx_integration_variant");
+    let structure = engine.table_structure(&table).await?;
+    let default = |structure: &dbx_core::TableStructure, column: &str| {
+        structure
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == column)
+            .and_then(|candidate| candidate.default_value.clone())
+    };
+    assert_eq!(default(&structure, "note"), None);
+    assert_eq!(
+        default(&structure, "quoted").as_deref(),
+        Some(r"'it''s \\ x'")
+    );
+    assert!(
+        default(&structure, "stamp")
+            .unwrap()
+            .to_ascii_lowercase()
+            .starts_with("current_timestamp")
+    );
+    assert!(
+        structure
+            .indexes
+            .iter()
+            .any(|index| index.name == "dbx_integration_variant_code" && index.columns == ["code"])
+    );
+    // MariaDB names each JSON column's implicit check after the column, so
+    // the twin table's checks must not be joined in.
+    let mut checks = structure
+        .checks
+        .iter()
+        .map(|check| check.name.clone())
+        .collect::<Vec<_>>();
+    checks.dedup();
+    assert_eq!(
+        checks.len(),
+        structure.checks.len(),
+        "{:?}",
+        structure.checks
+    );
+    assert!(structure.checks.len() <= 1, "{:?}", structure.checks);
+
+    let loaded = engine
+        .query_table(&table, &[], &[], &[], None, QueryOptions::default())
+        .await?;
+    for (column, value) in loaded.columns.iter().zip(&loaded.rows[0].values) {
+        assert!(
+            !matches!(value, CellValue::Bytes(_)),
+            "{} read as raw bytes",
+            column.name
+        );
+    }
+    let code = loaded
+        .columns
+        .iter()
+        .position(|column| column.name == "code");
+    assert_eq!(
+        loaded.rows[0].values[code.unwrap()],
+        CellValue::Text("Bin".into())
+    );
+
+    // Defaults must replay: export the table and recreate it under a new name.
+    let schema = dbx_core::render_sql_schema(
+        DatabaseKind::MySQL,
+        &table,
+        &structure,
+        std::slice::from_ref(&table),
+    )?
+    .replace(
+        "`dbx_integration_variant`",
+        "`dbx_integration_variant_copy`",
+    );
+    engine.execute_sql(&schema).await?;
+    let copy = engine
+        .table_structure(&TableRef::new("dbx_integration_variant_copy"))
+        .await?;
+    for column in ["note", "quoted", "stamp"] {
+        assert_eq!(
+            default(&copy, column),
+            default(&structure, column),
+            "{column}"
+        );
+    }
+    for table in [
+        "dbx_integration_variant",
+        "dbx_integration_variant_twin",
+        "dbx_integration_variant_copy",
+    ] {
+        engine
+            .execute_sql(&format!("DROP TABLE IF EXISTS {table}"))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Values the row editor sends as text (dates, uuids, enums, arrays, bit
 /// strings) and NULLs must land in typed columns, and every column must
 /// decode back to the text the editor would show.
@@ -767,6 +896,13 @@ async fn assert_postgres_enum_decoding(engine: &DatabaseEngine) -> Result<()> {
     result
 }
 
+async fn is_mariadb(engine: &DatabaseEngine) -> Result<bool> {
+    let version = engine
+        .query("SELECT VERSION()", QueryOptions::default())
+        .await?;
+    Ok(version.rows[0].values[0].to_string().contains("MariaDB"))
+}
+
 /// Defaults, indexes, checks, and view definitions, which the structure tab,
 /// SQL dumps, and schema comparison all rely on.
 async fn assert_schema_details(engine: &DatabaseEngine, kind: DatabaseKind) -> Result<()> {
@@ -798,7 +934,9 @@ async fn assert_schema_details(engine: &DatabaseEngine, kind: DatabaseKind) -> R
         ))
         .await?;
 
-    if kind == DatabaseKind::MySQL {
+    // MariaDB has no functional key parts.
+    let functional_indexes = kind == DatabaseKind::MySQL && !is_mariadb(engine).await?;
+    if functional_indexes {
         engine
             .execute_sql(&format!(
                 "CREATE INDEX dbx_integration_expression ON {name} ((LOWER(code)))"
@@ -825,7 +963,7 @@ async fn assert_schema_details(engine: &DatabaseEngine, kind: DatabaseKind) -> R
         None
     );
 
-    if kind == DatabaseKind::MySQL {
+    if functional_indexes {
         let expression = structure
             .indexes
             .iter()

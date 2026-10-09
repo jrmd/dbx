@@ -51,6 +51,23 @@ services:
       timeout: 5s
       retries: 30
 
+  mariadb:
+    image: mariadb:11.4
+    environment:
+      MARIADB_DATABASE: dbx_test
+      MARIADB_USER: dbx_test
+      MARIADB_PASSWORD: dbx_test_password
+      MARIADB_ROOT_PASSWORD: dbx_test_root_password
+    ports:
+      - "127.0.0.1:${DBX_TEST_MARIADB_PORT:-53307}:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
   redis:
     image: redis:7-alpine
     ports:

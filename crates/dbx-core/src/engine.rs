@@ -378,6 +378,22 @@ impl DatabaseEngine {
                 }
             }
         }
+        // MySQL flags text with a binary collation (`utf8mb4_bin`, and every
+        // MariaDB JSON column) as binary, so the driver reads it as bytes.
+        // Only the declared column type tells it apart from a real BLOB.
+        if self.kind().dialect() == DatabaseKind::MySQL
+            && result.rows.iter().any(|row| {
+                row.values
+                    .iter()
+                    .any(|value| matches!(value, CellValue::Bytes(_)))
+            })
+        {
+            let declared = match known_columns {
+                Some(columns) if !columns.is_empty() => columns.to_vec(),
+                _ => self.describe_table(table).await?,
+            };
+            crate::sql::recover_mysql_binary_collation_text(&mut result, &declared);
+        }
         // An empty `SELECT` exposes no result-set metadata. Fall back to the
         // table schema (already known to many callers) so an empty table still
         // has usable headers in the grid, without sqlx's costly describe.
