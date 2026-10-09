@@ -1,3 +1,7 @@
+## 0.7.3 - 2026-10-09
+
+- Drag the edge of the explorer sidebar or the row details panel to resize it. DBX remembers the widths; double-click an edge to restore the default.
+
 # Changelog
 
 ## 0.7.2 - 2026-10-09
