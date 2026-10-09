@@ -704,7 +704,10 @@ mod tests {
     #[test]
     fn next_occurrence_wraps_and_skips_selected_matches() {
         let text = "id, name, id, id";
-        assert_eq!(next_occurrence(text, "id", 2, &[0..2]), Some(10..12));
+        assert_eq!(
+            next_occurrence(text, "id", 2, std::slice::from_ref(&(0..2))),
+            Some(10..12)
+        );
         assert_eq!(
             next_occurrence(text, "id", 16, &[10..12, 14..16]),
             Some(0..2)
