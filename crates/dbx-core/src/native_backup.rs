@@ -31,30 +31,49 @@ fn decoded(value: &str) -> Result<String> {
 }
 
 pub async fn native_tool_version(kind: DatabaseKind, restore: bool) -> Result<String> {
-    let program = tool(kind, restore)?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(program)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| invalid("Native tool version check timed out"))?
-    .map_err(|_| invalid(&format!("Install {program} and make it available in PATH")))?;
-    if !output.status.success() || output.stdout.len() > 4096 {
-        return Err(invalid("Native tool version check failed"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    native_tool(kind, restore).await.map(|(_, version)| version)
 }
-fn tool(kind: DatabaseKind, restore: bool) -> Result<&'static str> {
+
+/// The first installed tool and its version.
+async fn native_tool(kind: DatabaseKind, restore: bool) -> Result<(&'static str, String)> {
+    let programs = tools(kind, restore)?;
+    for &program in programs {
+        let output = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(program)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| invalid("Native tool version check timed out"))?
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+        if !output.status.success() || output.stdout.len() > 4096 {
+            return Err(invalid("Native tool version check failed"));
+        }
+        return Ok((
+            program,
+            String::from_utf8_lossy(&output.stdout).trim().into(),
+        ));
+    }
+    Err(invalid(&format!(
+        "Install {} and make it available in PATH",
+        programs.join(" or ")
+    )))
+}
+
+/// Newer MariaDB packages may install only the `mariadb-*` names.
+fn tools(kind: DatabaseKind, restore: bool) -> Result<&'static [&'static str]> {
     match (kind, restore) {
-        (DatabaseKind::PostgreSQL, false) => Ok("pg_dump"),
-        (DatabaseKind::PostgreSQL, true) => Ok("pg_restore"),
-        (DatabaseKind::MySQL, false) => Ok("mysqldump"),
-        (DatabaseKind::MySQL, true) => Ok("mysql"),
+        (DatabaseKind::PostgreSQL, false) => Ok(&["pg_dump"]),
+        (DatabaseKind::PostgreSQL, true) => Ok(&["pg_restore"]),
+        (DatabaseKind::MySQL, false) => Ok(&["mysqldump", "mariadb-dump"]),
+        (DatabaseKind::MySQL, true) => Ok(&["mysql", "mariadb"]),
         _ => Err(invalid("Native backup supports PostgreSQL and MySQL")),
     }
 }
@@ -96,8 +115,29 @@ pub async fn native_backup(
             ));
         }
     }
-    let version = native_tool_version(config.kind, restore).await?;
+    let (program, version) = native_tool(config.kind, restore).await?;
     control.add_log(&version);
+    let mariadb_client = version.contains("MariaDB");
+    // mysqldump 8 reads histograms from COLUMN_STATISTICS, which MariaDB
+    // servers lack. Older clients have neither the table nor the option.
+    let skip_column_statistics = !restore
+        && config.kind == DatabaseKind::MySQL
+        && !mariadb_client
+        && !version.contains("Distrib")
+        && {
+            let engine = crate::DatabaseEngine::connect(config.clone()).await?;
+            let server = engine
+                .query(
+                    "SELECT VERSION()",
+                    crate::QueryOptions { max_rows: Some(1) },
+                )
+                .await?;
+            server
+                .rows
+                .first()
+                .and_then(|row| row.values.first())
+                .is_some_and(|value| value.to_string().contains("MariaDB"))
+        };
     if !restore && config.kind == DatabaseKind::PostgreSQL {
         let engine = crate::DatabaseEngine::connect(config.clone()).await?;
         let server = engine
@@ -179,7 +219,6 @@ pub async fn native_backup(
     return Err(invalid(
         "Native backup credential-file isolation currently requires Unix",
     ));
-    let program = tool(kind, restore)?;
     let mut command = tokio::process::Command::new(program);
     // Child-specific credentials replace ambient login files and environment.
     command
@@ -256,9 +295,10 @@ pub async fn native_backup(
             option_escape(&password)
         )
         .map_err(io)?;
-        command
-            .arg(format!("--defaults-file={}", credentials.display()))
-            .arg("--no-login-paths");
+        command.arg(format!("--defaults-file={}", credentials.display()));
+        if !mariadb_client {
+            command.arg("--no-login-paths");
+        }
         command
             .arg(format!("--host={host}"))
             .arg(format!("--port={}", url.port().unwrap_or(3306)));
@@ -284,7 +324,18 @@ pub async fn native_backup(
                 "verify-full" | "verify_identity" | "verify-identity" => "VERIFY_IDENTITY",
                 _ => return Err(invalid("Unknown MySQL TLS mode")),
             };
-            command.arg(format!("--ssl-mode={mode}"));
+            if mariadb_client {
+                // MariaDB clients have no --ssl-mode, and cannot verify the
+                // CA without the host name, so VERIFY_CA verifies both.
+                command.args(match mode {
+                    "DISABLED" => &["--skip-ssl"][..],
+                    "PREFERRED" => &["--skip-ssl-verify-server-cert"],
+                    "REQUIRED" => &["--ssl", "--skip-ssl-verify-server-cert"],
+                    _ => &["--ssl", "--ssl-verify-server-cert"],
+                });
+            } else {
+                command.arg(format!("--ssl-mode={mode}"));
+            }
         }
         for option in ["ssl-ca", "ssl-cert", "ssl-key"] {
             if let Some((_, value)) = options.iter().find(|(key, _)| key == option) {
@@ -300,6 +351,9 @@ pub async fn native_backup(
                 "--hex-blob",
                 "--verbose",
             ]);
+            if skip_column_statistics {
+                command.arg("--column-statistics=0");
+            }
         }
         command.arg(&database);
     }

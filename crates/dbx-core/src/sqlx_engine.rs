@@ -54,7 +54,37 @@ fn mysql_options(
 /// used, as the last two columns of a foreign-key row.
 /// MySQL reports literal defaults unquoted and expression defaults bare.
 /// Normalize both to an SQL expression that can be replayed in DDL.
-const MYSQL_DEFAULT_SQL: &str = "CASE WHEN COLUMN_DEFAULT IS NULL THEN NULL WHEN EXTRA LIKE '%DEFAULT_GENERATED%' THEN CASE WHEN UPPER(COLUMN_DEFAULT) LIKE 'CURRENT_TIMESTAMP%' THEN CAST(COLUMN_DEFAULT AS CHAR) ELSE CONCAT('(', CAST(COLUMN_DEFAULT AS CHAR), ')') END ELSE QUOTE(CAST(COLUMN_DEFAULT AS CHAR)) END AS column_default";
+/// Literal defaults are quoted by doubling `'` (not `QUOTE`'s `\'`), which
+/// exported schemas and `safe_schema_expression` both accept.
+const MYSQL_DEFAULT_SQL: &str = "CASE WHEN COLUMN_DEFAULT IS NULL THEN NULL WHEN EXTRA LIKE '%DEFAULT_GENERATED%' THEN CASE WHEN UPPER(COLUMN_DEFAULT) LIKE 'CURRENT_TIMESTAMP%' THEN CAST(COLUMN_DEFAULT AS CHAR) ELSE CONCAT('(', CAST(COLUMN_DEFAULT AS CHAR), ')') END ELSE CONCAT('''', REPLACE(REPLACE(CAST(COLUMN_DEFAULT AS CHAR), CHAR(92 USING utf8mb4), CONCAT(CHAR(92 USING utf8mb4), CHAR(92 USING utf8mb4))), '''', ''''''), '''') END AS column_default";
+
+/// MariaDB already reports defaults as SQL (`'text'`, `5`,
+/// `current_timestamp()`), and a nullable column without one as `NULL`.
+const MARIADB_DEFAULT_SQL: &str = "NULLIF(CAST(COLUMN_DEFAULT AS CHAR), 'NULL') AS column_default";
+
+/// What a MySQL-protocol server's catalog offers. MariaDB and older MySQL
+/// releases lack catalog columns that current MySQL has.
+#[derive(Clone, Copy, Debug)]
+struct MySqlCatalog {
+    mariadb: bool,
+    /// `STATISTICS.EXPRESSION` (functional key parts), MySQL 8.0.13+.
+    index_expressions: bool,
+    /// `CHECK_CONSTRAINTS`, MySQL 8.0.16+ and MariaDB 10.2.22+.
+    check_constraints: bool,
+    /// MariaDB's `CHECK_CONSTRAINTS.TABLE_NAME`. Its constraint names are
+    /// only unique per table (a column check is named after its column).
+    check_constraint_tables: bool,
+}
+
+impl MySqlCatalog {
+    fn default_sql(self) -> &'static str {
+        if self.mariadb {
+            MARIADB_DEFAULT_SQL
+        } else {
+            MYSQL_DEFAULT_SQL
+        }
+    }
+}
 
 const PG_FK_RULE_SQL: &str = "CASE con.confupdtype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END, CASE con.confdeltype WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' WHEN 'r' THEN 'RESTRICT' ELSE 'NO ACTION' END";
 
@@ -96,6 +126,7 @@ pub struct SqlxEngine {
     _tunnel: Option<crate::transport::Tunnel>,
     cloud_source: Option<Box<ConnectionConfig>>,
     cloud_refreshed: tokio::sync::Mutex<Instant>,
+    mysql_catalog: tokio::sync::OnceCell<MySqlCatalog>,
 }
 
 /// Native SQLx pools for the supported SQL drivers.
@@ -224,6 +255,7 @@ impl SqlxEngine {
             _tunnel: tunnel,
             cloud_source,
             cloud_refreshed: tokio::sync::Mutex::new(Instant::now()),
+            mysql_catalog: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -276,6 +308,7 @@ impl SqlxEngine {
             _tunnel: None,
             cloud_source: self.cloud_source.clone(),
             cloud_refreshed: tokio::sync::Mutex::new(*self.cloud_refreshed.lock().await),
+            mysql_catalog: self.mysql_catalog.clone(),
         })
     }
 
@@ -594,6 +627,41 @@ impl SqlxEngine {
         .await
     }
 
+    /// Probed once per engine: `use_database` stays on the same server.
+    async fn mysql_catalog(&self) -> Result<MySqlCatalog> {
+        self.mysql_catalog
+            .get_or_try_init(|| async {
+                let has = |table: &str, column: &str| {
+                    format!(
+                        "EXISTS (SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'information_schema' AND TABLE_NAME = '{table}' AND COLUMN_NAME = '{column}')"
+                    )
+                };
+                let result = self
+                    .metadata_query(
+                        &format!(
+                            "SELECT VERSION() LIKE '%MariaDB%', {}, {}, {}",
+                            has("STATISTICS", "EXPRESSION"),
+                            has("CHECK_CONSTRAINTS", "CHECK_CLAUSE"),
+                            has("CHECK_CONSTRAINTS", "TABLE_NAME"),
+                        ),
+                        &[],
+                    )
+                    .await?;
+                let row = result
+                    .rows
+                    .first()
+                    .ok_or_else(|| DbxError::Decode("Missing server capabilities".into()))?;
+                Ok(MySqlCatalog {
+                    mariadb: boolish_value(row, 0)?,
+                    index_expressions: boolish_value(row, 1)?,
+                    check_constraints: boolish_value(row, 2)?,
+                    check_constraint_tables: boolish_value(row, 3)?,
+                })
+            })
+            .await
+            .copied()
+    }
+
     async fn list_sql_tables(&self) -> Result<Vec<TableInfo>> {
         let result = match self.kind.dialect() {
             DatabaseKind::SQLite => {
@@ -679,7 +747,7 @@ impl SqlxEngine {
                 self.metadata_query(
                     // COLUMN_TYPE keeps `tinyint(1)`, `unsigned`, and enum
                     // labels, which DATA_TYPE drops.
-                    &format!("SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {MYSQL_DEFAULT_SQL} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION"),
+                    &format!("SELECT CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION", self.mysql_catalog().await?.default_sql()),
                     &[CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -853,9 +921,14 @@ impl SqlxEngine {
             }
             DatabaseKind::MySQL => {
                 let (filter, params) = self.table_filter(table, "TABLE_SCHEMA", "TABLE_NAME");
+                let expression = if self.mysql_catalog().await?.index_expressions {
+                    "CAST(EXPRESSION AS CHAR)"
+                } else {
+                    "NULL"
+                };
                 (
                     format!(
-                        "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), NON_UNIQUE, CAST(INDEX_TYPE AS CHAR), CAST(COLUMN_NAME AS CHAR), SUB_PART, CAST(COLLATION AS CHAR), CAST(EXPRESSION AS CHAR) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE(){filter} ORDER BY TABLE_NAME, INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX"
+                        "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), NON_UNIQUE, CAST(INDEX_TYPE AS CHAR), CAST(COLUMN_NAME AS CHAR), SUB_PART, CAST(COLLATION AS CHAR), {expression} FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE(){filter} ORDER BY TABLE_NAME, INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX"
                     ),
                     params,
                 )
@@ -1006,10 +1079,20 @@ impl SqlxEngine {
                 )
             }
             DatabaseKind::MySQL => {
+                let catalog = self.mysql_catalog().await?;
+                if !catalog.check_constraints {
+                    // MySQL before 8.0.16 parsed CHECK clauses but ignored them.
+                    return Ok(HashMap::new());
+                }
+                let same_table = if catalog.check_constraint_tables {
+                    " AND cc.TABLE_NAME = tc.TABLE_NAME"
+                } else {
+                    ""
+                };
                 let (filter, params) = self.table_filter(table, "tc.TABLE_SCHEMA", "tc.TABLE_NAME");
                 (
                     format!(
-                        "SELECT CAST(tc.TABLE_SCHEMA AS CHAR), CAST(tc.TABLE_NAME AS CHAR), CAST(tc.CONSTRAINT_NAME AS CHAR), CAST(cc.CHECK_CLAUSE AS CHAR) FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME WHERE tc.CONSTRAINT_TYPE = 'CHECK' AND tc.TABLE_SCHEMA = DATABASE(){filter} ORDER BY tc.TABLE_NAME, tc.CONSTRAINT_NAME"
+                        "SELECT CAST(tc.TABLE_SCHEMA AS CHAR), CAST(tc.TABLE_NAME AS CHAR), CAST(tc.CONSTRAINT_NAME AS CHAR), CAST(cc.CHECK_CLAUSE AS CHAR) FROM information_schema.TABLE_CONSTRAINTS tc JOIN information_schema.CHECK_CONSTRAINTS cc ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME{same_table} WHERE tc.CONSTRAINT_TYPE = 'CHECK' AND tc.TABLE_SCHEMA = DATABASE(){filter} ORDER BY tc.TABLE_NAME, tc.CONSTRAINT_NAME"
                     ),
                     params,
                 )
@@ -1104,7 +1187,8 @@ impl SqlxEngine {
                 "SELECT n.nspname, c.relname, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY n.nspname, c.relname, a.attnum"
             }
             DatabaseKind::MySQL => &format!(
-                "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {MYSQL_DEFAULT_SQL} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"
+                "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION",
+                self.mysql_catalog().await?.default_sql()
             ),
             _ => unreachable!("SQLx only supports PostgreSQL, MySQL and SQLite dialects"),
         };

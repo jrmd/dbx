@@ -174,6 +174,41 @@ pub fn postgres_reads_as_text(data_type: &str) -> bool {
     )
 }
 
+/// Restore text columns MySQL reported as binary. A binary collation such
+/// as `utf8mb4_bin` (which MariaDB uses for JSON) sets the column's binary
+/// flag, so the driver cannot tell the column from a BLOB. `declared` is the
+/// table's catalog description, which still names the real type.
+pub(crate) fn recover_mysql_binary_collation_text(
+    result: &mut crate::QueryResult,
+    declared: &[ColumnInfo],
+) {
+    let textual = |data_type: &str| {
+        let data_type = data_type.trim().to_ascii_lowercase();
+        let base = data_type.split(['(', ' ']).next().unwrap_or_default();
+        base.ends_with("char") || base.ends_with("text") || matches!(base, "json" | "enum" | "set")
+    };
+    for (index, column) in result.columns.iter_mut().enumerate() {
+        if !column.data_type.ends_with("BLOB") && !column.data_type.ends_with("BINARY") {
+            continue;
+        }
+        let Some(declared) = declared
+            .iter()
+            .find(|known| known.name == column.name)
+            .filter(|known| textual(&known.data_type))
+        else {
+            continue;
+        };
+        column.data_type = declared.data_type.clone();
+        for row in &mut result.rows {
+            if let Some(CellValue::Bytes(bytes)) = row.values.get(index)
+                && let Ok(text) = std::str::from_utf8(bytes)
+            {
+                row.values[index] = CellValue::Text(text.to_owned());
+            }
+        }
+    }
+}
+
 /// Count the rows of `table` that match `filters`.
 pub fn build_count(
     kind: DatabaseKind,
