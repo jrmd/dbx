@@ -16,7 +16,8 @@ const description =
   "A free, open-source database client for SQL databases, document stores, search, and streams. Written in Rust and drawn on the GPU — no Electron, no webview.";
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://dbx.jrmd.dev"),
+  metadataBase: new URL("https://dbx.bonusobjective.com"),
+  alternates: { canonical: "/" },
   title: "DBX — A native database client",
   description,
   applicationName: "DBX",
@@ -45,7 +46,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: "DBX — A native database client",
     description,
-    url: "https://dbx.jrmd.dev",
+    url: "https://dbx.bonusobjective.com",
     siteName: "DBX",
     type: "website",
   },

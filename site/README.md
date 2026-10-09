@@ -1,4 +1,4 @@
-# dbx.jrmd.dev
+# dbx.bonusobjective.com
 
 The DBX marketing site. Next.js 16, React 19, Tailwind 4, with motion and WebGL pieces from [Jez UI](https://ui.jrmd.dev).
 
@@ -15,7 +15,7 @@ Set `GITHUB_TOKEN` in the Vercel project to avoid the unauthenticated API rate l
 
 ## Deployment
 
-The Vercel project `dbx` is connected to `jrmd/dbx` with **Root Directory** `site`, so every push to `main` that touches `site/` deploys to production. The ignored build step `git diff --quiet HEAD^ HEAD -- .` skips commits that only change the app. `dbx.jrmd.dev` is a Cloudflare `CNAME` to `cname.vercel-dns.com`.
+The Vercel project `dbx` is connected to `jrmd/dbx` with **Root Directory** `site`, so every push to `main` that touches `site/` deploys to production. The ignored build step `git diff --quiet HEAD^ HEAD -- .` skips commits that only change the app. `dbx.bonusobjective.com` uses a DNS-only Cloudflare `CNAME` to the target supplied by Vercel. The previous `dbx.jrmd.dev` domain redirects to this address.
 
 ## Jez UI components
 
