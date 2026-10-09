@@ -123,7 +123,7 @@ impl DbxApp {
         let scroll_offset = scroll_handle.offset();
         let viewport_at_origin = scroll_offset.x == px(0.) && scroll_offset.y == px(0.);
         let window_size = window.bounds().size;
-        let sidebar_width = if self.compact_layout { 180.0 } else { 224.0 };
+        let sidebar_width = self.explorer_width();
         let pane_width = (f32::from(window_size.width) - sidebar_width - 46.0).max(0.0);
         // Prefer the measured viewport; the window-derived estimate only
         // covers the first frame, before the scroller has been laid out.

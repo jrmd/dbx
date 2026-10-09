@@ -3,8 +3,12 @@ mod connection;
 mod data;
 mod diagram;
 mod overlays;
+mod pane_resize;
 mod query;
 mod settings;
+
+pub(super) use pane_resize::PaneResize;
+use pane_resize::{GRID_MIN_WIDTH, INSPECTOR_MIN_WIDTH};
 
 use super::*;
 
