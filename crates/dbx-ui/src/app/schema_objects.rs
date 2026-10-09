@@ -1,5 +1,6 @@
 use super::*;
 use crate::workspace::SavedQuery;
+use dbx_core::SchemaObjectKind;
 
 impl DbxApp {
     pub(super) fn load_schema_objects_for(
@@ -92,9 +93,15 @@ impl DbxApp {
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(4.))
             .when(!objects.is_empty(), |view| {
-                view.child(div().p(px(8.)).text_size(px(11.)).child("Schema objects"))
+                view.child(
+                    div()
+                        .px(px(14.))
+                        .pt(px(8.))
+                        .text_size(px(11.))
+                        .text_color(theme().text_muted)
+                        .child("Schema objects"),
+                )
             })
             .when_some(session.schema_objects_error.clone(), |view, error| {
                 view.child(
@@ -106,30 +113,64 @@ impl DbxApp {
                 )
             })
             .children(objects.into_iter().enumerate().map(|(index, object)| {
-                button(
-                    SharedString::from(format!("schema-object-{session_id}-{index}")),
-                    SharedString::from(format!("{:?} {}", object.kind, object.name)),
-                    ButtonKind::Quiet,
+                let kind = match object.kind {
+                    SchemaObjectKind::Trigger => "Trigger",
+                    SchemaObjectKind::Sequence => "Sequence",
+                    SchemaObjectKind::Function => "Function",
+                    SchemaObjectKind::Procedure => "Procedure",
+                };
+                div().w_full().px(px(6.)).child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "schema-object-{session_id}-{index}"
+                        )))
+                        .w_full()
+                        .h(px(28.))
+                        .px(px(8.))
+                        .rounded(px(RADIUS_CONTROL))
+                        .text_size(px(12.))
+                        .text_color(theme().text)
+                        .flex()
+                        .items_center()
+                        .gap(px(7.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme().glass_hover))
+                        .tooltip(tip(object.name.clone()))
+                        .child(icon(Icon::Query, theme().text_muted))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(object.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.))
+                                .text_color(theme().text_muted)
+                                .child(kind),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(definition) = &object.definition {
+                                this.open_saved_query_for(
+                                    session_id,
+                                    SavedQuery {
+                                        name: object.name.clone(),
+                                        sql: definition.clone(),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.show_toast(
+                                    ToastKind::Info,
+                                    "This account cannot read the object definition",
+                                    cx,
+                                );
+                            }
+                        })),
                 )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if let Some(definition) = &object.definition {
-                        this.open_saved_query_for(
-                            session_id,
-                            SavedQuery {
-                                name: object.name.clone(),
-                                sql: definition.clone(),
-                            },
-                            window,
-                            cx,
-                        );
-                    } else {
-                        this.show_toast(
-                            ToastKind::Info,
-                            "This account cannot read the object definition",
-                            cx,
-                        );
-                    }
-                }))
             }))
             .into_any_element()
     }
