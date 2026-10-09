@@ -1,6 +1,8 @@
 use super::super::*;
 use crate::popups::DropdownMenu as _;
-use gpui_component::menu::PopupMenuItem;
+use crate::workspace::SavedQuery;
+use gpui::WeakEntity;
+use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 impl DbxApp {
     fn render_query_grid(
@@ -229,18 +231,8 @@ impl DbxApp {
         // Paint failed-query underlines only while the query revision still
         // matches the run that produced them; text edits clear the range.
         if sql_dialect {
-            let highlight = self
-                .session(session_id)
-                .and_then(|session| {
-                    let tab_id = session.active_secondary_tab?;
-                    let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
-                    let SecondaryTabKind::Query(query) = &tab.kind else {
-                        return None;
-                    };
-                    query.error_highlight.clone()
-                })
-                .map_or_else(Vec::new, |range| vec![range]);
-            query_editor.update(cx, |editor, cx| editor.set_diagnostics(highlight, cx));
+            let diagnostics = self.query_editor_diagnostics(session_id, cx);
+            query_editor.update(cx, |editor, cx| editor.set_diagnostics(diagnostics, cx));
         }
         let query_focus = query_editor.read(cx).focus_handle();
         let completion = query_focus
@@ -359,6 +351,15 @@ impl DbxApp {
             .unwrap();
         let name_focus = name_editor.read(cx).focus_handle();
         let history = self.recent_query_history_limited(session_id, 10);
+        let history_policy = self
+            .session(session_id)
+            .and_then(query_history_connection)
+            .and_then(|connection| {
+                self.workspace_documents
+                    .get(&crate::workspace::connection_key(&connection))
+            });
+        let history_disabled = history_policy.is_some_and(|document| document.history_disabled);
+        let history_retention = history_policy.map_or(100, |document| document.history_retention);
         let agent_open = self.agent_panel_open(session_id, tab_id);
         let agent_panel = self.render_agent_panel(session_id, tab_id, cx);
         let parameter_prompt = self.render_parameter_prompt(session_id, cx);
@@ -403,13 +404,43 @@ impl DbxApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .child(div().w(px(150.)).child(editor::input(name_editor, name_focus, false)))
-                    .child(Button::new("save-named-query").debug_selector(|| "save-named-query".into()).label("Save").ghost().with_size(Size::XSmall)
-                        .on_click(cx.listener(move |this, _, _, cx| this.save_named_query_for(session_id, cx))))
                     .border_color(theme().border)
                     .bg(theme().panel)
-                    // The tab already names the query; keep the actions right-aligned.
                     .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div().w(px(180.)).min_w(px(72.)).flex_shrink(1.).child(
+                                    editor::input_with_key_context(
+                                        name_editor,
+                                        name_focus,
+                                        false,
+                                        editor::TEXT_EDITOR_CONTEXT,
+                                    )
+                                    .h(px(28.))
+                                    .py(px(5.)),
+                                ),
+                            )
+                            .child(
+                                button("save-named-query", "Save", ButtonKind::Quiet)
+                                    .debug_selector(|| "save-named-query".into())
+                                    .tooltip("Save this query to the connection")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.save_named_query_for(session_id, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(7.))
+                            .child(
                         div()
                             .id("describe-query")
                             .h(px(28.))
@@ -500,279 +531,23 @@ impl DbxApp {
                                     .ghost()
                                     .tooltip("Query options")
                                     .child(icon(Icon::More, theme().text_muted))
-                                    .dropdown_menu(move |menu, _, _| {
-                                        let run_all = app.clone();
-                                        let format_query = app.clone();
-                                        let copy_selection = app.clone();
-                                        let copy_tsv = app.clone();
-                                        let copy_csv = app.clone();
-                                        let copy_json = app.clone();
-                                        let copy_insert = app.clone();
-                                        let export_insert = app.clone();
-                                        let export_tsv = app.clone();
-                                        let export_csv = app.clone();
-                                        let export_json = app.clone();
-                                        let reopen_last = app.clone();
-                                        let clear_history = app.clone();
-                                        let mut menu = menu;
-                                        let history_search = app.clone();
-                                        menu = menu.item(PopupMenuItem::new("Search local plaintext history… (history: SQL success:true after:YYYY-MM-DD)").on_click(move |_, window, cx| {
-                                            let _ = history_search.update(cx, |this, cx| this.search_history(window, cx));
-                                        }));
-                                        for (label, disabled) in [("Pause history recording for this connection", true), ("Resume history recording for this connection", false)] {
-                                            let policy = app.clone();
-                                            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                                                let _ = policy.update(cx, |this, cx| this.set_history_policy(session_id, Some(disabled), None, cx));
-                                            }));
-                                        }
-                                        for limit in [10, 30, 100] {
-                                            let policy = app.clone();
-                                            menu = menu.item(PopupMenuItem::new(format!("Keep {limit} history entries for this connection")).on_click(move |_, _, cx| {
-                                                let _ = policy.update(cx, |this, cx| this.set_history_policy(session_id, None, Some(limit), cx));
-                                            }));
-                                        }
-                                        if sql_dialect {
-                                            for (index, label) in ["Explain query", "Capture plan", "Compare plans", "Server sessions", "Lock waits", "Capture schema baseline", "Compare schema / draft migration"].into_iter().enumerate() {
-                                                let action = app.clone();
-                                                menu = menu.item(PopupMenuItem::new(label).disabled(busy).on_click(move |_, window, cx| {
-                                                    let _ = action.update(cx, |this, cx| match index {
-                                                        0 => this.explain_query_for(session_id, cx),
-                                                        1 => this.pin_plan_for(session_id, cx),
-                                                        2 => this.compare_plan_for(session_id, cx),
-                                                        3 => this.open_monitor_for(session_id, dbx_core::Monitor::Sessions, window, cx),
-                                                        4 => this.open_monitor_for(session_id, dbx_core::Monitor::Locks, window, cx),
-                                                        5 => this.inspect_schema_for(session_id, true, window, cx),
-                                                        _ => this.inspect_schema_for(session_id, false, window, cx),
-                                                    });
-                                                }));
-                                            }
-                                        }
-                                        if sql_dialect {
-                                            for (label, format) in [("Export full query as CSV…", dbx_core::QueryExportFormat::Csv), ("Export full query as TSV…", dbx_core::QueryExportFormat::Tsv), ("Export full query as typed JSONL…", dbx_core::QueryExportFormat::JsonLines)] {
-                                                let action = app.clone();
-                                                menu = menu.item(PopupMenuItem::new(label).disabled(busy).on_click(move |_, _, cx| {
-                                                    let _ = action.update(cx, |this, cx| this.export_full_query_for(session_id, format, cx));
-                                                }));
-                                            }
-                                        }
-                                        for seconds in [5, 30, 60, 300] {
-                                            let action = app.clone();
-                                            menu = menu.item(PopupMenuItem::new(format!("{}Query timeout: {seconds}s", if seconds == timeout_secs { "✓ " } else { "" })).on_click(move |_, _, cx| {
-                                                let _ = action.update(cx, |this, cx| this.set_query_timeout_for(session_id, seconds, cx));
-                                            }));
-                                        }
-                                        for saved in &saved_queries {
-                                            let saved = saved.clone();
-                                            let open = app.clone();
-                                            let remove = app.clone();
-                                            let name = saved.name.clone();
-                                            menu = menu.item(PopupMenuItem::new(format!("Open saved: {}", saved.name)).on_click(move |_, window, cx| {
-                                                let _ = open.update(cx, |this, cx| this.open_saved_query_for(session_id, saved.clone(), window, cx));
-                                            })).item(PopupMenuItem::new(format!("Delete saved: {name}")).on_click(move |_, _, cx| {
-                                                let _ = remove.update(cx, |this, cx| this.delete_saved_query_for(session_id, &name, cx));
-                                            }));
-                                        }
-                                        if sql_dialect {
-                                            menu = menu
-                                                .item(
-                                                    PopupMenuItem::new("Run all")
-                                                        .disabled(busy)
-                                                        .on_click(move |_, window, cx| {
-                                                            let _ = run_all.update(
-                                                                cx,
-                                                                |this, cx| {
-                                                                    this.request_run_query_for(
-                                                                        session_id, true, window, cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        }),
-                                                )
-                                                .item(PopupMenuItem::new("Format query").on_click(
-                                                    move |_, window, cx| {
-                                                        let _ =
-                                                            format_query.update(cx, |this, cx| {
-                                                                this.format_query_for(
-                                                                    session_id, window, cx,
-                                                                );
-                                                            });
-                                                    },
-                                                ));
-                                        }
-                                        let mut menu = menu
-                                            .separator()
-                                            .item(
-                                                PopupMenuItem::new("Copy selection")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = copy_selection.update(
-                                                            cx,
-                                                            |this, cx| {
-                                                                this.copy_query_selection_for(
-                                                                    session_id, cx,
-                                                                );
-                                                            },
-                                                        );
-                                                    }),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new("Copy result as TSV")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = copy_tsv.update(cx, |this, cx| {
-                                                            this.copy_query_result_for(
-                                                                session_id,
-                                                                QueryResultExportFormat::Tsv,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new("Copy result as CSV")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = copy_csv.update(cx, |this, cx| {
-                                                            this.copy_query_result_for(
-                                                                session_id,
-                                                                QueryResultExportFormat::Csv,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new("Copy result as JSON")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = copy_json.update(cx, |this, cx| {
-                                                            this.copy_query_result_for(
-                                                                session_id,
-                                                                QueryResultExportFormat::Json,
-                                                                cx,
-                                                            );
-                                                        });
-                                                    }),
-                                            )
-                                            .item(PopupMenuItem::new("Copy result as INSERT statements")
-                                                .disabled(!has_rowset).on_click(move |_, _, cx| {
-                                                    let _ = copy_insert.update(cx, |this, cx| this.copy_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
-                                                }))
-                                            .item(PopupMenuItem::new("Export loaded rows as INSERT statements…")
-                                                .disabled(!has_rowset).on_click(move |_, _, cx| {
-                                                    let _ = export_insert.update(cx, |this, cx| this.export_query_result_for(session_id, QueryResultExportFormat::Insert, cx));
-                                                }))
-                                            .separator()
-                                            .item(
-                                                PopupMenuItem::new("Export loaded rows as TSV…")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ =
-                                                            export_tsv.update(cx, |this, cx| {
-                                                                this.export_query_result_for(
-                                                                    session_id,
-                                                                    QueryResultExportFormat::Tsv,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                    }),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new("Export loaded rows as CSV…")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ =
-                                                            export_csv.update(cx, |this, cx| {
-                                                                this.export_query_result_for(
-                                                                    session_id,
-                                                                    QueryResultExportFormat::Csv,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                    }),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new("Export loaded rows as JSON…")
-                                                    .disabled(!has_rowset)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ =
-                                                            export_json.update(cx, |this, cx| {
-                                                                this.export_query_result_for(
-                                                                    session_id,
-                                                                    QueryResultExportFormat::Json,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                    }),
-                                            )
-                                            .separator()
-                                            .item(
-                                                PopupMenuItem::new("Reopen closed query").on_click(
-                                                    move |_, window, cx| {
-                                                        let _ =
-                                                            reopen_last.update(cx, |this, cx| {
-                                                                this.reopen_last_closed_query_for(
-                                                                    session_id, window, cx,
-                                                                );
-                                                            });
-                                                    },
-                                                ),
-                                            )
-                                            .item(
-                                                PopupMenuItem::new("Clear query history")
-                                                    .disabled(history.is_empty())
-                                                    .on_click(move |_, window, cx| {
-                                                        let _ =
-                                                            clear_history.update(cx, |this, cx| {
-                                                                this.request_clear_query_history_for(
-                                                                    session_id, window, cx,
-                                                                );
-                                                            });
-                                                    }),
-                                            );
-                                        if !history.is_empty() {
-                                            menu = menu.separator();
-                                            for (index, entry) in history.iter().enumerate() {
-                                                let entry = entry.clone();
-                                                let load_history = app.clone();
-                                                let compact_sql = entry
-                                                    .sql
-                                                    .split_whitespace()
-                                                    .collect::<Vec<_>>()
-                                                    .join(" ");
-                                                let compact_sql =
-                                                    if compact_sql.chars().count() > 56 {
-                                                        format!(
-                                                            "{}…",
-                                                            compact_sql
-                                                                .chars()
-                                                                .take(55)
-                                                                .collect::<String>()
-                                                        )
-                                                    } else {
-                                                        compact_sql
-                                                    };
-                                                menu = menu.item(
-                                                    PopupMenuItem::new(SharedString::from(
-                                                        format!(
-                                                            "Recent {}: {compact_sql}",
-                                                            index + 1
-                                                        ),
-                                                    ))
-                                                    .on_click(move |_, window, cx| {
-                                                        let _ =
-                                                            load_history.update(cx, |this, cx| {
-                                                                this.load_query_history_entry_for(
-                                                                    session_id, &entry, window, cx,
-                                                                );
-                                                            });
-                                                    }),
-                                                );
-                                            }
-                                        }
-                                        menu.scrollable(true)
+                                    .dropdown_menu({
+                                        let options = std::rc::Rc::new(QueryOptions {
+                                            app: app.clone(),
+                                            session_id,
+                                            sql: sql_dialect,
+                                            busy,
+                                            has_rowset,
+                                            timeout_secs,
+                                            saved: saved_queries.clone(),
+                                            history: history.clone(),
+                                            history_disabled,
+                                            history_retention,
+                                        });
+                                        move |menu, window, cx| options.clone().menu(menu, window, cx)
                                     }),
                             ),
+                    ),
                     ),
             )
             .when(in_transaction, |view| view.child(div().px(px(10.)).py(px(4.)).text_xs().text_color(theme().warning)
@@ -949,5 +724,269 @@ impl DbxApp {
                 ),
             )
             .into_any_element()
+    }
+}
+
+/// What the query tab's options menu acts on, shared by its submenus.
+struct QueryOptions {
+    app: WeakEntity<DbxApp>,
+    session_id: SessionId,
+    sql: bool,
+    busy: bool,
+    has_rowset: bool,
+    timeout_secs: u64,
+    saved: Vec<SavedQuery>,
+    history: Vec<QueryHistoryEntry>,
+    history_disabled: bool,
+    history_retention: usize,
+}
+
+impl QueryOptions {
+    /// A menu item that runs `action` on the app.
+    fn item(
+        &self,
+        label: impl Into<SharedString>,
+        action: impl Fn(&mut DbxApp, &mut Window, &mut Context<DbxApp>) + 'static,
+    ) -> PopupMenuItem {
+        let app = self.app.clone();
+        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            let _ = app.update(cx, |this, cx| action(this, window, cx));
+        })
+    }
+
+    fn menu(
+        self: std::rc::Rc<Self>,
+        mut menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let session_id = self.session_id;
+        if self.sql {
+            menu = menu
+                .item(
+                    self.item("Run all", move |this, window, cx| {
+                        this.request_run_query_for(session_id, true, window, cx)
+                    })
+                    .disabled(self.busy),
+                )
+                .item(self.item("Format query", move |this, window, cx| {
+                    this.format_query_for(session_id, window, cx)
+                }))
+                .separator()
+                .item(
+                    self.item("Explain query", move |this, _, cx| {
+                        this.explain_query_for(session_id, cx)
+                    })
+                    .disabled(self.busy),
+                );
+            let options = self.clone();
+            menu = menu.submenu("Diagnostics", window, cx, move |menu, _, _| {
+                let busy = options.busy;
+                menu.item(
+                    options
+                        .item("Capture plan", move |this, _, cx| {
+                            this.pin_plan_for(session_id, cx)
+                        })
+                        .disabled(busy),
+                )
+                .item(
+                    options
+                        .item("Compare plans", move |this, _, cx| {
+                            this.compare_plan_for(session_id, cx)
+                        })
+                        .disabled(busy),
+                )
+                .separator()
+                .item(options.item("Server sessions", move |this, window, cx| {
+                    this.open_monitor_for(session_id, dbx_core::Monitor::Sessions, window, cx)
+                }))
+                .item(options.item("Lock waits", move |this, window, cx| {
+                    this.open_monitor_for(session_id, dbx_core::Monitor::Locks, window, cx)
+                }))
+                .separator()
+                .item(
+                    options
+                        .item("Capture schema baseline", move |this, window, cx| {
+                            this.inspect_schema_for(session_id, true, window, cx)
+                        })
+                        .disabled(busy),
+                )
+                .item(
+                    options
+                        .item(
+                            "Compare schema / draft migration",
+                            move |this, window, cx| {
+                                this.inspect_schema_for(session_id, false, window, cx)
+                            },
+                        )
+                        .disabled(busy),
+                )
+            });
+            menu = menu.separator();
+        }
+
+        let options = self.clone();
+        menu = menu.submenu("Copy result", window, cx, move |mut menu, _, _| {
+            let rows = options.has_rowset;
+            menu = menu.item(
+                options
+                    .item("Selection", move |this, _, cx| {
+                        this.copy_query_selection_for(session_id, cx)
+                    })
+                    .disabled(!rows),
+            );
+            for (label, format) in [
+                ("As TSV", QueryResultExportFormat::Tsv),
+                ("As CSV", QueryResultExportFormat::Csv),
+                ("As JSON", QueryResultExportFormat::Json),
+                ("As INSERT statements", QueryResultExportFormat::Insert),
+            ] {
+                menu = menu.item(
+                    options
+                        .item(label, move |this, _, cx| {
+                            this.copy_query_result_for(session_id, format, cx)
+                        })
+                        .disabled(!rows),
+                );
+            }
+            menu
+        });
+        let options = self.clone();
+        menu = menu.submenu("Export", window, cx, move |mut menu, _, _| {
+            menu = menu.label("Loaded rows");
+            for (label, format) in [
+                ("CSV…", QueryResultExportFormat::Csv),
+                ("TSV…", QueryResultExportFormat::Tsv),
+                ("JSON…", QueryResultExportFormat::Json),
+                ("INSERT statements…", QueryResultExportFormat::Insert),
+            ] {
+                menu = menu.item(
+                    options
+                        .item(label, move |this, _, cx| {
+                            this.export_query_result_for(session_id, format, cx)
+                        })
+                        .disabled(!options.has_rowset),
+                );
+            }
+            if options.sql {
+                menu = menu.separator().label("Full query");
+                for (label, format) in [
+                    ("CSV…", dbx_core::QueryExportFormat::Csv),
+                    ("TSV…", dbx_core::QueryExportFormat::Tsv),
+                    ("Typed JSONL…", dbx_core::QueryExportFormat::JsonLines),
+                ] {
+                    menu = menu.item(
+                        options
+                            .item(label, move |this, _, cx| {
+                                this.export_full_query_for(session_id, format, cx)
+                            })
+                            .disabled(options.busy),
+                    );
+                }
+            }
+            menu
+        });
+        menu = menu.separator();
+
+        if !self.saved.is_empty() {
+            let options = self.clone();
+            menu = menu.submenu("Saved queries", window, cx, move |mut menu, window, cx| {
+                for saved in &options.saved {
+                    let saved = saved.clone();
+                    menu = menu.item(options.item(saved.name.clone(), move |this, window, cx| {
+                        this.open_saved_query_for(session_id, saved.clone(), window, cx)
+                    }));
+                }
+                let delete = options.clone();
+                menu.separator()
+                    .submenu("Delete", window, cx, move |mut menu, _, _| {
+                        for saved in &delete.saved {
+                            let name = saved.name.clone();
+                            menu =
+                                menu.item(delete.item(saved.name.clone(), move |this, _, cx| {
+                                    this.delete_saved_query_for(session_id, &name, cx)
+                                }));
+                        }
+                        menu
+                    })
+            });
+        }
+        let options = self.clone();
+        menu = menu.submenu("History", window, cx, move |mut menu, window, cx| {
+            menu = menu.item(options.item("Search…", |this, window, cx| {
+                this.search_history(window, cx)
+            }));
+            if !options.history.is_empty() {
+                menu = menu.separator().label("Recent");
+                for entry in &options.history {
+                    let entry = entry.clone();
+                    let compact = entry.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let label = if compact.chars().count() > 56 {
+                        format!("{}…", compact.chars().take(55).collect::<String>())
+                    } else {
+                        compact
+                    };
+                    menu = menu.item(options.item(label, move |this, window, cx| {
+                        this.load_query_history_entry_for(session_id, &entry, window, cx)
+                    }));
+                }
+            }
+            let recording = !options.history_disabled;
+            let retention = options.clone();
+            menu.separator()
+                .item(
+                    options
+                        .item("Record history", move |this, _, cx| {
+                            this.set_history_policy(session_id, Some(recording), None, cx)
+                        })
+                        .checked(recording),
+                )
+                .submenu("Keep", window, cx, move |mut menu, _, _| {
+                    for limit in [10, 30, 100] {
+                        menu = menu.item(
+                            retention
+                                .item(format!("{limit} entries"), move |this, _, cx| {
+                                    this.set_history_policy(session_id, None, Some(limit), cx)
+                                })
+                                .checked(retention.history_retention == limit),
+                        );
+                    }
+                    menu
+                })
+                .separator()
+                .item(
+                    options
+                        .item("Clear history…", move |this, window, cx| {
+                            this.request_clear_query_history_for(session_id, window, cx)
+                        })
+                        .disabled(options.history.is_empty()),
+                )
+        });
+        let options = self.clone();
+        menu = menu.submenu("Timeout", window, cx, move |mut menu, _, _| {
+            for seconds in [5, 30, 60, 300] {
+                let label = if seconds < 60 {
+                    format!("{seconds} seconds")
+                } else {
+                    format!(
+                        "{} minute{}",
+                        seconds / 60,
+                        if seconds == 60 { "" } else { "s" }
+                    )
+                };
+                menu = menu.item(
+                    options
+                        .item(label, move |this, _, cx| {
+                            this.set_query_timeout_for(session_id, seconds, cx)
+                        })
+                        .checked(options.timeout_secs == seconds),
+                );
+            }
+            menu
+        });
+        menu.separator()
+            .item(self.item("Reopen closed query", move |this, window, cx| {
+                this.reopen_last_closed_query_for(session_id, window, cx)
+            }))
     }
 }

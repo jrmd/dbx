@@ -466,7 +466,7 @@ impl FieldRow {
             TextEditor::new_with_language(
                 value.clone(),
                 false,
-                EditorLanguage::Sql,
+                EditorLanguage::Sql(None),
                 window,
                 editor_cx,
             )

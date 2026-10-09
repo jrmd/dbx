@@ -205,7 +205,7 @@ impl Engine for DuckEngine {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
-        if crate::split_sql_statements(&statement.sql).len() > 1 {
+        if crate::script::split_sql_statements_for(DatabaseKind::DuckDB, &statement.sql).len() > 1 {
             return Err(DbxError::Parse(
                 "Run one DuckDB SQL statement at a time".into(),
             ));
@@ -268,7 +268,7 @@ impl Engine for DuckEngine {
         .map_err(|_| DbxError::Query("DuckDB query worker failed".into()))?
     }
     async fn execute(&self, statement: &SqlStatement) -> Result<ExecResult> {
-        if crate::split_sql_statements(&statement.sql).len() > 1 {
+        if crate::script::split_sql_statements_for(DatabaseKind::DuckDB, &statement.sql).len() > 1 {
             return Err(DbxError::Parse(
                 "Run one DuckDB SQL statement at a time".into(),
             ));

@@ -20,10 +20,13 @@ mod console;
 mod diagnostics;
 mod engine;
 mod error;
+pub mod language;
 mod model;
+mod parameters;
 mod protected;
 mod redis_catalog;
 mod redis_engine;
+mod script;
 mod sql;
 mod sqlx_engine;
 mod transfer;
@@ -47,6 +50,10 @@ pub use model::{
 };
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
 pub use redis_engine::RedisEngine;
+pub use script::{
+    ScriptSpan, checked_split_sql_for, split_sql_statements, sql_backslash_escapes,
+    sql_dollar_quotes, sql_hash_comments, sql_statement_spans,
+};
 pub use sql::{
     SqlStatement, build_count, build_create_table, build_delete, build_delete_with_columns,
     build_drop_table, build_insert, build_insert_with_columns, build_multi_row_insert,
@@ -54,13 +61,12 @@ pub use sql::{
     build_update, build_update_with_columns, quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
-pub use transfer::checked_split_sql_for;
 pub use transfer::{
     DatabaseExportRequest, DatabaseExportSummary, DelimitedReader, DumpFormat, ExportSummary,
     FileFormat, ImportReport, QueryExportFormat, TransferControl, atomic_export,
     detect_file_format, export_database, export_query, export_table, import_database, import_file,
     render_row_change, render_sql_indexes, render_sql_insert, render_sql_schema,
-    split_sql_statements, with_transfer_control, write_atomic_export,
+    with_transfer_control, write_atomic_export,
 };
 
 #[cfg(test)]
@@ -524,7 +530,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             statement.sql,
-            "SELECT * FROM \"users\" WHERE \"id\" = CAST($1 AS uuid) AND \"name\" <> $2 AND \"seen_at\" > CAST($3 AS timestamp with time zone) AND CAST(\"id\" AS text) LIKE $4 ESCAPE '!' AND \"name\" LIKE $5 ESCAPE '!'"
+            "SELECT * FROM \"users\" WHERE \"id\" = CAST($1 AS uuid) AND \"name\" <> $2 AND \"seen_at\" > CAST($3 AS timestamp with time zone) AND CAST(\"id\" AS text) ILIKE $4 ESCAPE '!' AND \"name\" ILIKE $5 ESCAPE '!'"
         );
 
         let delete = build_delete_with_columns(
@@ -668,6 +674,41 @@ mod tests {
             "SELECT * FROM \"items\" WHERE \"deleted_at\" IS NULL"
         );
         assert!(statement.params.is_empty());
+    }
+
+    #[test]
+    fn postgres_equality_filters_compare_types_without_equals_as_text() {
+        let columns = [
+            typed_column("spot", "point"),
+            typed_column("markup", "xml"),
+            typed_column("id", "integer"),
+        ];
+        let statement = build_select_with_columns(
+            DatabaseKind::PostgreSQL,
+            &TableRef::new("places"),
+            &[],
+            &[
+                Filter::new(
+                    "spot",
+                    FilterOperator::Equals,
+                    Some(CellValue::Text("(1,2)".into())),
+                ),
+                Filter::new(
+                    "markup",
+                    FilterOperator::NotEquals,
+                    Some(CellValue::Text("<a/>".into())),
+                ),
+                Filter::new("spot", FilterOperator::Equals, Some(CellValue::Null)),
+                Filter::new("id", FilterOperator::Equals, Some(CellValue::Integer(3))),
+            ],
+            &[],
+            None,
+            &columns,
+        )
+        .unwrap();
+        assert!(statement.sql.ends_with(
+            "WHERE CAST(\"spot\" AS text) = $1 AND CAST(\"markup\" AS text) <> $2 AND \"spot\" IS NULL AND \"id\" = $3"
+        ));
     }
 
     #[test]

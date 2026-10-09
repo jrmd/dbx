@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use dbx_core::{ColumnInfo, DatabaseKind, EntityKind, QueryResult, TableInfo, TableRef};
 
-use crate::editor::{self, SqlCompletionTarget};
+use crate::editor::{self, SqlCompletionTarget, SqlDialect};
 
 fn table_ref(table: &TableInfo) -> TableRef {
     TableRef {
@@ -144,8 +144,9 @@ pub(super) fn sql_completion_items(
     context: &editor::SqlCompletionContext,
     sources: SqlCompletionRequest<'_>,
 ) -> Vec<SqlCompletionItem> {
+    let dialect = Some(sources.database_kind);
     let index = infer_sql_query_index(query_text, cursor, &sources);
-    let area = sql_completion_area(query_text, cursor, context, &index);
+    let area = sql_completion_area(query_text, cursor, context, &index, dialect);
     let SqlCompletionRequest {
         database_kind,
         tables,
@@ -179,7 +180,7 @@ pub(super) fn sql_completion_items(
     match area {
         SqlCompletionArea::General => {
             push_sql_keywords(&mut push, append_separator);
-            if sql_is_create_table_columns(query_text, cursor) {
+            if sql_is_create_table_columns(query_text, cursor, dialect) {
                 push_sql_types(&mut push, append_separator);
             }
             push_sql_functions(&mut push);
@@ -355,23 +356,66 @@ fn completion_match_score(search_text: &str, prefix: &str) -> Option<u8> {
     lowered.contains(prefix).then_some(3)
 }
 
+/// A relation a statement reads: a table, view or CTE, maybe aliased.
+#[derive(Clone, Debug)]
+pub(super) struct StatementSource {
+    pub(super) relation: String,
+    pub(super) schema: Option<String>,
+    pub(super) alias: Option<String>,
+    pub(super) columns: Vec<ColumnInfo>,
+    pub(super) cte: bool,
+}
+
+/// The CTEs a statement defines and the relations it reads, for the
+/// statement at `cursor`.
+pub(super) fn statement_sources(
+    query_text: &str,
+    cursor: usize,
+    request: &SqlCompletionRequest<'_>,
+) -> (Vec<StatementSource>, Vec<StatementSource>) {
+    let index = infer_sql_query_index(query_text, cursor, request);
+    let is_cte = |source: &SqlQuerySource| {
+        source.schema.is_none()
+            && index
+                .ctes
+                .iter()
+                .any(|cte| cte.relation.eq_ignore_ascii_case(&source.relation))
+    };
+    let convert = |source: &SqlQuerySource, cte: bool| StatementSource {
+        relation: source.relation.clone(),
+        schema: source.schema.clone(),
+        alias: source.alias.clone(),
+        columns: source.columns.clone(),
+        cte,
+    };
+    (
+        index.ctes.iter().map(|cte| convert(cte, true)).collect(),
+        index
+            .sources
+            .iter()
+            .map(|source| convert(source, is_cte(source)))
+            .collect(),
+    )
+}
+
 fn infer_sql_query_index(
     query_text: &str,
     cursor: usize,
     sources: &SqlCompletionRequest<'_>,
 ) -> SqlQueryIndex {
+    let dialect = Some(sources.database_kind);
     let cursor = cursor.min(query_text.len());
-    let (statement_start, statement_end) = sql_statement_bounds(query_text, cursor);
+    let (statement_start, statement_end) = sql_statement_bounds(query_text, cursor, dialect);
     let statement_text = &query_text[statement_start..statement_end];
     let statement_cursor = cursor
         .saturating_sub(statement_start)
         .min(statement_text.len());
     let query_prefix = &statement_text[..statement_text.floor_char_boundary(statement_cursor)];
-    let (_, current_depth) = sql_query_tokens(query_prefix);
-    let scopes = sql_parenthesis_scopes(statement_text);
+    let (_, current_depth) = sql_query_tokens(query_prefix, dialect);
+    let scopes = sql_parenthesis_scopes(statement_text, dialect);
     let (current_scope_start, current_scope_end) =
         sql_scope_for_position(statement_cursor, &scopes, statement_text.len());
-    let (tokens, _) = sql_query_tokens(statement_text);
+    let (tokens, _) = sql_query_tokens(statement_text, dialect);
     let ctes = infer_sql_ctes(statement_text, &tokens, sources, &scopes);
     let mut index = SqlQueryIndex {
         ctes,
@@ -419,7 +463,7 @@ fn infer_sql_query_index(
     }
 
     index.projection_aliases = infer_projection_columns(statement_text, sources);
-    index.insert_columns = infer_insert_columns(query_prefix);
+    index.insert_columns = infer_insert_columns(query_prefix, dialect);
     index
 }
 
@@ -428,24 +472,25 @@ fn sql_completion_area(
     cursor: usize,
     context: &editor::SqlCompletionContext,
     index: &SqlQueryIndex,
+    dialect: SqlDialect,
 ) -> SqlCompletionArea {
     let cursor = cursor.min(query_text.len());
-    let (statement_start, statement_end) = sql_statement_bounds(query_text, cursor);
+    let (statement_start, statement_end) = sql_statement_bounds(query_text, cursor, dialect);
     let statement_text = &query_text[statement_start..statement_end];
     let statement_cursor = cursor
         .saturating_sub(statement_start)
         .min(statement_text.len());
 
-    if sql_is_insert_column_list(statement_text, statement_cursor) {
+    if sql_is_insert_column_list(statement_text, statement_cursor, dialect) {
         return SqlCompletionArea::Column;
     }
-    if sql_is_insert_values_list(statement_text, statement_cursor) {
+    if sql_is_insert_values_list(statement_text, statement_cursor, dialect) {
         return SqlCompletionArea::General;
     }
-    if sql_is_create_table_columns(statement_text, statement_cursor) {
+    if sql_is_create_table_columns(statement_text, statement_cursor, dialect) {
         return SqlCompletionArea::Type;
     }
-    if sql_is_ddl_type_context(statement_text, statement_cursor) {
+    if sql_is_ddl_type_context(statement_text, statement_cursor, dialect) {
         return SqlCompletionArea::Type;
     }
     if context.target == SqlCompletionTarget::Table {
@@ -456,7 +501,7 @@ fn sql_completion_area(
     }
 
     let query_prefix = &statement_text[..statement_text.floor_char_boundary(statement_cursor)];
-    let (tokens, _) = sql_query_tokens(query_prefix);
+    let (tokens, _) = sql_query_tokens(query_prefix, dialect);
     let Some(keyword) = tokens
         .iter()
         .rev()
@@ -477,11 +522,11 @@ fn sql_completion_area(
     }
 }
 
-fn sql_query_tokens(text: &str) -> (Vec<SqlQueryToken>, usize) {
+fn sql_query_tokens(text: &str, dialect: SqlDialect) -> (Vec<SqlQueryToken>, usize) {
     let mut depth = 0;
     let mut offset = 0;
     let mut tokens = Vec::new();
-    for token in editor::lex_sql(text) {
+    for token in editor::lex_sql_for(text, dialect) {
         sql_update_parenthesis_depth(&mut depth, &text[offset..token.range.start]);
         let raw = text[token.range.clone()].to_owned();
         tokens.push(SqlQueryToken {
@@ -498,11 +543,11 @@ fn sql_query_tokens(text: &str) -> (Vec<SqlQueryToken>, usize) {
     (tokens, depth)
 }
 
-fn sql_statement_bounds(text: &str, cursor: usize) -> (usize, usize) {
+fn sql_statement_bounds(text: &str, cursor: usize, dialect: SqlDialect) -> (usize, usize) {
     let cursor = cursor.min(text.len());
     let mut separators = Vec::new();
     let mut offset = 0;
-    for token in editor::lex_sql(text) {
+    for token in editor::lex_sql_for(text, dialect) {
         sql_collect_statement_separators(text, offset, token.range.start, &mut separators);
         offset = token.range.end;
     }
@@ -534,8 +579,8 @@ fn sql_collect_statement_separators(
     );
 }
 
-fn sql_parenthesis_scopes(text: &str) -> Vec<(usize, usize)> {
-    let tokens = editor::lex_sql(text);
+fn sql_parenthesis_scopes(text: &str, dialect: SqlDialect) -> Vec<(usize, usize)> {
+    let tokens = editor::lex_sql_for(text, dialect);
     let mut scopes = Vec::new();
     let mut open_positions = Vec::new();
     let mut offset = 0;
@@ -647,21 +692,25 @@ fn sql_gap_is_only(text: &str, start: usize, end: usize, expected: char) -> bool
     found
 }
 
-fn sql_current_open_parenthesis(query_text: &str, cursor: usize) -> Option<usize> {
+fn sql_current_open_parenthesis(
+    query_text: &str,
+    cursor: usize,
+    dialect: SqlDialect,
+) -> Option<usize> {
     let cursor = cursor.min(query_text.len());
     let prefix = &query_text[..query_text.floor_char_boundary(cursor)];
-    let scopes = sql_parenthesis_scopes(prefix);
+    let scopes = sql_parenthesis_scopes(prefix, dialect);
     let (scope_start, _) = sql_scope_for_position(prefix.len(), &scopes, prefix.len());
     let open = scope_start.checked_sub(1)?;
     (prefix.as_bytes().get(open) == Some(&b'(')).then_some(open)
 }
 
-fn sql_is_insert_column_list(query_text: &str, cursor: usize) -> bool {
+fn sql_is_insert_column_list(query_text: &str, cursor: usize, dialect: SqlDialect) -> bool {
     let prefix = &query_text[..query_text.floor_char_boundary(cursor.min(query_text.len()))];
-    let Some(open) = sql_current_open_parenthesis(query_text, cursor) else {
+    let Some(open) = sql_current_open_parenthesis(query_text, cursor, dialect) else {
         return false;
     };
-    let (tokens, _) = sql_query_tokens(&prefix[..open]);
+    let (tokens, _) = sql_query_tokens(&prefix[..open], dialect);
     let Some(into_index) = tokens
         .iter()
         .rposition(|token| token.text == "into" && token.kind == editor::SqlTokenKind::Keyword)
@@ -681,12 +730,12 @@ fn sql_is_insert_column_list(query_text: &str, cursor: usize) -> bool {
         })
 }
 
-fn sql_is_insert_values_list(query_text: &str, cursor: usize) -> bool {
+fn sql_is_insert_values_list(query_text: &str, cursor: usize, dialect: SqlDialect) -> bool {
     let prefix = &query_text[..query_text.floor_char_boundary(cursor.min(query_text.len()))];
-    let Some(open) = sql_current_open_parenthesis(query_text, cursor) else {
+    let Some(open) = sql_current_open_parenthesis(query_text, cursor, dialect) else {
         return false;
     };
-    let (tokens, _) = sql_query_tokens(&prefix[..open]);
+    let (tokens, _) = sql_query_tokens(&prefix[..open], dialect);
     let Some(values_index) = tokens
         .iter()
         .rposition(|token| token.text == "values" && token.kind == editor::SqlTokenKind::Keyword)
@@ -699,12 +748,12 @@ fn sql_is_insert_values_list(query_text: &str, cursor: usize) -> bool {
         .any(|token| token.text == "insert" && token.kind == editor::SqlTokenKind::Keyword)
 }
 
-fn sql_is_create_table_columns(query_text: &str, cursor: usize) -> bool {
+fn sql_is_create_table_columns(query_text: &str, cursor: usize, dialect: SqlDialect) -> bool {
     let prefix = &query_text[..query_text.floor_char_boundary(cursor.min(query_text.len()))];
-    let Some(open) = sql_current_open_parenthesis(query_text, cursor) else {
+    let Some(open) = sql_current_open_parenthesis(query_text, cursor, dialect) else {
         return false;
     };
-    let (tokens, depth) = sql_query_tokens(&prefix[..open]);
+    let (tokens, depth) = sql_query_tokens(&prefix[..open], dialect);
     let Some(create_index) = tokens.iter().rposition(|token| {
         token.text == "create"
             && token.kind == editor::SqlTokenKind::Keyword
@@ -723,9 +772,9 @@ fn sql_is_create_table_columns(query_text: &str, cursor: usize) -> bool {
             .is_some_and(|token| matches!(token.text.as_str(), "check" | "constraint"))
 }
 
-fn sql_is_ddl_type_context(query_text: &str, cursor: usize) -> bool {
+fn sql_is_ddl_type_context(query_text: &str, cursor: usize, dialect: SqlDialect) -> bool {
     let prefix = &query_text[..query_text.floor_char_boundary(cursor.min(query_text.len()))];
-    let (tokens, _) = sql_query_tokens(prefix);
+    let (tokens, _) = sql_query_tokens(prefix, dialect);
     let Some(alter_index) = tokens
         .iter()
         .rposition(|token| token.text == "alter" && token.kind == editor::SqlTokenKind::Keyword)
@@ -755,6 +804,7 @@ fn infer_sql_ctes(
     sources: &SqlCompletionRequest<'_>,
     scopes: &[(usize, usize)],
 ) -> Vec<SqlQuerySource> {
+    let dialect = Some(sources.database_kind);
     let mut ctes = Vec::new();
     for (with_index, with_token) in tokens
         .iter()
@@ -779,7 +829,7 @@ fn infer_sql_ctes(
                 break;
             };
             let declared_columns =
-                sql_cte_column_names(query_text, name_token.end, tokens[as_index].start);
+                sql_cte_column_names(query_text, name_token.end, tokens[as_index].start, dialect);
             let Some(mut body_first) = sql_next_word(tokens, as_index + 1) else {
                 break;
             };
@@ -846,14 +896,19 @@ fn infer_sql_ctes(
     ctes
 }
 
-fn sql_cte_column_names(query_text: &str, start: usize, end: usize) -> Option<Vec<String>> {
+fn sql_cte_column_names(
+    query_text: &str,
+    start: usize,
+    end: usize,
+    dialect: SqlDialect,
+) -> Option<Vec<String>> {
     let declaration = query_text.get(start..end)?;
     let open = declaration.find('(')?;
     let close = declaration.rfind(')')?;
     if close <= open {
         return None;
     }
-    let (tokens, _) = sql_query_tokens(&declaration[open + 1..close]);
+    let (tokens, _) = sql_query_tokens(&declaration[open + 1..close], dialect);
     let names = tokens
         .into_iter()
         .filter(sql_token_is_word)
@@ -1109,7 +1164,7 @@ fn infer_projection_columns(
     query_text: &str,
     sources: &SqlCompletionRequest<'_>,
 ) -> Vec<ColumnInfo> {
-    let (tokens, _) = sql_query_tokens(query_text);
+    let (tokens, _) = sql_query_tokens(query_text, Some(sources.database_kind));
     let Some(select_depth) = tokens
         .iter()
         .filter(|token| token.text == "select" && token.kind == editor::SqlTokenKind::Keyword)
@@ -1201,14 +1256,14 @@ fn projection_column(
     )
 }
 
-fn infer_insert_columns(query_text: &str) -> HashSet<String> {
-    if !sql_is_insert_column_list(query_text, query_text.len()) {
+fn infer_insert_columns(query_text: &str, dialect: SqlDialect) -> HashSet<String> {
+    if !sql_is_insert_column_list(query_text, query_text.len(), dialect) {
         return HashSet::new();
     }
     let Some(open) = query_text.rfind('(') else {
         return HashSet::new();
     };
-    let (tokens, _) = sql_query_tokens(&query_text[open + 1..]);
+    let (tokens, _) = sql_query_tokens(&query_text[open + 1..], dialect);
     tokens
         .into_iter()
         .filter(|token| token.kind == editor::SqlTokenKind::Identifier)
@@ -1262,7 +1317,8 @@ fn push_sql_functions(push: &mut impl FnMut(SqlCompletionItem)) {
         push(SqlCompletionItem {
             label: (*function).into(),
             insert_text,
-            detail: "function".into(),
+            detail: editor::function_signature(function)
+                .map_or_else(|| "function".into(), |signature| signature.label()),
             search_text: (*function).into(),
             kind: CompletionItemKind::Function,
         });

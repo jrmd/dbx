@@ -17,7 +17,7 @@
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fs,
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -95,6 +95,7 @@ pub(crate) fn report_transfer(rows: u64, statements: u64) {
 }
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
+use crate::script::{MAX_TRANSFER_RECORD_BYTES, SqlScriptReader, checked_split_sql_for};
 use crate::{
     CellValue, ColumnInfo, DatabaseEngine, DatabaseKind, DbxError, Filter, MutationValue, Page,
     QueryOptions, Result, RowChange, RowData, TableRef, TableStructure,
@@ -2405,468 +2406,6 @@ fn delimited_value_field(value: &CellValue) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// SQL script splitting
-// ---------------------------------------------------------------------------
-
-/// Split a SQL script into individual statements.
-///
-/// Understands single/double-quoted strings and backtick identifiers,
-/// `--`/`#` line comments, nested block comments, PostgreSQL dollar-quoted
-/// strings, and MySQL-style `DELIMITER` directives so routine bodies from
-/// real-world dumps survive intact. Trailing content without a terminator is
-/// returned as one final statement when it is not blank. The function never
-/// fails: malformed scripts simply produce statements the engine will
-/// reject with its own diagnostics.
-pub fn split_sql_statements(script: &str) -> Vec<String> {
-    checked_split_sql_statements(script).unwrap_or_else(|_| vec![script.to_owned()])
-}
-pub(crate) fn checked_split_sql_statements(script: &str) -> Result<Vec<String>> {
-    checked_split_sql_for(None, script)
-}
-pub fn checked_split_sql_for(kind: Option<DatabaseKind>, script: &str) -> Result<Vec<String>> {
-    if kind == Some(DatabaseKind::SqlServer) {
-        return split_sql_server_script(script);
-    }
-    let mut reader = SqlScriptReader::with_kind(script.as_bytes(), kind);
-    let mut statements = Vec::new();
-    while let Some(statement) = reader.next_statement().map_err(io_error)? {
-        statements.push(statement);
-    }
-    Ok(statements)
-}
-
-/// T-SQL module bodies (procedures, functions, triggers, views) contain
-/// semicolons but must reach the server as one batch, ended by `GO`.
-fn split_sql_server_script(script: &str) -> Result<Vec<String>> {
-    let mut batches = vec![String::new()];
-    for line in script.split_inclusive('\n') {
-        if line.trim().eq_ignore_ascii_case("go") {
-            batches.push(String::new());
-        } else if let Some(batch) = batches.last_mut() {
-            batch.push_str(line);
-        }
-    }
-    let mut statements = Vec::new();
-    for batch in batches {
-        let words = sql_words_for(&batch);
-        let module = matches!(words.first().map(String::as_str), Some("CREATE" | "ALTER"))
-            && words
-                .iter()
-                .skip(1)
-                .find(|word| !matches!(word.as_str(), "OR" | "ALTER"))
-                .is_some_and(|word| {
-                    matches!(
-                        word.as_str(),
-                        "PROCEDURE" | "PROC" | "FUNCTION" | "TRIGGER" | "VIEW"
-                    )
-                });
-        if module {
-            let trimmed = batch.trim();
-            if !trimmed.is_empty() {
-                statements.push(trimmed.to_owned());
-            }
-            continue;
-        }
-        let mut reader =
-            SqlScriptReader::with_kind(batch.as_bytes(), Some(DatabaseKind::SqlServer));
-        while let Some(statement) = reader.next_statement().map_err(io_error)? {
-            statements.push(statement);
-        }
-    }
-    Ok(statements)
-}
-
-/// The first few upper-cased words of a batch, skipping leading comments.
-fn sql_words_for(batch: &str) -> Vec<String> {
-    let mut text = batch.trim_start();
-    loop {
-        if let Some(rest) = text.strip_prefix("--") {
-            text = rest
-                .split_once('\n')
-                .map_or("", |(_, rest)| rest)
-                .trim_start();
-        } else if let Some(rest) = text.strip_prefix("/*") {
-            text = rest
-                .split_once("*/")
-                .map_or("", |(_, rest)| rest)
-                .trim_start();
-        } else {
-            break;
-        }
-    }
-    text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .filter(|word| !word.is_empty())
-        .take(4)
-        .map(str::to_ascii_uppercase)
-        .collect()
-}
-
-#[derive(Clone)]
-enum ScriptState {
-    Normal,
-    LineComment,
-    BlockComment(usize, bool),
-    SingleQuote(bool),
-    DoubleQuote,
-    Backtick,
-    Dollar(String),
-}
-
-const MAX_TRANSFER_RECORD_BYTES: usize = 64 * 1024 * 1024;
-struct SqlScriptReader<R> {
-    kind: Option<DatabaseKind>,
-    input: R,
-    state: ScriptState,
-    delimiter: String,
-    trigger: bool,
-    trigger_depth: usize,
-    current: String,
-    ready: VecDeque<String>,
-    at_line_start: bool,
-    first_line: bool,
-    ended: bool,
-}
-impl<R: BufRead> SqlScriptReader<R> {
-    fn with_kind(input: R, kind: Option<DatabaseKind>) -> Self {
-        Self {
-            kind,
-            input,
-            state: ScriptState::Normal,
-            delimiter: ";".into(),
-            trigger: false,
-            trigger_depth: 0,
-            current: String::new(),
-            ready: VecDeque::new(),
-            at_line_start: true,
-            first_line: true,
-            ended: false,
-        }
-    }
-    fn next_statement(&mut self) -> io::Result<Option<String>> {
-        loop {
-            if let Some(statement) = self.ready.pop_front() {
-                return Ok(Some(statement));
-            }
-            if self.ended {
-                return Ok(None);
-            }
-            let mut line = String::new();
-            let count = (&mut self.input)
-                .take((MAX_TRANSFER_RECORD_BYTES + 1) as u64)
-                .read_line(&mut line)?;
-            if line.len() > MAX_TRANSFER_RECORD_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SQL line exceeds the 64 MiB transfer budget",
-                ));
-            }
-            if count == 0 {
-                self.ended = true;
-                let remaining = std::mem::take(&mut self.current);
-                if !remaining.trim().is_empty() {
-                    return Ok(Some(remaining.trim().to_owned()));
-                }
-                return Ok(None);
-            }
-            if self.first_line {
-                line = line.trim_start_matches('\u{feff}').to_owned();
-                self.first_line = false;
-            }
-            self.feed(&line)?;
-        }
-    }
-    fn feed(&mut self, script: &str) -> io::Result<()> {
-        let characters: Vec<char> = script.chars().collect();
-        let mut statements = Vec::new();
-        let mut current = std::mem::take(&mut self.current);
-        let mut delimiter = self.delimiter.clone();
-        let mut state = self.state.clone();
-        let mut at_line_start = self.at_line_start;
-        let mut index = 0usize;
-        while index < characters.len() {
-            if current.len() > MAX_TRANSFER_RECORD_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SQL statement exceeds the 64 MiB transfer budget",
-                ));
-            }
-            let character = characters[index];
-            let matches_here = |needle: &str, at: usize| {
-                characters[at..].starts_with(needle.chars().collect::<Vec<_>>().as_slice())
-            };
-            match state.clone() {
-                ScriptState::Normal => {
-                    if at_line_start
-                        && current.trim().is_empty()
-                        && matches_here_ci(&characters, index, "delimiter")
-                        && characters
-                            .get(index + "delimiter".len())
-                            .is_some_and(|next| next.is_whitespace())
-                    {
-                        index += "delimiter".len();
-                        let mut token = String::new();
-                        while let Some(&next) = characters.get(index) {
-                            if next == '\n' || next == '\r' {
-                                break;
-                            }
-                            token.push(next);
-                            index += 1;
-                        }
-                        let trimmed = token.trim();
-                        if !trimmed.is_empty() {
-                            delimiter = trimmed.to_owned();
-                        }
-                        continue;
-                    }
-                    // T-SQL clients separate batches with a line holding
-                    // only GO; it is not SQL the server understands.
-                    if self.kind == Some(DatabaseKind::SqlServer)
-                        && matches_here_ci(&characters, index, "go")
-                        && characters[..index].iter().all(|c| c.is_whitespace())
-                        && characters[index + 2..].iter().all(|c| c.is_whitespace())
-                    {
-                        let trimmed = current.trim();
-                        if !trimmed.is_empty() {
-                            statements.push(trimmed.to_owned());
-                        }
-                        current.clear();
-                        at_line_start = true;
-                        index = characters.len();
-                        continue;
-                    }
-                    if character == '-' && matches_here("--", index) {
-                        state = ScriptState::LineComment;
-                        index += 2;
-                        continue;
-                    }
-                    // `#name` is a temporary table in T-SQL, not a comment.
-                    if character == '#' && self.kind != Some(DatabaseKind::SqlServer) {
-                        state = ScriptState::LineComment;
-                        index += 1;
-                        continue;
-                    }
-                    if character == '/' && matches_here("/*", index) {
-                        if matches_here("/*!", index) {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "Expand executable MySQL version comments before running or importing a script",
-                            ));
-                        }
-                        let preserve = matches_here("/*+", index);
-                        if preserve {
-                            current.push_str("/*");
-                        } else {
-                            current.push(' ');
-                        }
-                        state = ScriptState::BlockComment(1, preserve);
-                        index += 2;
-                        continue;
-                    }
-                    if delimiter == ";"
-                        && character.is_ascii_alphabetic()
-                        && self
-                            .kind
-                            .is_none_or(|kind| kind.dialect() == DatabaseKind::SQLite)
-                    {
-                        let start = index;
-                        while characters.get(index).is_some_and(|character| {
-                            character.is_ascii_alphanumeric() || *character == '_'
-                        }) {
-                            index += 1;
-                        }
-                        let word = characters[start..index].iter().collect::<String>();
-                        if word.eq_ignore_ascii_case("TRIGGER") {
-                            let prefix = sql_words_for(&current);
-                            if prefix.first().is_some_and(|word| word == "CREATE")
-                                && prefix.iter().all(|word| {
-                                    matches!(word.as_str(), "CREATE" | "TEMP" | "TEMPORARY")
-                                })
-                            {
-                                self.trigger = true;
-                            }
-                        }
-                        if self.trigger {
-                            match word.to_ascii_uppercase().as_str() {
-                                "BEGIN" | "CASE" => self.trigger_depth += 1,
-                                "END" => self.trigger_depth = self.trigger_depth.saturating_sub(1),
-                                _ => {}
-                            }
-                        }
-                        current.push_str(&word);
-                        at_line_start = false;
-                        continue;
-                    }
-                    if matches_here(&delimiter, index) && (!self.trigger || self.trigger_depth == 0)
-                    {
-                        let trimmed = current.trim();
-                        if !trimmed.is_empty() {
-                            statements.push(trimmed.to_owned());
-                        }
-                        current.clear();
-                        self.trigger = false;
-                        self.trigger_depth = 0;
-                        at_line_start = true;
-                        index += delimiter.chars().count();
-                        continue;
-                    }
-                    match character {
-                        '\'' => {
-                            state = ScriptState::SingleQuote(crate::protected::backslash_string(
-                                self.kind, &current,
-                            ));
-                            current.push(character);
-                            index += 1;
-                        }
-                        '"' => {
-                            state = ScriptState::DoubleQuote;
-                            current.push(character);
-                            index += 1;
-                        }
-                        '`' => {
-                            state = ScriptState::Backtick;
-                            current.push(character);
-                            index += 1;
-                        }
-                        '$' => {
-                            if let Some(tag) = parse_dollar_tag(&characters[index..]) {
-                                let token_length = tag.chars().count() + 2;
-                                current.extend(characters[index..index + token_length].iter());
-                                index += token_length;
-                                state = ScriptState::Dollar(tag);
-                            } else {
-                                current.push(character);
-                                index += 1;
-                            }
-                        }
-                        _ => {
-                            if !character.is_whitespace() {
-                                at_line_start = false;
-                            }
-                            current.push(character);
-                            index += 1;
-                        }
-                    }
-                }
-                ScriptState::LineComment => {
-                    if character == '\n' {
-                        state = ScriptState::Normal;
-                        at_line_start = true;
-                        current.push(character);
-                    }
-                    index += 1;
-                }
-                ScriptState::BlockComment(depth, preserve) => {
-                    if character == '/' && matches_here("/*", index) {
-                        if preserve {
-                            current.push_str("/*");
-                        }
-                        state = ScriptState::BlockComment(depth + 1, preserve);
-                        index += 2;
-                    } else if character == '*' && matches_here("*/", index) {
-                        if preserve {
-                            current.push_str("*/");
-                        }
-                        state = if depth <= 1 {
-                            ScriptState::Normal
-                        } else {
-                            ScriptState::BlockComment(depth - 1, preserve)
-                        };
-                        index += 2;
-                    } else {
-                        if preserve {
-                            current.push(character);
-                        }
-                        index += 1;
-                    }
-                }
-                ScriptState::SingleQuote(escape) => {
-                    current.push(character);
-                    if character == '\\' && escape {
-                        if let Some(&next) = characters.get(index + 1) {
-                            current.push(next);
-                            index += 2;
-                            continue;
-                        }
-                    } else if character == '\'' {
-                        if characters.get(index + 1) == Some(&'\'') {
-                            current.push('\'');
-                            index += 2;
-                            continue;
-                        }
-                        state = ScriptState::Normal;
-                    }
-                    index += 1;
-                }
-                ScriptState::DoubleQuote => {
-                    current.push(character);
-                    if character == '"' {
-                        if characters.get(index + 1) == Some(&'"') {
-                            current.push('"');
-                            index += 2;
-                            continue;
-                        }
-                        state = ScriptState::Normal;
-                    }
-                    index += 1;
-                }
-                ScriptState::Backtick => {
-                    current.push(character);
-                    if character == '`' {
-                        if characters.get(index + 1) == Some(&'`') {
-                            current.push('`');
-                            index += 2;
-                            continue;
-                        }
-                        state = ScriptState::Normal;
-                    }
-                    index += 1;
-                }
-                ScriptState::Dollar(tag) => {
-                    let closing = format!("${tag}$");
-                    if matches_here(&closing, index) {
-                        current.push_str(&closing);
-                        index += closing.chars().count();
-                        state = ScriptState::Normal;
-                    } else {
-                        current.push(character);
-                        index += 1;
-                    }
-                }
-            }
-        }
-
-        self.current = current;
-        self.state = state;
-        self.delimiter = delimiter;
-        self.at_line_start = at_line_start;
-        self.ready.extend(statements);
-        Ok(())
-    }
-}
-
-fn matches_here_ci(characters: &[char], index: usize, needle: &str) -> bool {
-    needle.chars().enumerate().all(|(offset, expected)| {
-        characters
-            .get(index + offset)
-            .is_some_and(|found| found.eq_ignore_ascii_case(&expected))
-    })
-}
-
-/// Parse `$tag$` starting at `characters[0]`, returning the inner tag when
-/// the shape matches. The empty tag (`$$`) is valid PostgreSQL syntax.
-fn parse_dollar_tag(characters: &[char]) -> Option<String> {
-    let mut tag = String::new();
-    for &character in characters.iter().skip(1) {
-        match character {
-            '$' => return Some(tag),
-            _ if character.is_ascii_alphanumeric() || character == '_' => tag.push(character),
-            _ => return None,
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Compression helpers
 // ---------------------------------------------------------------------------
 
@@ -2881,6 +2420,7 @@ fn elapsed_ms_since(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::split_sql_statements;
 
     #[test]
     fn dump_header_keeps_identifier_line_breaks_inside_comments() {
@@ -3101,6 +2641,29 @@ mod tests {
             vec![Some("\u{feff}data".into()), Some("".into())]
         );
         assert!(reader.next_record().unwrap().is_none());
+    }
+    #[test]
+    fn hash_is_a_comment_only_where_the_dialect_says_so() {
+        let script = "SELECT doc #>> '{a,b}', 5 # 3 FROM t; SELECT 2";
+        for kind in [
+            DatabaseKind::PostgreSQL,
+            DatabaseKind::CockroachDB,
+            DatabaseKind::SQLite,
+            DatabaseKind::DuckDB,
+        ] {
+            assert_eq!(
+                checked_split_sql_for(Some(kind), script).unwrap(),
+                ["SELECT doc #>> '{a,b}', 5 # 3 FROM t", "SELECT 2"],
+                "{kind:?}"
+            );
+        }
+        for kind in [DatabaseKind::MySQL, DatabaseKind::BigQuery] {
+            assert_eq!(
+                checked_split_sql_for(Some(kind), "SELECT 1; # a;b\nSELECT 2").unwrap(),
+                ["SELECT 1", "SELECT 2"],
+                "{kind:?}"
+            );
+        }
     }
     #[test]
     fn dialect_splitting_preserves_backslashes_hints_and_token_boundaries() {

@@ -1125,3 +1125,74 @@ async fn strict_tls_over_ssh_integration() -> Result<()> {
     }
     Ok(())
 }
+
+/// Query-document parameters arrive typed from the prompt (JSON scalars are
+/// numbers/booleans, anything else text); PostgreSQL must still bind them to
+/// the type it infers for each placeholder.
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn postgresql_parameters_bind_to_inferred_types() -> Result<()> {
+    let Some(url) = integration_url("DBX_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let engine = std::sync::Arc::new(
+        DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::PostgreSQL, url)).await?,
+    );
+    engine
+        .execute_sql("DROP TABLE IF EXISTS dbx_integration_params")
+        .await?;
+    engine.execute_sql("DROP TYPE IF EXISTS dbx_mood").await?;
+    engine
+        .execute_sql("CREATE TYPE dbx_mood AS ENUM ('calm', 'busy')")
+        .await?;
+    engine
+        .execute_sql("CREATE TABLE dbx_integration_params (id uuid PRIMARY KEY, code varchar(10), day date, amount numeric(10,2), qty int, mood dbx_mood, doc jsonb)")
+        .await?;
+    engine
+        .execute_sql("INSERT INTO dbx_integration_params VALUES ('6f1c5a9e-3b0a-4c64-9d4e-6f1c5a9e3b0a', '00123', '2026-10-08', 4.50, 7, 'busy', '{\"a\": 1}')")
+        .await?;
+    let session = dbx_core::QuerySession::new(engine.clone());
+    let statement = dbx_core::SqlStatement::new(
+        "SELECT qty FROM dbx_integration_params WHERE id = $1 AND code = $2 AND day = $3 AND amount = $4 AND qty = $5 AND mood = $6 AND doc = $7 AND '$1' <> $2",
+        vec![
+            CellValue::Text("6f1c5a9e-3b0a-4c64-9d4e-6f1c5a9e3b0a".into()),
+            CellValue::Text("00123".into()),
+            CellValue::Text("2026-10-08".into()),
+            CellValue::Real(4.5),
+            CellValue::Text("7".into()),
+            CellValue::Text("busy".into()),
+            CellValue::Text("{\"a\": 1}".into()),
+        ],
+    );
+    let result = session
+        .run_prepared(
+            vec![statement],
+            QueryOptions::default(),
+            std::time::Duration::from_secs(10),
+            dbx_core::QueryCancellation::default(),
+        )
+        .await?;
+    let outcome = &result.statements[0];
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.result.rows[0].values, vec![CellValue::Integer(7)]);
+
+    // A number typed for a character column compares as its text.
+    let numeric_code = dbx_core::SqlStatement::new(
+        "SELECT count(*) FROM dbx_integration_params WHERE code = $1 OR id = $2",
+        vec![CellValue::Integer(123), CellValue::Null],
+    );
+    let result = session
+        .run_prepared(
+            vec![numeric_code],
+            QueryOptions::default(),
+            std::time::Duration::from_secs(10),
+            dbx_core::QueryCancellation::default(),
+        )
+        .await?;
+    assert_eq!(result.statements[0].error, None);
+    engine
+        .execute_sql("DROP TABLE dbx_integration_params")
+        .await?;
+    engine.execute_sql("DROP TYPE dbx_mood").await?;
+    Ok(())
+}

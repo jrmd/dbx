@@ -45,6 +45,28 @@ Run a selection or the current statement, use parameters, and inspect each
 statement's result. Native PostgreSQL/MySQL/SQLite/CockroachDB and SQL Server
 query tabs own independent sessions. An interrupted transaction is not replayed.
 
+## Write SQL
+
+The editor checks SQL as you type against a real parser and the connection's
+loaded schema, underlining unknown statements, tables and columns; hover an
+underline for the message. Hover a table, column, alias or CTE to see its
+columns and types, and a built-in function for its signature. While typing a
+call's arguments, the current parameter is shown above the line.
+Cmd/Ctrl-click a table to open it, or an alias or CTE to jump to its definition.
+
+| Action | macOS | Linux |
+| --- | --- | --- |
+| Add next match as a caret | Cmd-D | Ctrl-D |
+| Rename every use of a name | F2 | F2 |
+| Back to one caret | Escape | Escape |
+| Fold / unfold block | Cmd-Alt-[ / ] | Ctrl-Shift-[ / ] |
+| Toggle line comment | Cmd-/ | Ctrl-/ |
+| Move lines | Alt-Up / Down | Alt-Up / Down |
+| Duplicate / delete lines | Shift-Cmd-D / K | Ctrl-Shift-D / K |
+
+Folding also works from the chevrons beside the line numbers. Rename and
+occurrence highlighting cover the current statement only.
+
 ## Edit safely and resume work
 
 Stage inserts, edits and deletes; inspect their combined SQL before committing.

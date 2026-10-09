@@ -12,18 +12,22 @@
 //! ranges internally, while GPUI's input protocol is UTF-16; all conversion
 //! happens at the boundary below.
 
+mod commands;
+mod folding;
+mod signatures;
 mod syntax;
+pub use signatures::function_signature;
 pub use syntax::*;
 
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InteractiveElement as _,
+    AnyElement, App, Bounds, ClipboardItem, Context, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InteractiveElement as _,
     IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, Size, StatefulInteractiveElement as _,
-    Style, Subscription, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, size,
+    PaintQuad, Pixels, Point, ScrollHandle, ShapedLine, SharedString, Size,
+    StatefulInteractiveElement as _, Style, Subscription, TextAlign, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, anchored, deferred, div, fill, point, prelude::*, px, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -77,6 +81,26 @@ actions!(
         Undo,
         Redo,
         ShowCharacterPalette,
+        Indent,
+        Outdent,
+        ToggleLineComment,
+        DuplicateLines,
+        MoveLinesUp,
+        MoveLinesDown,
+        DeleteLines,
+        SelectUp,
+        SelectDown,
+        MoveToStart,
+        MoveToEnd,
+        SelectToStart,
+        SelectToEnd,
+        DeleteWordLeft,
+        DeleteToLineStart,
+        SelectLine,
+        SelectNextOccurrence,
+        SelectAllOccurrences,
+        Fold,
+        Unfold,
     ]
 );
 
@@ -144,11 +168,117 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
             ShowCharacterPalette,
             Some(TEXT_EDITOR_CONTEXT),
         ),
+        KeyBinding::new("shift-up", SelectUp, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-down", SelectDown, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-home", SelectToStartOfLine, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-end", SelectToEndOfLine, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-up", MoveToStart, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-down", MoveToEnd, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-home", MoveToStart, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-end", MoveToEnd, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-cmd-up", SelectToStart, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-cmd-down", SelectToEnd, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-home", SelectToStart, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-end", SelectToEnd, Some(TEXT_EDITOR_CONTEXT)),
+        // macOS moves by word with Option; other platforms with Ctrl.
+        KeyBinding::new("alt-left", MoveToPreviousWord, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-right", MoveToNextWord, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new(
+            "alt-shift-left",
+            SelectToPreviousWordStart,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new(
+            "alt-shift-right",
+            SelectToNextWordEnd,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new("alt-backspace", DeleteWordLeft, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-backspace", DeleteWordLeft, Some(TEXT_EDITOR_CONTEXT)),
+        KeyBinding::new(
+            "cmd-backspace",
+            DeleteToLineStart,
+            Some(TEXT_EDITOR_CONTEXT),
+        ),
+        // Code-editing commands apply to the multiline query editor only, so
+        // Tab still moves focus between form fields.
+        KeyBinding::new("tab", Indent, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-tab", Outdent, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-]", Indent, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-[", Outdent, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-/", ToggleLineComment, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-/", ToggleLineComment, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-cmd-d", DuplicateLines, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-d", DuplicateLines, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-up", MoveLinesUp, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-down", MoveLinesDown, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-cmd-k", DeleteLines, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-k", DeleteLines, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-l", SelectLine, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-l", SelectLine, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("cmd-d", SelectNextOccurrence, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-d", SelectNextOccurrence, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("f2", SelectAllOccurrences, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-cmd-[", Fold, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-cmd-]", Unfold, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-[", Fold, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new("ctrl-shift-]", Unfold, Some(SQL_EDITOR_CONTEXT)),
+        KeyBinding::new(
+            "shift-cmd-l",
+            SelectAllOccurrences,
+            Some(SQL_EDITOR_CONTEXT),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-l",
+            SelectAllOccurrences,
+            Some(SQL_EDITOR_CONTEXT),
+        ),
     ]
 }
 
 /// A native single-line or multiline text editor.
 const HISTORY_LIMIT: usize = 100;
+
+/// How long the pointer rests on code before its hover card appears.
+const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+
+pub use dbx_core::language::DiagnosticSeverity;
+
+/// A problem painted with a wavy underline; its message shows on hover.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EditorDiagnostic {
+    pub range: Range<usize>,
+    pub severity: DiagnosticSeverity,
+    pub message: SharedString,
+}
+
+/// What the editor shows when the pointer rests on a range of code.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoverInfo {
+    pub range: Range<usize>,
+    pub title: SharedString,
+    pub detail: Option<SharedString>,
+}
+
+/// Schema-aware services the host application provides to the SQL editor.
+pub trait SqlLanguageHost: 'static {
+    /// Information about the code at `offset`, if any.
+    fn hover(&self, text: &str, offset: usize, cx: &App) -> Option<HoverInfo>;
+    /// Open the object named at `offset`; returns whether there was one.
+    fn go_to_definition(
+        &self,
+        text: &str,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool;
+}
+
+struct EditorHover {
+    info: HoverInfo,
+    position: Point<Pixels>,
+    visible: bool,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EditorSnapshot {
@@ -178,10 +308,23 @@ pub struct TextEditor {
     password: bool,
     /// UTF-8 byte ranges at grapheme boundaries.
     selected_range: Range<usize>,
+    /// Further selections edited together with `selected_range`, sorted and
+    /// never overlapping it. Their carets sit at their ends. Anything other
+    /// than typing and deleting collapses them.
+    extra_selections: Vec<Range<usize>>,
+    /// Opening offsets of folded blocks, valid for `fold_basis`.
+    folds: Vec<usize>,
+    /// The text `folds` were last checked against, kept only while folded.
+    fold_basis: String,
+    /// The folded blocks as of the last render.
+    folded: Vec<folding::FoldRegion>,
     /// UTF-8 byte ranges painted with a wavy error underline. The SQL shell
     /// derives these from failed-query messages; they are advisory paint only
     /// and never participate in selection or input handling.
-    diagnostics: Vec<Range<usize>>,
+    diagnostics: Vec<EditorDiagnostic>,
+    language_host: Option<std::rc::Rc<dyn SqlLanguageHost>>,
+    hover: Option<EditorHover>,
+    _hover_task: Option<gpui::Task<()>>,
     selection_reversed: bool,
     /// The currently composing IME text, as a UTF-8 byte range.
     marked_range: Option<Range<usize>>,
@@ -199,6 +342,9 @@ pub struct TextEditor {
     is_selecting: bool,
     undo_history: Vec<EditorSnapshot>,
     redo_history: Vec<EditorSnapshot>,
+    /// Where the current run of typed word characters ends. Continuing the
+    /// run joins the previous undo step, so undo removes words, not letters.
+    typing_run: Option<usize>,
     /// Scroll the caret into view on the next paint even while unfocused,
     /// so a find bar can reveal the match it selected.
     reveal_requested: std::cell::Cell<bool>,
@@ -233,6 +379,11 @@ impl TextEditor {
         let observed = cx.observe(&value, |this, value, cx| {
             let text = value.read(cx);
             this.selected_range = clamp_range(text, this.selected_range.clone());
+            this.extra_selections.retain(|range| {
+                range.end <= text.len()
+                    && text.is_char_boundary(range.start)
+                    && text.is_char_boundary(range.end)
+            });
             this.marked_range = this
                 .marked_range
                 .take()
@@ -249,7 +400,14 @@ impl TextEditor {
             language,
             password: false,
             selected_range: 0..0,
+            extra_selections: Vec::new(),
+            folds: Vec::new(),
+            fold_basis: String::new(),
+            folded: Vec::new(),
             diagnostics: Vec::new(),
+            language_host: None,
+            hover: None,
+            _hover_task: None,
             selection_reversed: false,
             marked_range: None,
             scroll_handle: ScrollHandle::new(),
@@ -260,14 +418,20 @@ impl TextEditor {
             is_selecting: false,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
+            typing_run: None,
             reveal_requested: std::cell::Cell::new(false),
             _subscriptions: vec![observed, focus, blur],
         }
     }
 
     /// Create a multiline SQL editor backed by an existing value entity.
-    pub fn new_sql(value: Entity<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_with_language(value, true, EditorLanguage::Sql, window, cx)
+    pub fn new_sql(
+        value: Entity<String>,
+        dialect: SqlDialect,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_language(value, true, EditorLanguage::Sql(dialect), window, cx)
     }
 
     /// Create a multiline Redis command editor backed by an existing value.
@@ -335,6 +499,7 @@ impl TextEditor {
     #[allow(dead_code)]
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.record_history(cx);
+        self.extra_selections.clear();
         let text = normalize_value(&text.into(), self.multiline);
         let cursor = text.len();
         self.selected_range = cursor..cursor;
@@ -360,6 +525,19 @@ impl TextEditor {
         (!self.selected_range.is_empty()).then(|| text[self.selected_range.clone()].to_owned())
     }
 
+    /// The syntax this editor highlights and executes.
+    pub fn language(&self) -> EditorLanguage {
+        self.language
+    }
+
+    /// The SQL dialect this editor lexes and splits statements with.
+    pub fn sql_dialect(&self) -> SqlDialect {
+        match self.language {
+            EditorLanguage::Sql(dialect) => dialect,
+            _ => None,
+        }
+    }
+
     /// Resolve the text DBX should execute for the supplied scope.
     #[allow(dead_code)]
     pub fn execution_text(&self, scope: QueryExecutionScope, cx: &App) -> String {
@@ -369,6 +547,7 @@ impl TextEditor {
             self.selected_range.clone(),
             self.cursor_offset(),
             scope,
+            self.sql_dialect(),
         );
         text[range].to_owned()
     }
@@ -382,6 +561,7 @@ impl TextEditor {
             self.selected_range.clone(),
             self.cursor_offset(),
             scope,
+            self.sql_dialect(),
         )
     }
 
@@ -421,17 +601,522 @@ impl TextEditor {
     /// UTF-8 byte offsets into the current value; passing an empty vector
     /// clears highlighting. No-ops when the set is unchanged so callers can
     /// invoke this every render frame without invalidating the window.
-    pub fn set_diagnostics(&mut self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
-        if self.diagnostics == ranges {
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<EditorDiagnostic>, cx: &mut Context<Self>) {
+        if self.diagnostics == diagnostics {
             return;
         }
-        self.diagnostics = clamp_ranges(&self.text(cx), ranges);
+        let text = self.text(cx);
+        self.diagnostics = diagnostics
+            .into_iter()
+            .map(|diagnostic| EditorDiagnostic {
+                range: clamp_range(&text, diagnostic.range),
+                ..diagnostic
+            })
+            .collect();
         cx.notify();
+    }
+
+    /// Every selection in document order, and which one is the primary.
+    fn all_selections(&self) -> (Vec<Range<usize>>, usize) {
+        let mut selections = self.extra_selections.clone();
+        let primary = selections.partition_point(|range| range.start < self.selected_range.start);
+        selections.insert(primary, self.selected_range.clone());
+        (selections, primary)
+    }
+
+    /// Apply one edit to every selection as a single undo step.
+    fn edit_all_selections(
+        &mut self,
+        edit: impl FnOnce(&str, &[Range<usize>]) -> commands::MultiEdit,
+        cx: &mut Context<Self>,
+    ) {
+        let (selections, primary) = self.all_selections();
+        let edit = edit(self.value.read(cx), &selections);
+        self.typing_run = None;
+        self.marked_range = None;
+        self.record_history(cx);
+        self.set_text_without_selection(edit.text, cx);
+        let mut selections = edit.selections;
+        self.selected_range = selections.remove(primary);
+        selections.dedup();
+        selections.retain(|range| *range != self.selected_range);
+        self.extra_selections = selections;
+        self.selection_reversed = false;
+        self.reveal_requested.set(true);
+        cx.notify();
+    }
+
+    /// Drop every selection but the primary one; returns whether there were
+    /// others. The query shell calls this from Escape.
+    pub fn collapse_selections(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.extra_selections.is_empty() {
+            return false;
+        }
+        self.extra_selections.clear();
+        cx.notify();
+        true
+    }
+
+    /// Select the word at the caret, or add the next match of the selection.
+    fn select_next_occurrence(
+        &mut self,
+        _: &SelectNextOccurrence,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_code() {
+            cx.propagate();
+            return;
+        }
+        let text = self.text(cx);
+        if self.selected_range.is_empty() {
+            let word = commands::word_at(&text, self.cursor_offset_internal());
+            if text[word.clone()]
+                .chars()
+                .any(|c| c.is_alphanumeric() || c == '_')
+            {
+                self.selected_range = word;
+                self.selection_reversed = false;
+                cx.notify();
+            }
+            return;
+        }
+        let needle = &text[self.selected_range.clone()];
+        let (taken, _) = self.all_selections();
+        if let Some(next) =
+            commands::next_occurrence(&text, needle, self.selected_range.end, &taken)
+        {
+            let previous = std::mem::replace(&mut self.selected_range, next);
+            let at = self
+                .extra_selections
+                .partition_point(|range| range.start < previous.start);
+            self.extra_selections.insert(at, previous);
+            self.selection_reversed = false;
+            self.reveal_requested.set(true);
+            cx.notify();
+        }
+    }
+
+    /// Select every match of the selection, or with none every use of the
+    /// identifier at the caret in its statement, to rename them together.
+    fn select_all_occurrences(
+        &mut self,
+        _: &SelectAllOccurrences,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_code() {
+            cx.propagate();
+            return;
+        }
+        let text = self.text(cx);
+        let cursor = self.cursor_offset_internal();
+        let ranges = if self.selected_range.is_empty() {
+            let mut cache = self.paint_cache.borrow_mut();
+            cache.refresh(&text, self.language);
+            let mut ranges = cache.occurrences(&text, cursor, self.sql_dialect());
+            if ranges.is_empty() {
+                ranges = cache
+                    .sql_tokens(cursor.saturating_sub(1)..cursor)
+                    .into_iter()
+                    .filter(|token| {
+                        token.kind == SqlTokenKind::Identifier
+                            && token.range.start <= cursor
+                            && cursor <= token.range.end
+                    })
+                    .map(|token| token.range)
+                    .take(1)
+                    .collect();
+            }
+            // Rename the name inside quotes and keep the quotes.
+            ranges
+                .into_iter()
+                .map(|range| {
+                    if text[range.clone()].starts_with(['"', '`', '[']) && range.len() >= 2 {
+                        range.start + 1..range.end - 1
+                    } else {
+                        range
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let needle = &text[self.selected_range.clone()];
+            text.match_indices(needle)
+                .map(|(index, _)| index..index + needle.len())
+                .collect()
+        };
+        // The caret may sit just outside a quoted name's renamed contents.
+        let Some(primary) = ranges
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, range)| range.start.abs_diff(cursor).min(range.end.abs_diff(cursor)))
+            .map(|(index, _)| index)
+        else {
+            return;
+        };
+        let mut ranges = ranges;
+        self.selected_range = ranges.remove(primary);
+        self.extra_selections = ranges;
+        self.selection_reversed = false;
+        cx.notify();
+    }
+
+    /// Bring folds up to date with the text and selections: follow edits,
+    /// drop blocks that no longer fold, and open any fold hiding a caret.
+    fn reconcile_folds(&mut self, cx: &App) {
+        if self.folds.is_empty() {
+            self.folded.clear();
+            return;
+        }
+        let text = self.value.read(cx);
+        if self.fold_basis != *text {
+            folding::shift_offsets(&self.fold_basis, text, &mut self.folds);
+            self.fold_basis.clone_from(text);
+        }
+        let carets = std::iter::once(&self.selected_range)
+            .chain(&self.extra_selections)
+            .flat_map(|range| [range.start, range.end])
+            .map(|offset| line_and_column(text, clamp_boundary(text, offset)).0)
+            .collect::<Vec<_>>();
+        let mut cache = self.paint_cache.borrow_mut();
+        cache.refresh(text, self.language);
+        let regions = cache.fold_regions(text);
+        self.folded = regions
+            .iter()
+            .filter(|region| self.folds.contains(&region.open))
+            .filter(|region| !carets.iter().any(|line| region.hidden().contains(line)))
+            .cloned()
+            .collect();
+        self.folds = self.folded.iter().map(|region| region.open).collect();
+        if self.folds.is_empty() {
+            self.fold_basis.clear();
+        }
+    }
+
+    /// The innermost foldable block around `line` that `filter` accepts.
+    fn fold_region_at(
+        &self,
+        line: usize,
+        cx: &App,
+        filter: impl Fn(&folding::FoldRegion) -> bool,
+    ) -> Option<folding::FoldRegion> {
+        let text = self.value.read(cx);
+        let mut cache = self.paint_cache.borrow_mut();
+        cache.refresh(text, self.language);
+        cache
+            .fold_regions(text)
+            .iter()
+            .filter(|region| (region.start_line..=region.end_line).contains(&line))
+            .filter(|region| filter(region))
+            .max_by_key(|region| region.start_line)
+            .cloned()
+    }
+
+    fn fold_region(&mut self, region: folding::FoldRegion, cx: &mut Context<Self>) {
+        if self.folds.is_empty() {
+            self.fold_basis = self.text(cx);
+        }
+        self.folds.push(region.open);
+        // Park the caret on the visible opening line.
+        if region
+            .hidden()
+            .contains(&line_and_column(&self.text(cx), self.cursor_offset()).0)
+            || line_and_column(&self.text(cx), self.cursor_offset()).0 == region.end_line
+        {
+            self.move_to(region.open + 1, cx);
+        }
+        self.reconcile_folds(cx);
+        cx.notify();
+    }
+
+    fn fold(&mut self, _: &Fold, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_code() {
+            cx.propagate();
+            return;
+        }
+        let line = line_and_column(&self.text(cx), self.cursor_offset()).0;
+        if let Some(region) =
+            self.fold_region_at(line, cx, |region| !self.folds.contains(&region.open))
+        {
+            self.fold_region(region, cx);
+        }
+    }
+
+    fn unfold(&mut self, _: &Unfold, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_code() {
+            cx.propagate();
+            return;
+        }
+        let line = line_and_column(&self.text(cx), self.cursor_offset()).0;
+        if let Some(region) =
+            self.fold_region_at(line, cx, |region| self.folds.contains(&region.open))
+        {
+            self.folds.retain(|open| *open != region.open);
+            self.reconcile_folds(cx);
+            cx.notify();
+        }
+    }
+
+    /// Fold or unfold the block that starts on `line`, from the gutter.
+    fn toggle_fold_at(&mut self, line: usize, cx: &mut Context<Self>) {
+        if let Some(region) = self.folded.iter().find(|region| region.start_line == line) {
+            let open = region.open;
+            self.folds.retain(|folded| *folded != open);
+            self.reconcile_folds(cx);
+            cx.notify();
+        } else if let Some(region) =
+            self.fold_region_at(line, cx, |region| region.start_line == line)
+        {
+            self.fold_region(region, cx);
+        }
+    }
+
+    /// Provide hover information and go-to-definition for SQL.
+    pub fn set_language_host(&mut self, host: std::rc::Rc<dyn SqlLanguageHost>) {
+        self.language_host = Some(host);
+    }
+
+    /// The hover card for the code under the pointer: a diagnostic's message
+    /// first, otherwise what the language host knows.
+    fn hover_info_at(&self, offset: usize, cx: &App) -> Option<HoverInfo> {
+        if let Some(diagnostic) = self
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.range.start <= offset && offset < diagnostic.range.end)
+            .max_by_key(|diagnostic| diagnostic.severity)
+        {
+            return Some(HoverInfo {
+                range: diagnostic.range.clone(),
+                title: diagnostic.message.clone(),
+                detail: None,
+            });
+        }
+        let text = self.value.read(cx);
+        self.language_host
+            .as_ref()
+            .and_then(|host| host.hover(text, offset, cx))
+            .or_else(|| self.function_hover(text, offset))
+    }
+
+    /// The signature of the built-in function named at `offset`.
+    fn function_hover(&self, text: &str, offset: usize) -> Option<HoverInfo> {
+        if !self.is_code() {
+            return None;
+        }
+        let mut cache = self.paint_cache.borrow_mut();
+        cache.refresh(text, self.language);
+        let tokens = cache.sql_tokens(offset..offset);
+        let (range, signature) = signatures::function_at(text, offset, &tokens)?;
+        Some(HoverInfo {
+            range,
+            title: signature.label().into(),
+            detail: Some(signature.summary.into()),
+        })
+    }
+
+    /// The alias or CTE definition for a use of it at `offset`.
+    fn local_definition(&self, text: &str, offset: usize) -> Option<Range<usize>> {
+        if !self.is_code() {
+            return None;
+        }
+        let statement = sql_statement_range(text, offset, self.sql_dialect());
+        let mut cache = self.paint_cache.borrow_mut();
+        cache.refresh(text, self.language);
+        let tokens = cache.sql_tokens(statement);
+        signatures::local_definition(text, offset, &tokens)
+    }
+
+    /// The built-in function call around the caret, for signature help.
+    fn signature_help(&self, cx: &App) -> Option<signatures::CallSite> {
+        if !self.is_code() || !self.selected_range.is_empty() || self.marked_range.is_some() {
+            return None;
+        }
+        let text = self.value.read(cx);
+        let cursor = self.cursor_offset_internal();
+        let mut cache = self.paint_cache.borrow_mut();
+        cache.refresh(text, self.language);
+        let tokens = cache.sql_tokens(cursor.saturating_sub(signatures::CALL_SCAN_LIMIT)..cursor);
+        signatures::call_at(text, cursor, &tokens)
+    }
+
+    fn render_signature_help(&self, window: &Window, cx: &App) -> Option<AnyElement> {
+        if !self.focus_handle.is_focused(window) {
+            return None;
+        }
+        let call = self.signature_help(cx)?;
+        let bounds = self.last_bounds?;
+        let text = self.value.read(cx);
+        let (line, column) = line_and_column(text, call.name.start);
+        let line_height = bounds.size.height / self.last_layout.count.max(1) as f32;
+        let x = self
+            .last_layout
+            .get(line)
+            .map_or(px(0.), |shaped| shaped.x_for_index(column));
+        let position = point(
+            bounds.left() + x,
+            bounds.top() + self.last_layout.top(line, line_height),
+        );
+        let signature = call.signature;
+        let active = signature.active_param(call.argument);
+        let mut parts = vec![(format!("{}(", signature.name), false)];
+        for (index, param) in signature.params.iter().enumerate() {
+            if index > 0 {
+                parts.push((", ".into(), false));
+            }
+            parts.push(((*param).into(), active == Some(index)));
+        }
+        if signature.variadic {
+            parts.push((", …".into(), false));
+        }
+        parts.push((format!(") → {}", signature.returns), false));
+        let card = div()
+            .id("dbx-editor-signature")
+            .debug_selector(|| "dbx-editor-signature".into())
+            .max_w(px(480.))
+            .px(px(9.))
+            .py(px(6.))
+            .rounded(px(7.))
+            .border_1()
+            .border_color(theme().border_strong)
+            .bg(theme().panel_raised)
+            .text_size(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .text_color(theme().text_muted)
+                    .children(parts.into_iter().map(|(part, active)| {
+                        div()
+                            .when(active, |part| {
+                                part.text_color(theme().text)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                            })
+                            .child(part)
+                    })),
+            )
+            .child(
+                div()
+                    .pt(px(3.))
+                    .text_size(px(11.))
+                    .text_color(theme().text_muted)
+                    .child(signature.summary),
+            );
+        Some(
+            deferred(
+                anchored()
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .position(position - point(px(9.), px(4.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .with_priority(30)
+            .into_any_element(),
+        )
+    }
+
+    fn update_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let info = self
+            .text_index_at(position, cx)
+            .and_then(|offset| self.hover_info_at(offset, cx));
+        let Some(info) = info else {
+            self.clear_hover(cx);
+            return;
+        };
+        if self.hover.as_ref().is_some_and(|hover| hover.info == info) {
+            return;
+        }
+        let was_visible = self.hover.as_ref().is_some_and(|hover| hover.visible);
+        self.hover = Some(EditorHover {
+            info,
+            position,
+            visible: false,
+        });
+        if was_visible {
+            cx.notify();
+        }
+        self._hover_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(HOVER_DELAY).await;
+            let _ = this.update(cx, |editor, cx| {
+                if let Some(hover) = editor.hover.as_mut() {
+                    hover.visible = true;
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        self._hover_task = None;
+        if self.hover.take().is_some_and(|hover| hover.visible) {
+            cx.notify();
+        }
+    }
+
+    /// The text offset under `position`, only when the pointer is over a
+    /// line's text rather than the empty space after it.
+    fn text_index_at(&self, position: Point<Pixels>, cx: &App) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        if self.last_layout.count == 0 || !bounds.contains(&position) {
+            return None;
+        }
+        let line_height = bounds.size.height / self.last_layout.count as f32;
+        let line = self
+            .last_layout
+            .line_at(position.y - bounds.top(), line_height);
+        let shaped = self.last_layout.get(line)?;
+        if position.x - bounds.left() > shaped.width {
+            return None;
+        }
+        let offset = self.index_for_mouse_position(position, cx);
+        // The hit test rounds to the nearest boundary; hover the character
+        // under the pointer instead.
+        let text = self.value.read(cx);
+        let x = shaped.x_for_index(offset - nth_line_start(text, line));
+        Some(if x > position.x - bounds.left() {
+            previous_boundary(text, offset)
+        } else {
+            offset
+        })
+    }
+
+    fn render_hover(&self) -> Option<AnyElement> {
+        let hover = self.hover.as_ref().filter(|hover| hover.visible)?;
+        let card = div()
+            .id("dbx-editor-hover")
+            .debug_selector(|| "dbx-editor-hover".into())
+            .max_w(px(420.))
+            .px(px(9.))
+            .py(px(6.))
+            .rounded(px(7.))
+            .border_1()
+            .border_color(theme().border_strong)
+            .bg(theme().panel_raised)
+            .text_size(px(12.))
+            .text_color(theme().text)
+            .child(hover.info.title.clone())
+            .children(hover.info.detail.clone().map(|detail| {
+                div()
+                    .pt(px(3.))
+                    .text_size(px(11.))
+                    .text_color(theme().text_muted)
+                    .child(detail)
+            }));
+        Some(
+            deferred(
+                anchored()
+                    .position(hover.position + point(px(0.), px(18.)))
+                    .snap_to_window_with_margin(px(8.))
+                    .child(card),
+            )
+            .with_priority(40)
+            .into_any_element(),
+        )
     }
 
     /// Select a UTF-8 byte range and scroll it into view.
     pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let range = clamp_range(&self.text(cx), range);
+        self.extra_selections.clear();
         self.selected_range = range;
         self.selection_reversed = false;
         self.reveal_requested.set(true);
@@ -452,6 +1137,7 @@ impl TextEditor {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         let offset = clamp_boundary(&self.text(cx), offset);
         self.selected_range = offset..offset;
         self.selection_reversed = false;
@@ -459,6 +1145,7 @@ impl TextEditor {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         let offset = clamp_boundary(&self.text(cx), offset);
         if self.selection_reversed {
             self.selected_range.start = offset;
@@ -473,13 +1160,27 @@ impl TextEditor {
     }
 
     fn replace(&mut self, range: Range<usize>, inserted: &str, cx: &mut Context<Self>) {
+        self.typing_run = None;
+        self.extra_selections.clear();
+        self.replace_recording(range, inserted, true, cx);
+    }
+
+    fn replace_recording(
+        &mut self,
+        range: Range<usize>,
+        inserted: &str,
+        record: bool,
+        cx: &mut Context<Self>,
+    ) {
         let text = self.text(cx);
         let range = clamp_range(&text, range);
         let inserted = normalize_value(inserted, self.multiline);
         if text[range.clone()] == inserted {
             return;
         }
-        self.record_history(cx);
+        if record {
+            self.record_history(cx);
+        }
         let next = replace_selection(&text, range.clone(), &inserted);
         let cursor = range.start + inserted.len();
         self.selected_range = cursor..cursor;
@@ -508,6 +1209,7 @@ impl TextEditor {
     }
 
     fn restore_snapshot(&mut self, snapshot: EditorSnapshot, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         self.selected_range = clamp_range(&snapshot.text, snapshot.selection);
         self.selection_reversed = snapshot.selection_reversed;
         self.marked_range = None;
@@ -573,6 +1275,7 @@ impl TextEditor {
 
     /// Select the whole value, so typing replaces it.
     pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.extra_selections.clear();
         self.move_to(0, cx);
         self.select_to(self.text(cx).len(), cx);
     }
@@ -660,19 +1363,34 @@ impl TextEditor {
         if !self.multiline {
             return;
         }
+        let target = self.vertical_target(direction, cx);
+        self.move_to(target, cx);
+    }
 
-        let text = self.text(cx);
+    /// The offset one line up or down at the same column; past the first or
+    /// last line this is the start or end of the text.
+    fn vertical_target(&self, direction: isize, cx: &App) -> usize {
+        let text = self.value.read(cx);
         let cursor = self.cursor_offset();
-        let (line, column) = line_and_column(&text, cursor);
-        let target = (line as isize + direction).max(0) as usize;
-        let lines: Vec<_> = text.split('\n').collect();
-        if target >= lines.len() {
-            self.move_to(text.len(), cx);
-            return;
+        if !self.multiline {
+            return cursor;
         }
-        let start = nth_line_start(&text, target);
-        let target_column = clamp_boundary(lines[target], column).min(lines[target].len());
-        self.move_to(start + target_column, cx);
+        let (line, column) = line_and_column(text, cursor);
+        // Step over folded lines: move by painted row.
+        let rows = folding::RowMap::new(&self.folded);
+        let target = rows.row(line) as isize + direction;
+        let line_count = text.split('\n').count();
+        if target < 0 {
+            return 0;
+        }
+        let target = target as usize;
+        if target >= rows.rows(line_count) {
+            return text.len();
+        }
+        let target = rows.line(target);
+        let start = nth_line_start(text, target);
+        let target_line = &text[start..line_end(text, start)];
+        start + clamp_boundary(target_line, column.min(target_line.len()))
     }
 
     /// Move the cursor between lines without requiring the caller to depend
@@ -690,6 +1408,19 @@ impl TextEditor {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.extra_selections.is_empty() {
+            self.edit_all_selections(
+                |text, selections| commands::delete_at_all(text, selections, true),
+                cx,
+            );
+            return;
+        }
+        if self.is_code()
+            && let Some(edit) = commands::delete_pair(&self.text(cx), &self.selected_range)
+        {
+            self.apply_edit(edit, cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             let cursor = self.cursor_offset();
             let previous = previous_boundary(&self.text(cx), cursor);
@@ -702,6 +1433,13 @@ impl TextEditor {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.extra_selections.is_empty() {
+            self.edit_all_selections(
+                |text, selections| commands::delete_at_all(text, selections, false),
+                cx,
+            );
+            return;
+        }
         if self.selected_range.is_empty() {
             let cursor = self.cursor_offset();
             let next = next_boundary(&self.text(cx), cursor);
@@ -713,8 +1451,157 @@ impl TextEditor {
         self.replace(self.selected_range.clone(), "", cx);
     }
 
+    /// The multiline SQL editor gets code-editing behaviour; filters, cell
+    /// editors and connection fields stay plain text fields.
+    fn is_code(&self) -> bool {
+        self.multiline && matches!(self.language, EditorLanguage::Sql(_))
+    }
+
+    /// Replace the whole text and selection as one undo step.
+    fn apply_edit(&mut self, edit: commands::Edit, cx: &mut Context<Self>) {
+        self.typing_run = None;
+        self.extra_selections.clear();
+        if edit.text != *self.value.read(cx) {
+            self.record_history(cx);
+            self.marked_range = None;
+            self.set_text_without_selection(edit.text, cx);
+        }
+        self.selected_range = edit.selection;
+        self.selection_reversed = false;
+        self.reveal_requested.set(true);
+        cx.notify();
+    }
+
+    fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_code() {
+            cx.propagate();
+            return;
+        }
+        let edit = commands::indent(&self.text(cx), self.selected_range.clone());
+        self.apply_edit(edit, cx);
+    }
+
+    fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_code() {
+            cx.propagate();
+            return;
+        }
+        if let Some(edit) = commands::outdent(&self.text(cx), self.selected_range.clone()) {
+            self.apply_edit(edit, cx);
+        }
+    }
+
+    fn toggle_line_comment(
+        &mut self,
+        _: &ToggleLineComment,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_code() {
+            let edit = commands::toggle_line_comment(&self.text(cx), self.selected_range.clone());
+            self.apply_edit(edit, cx);
+        }
+    }
+
+    fn duplicate_lines(&mut self, _: &DuplicateLines, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_code() {
+            let edit = commands::duplicate_lines(&self.text(cx), self.selected_range.clone());
+            self.apply_edit(edit, cx);
+        }
+    }
+
+    fn move_lines_up(&mut self, _: &MoveLinesUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_lines(-1, cx);
+    }
+
+    fn move_lines_down(&mut self, _: &MoveLinesDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_lines(1, cx);
+    }
+
+    fn move_lines(&mut self, direction: isize, cx: &mut Context<Self>) {
+        if self.is_code()
+            && let Some(edit) =
+                commands::move_lines(&self.text(cx), self.selected_range.clone(), direction)
+        {
+            self.apply_edit(edit, cx);
+        }
+    }
+
+    fn delete_lines(&mut self, _: &DeleteLines, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_code() {
+            let edit = commands::delete_lines(&self.text(cx), self.selected_range.clone());
+            self.apply_edit(edit, cx);
+        }
+    }
+
+    fn select_line(&mut self, _: &SelectLine, _: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        let lines = commands::selected_lines(&text, &self.selected_range);
+        // Repeating extends the selection by the next line.
+        let end = if self.selected_range == (lines.start..(lines.end + 1).min(text.len())) {
+            line_end(&text, (lines.end + 1).min(text.len()))
+        } else {
+            lines.end
+        };
+        let end = if end < text.len() { end + 1 } else { end };
+        self.extra_selections.clear();
+        self.selected_range = lines.start..end;
+        self.selection_reversed = false;
+        self.reveal_requested.set(true);
+        cx.notify();
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(-1, cx);
+        self.select_to(target, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        let target = self.vertical_target(1, cx);
+        self.select_to(target, cx);
+    }
+
+    fn move_to_start(&mut self, _: &MoveToStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.text(cx).len(), cx);
+    }
+
+    fn select_to_start(&mut self, _: &SelectToStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.text(cx).len(), cx);
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let text = self.text(cx);
+            self.select_to(previous_word_boundary(&text, self.cursor_offset()), cx);
+        }
+        self.replace(self.selected_range.clone(), "", cx);
+    }
+
+    fn delete_to_line_start(
+        &mut self,
+        _: &DeleteToLineStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            let text = self.text(cx);
+            self.select_to(line_start(&text, self.cursor_offset()), cx);
+        }
+        self.replace(self.selected_range.clone(), "", cx);
+    }
+
     fn newline(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
-        if self.multiline {
+        if self.is_code() {
+            self.insert_newline(cx);
+        } else if self.multiline {
             self.replace(self.selected_range.clone(), "\n", cx);
         } else {
             // A single-line field has no newline; let an enclosing form bind
@@ -723,16 +1610,33 @@ impl TextEditor {
         }
     }
 
-    /// Insert a newline for a shell-level Enter handler.
+    /// Insert a newline for a shell-level Enter handler. The SQL editor keeps
+    /// the line's indentation and opens bracketed blocks.
     pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
-        if self.multiline {
+        if !self.extra_selections.is_empty() {
+            self.edit_all_selections(
+                |text, selections| commands::insert_at_all(text, selections, "\n"),
+                cx,
+            );
+        } else if self.is_code() {
+            let edit = commands::newline(&self.text(cx), self.selected_range.clone());
+            self.apply_edit(edit, cx);
+        } else if self.multiline {
             self.replace(self.selected_range.clone(), "\n", cx);
         }
     }
 
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace(self.selected_range.clone(), &text, cx);
+            if self.extra_selections.is_empty() {
+                self.replace(self.selected_range.clone(), &text, cx);
+            } else {
+                let text = normalize_value(&text, self.multiline);
+                self.edit_all_selections(
+                    |content, selections| commands::insert_at_all(content, selections, &text),
+                    cx,
+                );
+            }
         }
     }
 
@@ -775,8 +1679,9 @@ impl TextEditor {
         }
 
         let line_height = bounds.size.height / self.last_layout.count.max(1) as f32;
-        let line = ((position.y - bounds.top()) / line_height) as usize;
-        let line = line.min(self.last_layout.count - 1);
+        let line = self
+            .last_layout
+            .line_at(position.y - bounds.top(), line_height);
         let local_x = position.x - bounds.left();
         let offset = nth_line_start(text, line);
         // Only visible lines are laid out; the pointer is over one of them.
@@ -799,13 +1704,46 @@ impl TextEditor {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
+        self.clear_hover(cx);
+        self.extra_selections.clear();
+        if event.modifiers.secondary()
+            && !event.modifiers.shift
+            && let Some(offset) = self.text_index_at(event.position, cx)
+        {
+            let text = self.text(cx);
+            if let Some(definition) = self.local_definition(&text, offset) {
+                self.select_range(definition, cx);
+                return;
+            }
+            if let Some(host) = self.language_host.clone()
+                && host.go_to_definition(&text, offset, window, cx)
+            {
+                return;
+            }
+        }
         let index = self.index_for_mouse_position(event.position, cx);
         // Snapshot after resolving the initial click, before the focus and
         // selection notifications can cause another paint pass.
         self.selection_bounds = self.last_bounds;
         self.is_selecting = true;
+        self.typing_run = None;
         if event.modifiers.shift {
             self.select_to(index, cx);
+        } else if event.click_count == 2 {
+            let text = self.text(cx);
+            let word = commands::word_at(&text, index);
+            self.selected_range = word;
+            self.selection_reversed = false;
+            self.is_selecting = false;
+            cx.notify();
+        } else if event.click_count >= 3 {
+            let text = self.text(cx);
+            let start = line_start(&text, index);
+            let end = line_end(&text, index);
+            self.selected_range = start..(end + 1).min(text.len());
+            self.selection_reversed = false;
+            self.is_selecting = false;
+            cx.notify();
         } else {
             self.move_to(index, cx);
         }
@@ -826,6 +1764,9 @@ impl TextEditor {
             self.select_to(self.index_for_mouse_position(event.position, cx), cx);
         } else {
             self.selection_bounds = None;
+            if self.is_code() {
+                self.update_hover(event.position, cx);
+            }
         }
     }
 }
@@ -860,20 +1801,33 @@ fn completion_anchor(
         .unwrap_or(px(0.));
     point(
         bounds.left() + x,
-        bounds.top() + line_height * (line + 1).min(layout.count.max(1)) as f32,
+        bounds.top() + layout.top(line, line_height) + line_height,
     )
 }
 
 /// The lines laid out in the last frame: the visible ones and the caret's.
 #[derive(Default)]
 struct LineLayouts {
-    /// Total lines in the document, laid out or not.
+    /// Painted rows: the document's lines less folded ones, laid out or not.
     count: usize,
     /// Shaped lines by line index, in ascending order.
     lines: Vec<(usize, ShapedLine)>,
+    /// Which lines folding hid when these were laid out.
+    rows: folding::RowMap,
 }
 
 impl LineLayouts {
+    /// The document line painted at the row under `y`, from the top.
+    fn line_at(&self, y: Pixels, line_height: Pixels) -> usize {
+        let row = ((y / line_height).max(0.) as usize).min(self.count.saturating_sub(1));
+        self.rows.line(row)
+    }
+
+    /// The top of `line`'s row.
+    fn top(&self, line: usize, line_height: Pixels) -> Pixels {
+        line_height * self.rows.row(line) as f32
+    }
+
     fn get(&self, line: usize) -> Option<&ShapedLine> {
         self.lines
             .binary_search_by_key(&line, |(index, _)| *index)
@@ -896,6 +1850,10 @@ struct PaintCache {
     longest_lines: Vec<usize>,
     /// The measured width and the font size it was measured at.
     width: Option<(Pixels, Pixels)>,
+    /// The caret offset and the uses of the identifier under it.
+    occurrences: Option<(usize, Vec<Range<usize>>)>,
+    /// Blocks that can fold, computed when first needed.
+    fold_regions: Option<Vec<folding::FoldRegion>>,
 }
 
 impl PaintCache {
@@ -910,9 +1868,11 @@ impl PaintCache {
         self.language = language;
         self.valid = true;
         self.width = None;
+        self.occurrences = None;
+        self.fold_regions = None;
         self.tokens = match language {
             EditorLanguage::PlainText => Vec::new(),
-            EditorLanguage::Sql => lex_sql(text)
+            EditorLanguage::Sql(dialect) => lex_sql_for(text, dialect)
                 .into_iter()
                 .map(HighlightToken::from)
                 .collect(),
@@ -960,6 +1920,57 @@ impl PaintCache {
     fn line_and_column(&self, offset: usize) -> (usize, usize) {
         let line = self.line_starts.partition_point(|start| *start <= offset) - 1;
         (line, offset - self.line_starts[line])
+    }
+
+    /// Uses of the identifier at `cursor` in its statement, reused while
+    /// neither the text nor the caret changes.
+    fn occurrences(&mut self, text: &str, cursor: usize, dialect: SqlDialect) -> Vec<Range<usize>> {
+        if let Some((cached, ranges)) = &self.occurrences
+            && *cached == cursor
+        {
+            return ranges.clone();
+        }
+        let touching = self
+            .sql_tokens(cursor.saturating_sub(1)..cursor)
+            .iter()
+            .any(|token| {
+                token.kind == SqlTokenKind::Identifier
+                    && token.range.start <= cursor
+                    && cursor <= token.range.end
+            });
+        let ranges = if touching {
+            let statement = sql_statement_range(text, cursor, dialect);
+            let tokens = self.sql_tokens(statement.clone());
+            signatures::occurrences(text, cursor, &tokens, statement)
+        } else {
+            Vec::new()
+        };
+        self.occurrences = Some((cursor, ranges.clone()));
+        ranges
+    }
+
+    /// Blocks that can fold, by opening offset.
+    fn fold_regions(&mut self, text: &str) -> &[folding::FoldRegion] {
+        if self.fold_regions.is_none() {
+            let tokens = self.sql_tokens(0..text.len());
+            self.fold_regions = Some(folding::fold_regions(text, &tokens, &self.line_starts));
+        }
+        self.fold_regions.as_deref().unwrap_or_default()
+    }
+
+    /// SQL tokens overlapping `range`, in document order.
+    fn sql_tokens(&self, range: Range<usize>) -> Vec<SqlToken> {
+        self.tokens_from(range.start)
+            .iter()
+            .take_while(|token| token.range.start <= range.end)
+            .filter_map(|token| match token.kind {
+                HighlightTokenKind::Sql(kind) => Some(SqlToken {
+                    kind,
+                    range: token.range.clone(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Tokens from the first one that can touch `line_start`.
@@ -1047,7 +2058,35 @@ impl EntityInputHandler for TextEditor {
             })
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-        self.replace(range, text, cx);
+        let typing = self.marked_range.is_none() && range == self.selected_range;
+        if typing && !self.extra_selections.is_empty() {
+            self.edit_all_selections(
+                |content, selections| commands::insert_at_all(content, selections, text),
+                cx,
+            );
+            return;
+        }
+        if !typing {
+            self.extra_selections.clear();
+        }
+        if typing
+            && self.is_code()
+            && let Some(edit) = commands::type_character(&content, range.clone(), text)
+        {
+            self.apply_edit(edit, cx);
+            return;
+        }
+        // Consecutive word characters typed at the caret share an undo step.
+        let word = text.chars().count() == 1
+            && text
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_');
+        let continues = typing && word && range.is_empty() && self.typing_run == Some(range.start);
+        self.typing_run = None;
+        self.replace_recording(range.clone(), text, !continues, cx);
+        if typing && word {
+            self.typing_run = Some(range.start + text.len());
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -1058,6 +2097,7 @@ impl EntityInputHandler for TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.extra_selections.clear();
         let content = self.text(cx);
         let range = range
             .map(|range| {
@@ -1120,11 +2160,11 @@ impl EntityInputHandler for TextEditor {
         Some(Bounds::from_corners(
             point(
                 bounds.left() + start.x_for_index(start_col),
-                bounds.top() + line_height * start_line as f32,
+                bounds.top() + self.last_layout.top(start_line, line_height),
             ),
             point(
                 bounds.left() + end.x_for_index(end_col),
-                bounds.top() + line_height * (end_line + 1) as f32,
+                bounds.top() + self.last_layout.top(end_line, line_height) + line_height,
             ),
         ))
     }
@@ -1144,7 +2184,10 @@ impl EntityInputHandler for TextEditor {
 }
 
 impl Render for TextEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.is_code() {
+            self.reconcile_folds(cx);
+        }
         let editor = div()
             .id(gpui::SharedString::from(format!(
                 "dbx-text-editor-scroll-{:?}",
@@ -1160,17 +2203,236 @@ impl Render for TextEditor {
                 editor: cx.entity(),
             });
 
-        if self.multiline {
-            editor.overflow_scroll()
+        if self.is_code() {
+            div()
+                .flex()
+                .size_full()
+                .min_w_0()
+                .child(LineNumberGutter {
+                    editor: cx.entity(),
+                })
+                .child(editor.overflow_scroll())
+                .children(self.render_signature_help(window, cx))
+                .children(self.render_hover())
+                .into_any_element()
+        } else if self.multiline {
+            editor.overflow_scroll().into_any_element()
         } else {
             // The compact field's content area can be fractionally shorter
             // than one painted line. Never let caret reveal chase that
             // unavoidable vertical clipping; single-line editors only need
             // horizontal scrolling.
-            editor.overflow_x_scroll()
+            editor.overflow_x_scroll().into_any_element()
         }
     }
 }
+
+/// Line numbers beside the SQL editor. The gutter sits outside the scroll
+/// area so it never scrolls horizontally; it follows the vertical offset.
+struct LineNumberGutter {
+    editor: Entity<TextEditor>,
+}
+
+impl IntoElement for LineNumberGutter {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for LineNumberGutter {
+    type RequestLayoutState = ();
+    type PrepaintState = gpui::Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let editor = self.editor.read(cx);
+        let line_count = editor
+            .value
+            .read(cx)
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let digits = line_count.to_string().len().max(2);
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let sample = "0".repeat(digits);
+        let width = window
+            .text_system()
+            .shape_line(
+                sample.clone().into(),
+                font_size,
+                &[TextRun {
+                    len: sample.len(),
+                    font: style.font(),
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            )
+            .width;
+        let mut layout = Style::default();
+        layout.size.width = (width + px(GUTTER_PADDING * 2. + FOLD_COLUMN)).into();
+        layout.size.height = gpui::relative(1.).into();
+        layout.flex_shrink = 0.;
+        (window.request_layout(layout, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        _: &mut App,
+    ) -> gpui::Hitbox {
+        window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _: &mut (),
+        hitbox: &mut gpui::Hitbox,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let editor = self.editor.read(cx);
+        let text = editor.value.read(cx);
+        let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let (cursor_line, _) = line_and_column(text, editor.cursor_offset());
+        let focused = editor.focus_handle.is_focused(window);
+        let offset = editor.scroll_handle.offset().y;
+        let line_height = window.line_height();
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let rows = folding::RowMap::new(&editor.folded);
+        let row_count = rows.rows(line_count);
+        let first = ((-offset) / line_height).floor().max(0.) as usize;
+        let visible = (bounds.size.height / line_height).ceil() as usize + 1;
+        let hovered = hitbox.is_hovered(window);
+        // Fold starts: folded ones always show; the rest while hovered.
+        let folded_starts = editor
+            .folded
+            .iter()
+            .map(|region| region.start_line)
+            .collect::<Vec<_>>();
+        let fold_starts = if hovered {
+            let mut cache = editor.paint_cache.borrow_mut();
+            cache.refresh(text, editor.language);
+            cache
+                .fold_regions(text)
+                .iter()
+                .map(|region| region.start_line)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let shape = |window: &mut Window, label: &str, color: gpui::Hsla| {
+            window.text_system().shape_line(
+                label.to_owned().into(),
+                font_size,
+                &[TextRun {
+                    len: label.len(),
+                    font: style.font(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            )
+        };
+        let numbers_right = bounds.right() - px(GUTTER_PADDING + FOLD_COLUMN);
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            for row in first..(first + visible).min(row_count) {
+                let line = rows.line(row);
+                let number = (line + 1).to_string();
+                let color = if focused && line == cursor_line {
+                    theme().text
+                } else {
+                    theme().text_muted
+                };
+                let shaped = shape(window, &number, color.into());
+                let y = bounds.top() + offset + line_height * row as f32;
+                let _ = shaped.paint(
+                    point(numbers_right - shaped.width, y),
+                    line_height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+                let chevron = if folded_starts.contains(&line) {
+                    Some("▸")
+                } else if fold_starts.contains(&line) {
+                    Some("▾")
+                } else {
+                    None
+                };
+                if let Some(chevron) = chevron {
+                    let shaped = shape(window, chevron, theme().text_muted.into());
+                    let x = numbers_right + px(FOLD_COLUMN / 2. + 2.) - shaped.width / 2.;
+                    let _ =
+                        shaped.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+                }
+            }
+        });
+
+        let fold_area =
+            Bounds::from_corners(point(numbers_right, bounds.top()), bounds.bottom_right());
+        if hovered {
+            window.set_cursor_style(gpui::CursorStyle::Arrow, hitbox);
+        }
+        let editor = self.editor.clone();
+        let hitbox = hitbox.clone();
+        window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _| {
+            if phase == gpui::DispatchPhase::Bubble && hitbox.is_hovered(window) != hovered {
+                window.refresh();
+            }
+        });
+        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+            if phase != gpui::DispatchPhase::Bubble
+                || event.button != MouseButton::Left
+                || !fold_area.contains(&event.position)
+            {
+                return;
+            }
+            let row = ((event.position.y - bounds.top() - offset) / line_height).max(0.) as usize;
+            if row >= row_count {
+                return;
+            }
+            let line = rows.line(row);
+            editor.update(cx, |editor, cx| editor.toggle_fold_at(line, cx));
+            window.refresh();
+            cx.stop_propagation();
+        });
+    }
+}
+
+const GUTTER_PADDING: f32 = 8.;
+/// Room for fold chevrons between the line numbers and the text.
+const FOLD_COLUMN: f32 = 12.;
 
 struct TextEditorText {
     editor: Entity<TextEditor>,
@@ -1178,7 +2440,13 @@ struct TextEditorText {
 
 struct PrepaintState {
     lines: LineLayouts,
+    /// Current-line and matching-bracket highlights, painted under the text.
+    decorations: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// Carets of the selections beyond the primary one.
+    extra_cursors: Vec<PaintQuad>,
+    /// `⋯` after each folded block's opening line.
+    fold_markers: Vec<(Point<Pixels>, ShapedLine)>,
     selections: Vec<PaintQuad>,
     /// The child bounds after applying any caret-reveal delta calculated for
     /// this frame. Painting with these bounds keeps the text and scroll
@@ -1262,7 +2530,8 @@ impl Element for TextEditorText {
                     width
                 }
             };
-            (width, cache.line_starts.len())
+            let rows = folding::RowMap::new(&editor.folded);
+            (width, rows.rows(cache.line_starts.len()))
         };
 
         let mut style = Style::default();
@@ -1293,6 +2562,8 @@ impl Element for TextEditorText {
             .as_deref()
             .map(|masked| masked.split('\n').collect::<Vec<_>>());
         let line_count = cache.line_starts.len();
+        let rows = folding::RowMap::new(&editor.folded);
+        let row_count = rows.rows(line_count);
 
         let shape = |window: &mut Window, line: usize| {
             let line_start = cache.line_starts[line];
@@ -1337,7 +2608,7 @@ impl Element for TextEditorText {
         let cursor_shaped = shape(window, cursor_line);
         let cursor_position = point(
             cursor_shaped.x_for_index(display_column(cursor_line, cursor_col)),
-            line_height * cursor_line as f32,
+            line_height * rows.row(cursor_line) as f32,
         );
         let focused = editor.focus_handle.is_focused(window);
         let reveal = editor.reveal_requested.replace(false);
@@ -1360,19 +2631,20 @@ impl Element for TextEditorText {
         // Lay out only the lines inside the scroll viewport, plus the caret's
         // line for hit testing and input-method bounds.
         let viewport = window.content_mask().bounds;
-        let first = ((viewport.top() - paint_bounds.top()) / line_height)
+        let first_row = ((viewport.top() - paint_bounds.top()) / line_height)
             .floor()
             .max(0.) as usize;
-        let last = (((viewport.bottom() - paint_bounds.top()) / line_height)
+        let last_row = (((viewport.bottom() - paint_bounds.top()) / line_height)
             .ceil()
             .max(0.) as usize)
-            .min(line_count);
+            .min(row_count);
         let mut cursor_shaped = Some(cursor_shaped);
-        let mut lines = Vec::with_capacity(last.saturating_sub(first) + 1);
+        let first = rows.line(first_row);
+        let mut lines = Vec::with_capacity(last_row.saturating_sub(first_row) + 1);
         if cursor_line < first {
             lines.push((cursor_line, cursor_shaped.take().unwrap()));
         }
-        for line in first..last.max(first) {
+        for line in (first_row..last_row.max(first_row)).map(|row| rows.line(row)) {
             let shaped = if line == cursor_line {
                 cursor_shaped.take().unwrap()
             } else {
@@ -1384,6 +2656,29 @@ impl Element for TextEditorText {
             lines.push((cursor_line, shaped));
         }
 
+        let extra_cursors = if focused {
+            editor
+                .extra_selections
+                .iter()
+                .filter_map(|range| {
+                    let (line, column) = cache.line_and_column(clamp_boundary(text, range.end));
+                    let (_, shaped) = lines.iter().find(|(shaped_line, _)| *shaped_line == line)?;
+                    Some(fill(
+                        Bounds::new(
+                            point(
+                                paint_bounds.left()
+                                    + shaped.x_for_index(display_column(line, column)),
+                                paint_bounds.top() + line_height * rows.row(line) as f32,
+                            ),
+                            size(px(2.), line_height),
+                        ),
+                        crate::theme::theme().focus_ring,
+                    ))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let cursor_quad = focused.then(|| {
             fill(
                 Bounds::new(
@@ -1400,11 +2695,13 @@ impl Element for TextEditorText {
         });
 
         let mut selections = Vec::new();
-        if !editor.selected_range.is_empty() {
+        let painted_selections = std::iter::once(&editor.selected_range)
+            .chain(&editor.extra_selections)
+            .filter(|range| !range.is_empty());
+        for selected in painted_selections {
             let (start_line, start_col) =
-                cache.line_and_column(clamp_boundary(text, editor.selected_range.start));
-            let (end_line, end_col) =
-                cache.line_and_column(clamp_boundary(text, editor.selected_range.end));
+                cache.line_and_column(clamp_boundary(text, selected.start));
+            let (end_line, end_col) = cache.line_and_column(clamp_boundary(text, selected.end));
             for (line, shaped_line) in lines
                 .iter()
                 .filter(|(line, _)| (start_line..=end_line).contains(line))
@@ -1424,11 +2721,11 @@ impl Element for TextEditorText {
                     Bounds::from_corners(
                         point(
                             paint_bounds.left() + start,
-                            paint_bounds.top() + line_height * line as f32,
+                            paint_bounds.top() + line_height * rows.row(line) as f32,
                         ),
                         point(
                             paint_bounds.left() + end,
-                            paint_bounds.top() + line_height * (line + 1) as f32,
+                            paint_bounds.top() + line_height * (rows.row(line) + 1) as f32,
                         ),
                     ),
                     theme().selection,
@@ -1436,12 +2733,139 @@ impl Element for TextEditorText {
             }
         }
 
+        let mut decorations = Vec::new();
+        if editor.is_code() && focused {
+            if editor.selected_range.is_empty() {
+                decorations.push(fill(
+                    Bounds::from_corners(
+                        point(
+                            viewport.left(),
+                            paint_bounds.top() + line_height * rows.row(cursor_line) as f32,
+                        ),
+                        point(
+                            viewport.right().max(paint_bounds.right()),
+                            paint_bounds.top() + line_height * (rows.row(cursor_line) + 1) as f32,
+                        ),
+                    ),
+                    theme().grid_alternate,
+                ));
+            }
+            if editor.selected_range.is_empty() {
+                for range in cache.occurrences(text, cursor, editor.sql_dialect()) {
+                    let (line, start) = cache.line_and_column(range.start);
+                    let (end_line, end) = cache.line_and_column(range.end);
+                    let Some((_, shaped)) = lines
+                        .iter()
+                        .find(|(shaped_line, _)| *shaped_line == line && line == end_line)
+                    else {
+                        continue;
+                    };
+                    decorations.push(fill(
+                        Bounds::from_corners(
+                            point(
+                                paint_bounds.left() + shaped.x_for_index(start),
+                                paint_bounds.top() + line_height * rows.row(line) as f32,
+                            ),
+                            point(
+                                paint_bounds.left() + shaped.x_for_index(end),
+                                paint_bounds.top() + line_height * (rows.row(line) + 1) as f32,
+                            ),
+                        ),
+                        theme().selection.alpha(0.45),
+                    ));
+                }
+            }
+            let near_bracket = [Some(cursor), cursor.checked_sub(1)]
+                .into_iter()
+                .flatten()
+                .any(|offset| {
+                    text.as_bytes()
+                        .get(offset)
+                        .is_some_and(|byte| b"()[]{}".contains(byte))
+                });
+            if near_bracket {
+                let tokens = cache
+                    .tokens
+                    .iter()
+                    .filter_map(|token| match token.kind {
+                        HighlightTokenKind::Sql(kind) => Some(SqlToken {
+                            kind,
+                            range: token.range.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if let Some((first, second)) = commands::matching_bracket(text, cursor, &tokens) {
+                    for offset in [first, second] {
+                        let (line, column) = cache.line_and_column(offset);
+                        if let Some((_, shaped)) =
+                            lines.iter().find(|(shaped_line, _)| *shaped_line == line)
+                        {
+                            let left = shaped.x_for_index(column);
+                            let right = shaped.x_for_index(column + 1);
+                            decorations.push(fill(
+                                Bounds::from_corners(
+                                    point(
+                                        paint_bounds.left() + left,
+                                        paint_bounds.top() + line_height * rows.row(line) as f32,
+                                    ),
+                                    point(
+                                        paint_bounds.left() + right,
+                                        paint_bounds.top()
+                                            + line_height * (rows.row(line) + 1) as f32,
+                                    ),
+                                ),
+                                theme().accent_soft,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut fold_markers = Vec::new();
+        for region in &editor.folded {
+            let Some((_, shaped)) = lines.iter().find(|(line, _)| *line == region.start_line)
+            else {
+                continue;
+            };
+            let marker = window.text_system().shape_line(
+                "⋯".into(),
+                font_size,
+                &[TextRun {
+                    len: "⋯".len(),
+                    font: style.font(),
+                    color: crate::theme::theme().text_muted.into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            );
+            let top = paint_bounds.top() + line_height * rows.row(region.start_line) as f32;
+            let left = paint_bounds.left() + shaped.width + px(6.);
+            decorations.push(
+                fill(
+                    Bounds::new(
+                        point(left, top + px(2.)),
+                        size(marker.width + px(8.), line_height - px(4.)),
+                    ),
+                    crate::theme::theme().grid_alternate,
+                )
+                .corner_radii(px(3.)),
+            );
+            fold_markers.push((point(left + px(4.), top), marker));
+        }
         PrepaintState {
             lines: LineLayouts {
-                count: line_count,
+                count: row_count,
                 lines,
+                rows,
             },
+            decorations,
             cursor: cursor_quad,
+            extra_cursors,
+            fold_markers,
             selections,
             paint_bounds,
             scroll_offset,
@@ -1468,6 +2892,9 @@ impl Element for TextEditorText {
             cx,
         );
 
+        for decoration in state.decorations.drain(..) {
+            window.paint_quad(decoration);
+        }
         for selection in state.selections.drain(..) {
             window.paint_quad(selection);
         }
@@ -1476,7 +2903,7 @@ impl Element for TextEditorText {
                 .paint(
                     point(
                         state.paint_bounds.left(),
-                        state.paint_bounds.top() + window.line_height() * *line as f32,
+                        state.paint_bounds.top() + state.lines.top(*line, window.line_height()),
                     ),
                     window.line_height(),
                     TextAlign::Left,
@@ -1489,12 +2916,30 @@ impl Element for TextEditorText {
         if let Some(cursor) = state.cursor.take() {
             window.paint_quad(cursor);
         }
+        for cursor in state.extra_cursors.drain(..) {
+            window.paint_quad(cursor);
+        }
+        for (origin, marker) in state.fold_markers.drain(..) {
+            let _ = marker.paint(
+                origin,
+                window.line_height(),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
 
         self.editor.update(cx, |editor, _| {
             if let Some(scroll_offset) = state.scroll_offset
                 && editor.scroll_handle.offset() != scroll_offset
             {
                 editor.scroll_handle.set_offset(scroll_offset);
+                // The line-number gutter painted earlier this frame with the
+                // old offset.
+                if editor.is_code() {
+                    window.refresh();
+                }
             }
             // The prepaint state is no longer needed after painting. Move the
             // shaped lines into the editor so the hit-test/completion cache
@@ -1767,6 +3212,134 @@ fn input_with_context(
                 });
             }
         })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &Indent, window, cx| {
+                editor.update(cx, |editor, cx| editor.indent(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &Outdent, window, cx| {
+                editor.update(cx, |editor, cx| editor.outdent(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &ToggleLineComment, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.toggle_line_comment(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &DuplicateLines, window, cx| {
+                editor.update(cx, |editor, cx| editor.duplicate_lines(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveLinesUp, window, cx| {
+                editor.update(cx, |editor, cx| editor.move_lines_up(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveLinesDown, window, cx| {
+                editor.update(cx, |editor, cx| editor.move_lines_down(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &DeleteLines, window, cx| {
+                editor.update(cx, |editor, cx| editor.delete_lines(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectUp, window, cx| {
+                editor.update(cx, |editor, cx| editor.select_up(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectDown, window, cx| {
+                editor.update(cx, |editor, cx| editor.select_down(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveToStart, window, cx| {
+                editor.update(cx, |editor, cx| editor.move_to_start(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &MoveToEnd, window, cx| {
+                editor.update(cx, |editor, cx| editor.move_to_end(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectToStart, window, cx| {
+                editor.update(cx, |editor, cx| editor.select_to_start(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectToEnd, window, cx| {
+                editor.update(cx, |editor, cx| editor.select_to_end(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &DeleteWordLeft, window, cx| {
+                editor.update(cx, |editor, cx| editor.delete_word_left(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &DeleteToLineStart, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.delete_to_line_start(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectLine, window, cx| {
+                editor.update(cx, |editor, cx| editor.select_line(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectNextOccurrence, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.select_next_occurrence(action, window, cx)
+                });
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &Fold, window, cx| {
+                editor.update(cx, |editor, cx| editor.fold(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &Unfold, window, cx| {
+                editor.update(cx, |editor, cx| editor.unfold(action, window, cx));
+            }
+        })
+        .on_action({
+            let editor = editor.clone();
+            move |action: &SelectAllOccurrences, window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.select_all_occurrences(action, window, cx)
+                });
+            }
+        })
         .on_mouse_down(MouseButton::Left, {
             let editor = editor.clone();
             move |event, window, cx| {
@@ -1806,12 +3379,12 @@ fn editor_text_runs(
     language: EditorLanguage,
     tokens: &[HighlightToken],
     marked_range: Option<&Range<usize>>,
-    diagnostics: &[Range<usize>],
+    diagnostics: &[EditorDiagnostic],
 ) -> Vec<TextRun> {
     let base = style.to_run(line.len());
     let runs = match language {
         EditorLanguage::PlainText => vec![base],
-        EditorLanguage::Sql | EditorLanguage::Redis | EditorLanguage::Json => {
+        EditorLanguage::Sql(_) | EditorLanguage::Redis | EditorLanguage::Json => {
             syntax_runs(line, line_start, tokens, &base)
         }
     };
@@ -1922,12 +3495,16 @@ fn apply_marked_runs(
 fn apply_diagnostic_runs(
     line_len: usize,
     line_start: usize,
-    diagnostics: &[Range<usize>],
+    diagnostics: &[EditorDiagnostic],
     mut runs: Vec<TextRun>,
 ) -> Vec<TextRun> {
-    for range in diagnostics {
-        let Some(range) = marked_slice(line_len, line_start, range) else {
+    for diagnostic in diagnostics {
+        let Some(range) = marked_slice(line_len, line_start, &diagnostic.range) else {
             continue;
+        };
+        let color = match diagnostic.severity {
+            DiagnosticSeverity::Error => theme().danger,
+            DiagnosticSeverity::Warning => theme().warning,
         };
         let mut result = Vec::with_capacity(runs.len() + 2);
         let mut offset = 0;
@@ -1947,7 +3524,7 @@ fn apply_diagnostic_runs(
                 result.push(TextRun {
                     len: end - start,
                     underline: Some(UnderlineStyle {
-                        color: Some(theme().danger.into()),
+                        color: Some(color.into()),
                         thickness: px(1.),
                         wavy: true,
                     }),
@@ -2066,14 +3643,6 @@ fn clamp_boundary(text: &str, mut offset: usize) -> usize {
 
 fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
     clamp_boundary(text, range.start)..clamp_boundary(text, range.end)
-}
-
-fn clamp_ranges(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    ranges
-        .into_iter()
-        .map(|range| clamp_range(text, range))
-        .filter(|range| !range.is_empty())
-        .collect()
 }
 
 fn previous_boundary(text: &str, offset: usize) -> usize {
@@ -2237,6 +3806,7 @@ fn scroll_offset_for_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dbx_core::DatabaseKind;
 
     #[test]
     fn grapheme_navigation_never_splits_emoji_or_combining_marks() {
@@ -2284,6 +3854,7 @@ mod tests {
             0..0,
             cursor,
             QueryExecutionScope::SelectionOrStatement,
+            None,
         );
         assert_eq!(&text[range], "\nSELECT 🦀 FROM users;");
 
@@ -2293,6 +3864,7 @@ mod tests {
             selection,
             cursor,
             QueryExecutionScope::SelectionOrStatement,
+            None,
         );
         assert_eq!(&text[range], "SELECT 3");
     }
@@ -2301,14 +3873,17 @@ mod tests {
     fn sql_execution_keeps_the_last_statement_after_its_terminator() {
         let statement = "SELECT * FROM missing_table;";
         assert_eq!(
-            sql_statement_range(statement, statement.len()),
+            sql_statement_range(statement, statement.len(), None),
             0..statement.len()
         );
 
         let with_trailing_whitespace = "SELECT 1;\n  ";
         assert_eq!(
-            &with_trailing_whitespace
-                [sql_statement_range(with_trailing_whitespace, with_trailing_whitespace.len(),)],
+            &with_trailing_whitespace[sql_statement_range(
+                with_trailing_whitespace,
+                with_trailing_whitespace.len(),
+                None
+            )],
             "SELECT 1;"
         );
     }
@@ -2317,19 +3892,71 @@ mod tests {
     fn sql_execution_ignores_terminators_inside_lexical_regions() {
         let text = "SELECT ';', $$BEGIN; END$$ /* ; */ -- ;\n; SELECT 2;";
         let first_end = text.find(" SELECT 2").unwrap();
-        assert_eq!(sql_statement_range(text, 10), 0..first_end);
+        assert_eq!(sql_statement_range(text, 10, None), 0..first_end);
         let second = text.find("SELECT 2").unwrap();
-        assert_eq!(&text[sql_statement_range(text, second)], " SELECT 2;");
+        assert_eq!(&text[sql_statement_range(text, second, None)], " SELECT 2;");
+    }
+
+    #[test]
+    fn sql_execution_keeps_trigger_bodies_whole() {
+        let text = "CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN\n  UPDATE y SET a = CASE WHEN 1 THEN 2 END;\n  DELETE FROM z;\nEND;\nBEGIN; SELECT 2;";
+        let trigger_end = text.find("\nBEGIN;").unwrap();
+        let inside_body = text.find("DELETE").unwrap();
+        assert_eq!(sql_statement_range(text, inside_body, None), 0..trigger_end);
+        assert_eq!(sql_statement_count(text, None), 3);
+        let select = text.find("SELECT 2").unwrap();
+        assert_eq!(&text[sql_statement_range(text, select, None)], " SELECT 2;");
+    }
+
+    #[test]
+    fn statements_and_tokens_follow_the_connection_dialect() {
+        let postgres = Some(DatabaseKind::PostgreSQL);
+        let mysql = Some(DatabaseKind::MySQL);
+        // `#` is an operator in PostgreSQL and a comment in MySQL.
+        let text = "SELECT doc #>> '{a}' FROM t; SELECT 2";
+        assert!(
+            !lex_sql_for(text, postgres)
+                .iter()
+                .any(|token| token.kind == SqlTokenKind::Comment)
+        );
+        assert_eq!(sql_statement_count(text, postgres), 2);
+        let commented = "SELECT 1; # a;b\nSELECT 2";
+        let second = commented.find("SELECT 2").unwrap();
+        assert_eq!(
+            &commented[sql_statement_range(commented, second, mysql)],
+            " # a;b\nSELECT 2"
+        );
+        // PostgreSQL standard strings keep backslashes literal.
+        let path = "SELECT 'C:\\'; SELECT 2";
+        assert_eq!(sql_statement_count(path, postgres), 2);
+        // `$$` is a MySQL delimiter, not a string.
+        let routine = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END $$\nDELIMITER ;";
+        assert!(
+            lex_sql_for(routine, mysql)
+                .iter()
+                .any(|token| token.kind == SqlTokenKind::Keyword
+                    && &routine[token.range.clone()] == "CREATE")
+        );
+        let body = routine.find("SELECT 1").unwrap();
+        assert_eq!(sql_statement_delimiter(routine, body, mysql), ";");
+        let routines = "DELIMITER $$\nCREATE PROCEDURE a() BEGIN SELECT 1; END $$\nCREATE PROCEDURE b() BEGIN SELECT 2; END $$\nDELIMITER ;";
+        let second_body = routines.find("SELECT 2").unwrap();
+        assert_eq!(sql_statement_delimiter(routines, second_body, mysql), "$$");
+        // Danger classification sees past PostgreSQL `#` operators.
+        assert_eq!(
+            sql_execution_kind("UPDATE t SET flags = flags # 4 WHERE id = 1", postgres),
+            SqlExecutionKind::MutationRisk
+        );
     }
 
     #[test]
     fn statement_count_ignores_lexical_semicolons_and_empty_statements() {
         assert_eq!(
-            sql_statement_count("; SELECT ';'; $$BEGIN; END$$; -- ;\n"),
+            sql_statement_count("; SELECT ';'; $$BEGIN; END$$; -- ;\n", None),
             2
         );
         assert_eq!(
-            sql_statement_count("-- comment only\n/* still comment */"),
+            sql_statement_count("-- comment only\n/* still comment */", None),
             0
         );
     }
@@ -2337,97 +3964,113 @@ mod tests {
     #[test]
     fn schema_change_detection_is_lexer_aware_and_conservative() {
         assert!(sql_may_change_schema(
-            "SELECT 1; CREATE TABLE audit_log (id int)"
+            "SELECT 1; CREATE TABLE audit_log (id int)",
+            None
         ));
         assert!(sql_may_change_schema(
-            "ALTER TABLE users ADD COLUMN active boolean"
+            "ALTER TABLE users ADD COLUMN active boolean",
+            None
         ));
-        assert!(sql_may_change_schema("CALL install_schema()"));
+        assert!(sql_may_change_schema("CALL install_schema()", None));
         assert!(!sql_may_change_schema(
-            "SELECT 'CREATE TABLE decoy'; -- DROP TABLE decoy\nSELECT 2"
+            "SELECT 'CREATE TABLE decoy'; -- DROP TABLE decoy\nSELECT 2",
+            None
         ));
         assert!(!sql_may_change_schema(
-            "SELECT $$ALTER TABLE decoy ADD COLUMN value int$$"
+            "SELECT $$ALTER TABLE decoy ADD COLUMN value int$$",
+            None
         ));
     }
 
     #[test]
     fn execution_kind_is_conservative_about_writes() {
-        assert_eq!(sql_execution_kind("SELECT 1"), SqlExecutionKind::Read);
+        assert_eq!(sql_execution_kind("SELECT 1", None), SqlExecutionKind::Read);
         assert_eq!(
-            sql_execution_kind("SELECT 1; UPDATE users SET active = TRUE"),
+            sql_execution_kind("SELECT 1; UPDATE users SET active = TRUE", None),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
-            sql_execution_kind("DELETE FROM users"),
+            sql_execution_kind("DELETE FROM users", None),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
-            sql_execution_kind("DELETE FROM users WHERE id = 1"),
+            sql_execution_kind("DELETE FROM users WHERE id = 1", None),
             SqlExecutionKind::MutationRisk
         );
         assert_eq!(
-            sql_execution_kind("UPDATE users SET active = TRUE"),
+            sql_execution_kind("UPDATE users SET active = TRUE", None),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
-            sql_execution_kind("UPDATE users SET active = TRUE WHERE id = 1"),
+            sql_execution_kind("UPDATE users SET active = TRUE WHERE id = 1", None),
             SqlExecutionKind::MutationRisk
-        );
-        assert_eq!(
-            sql_execution_kind("WITH doomed AS (SELECT id FROM users) DELETE FROM users"),
-            SqlExecutionKind::Destructive
         );
         assert_eq!(
             sql_execution_kind(
-                "WITH changed AS (SELECT id FROM users) UPDATE users SET active = TRUE"
+                "WITH doomed AS (SELECT id FROM users) DELETE FROM users",
+                None
             ),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
             sql_execution_kind(
-                "WITH matched AS (SELECT id FROM users) DELETE FROM users WHERE id = 1"
-            ),
-            SqlExecutionKind::MutationRisk
-        );
-        assert_eq!(
-            sql_execution_kind(
-                "WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted"
+                "WITH changed AS (SELECT id FROM users) UPDATE users SET active = TRUE",
+                None
             ),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
             sql_execution_kind(
-                "WITH changed AS (UPDATE users SET active = TRUE WHERE id = 1 RETURNING *) SELECT * FROM changed"
+                "WITH matched AS (SELECT id FROM users) DELETE FROM users WHERE id = 1",
+                None
             ),
             SqlExecutionKind::MutationRisk
         );
         assert_eq!(
             sql_execution_kind(
-                "WITH selected AS (SELECT id FROM users WHERE active = TRUE) SELECT * FROM selected"
+                "WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted",
+                None
+            ),
+            SqlExecutionKind::Destructive
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH changed AS (UPDATE users SET active = TRUE WHERE id = 1 RETURNING *) SELECT * FROM changed",
+                None
+            ),
+            SqlExecutionKind::MutationRisk
+        );
+        assert_eq!(
+            sql_execution_kind(
+                "WITH selected AS (SELECT id FROM users WHERE active = TRUE) SELECT * FROM selected",
+                None
             ),
             SqlExecutionKind::Read
         );
         assert_eq!(
             sql_execution_kind(
-                "WITH selected AS (SELECT 'DELETE FROM users', $$UPDATE users$$) /* DELETE */ SELECT * FROM selected"
+                "WITH selected AS (SELECT 'DELETE FROM users', $$UPDATE users$$) /* DELETE */ SELECT * FROM selected",
+                None
             ),
             SqlExecutionKind::Read
         );
         assert_eq!(
-            sql_execution_kind("MERGE INTO users USING incoming ON users.id = incoming.id"),
+            sql_execution_kind(
+                "MERGE INTO users USING incoming ON users.id = incoming.id",
+                None
+            ),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
-            sql_execution_kind("REPLACE INTO users(id) VALUES (1)"),
+            sql_execution_kind("REPLACE INTO users(id) VALUES (1)", None),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
-            sql_execution_kind("DROP TABLE users"),
+            sql_execution_kind("DROP TABLE users", None),
             SqlExecutionKind::Destructive
         );
         assert_eq!(
-            sql_execution_kind("EXPLAIN SELECT 1"),
+            sql_execution_kind("EXPLAIN SELECT 1", None),
             SqlExecutionKind::MutationRisk
         );
     }
@@ -2436,11 +4079,17 @@ mod tests {
     fn execution_scope_supports_document_and_line_or_selection_commands() {
         let text = "SET one\nGET two\nDEL three";
         assert_eq!(
-            execution_range(text, 0..0, 9, QueryExecutionScope::SelectionOrCurrentLine),
+            execution_range(
+                text,
+                0..0,
+                9,
+                QueryExecutionScope::SelectionOrCurrentLine,
+                None
+            ),
             8..15
         );
         assert_eq!(
-            execution_range(text, 0..0, 9, QueryExecutionScope::Document),
+            execution_range(text, 0..0, 9, QueryExecutionScope::Document, None),
             0..text.len()
         );
     }
@@ -2489,7 +4138,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut cache = PaintCache::default();
-        cache.refresh(&text, EditorLanguage::Sql);
+        cache.refresh(&text, EditorLanguage::Sql(None));
         assert_eq!(cache.line_starts.len(), 20_001);
         assert!(cache.longest_lines.contains(&20_000));
         assert_eq!(cache.longest_lines.len(), PaintCache::MEASURED_LINES);
@@ -2502,9 +4151,9 @@ mod tests {
         assert!(tokens[0].range.start >= cache.line_starts[19_999]);
         // Unchanged text keeps the measured width; edits clear it.
         cache.width = Some((px(13.), px(500.)));
-        cache.refresh(&text, EditorLanguage::Sql);
+        cache.refresh(&text, EditorLanguage::Sql(None));
         assert!(cache.width.is_some());
-        cache.refresh(&format!("{text} "), EditorLanguage::Sql);
+        cache.refresh(&format!("{text} "), EditorLanguage::Sql(None));
         assert!(cache.width.is_none());
     }
 
@@ -2544,13 +4193,17 @@ mod tests {
             .collect();
         let style = gpui::TextStyle::default();
         let second_line_start = "SELECT\n".len();
-        let diagnostics = std::iter::once(second_line_start + 5..text.len()).collect::<Vec<_>>();
+        let diagnostics = vec![EditorDiagnostic {
+            range: second_line_start + 5..text.len(),
+            severity: DiagnosticSeverity::Error,
+            message: "error".into(),
+        }];
 
         let runs = editor_text_runs(
             "FROM users",
             second_line_start,
             &style,
-            EditorLanguage::Sql,
+            EditorLanguage::Sql(None),
             &tokens,
             Some(&(second_line_start..second_line_start + 4)),
             &diagnostics,
@@ -2704,8 +4357,24 @@ mod tests {
     #[test]
     fn editor_bindings_are_scoped_to_the_text_editor_context() {
         let bindings = default_key_bindings();
-        assert_eq!(bindings.len(), 32);
         assert!(bindings.iter().all(|binding| binding.predicate().is_some()));
+        // Tab indents only in the SQL editor; form fields keep focus traversal.
+        let tab = bindings
+            .iter()
+            .find(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(|keystroke| keystroke.unparse())
+                    .eq(["tab".to_owned()])
+            })
+            .unwrap();
+        assert!(
+            tab.predicate()
+                .unwrap()
+                .to_string()
+                .contains(SQL_EDITOR_CONTEXT)
+        );
         assert_eq!(TEXT_INPUT_CONTEXT, TEXT_EDITOR_CONTEXT);
     }
 
@@ -3173,13 +4842,13 @@ mod tests {
     #[test]
     fn format_cursor_stays_on_the_same_token() {
         let text = "select id,name from users";
-        let (formatted, cursor) = format_sql_at_cursor(text, 7);
+        let (formatted, cursor) = format_sql_at_cursor(text, 7, None);
         assert_eq!(&formatted[cursor..cursor + 2], "id");
         // Cursor in the gap before `name` maps to that token's start.
-        let (_, gap_cursor) = format_sql_at_cursor(text, 10);
+        let (_, gap_cursor) = format_sql_at_cursor(text, 10, None);
         assert!(formatted[gap_cursor..].starts_with("name"));
         // End of input clamps to the end of the output.
-        let (_, end_cursor) = format_sql_at_cursor(text, text.len());
+        let (_, end_cursor) = format_sql_at_cursor(text, text.len(), None);
         assert_eq!(end_cursor, formatted.len());
     }
 
@@ -3220,5 +4889,190 @@ mod tests {
     fn error_range_returns_none_when_nothing_matches() {
         assert_eq!(sql_error_range("connection refused", "SELECT 1"), None);
         assert_eq!(sql_error_range("syntax error", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod code_editing_tests {
+    use super::*;
+    use dbx_core::DatabaseKind;
+    use gpui::{EntityInputHandler, TestAppContext};
+
+    struct Harness {
+        editor: Entity<TextEditor>,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let focus = self.editor.read(cx).focus_handle();
+            div()
+                .w(px(480.))
+                .h(px(240.))
+                .child(sql_input_fill(self.editor.clone(), focus))
+        }
+    }
+
+    #[gpui::test]
+    fn sql_editor_pairs_indents_and_undoes_words(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| String::new());
+            let editor =
+                cx.new(|cx| TextEditor::new_sql(value, Some(DatabaseKind::PostgreSQL), window, cx));
+            Harness { editor }
+        });
+        let editor = harness.read_with(cx, |harness, _| harness.editor.clone());
+        let text =
+            |cx: &mut gpui::VisualTestContext| editor.read_with(cx, |editor, cx| editor.text(cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.focus_handle.focus(window, cx);
+                for typed in ["S", "E", "L", "E", "C", "T", " ", "f", "("] {
+                    editor.replace_text_in_range(None, typed, window, cx);
+                }
+                editor.newline(&Enter, window, cx);
+                editor.replace_text_in_range(None, "x", window, cx);
+            });
+        });
+        assert_eq!(text(cx), "SELECT f(\n  x\n)");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.toggle_line_comment(&ToggleLineComment, window, cx);
+            });
+        });
+        assert_eq!(text(cx), "SELECT f(\n  -- x\n)");
+        cx.update(|_, cx| editor.update(cx, |editor, cx| editor.undo(cx)));
+        assert_eq!(text(cx), "SELECT f(\n  x\n)");
+        // Typed letters undo as one word, not one letter at a time.
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                // `x`, the newline, the bracket pair, then the word `f`.
+                for _ in 0..4 {
+                    editor.undo(cx);
+                }
+            })
+        });
+        assert_eq!(text(cx), "SELECT ");
+        cx.update(|_, cx| editor.update(cx, |editor, cx| editor.undo(cx)));
+        assert_eq!(text(cx), "SELECT");
+    }
+
+    #[gpui::test]
+    fn several_selections_type_delete_and_rename_together(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| "SELECT u.id, \"u\".name FROM users u;\nSELECT u".to_owned());
+            let editor =
+                cx.new(|cx| TextEditor::new_sql(value, Some(DatabaseKind::PostgreSQL), window, cx));
+            Harness { editor }
+        });
+        let editor = harness.read_with(cx, |harness, _| harness.editor.clone());
+        let text =
+            |cx: &mut gpui::VisualTestContext| editor.read_with(cx, |editor, cx| editor.text(cx));
+        // F2 on the alias selects its uses in this statement only, inside quotes.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.focus_handle.focus(window, cx);
+                editor.move_to(7, cx);
+                editor.select_all_occurrences(&SelectAllOccurrences, window, cx);
+                assert_eq!(editor.extra_selections.len(), 2);
+                for typed in ["a", "c"] {
+                    editor.replace_text_in_range(None, typed, window, cx);
+                }
+            });
+        });
+        assert_eq!(
+            text(cx),
+            "SELECT ac.id, \"ac\".name FROM users ac;\nSELECT u"
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.backspace(&Backspace, window, cx);
+            });
+        });
+        assert_eq!(text(cx), "SELECT a.id, \"a\".name FROM users a;\nSELECT u");
+        // One undo step per edit, and undo collapses to a single caret.
+        cx.update(|_, cx| editor.update(cx, |editor, cx| editor.undo(cx)));
+        assert_eq!(
+            text(cx),
+            "SELECT ac.id, \"ac\".name FROM users ac;\nSELECT u"
+        );
+        assert!(editor.read_with(cx, |editor, _| editor.extra_selections.is_empty()));
+
+        // Cmd-D selects the word, then adds the next match each time.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.move_to(8, cx);
+                editor.select_next_occurrence(&SelectNextOccurrence, window, cx);
+                assert_eq!(editor.selected_range, 7..9);
+                editor.select_next_occurrence(&SelectNextOccurrence, window, cx);
+                editor.select_next_occurrence(&SelectNextOccurrence, window, cx);
+                assert_eq!(editor.extra_selections.len(), 2);
+                editor.replace_text_in_range(None, "t", window, cx);
+            });
+        });
+        assert_eq!(text(cx), "SELECT t.id, \"t\".name FROM users t;\nSELECT u");
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                assert!(editor.collapse_selections(cx));
+                assert!(!editor.collapse_selections(cx));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn folded_blocks_hide_lines_follow_edits_and_open_for_the_caret(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value =
+                cx.new(|_| "WITH a AS (\n  SELECT 1\n  FROM t\n)\nSELECT *\nFROM a".to_owned());
+            let editor =
+                cx.new(|cx| TextEditor::new_sql(value, Some(DatabaseKind::PostgreSQL), window, cx));
+            Harness { editor }
+        });
+        let editor = harness.read_with(cx, |harness, _| harness.editor.clone());
+        let draw =
+            |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+        let rows = |cx: &mut gpui::VisualTestContext| {
+            editor.read_with(cx, |editor, _| editor.last_layout.count)
+        };
+        draw(cx);
+        assert_eq!(rows(cx), 6);
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.focus_handle.focus(window, cx);
+                editor.move_to(15, cx);
+                editor.fold(&Fold, window, cx);
+            })
+        });
+        draw(cx);
+        assert_eq!(rows(cx), 4, "the two body lines are hidden");
+        // Down from the opening line lands on the closing line.
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.move_to(5, cx);
+                editor.down(&Down, window, cx);
+                let text = editor.text(cx);
+                assert_eq!(line_and_column(&text, editor.cursor_offset()).0, 3);
+                // Typing above the block keeps it folded.
+                editor.move_to(0, cx);
+                editor.replace_text_in_range(None, "-- x\n", window, cx);
+            })
+        });
+        draw(cx);
+        assert_eq!(rows(cx), 5);
+        // Putting the caret inside opens it.
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                let inside = editor.text(cx).find("FROM t").unwrap();
+                editor.move_to(inside, cx);
+            })
+        });
+        draw(cx);
+        assert_eq!(rows(cx), 7);
+        assert!(editor.read_with(cx, |editor, _| editor.folds.is_empty()));
     }
 }

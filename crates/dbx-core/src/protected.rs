@@ -8,7 +8,7 @@ use async_trait::async_trait;
 
 pub(crate) fn ensure_query(kind: DatabaseKind, query: &str) -> Result<()> {
     let allowed = if kind.is_sql() {
-        crate::transfer::checked_split_sql_for(Some(kind), query)?
+        crate::script::checked_split_sql_for(Some(kind), query)?
             .iter()
             .all(|statement| {
                 let first = crate::sqlx_engine::top_level_operation_keyword(statement)
@@ -194,29 +194,14 @@ fn contains_write_stage(value: &serde_json::Value) -> bool {
     }
 }
 /// SQL keywords outside literals, quoted identifiers and comments.
-pub(crate) fn backslash_string(kind: Option<DatabaseKind>, prefix: &str) -> bool {
-    match kind.map(DatabaseKind::dialect) {
-        None | Some(DatabaseKind::MySQL) => true,
-        Some(DatabaseKind::PostgreSQL) => {
-            prefix
-                .as_bytes()
-                .last()
-                .is_some_and(|byte| matches!(byte, b'e' | b'E'))
-                && (prefix.len() < 2
-                    || prefix
-                        .as_bytes()
-                        .get(prefix.len() - 2)
-                        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_'))
-        }
-        _ => false,
-    }
-}
 pub(crate) fn sql_words_for(kind: Option<DatabaseKind>, sql: &str) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut index = 0;
     let mut words = Vec::new();
     while index < bytes.len() {
-        if bytes[index..].starts_with(b"--") || bytes[index] == b'#' {
+        if bytes[index..].starts_with(b"--")
+            || (bytes[index] == b'#' && crate::script::sql_hash_comments(kind))
+        {
             while index < bytes.len() && bytes[index] != b'\n' {
                 index += 1;
             }
@@ -238,7 +223,8 @@ pub(crate) fn sql_words_for(kind: Option<DatabaseKind>, sql: &str) -> Vec<String
                 }
             }
         } else if b"\'\"`[".contains(&bytes[index]) {
-            let escaped = bytes[index] == b'\'' && backslash_string(kind, &sql[..index]);
+            let escaped =
+                bytes[index] == b'\'' && crate::script::sql_backslash_escapes(kind, &sql[..index]);
             let end = if bytes[index] == b'[' {
                 b']'
             } else {
@@ -259,7 +245,7 @@ pub(crate) fn sql_words_for(kind: Option<DatabaseKind>, sql: &str) -> Vec<String
                     index += 1;
                 }
             }
-        } else if bytes[index] == b'$' {
+        } else if bytes[index] == b'$' && crate::script::sql_dollar_quotes(kind) {
             let start = index;
             index += 1;
             while index < bytes.len()
@@ -313,6 +299,9 @@ mod tests {
                 r#"{"aggregate":"t","pipeline":[{"\u0024out":"other"}]}"#
             )
             .is_err()
-        );
+        ); // `#` is an operator in PostgreSQL, so it cannot hide what follows;
+        // `SELECT ... INTO` creates a table there.
+        assert!(ensure_query(DatabaseKind::PostgreSQL, "SELECT 5 # 3 INTO copy FROM t").is_err());
+        ensure_query(DatabaseKind::MySQL, "SELECT 1 # INTO, UPDATE\n").unwrap();
     }
 }

@@ -134,7 +134,7 @@ impl QuerySession {
         cancellation: QueryCancellation,
     ) -> Result<ScriptResult> {
         let statements = if self.engine.kind().is_sql() {
-            crate::transfer::checked_split_sql_for(Some(self.engine.kind()), sql)?
+            crate::script::checked_split_sql_for(Some(self.engine.kind()), sql)?
         } else {
             vec![sql.to_owned()]
         }
@@ -508,7 +508,19 @@ async fn execute_script(
             Ok(QueryResult::empty(Some(0), 0))
         } else {
             match state.connection.as_mut() {
-                Some(connection) => connection.query(&prepared, options).await,
+                Some(connection) => {
+                    let adapted = match connection {
+                        SqlConnection::Postgres(postgres) if !prepared.params.is_empty() => Some(
+                            crate::parameters::adapt_postgres_parameters(postgres, &prepared).await,
+                        ),
+                        _ => None,
+                    };
+                    match adapted {
+                        Some(Ok(adapted)) => connection.query(&adapted, options).await,
+                        Some(Err(error)) => Err(error),
+                        None => connection.query(&prepared, options).await,
+                    }
+                }
                 None => engine.query_statement(&prepared, options).await,
             }
         };

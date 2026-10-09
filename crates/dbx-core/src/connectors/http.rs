@@ -224,7 +224,7 @@ impl HttpEngine {
     ) -> Result<QueryResult> {
         let started = Instant::now();
         if matches!(self.kind, DatabaseKind::Turso | DatabaseKind::CloudflareD1)
-            && crate::split_sql_statements(&statement.sql).len() > 1
+            && crate::script::split_sql_statements_for(self.kind, &statement.sql).len() > 1
         {
             return Err(DbxError::Parse(format!(
                 "Run one {} SQL statement at a time",
