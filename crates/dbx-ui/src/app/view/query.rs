@@ -902,10 +902,17 @@ impl QueryOptions {
                     .submenu("Delete", window, cx, move |mut menu, _, _| {
                         for saved in &delete.saved {
                             let name = saved.name.clone();
-                            menu =
-                                menu.item(delete.item(saved.name.clone(), move |this, _, cx| {
-                                    this.delete_saved_query_for(session_id, &name, cx)
-                                }));
+                            menu = menu.item(delete.item(
+                                saved.name.clone(),
+                                move |this, window, cx| {
+                                    this.request_delete_saved_query_for(
+                                        session_id,
+                                        name.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            ));
                         }
                         menu
                     })

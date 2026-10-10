@@ -179,6 +179,27 @@ impl DbxApp {
         self.load_data_tab_for(session_id, tab_id, filters, window, cx);
     }
 
+    pub(super) fn request_delete_saved_filter_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ask_to_delete(
+            "Delete saved filter set?".into(),
+            "The saved filter set will be removed for this table.",
+            ConfirmationAction::DeleteSavedFilter {
+                session_id,
+                tab_id,
+                index,
+            },
+            window,
+            cx,
+        );
+    }
+
     pub(super) fn delete_saved_filter_for(
         &mut self,
         session_id: SessionId,

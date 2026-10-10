@@ -205,11 +205,7 @@ impl Engine for DuckEngine {
         statement: &SqlStatement,
         options: QueryOptions,
     ) -> Result<QueryResult> {
-        if crate::script::split_sql_statements_for(DatabaseKind::DuckDB, &statement.sql).len() > 1 {
-            return Err(DbxError::Parse(
-                "Run one DuckDB SQL statement at a time".into(),
-            ));
-        }
+        crate::script::ensure_single_statement(DatabaseKind::DuckDB, &statement.sql, "DuckDB")?;
         let connection = self.connection.clone();
         let statement = statement.clone();
         tokio::task::spawn_blocking(move || {
@@ -268,11 +264,7 @@ impl Engine for DuckEngine {
         .map_err(|_| DbxError::Query("DuckDB query worker failed".into()))?
     }
     async fn execute(&self, statement: &SqlStatement) -> Result<ExecResult> {
-        if crate::script::split_sql_statements_for(DatabaseKind::DuckDB, &statement.sql).len() > 1 {
-            return Err(DbxError::Parse(
-                "Run one DuckDB SQL statement at a time".into(),
-            ));
-        }
+        crate::script::ensure_single_statement(DatabaseKind::DuckDB, &statement.sql, "DuckDB")?;
         let connection = self.connection.clone();
         let statement = statement.clone();
         tokio::task::spawn_blocking(move || {

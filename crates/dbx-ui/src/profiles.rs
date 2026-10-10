@@ -290,6 +290,21 @@ pub enum ProfileError {
     Secret(#[from] SecretStoreError),
 }
 
+/// Largest profile document accepted; real files are a few kilobytes.
+const MAX_PROFILE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_limited(path: &Path) -> ProfileResult<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_PROFILE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PROFILE_FILE_BYTES {
+        return Err(ProfileError::Invalid("profile file is too large".into()));
+    }
+    Ok(bytes)
+}
+
 pub type ProfileResult<T> = Result<T, ProfileError>;
 
 /// Persistent profile repository.
@@ -593,24 +608,29 @@ impl ProfileStore {
         }
 
         if let Err(error) = self.write_document(&document) {
-            if let Some(previous) = &prior_secret {
+            let rollback = if let Some(previous) = &prior_secret {
                 let key = new_secret_key
                     .as_deref()
                     .expect("an existing password replacement has a vault key");
                 match previous {
-                    Some(secret) => {
-                        let _ = self.secrets.set(key, secret);
-                    }
-                    None => {
-                        let _ = self.secrets.delete(key);
-                    }
+                    Some(secret) => self.secrets.set(key, secret),
+                    None => self.secrets.delete(key),
                 }
             } else if existing.is_none()
                 && let Some(key) = &new_secret_key
             {
-                let _ = self.secrets.delete(key);
-            }
-            return Err(error);
+                self.secrets.delete(key)
+            } else {
+                Ok(())
+            };
+            // Say so when the credential could not be put back, rather than
+            // leaving the secret store silently out of step with the profile.
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => ProfileError::Invalid(format!(
+                    "{error}; the stored credential could not be restored: {rollback}"
+                )),
+            });
         }
 
         Ok(replacement.into_public())
@@ -706,9 +726,12 @@ impl ProfileStore {
         if !self.path.exists() {
             return Ok(ProfileDocument::empty());
         }
-        let bytes = fs::read(&self.path)?;
+        let bytes = read_limited(&self.path)?;
         let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
-        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let version = value
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX));
         if version != 1 && version != PROFILE_FILE_VERSION {
             return Err(ProfileError::UnsupportedVersion {
                 found: version,

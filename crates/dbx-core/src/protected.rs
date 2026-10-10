@@ -193,6 +193,16 @@ fn contains_write_stage(value: &serde_json::Value) -> bool {
         _ => false,
     }
 }
+/// Square brackets quote identifiers only in SQL Server and SQLite dialects;
+/// elsewhere they are array subscripts or list literals.
+fn brackets_quote_identifiers(kind: Option<DatabaseKind>) -> bool {
+    kind.is_none_or(|kind| {
+        matches!(
+            kind.dialect(),
+            DatabaseKind::SqlServer | DatabaseKind::SQLite
+        )
+    })
+}
 /// SQL keywords outside literals, quoted identifiers and comments.
 pub(crate) fn sql_words_for(kind: Option<DatabaseKind>, sql: &str) -> Vec<String> {
     let bytes = sql.as_bytes();
@@ -222,7 +232,9 @@ pub(crate) fn sql_words_for(kind: Option<DatabaseKind>, sql: &str) -> Vec<String
                     index += 1;
                 }
             }
-        } else if b"\'\"`[".contains(&bytes[index]) {
+        } else if b"\'\"`".contains(&bytes[index])
+            || (bytes[index] == b'[' && brackets_quote_identifiers(kind))
+        {
             let escaped =
                 bytes[index] == b'\'' && crate::script::sql_backslash_escapes(kind, &sql[..index]);
             let end = if bytes[index] == b'[' {
@@ -303,5 +315,17 @@ mod tests {
         // `SELECT ... INTO` creates a table there.
         assert!(ensure_query(DatabaseKind::PostgreSQL, "SELECT 5 # 3 INTO copy FROM t").is_err());
         ensure_query(DatabaseKind::MySQL, "SELECT 1 # INTO, UPDATE\n").unwrap();
+    }
+
+    #[test]
+    fn brackets_only_quote_identifiers_where_the_engine_allows_it() {
+        // PostgreSQL brackets are array subscripts, so a `]` inside a string
+        // there must not unbalance the scan and hide the DELETE that follows.
+        let hidden = "SELECT (ARRAY[1])[ (']')::int ] INTO copy FROM t";
+        assert!(ensure_query(DatabaseKind::PostgreSQL, hidden).is_err());
+        assert!(ensure_query(DatabaseKind::MySQL, hidden).is_err());
+        // SQL Server and SQLite still quote identifiers with brackets.
+        ensure_query(DatabaseKind::SQLite, "SELECT [delete] FROM [update]").unwrap();
+        ensure_query(DatabaseKind::SqlServer, "SELECT [drop] FROM t").unwrap();
     }
 }

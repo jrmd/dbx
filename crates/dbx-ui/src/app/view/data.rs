@@ -247,11 +247,11 @@ impl DbxApp {
                                                             PopupMenuItem::new(format!(
                                                                 "Delete “{name}”"
                                                             ))
-                                                            .on_click(move |_, _, cx| {
+                                                            .on_click(move |_, window, cx| {
                                                                 let _ = app.update(cx, |this, cx| {
-                                                                    this.delete_saved_filter_for(
+                                                                    this.request_delete_saved_filter_for(
                                                                         session_id, tab_id, index,
-                                                                        cx,
+                                                                        window, cx,
                                                                     )
                                                                 });
                                                             }),
@@ -645,8 +645,10 @@ impl DbxApp {
                                     button("discard-cell-edits", "Discard", ButtonKind::Quiet)
                                         .cursor_pointer()
                                         .disabled(busy)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.discard_pending_edits_for(session_id, tab_id, cx)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.request_discard_pending_edits_for(
+                                                session_id, tab_id, window, cx,
+                                            )
                                         })),
                                 )
                                 .child(

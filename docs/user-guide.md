@@ -67,6 +67,22 @@ Cmd/Ctrl-click a table to open it, or an alias or CTE to jump to its definition.
 Folding also works from the chevrons beside the line numbers. Rename and
 occurrence highlighting cover the current statement only.
 
+## Navigate by keyboard
+
+| Action | macOS | Linux |
+| --- | --- | --- |
+| Focus the table explorer | Cmd-Shift-E | Ctrl-Shift-E |
+| Move through tables | Up / Down, Home / End | Up / Down, Home / End |
+| Open the table under the cursor | Enter | Enter |
+| Table menu | Shift-F10 or Menu | Shift-F10 or Menu |
+| Next / previous tab of the connection | Cmd-Alt-Right / Left | Alt-PageDown / PageUp |
+| Next / previous connection | Cmd-Shift-] / [ | Ctrl-Tab / Ctrl-Shift-Tab |
+
+Down in the explorer's search box continues into the list. In the table menu,
+Up / Down / Home / End move over the available items, Enter runs one, and
+Escape closes the menu and returns to the list. Items that the connection
+cannot perform are skipped.
+
 ## Edit safely and resume work
 
 Stage inserts, edits and deletes; inspect their combined SQL before committing.

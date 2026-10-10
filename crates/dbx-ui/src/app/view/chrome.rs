@@ -502,7 +502,40 @@ impl DbxApp {
         };
         let search_focus = search_editor.read(cx).focus_handle();
         let explorer_actions = cx.entity().downgrade();
+        let (explorer_focus, explorer_scroll, cursor_bounds, list_bounds) = self
+            .session(session_id)
+            .map(|session| {
+                (
+                    session.sidebar.focus.clone(),
+                    session.sidebar.scroll.clone(),
+                    session.sidebar.cursor_bounds.clone(),
+                    session.sidebar.list_bounds.clone(),
+                )
+            })
+            .expect("session checked above");
+        let explorer_focused = explorer_focus.is_focused(window);
+        let cursor_id = explorer_focused
+            .then(|| self.explorer_cursor_id(session_id))
+            .flatten();
         let table_count = visible_tables.len();
+        let empty_note = visible_tables.is_empty().then(|| {
+            let session = self.session(session_id);
+            if session.is_some_and(|session| session.busy) {
+                "Loading…"
+            } else if !search.trim().is_empty() {
+                "No matches"
+            } else if session.is_some_and(|session| session.error.is_some()) {
+                "Couldn’t load the list"
+            } else {
+                match kind {
+                    DatabaseKind::Redis => "No keys",
+                    DatabaseKind::Kafka => "No topics",
+                    DatabaseKind::MongoDB => "No collections",
+                    DatabaseKind::Elasticsearch => "No indices",
+                    _ => "No tables",
+                }
+            }
+        });
         glass(div(), RADIUS_GLASS, 8.)
             .w(px(self.explorer_width()))
             .flex_none()
@@ -711,6 +744,16 @@ impl DbxApp {
                                 .bg(theme().glass_hover)
                                 .border_1()
                                 .border_color(theme().hairline)
+                                .capture_key_down(cx.listener(
+                                    |this, event: &KeyDownEvent, window, cx| {
+                                        if event.keystroke.key == "down"
+                                            && !event.keystroke.modifiers.modified()
+                                        {
+                                            this.focus_explorer_list(window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    },
+                                ))
                                 .child(icon(Icon::Search, theme().text_muted))
                                 .child(div().flex_1().min_w_0().child(editor::bare_input(
                                     search_editor,
@@ -721,7 +764,32 @@ impl DbxApp {
                     }),
             )
             .child(
-                div().flex_1().min_h_0().py(px(6.)).child(
+                div()
+                    .id("explorer-list")
+                    .key_context("DbxExplorer")
+                    .track_focus(&explorer_focus)
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .py(px(6.))
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| list_bounds.set(Some(bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(
+                    if let Some(note) = empty_note {
+                        div()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .text_size(px(11.))
+                            .text_color(theme().text_muted)
+                            .child(note)
+                            .into_any_element()
+                    } else {
                     uniform_list(
                         "sidebar-tables",
                         visible_tables.len(),
@@ -734,13 +802,18 @@ impl DbxApp {
                                         table,
                                         selected_table.as_ref(),
                                         selected_schema.as_deref(),
+                                        cursor_id.as_deref(),
+                                        &cursor_bounds,
                                         cx,
                                     )
                                 })
                                 .collect::<Vec<_>>()
                         }),
                     )
-                    .h_full(),
+                    .track_scroll(&explorer_scroll)
+                    .h_full()
+                    .into_any_element()
+                    },
                 ),
             )
             .child(self.render_schema_objects_for(session_id, None, cx))
@@ -1232,8 +1305,13 @@ fn sidebar_row(
     table: &TableInfo,
     selected_table: Option<&TableRef>,
     selected_schema: Option<&str>,
+    cursor_id: Option<&str>,
+    cursor_bounds: &CursorBounds,
     cx: &mut Context<DbxApp>,
 ) -> Div {
+    let row_id = table_sidebar_id(table);
+    let at_cursor = cursor_id == Some(row_id.as_str());
+    let cursor_bounds = cursor_bounds.clone();
     let selected = selected_table
         .is_some_and(|current| current.name == table.name && current.schema == table.schema);
     let label = table_sidebar_label(table, selected_schema);
@@ -1241,7 +1319,8 @@ fn sidebar_row(
     let table_ref = table.clone();
     div().w_full().px(px(6.)).child(
         div()
-            .id(SharedString::from(table_sidebar_id(table)))
+            .id(SharedString::from(row_id.clone()))
+            .relative()
             .w_full()
             .h(px(28.))
             .px(px(8.))
@@ -1259,6 +1338,16 @@ fn sidebar_row(
             .items_center()
             .gap(px(7.))
             .cursor_pointer()
+            .when(at_cursor, |row| {
+                row.border_1().border_color(theme().focus_ring).child(
+                    gpui::canvas(
+                        move |bounds, _, _| cursor_bounds.set(Some((row_id, bounds))),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .when(!selected, |row| {
                 row.hover(|style| style.bg(theme().glass_hover))
             })
@@ -1276,17 +1365,22 @@ fn sidebar_row(
             ))
             .child(div().truncate().child(label))
             .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_explorer_cursor(session_id, &table_ref, cx);
                 this.select_table_for(session_id, table_ref.clone(), window, cx);
             }))
-            .on_aux_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                if table_click_action(event) == TableClickAction::OpenContextMenu {
-                    this.open_table_context_menu(
-                        session_id,
-                        menu_table.clone(),
-                        event.position(),
-                        cx,
-                    );
-                }
-            })),
+            .on_aux_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if table_click_action(event) == TableClickAction::OpenContextMenu {
+                        this.set_explorer_cursor(session_id, &menu_table, cx);
+                        this.open_table_context_menu(
+                            session_id,
+                            menu_table.clone(),
+                            event.position(),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            ),
     )
 }

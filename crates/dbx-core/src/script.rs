@@ -31,6 +31,17 @@ pub fn split_sql_statements(script: &str) -> Vec<String> {
 pub(crate) fn split_sql_statements_for(kind: DatabaseKind, script: &str) -> Vec<String> {
     checked_split_sql_for(Some(kind), script).unwrap_or_else(|_| vec![script.to_owned()])
 }
+/// Rejects scripts with more than one statement. Unlike the lenient splitter,
+/// a script that cannot be scanned (for example an oversized line) is an error
+/// rather than being passed through as a single statement.
+pub(crate) fn ensure_single_statement(kind: DatabaseKind, script: &str, label: &str) -> Result<()> {
+    if checked_split_sql_for(Some(kind), script)?.len() > 1 {
+        return Err(DbxError::Parse(format!(
+            "Run one {label} SQL statement at a time"
+        )));
+    }
+    Ok(())
+}
 pub(crate) fn checked_split_sql_statements(script: &str) -> Result<Vec<String>> {
     checked_split_sql_for(None, script)
 }

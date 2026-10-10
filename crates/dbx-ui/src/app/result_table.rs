@@ -152,12 +152,18 @@ fn cell_display_text(value: &CellValue) -> String {
     }
 }
 
-/// Order cells for a local header sort: NULLs first, numbers numerically,
-/// then everything else by its display text.
-fn compare_cells(left: Option<&CellValue>, right: Option<&CellValue>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    fn number(value: &CellValue) -> Option<f64> {
-        match value {
+/// One row's sort cell with its numeric reading computed once, so an
+/// `n log n` sort never re-parses text or re-formats values per comparison.
+struct SortKey<'a> {
+    value: &'a CellValue,
+    number: Option<f64>,
+    text: std::cell::OnceCell<String>,
+}
+
+impl<'a> SortKey<'a> {
+    fn new(value: Option<&'a CellValue>) -> Self {
+        let value = value.unwrap_or(&CellValue::Null);
+        let number = match value {
             CellValue::Integer(value) => Some(*value as f64),
             CellValue::Unsigned(value) => Some(*value as f64),
             CellValue::Real(value) => Some(*value),
@@ -167,11 +173,24 @@ fn compare_cells(left: Option<&CellValue>, right: Option<&CellValue>) -> std::cm
                 .ok()
                 .filter(|value| value.is_finite()),
             _ => None,
+        };
+        Self {
+            value,
+            number,
+            text: std::cell::OnceCell::new(),
         }
     }
-    let left = left.unwrap_or(&CellValue::Null);
-    let right = right.unwrap_or(&CellValue::Null);
-    match (left, right) {
+
+    fn text(&self) -> &str {
+        self.text.get_or_init(|| plain_cell_text(self.value))
+    }
+}
+
+/// Order cells for a local header sort: NULLs first, numbers numerically,
+/// then everything else by its display text.
+fn compare_cells(left: &SortKey, right: &SortKey) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left.value, right.value) {
         (CellValue::Null, CellValue::Null) => Ordering::Equal,
         (CellValue::Null, _) => Ordering::Less,
         (_, CellValue::Null) => Ordering::Greater,
@@ -179,9 +198,9 @@ fn compare_cells(left: Option<&CellValue>, right: Option<&CellValue>) -> std::cm
         (CellValue::Unsigned(left), CellValue::Unsigned(right)) => left.cmp(right),
         (CellValue::Boolean(left), CellValue::Boolean(right)) => left.cmp(right),
         (CellValue::Bytes(left), CellValue::Bytes(right)) => left.cmp(right),
-        _ => match (number(left), number(right)) {
+        _ => match (left.number, right.number) {
             (Some(left), Some(right)) => left.total_cmp(&right),
-            _ => plain_cell_text(left).cmp(&plain_cell_text(right)),
+            _ => left.text().cmp(right.text()),
         },
     }
 }
@@ -429,14 +448,26 @@ impl ResultTableDelegate {
             self.replace_rows(source);
             return;
         };
-        let mut sorted = (*source).clone();
-        sorted.rows.sort_by(|left, right| {
-            let ordering = compare_cells(left.values.get(index), right.values.get(index));
+        let keys = source
+            .rows
+            .iter()
+            .map(|row| SortKey::new(row.values.get(index)))
+            .collect::<Vec<_>>();
+        let mut order = (0..keys.len()).collect::<Vec<_>>();
+        order.sort_by(|&left, &right| {
+            let ordering = compare_cells(&keys[left], &keys[right]);
             match direction {
                 OrderDirection::Ascending => ordering,
                 OrderDirection::Descending => ordering.reverse(),
             }
         });
+        let sorted = QueryResult {
+            columns: source.columns.clone(),
+            rows: order.iter().map(|&row| source.rows[row].clone()).collect(),
+            rows_affected: source.rows_affected,
+            truncated: source.truncated,
+            elapsed_ms: source.elapsed_ms,
+        };
         self.sort = Some((index, direction));
         self.unsorted = Some(source);
         self.replace_rows(Arc::new(sorted));
@@ -1677,6 +1708,34 @@ pub(super) fn foreign_key_target_table(
 mod tests {
     use super::*;
     use dbx_core::RowData;
+
+    #[test]
+    fn local_sort_keys_order_nulls_numbers_and_text() {
+        let order = |left: CellValue, right: CellValue| {
+            compare_cells(&SortKey::new(Some(&left)), &SortKey::new(Some(&right)))
+        };
+        use std::cmp::Ordering::*;
+        assert_eq!(order(CellValue::Null, CellValue::Integer(1)), Less);
+        assert_eq!(
+            order(CellValue::Text("10".into()), CellValue::Text("9".into())),
+            Greater
+        );
+        assert_eq!(
+            order(CellValue::Text("10".into()), CellValue::Integer(10)),
+            Equal
+        );
+        assert_eq!(
+            order(
+                CellValue::Text("apple".into()),
+                CellValue::Text("pear".into())
+            ),
+            Less
+        );
+        assert_eq!(
+            compare_cells(&SortKey::new(None), &SortKey::new(Some(&CellValue::Null))),
+            Equal
+        );
+    }
 
     fn export_result() -> QueryResult {
         QueryResult {

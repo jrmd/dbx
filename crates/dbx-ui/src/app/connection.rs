@@ -963,23 +963,32 @@ impl DbxApp {
                     &requested_fields,
                 );
                 match save_result {
-                    Ok(profile) if unchanged => {
+                    Ok(profile) => {
+                        // Environment tags are a safety cue, so open sessions
+                        // follow the saved profile even if the form moved on.
                         for session in &mut this.sessions {
                             if session.profile_id == Some(profile.id) {
                                 session.tag = profile.tag.clone();
                             }
                         }
-                        this.draft.selected_profile = Some(profile.id);
-                        this.show_toast(
-                            ToastKind::Success,
-                            format!("Saved “{}”", profile.name),
-                            cx,
-                        );
-                        this.error = None;
+                        if unchanged {
+                            this.draft.selected_profile = Some(profile.id);
+                            this.show_toast(
+                                ToastKind::Success,
+                                format!("Saved “{}”", profile.name),
+                                cx,
+                            );
+                            this.error = None;
+                        } else {
+                            this.show_toast(
+                                ToastKind::Info,
+                                format!("Saved “{}”; the form changed while saving", profile.name),
+                                cx,
+                            );
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) if unchanged => this.set_error(error.to_string()),
-                    Err(_) => {}
+                    Err(error) => this.show_toast(ToastKind::Error, error.to_string(), cx),
                 }
                 requested_fields.password.zeroize();
                 requested_fields.connection_string.zeroize();
@@ -1315,6 +1324,19 @@ impl DbxApp {
             Ok::<(), anyhow::Error>(())
         })
         .detach();
+    }
+
+    /// Stops an in-flight test (an unreachable host can take a while to time
+    /// out) and invalidates its result so a late reply is ignored.
+    pub(super) fn cancel_connection_test(&mut self, cx: &mut Context<Self>) {
+        if !self.testing_connection {
+            return;
+        }
+        self.connection_test_abort.cancel();
+        self.test_generation += 1;
+        self.testing_connection = false;
+        self.show_toast(ToastKind::Info, "Connection test cancelled", cx);
+        cx.notify();
     }
 
     pub(super) fn test_connection(&mut self, cx: &mut Context<Self>) {

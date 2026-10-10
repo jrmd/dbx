@@ -35,13 +35,13 @@ impl DbxApp {
         }
     }
 
-    pub(super) fn persist_startup_workspace(&mut self, cx: &mut Context<Self>) {
+    /// Captures the open connections and tabs, claiming the next startup
+    /// revision so any older pending save is dropped.
+    fn startup_snapshot(&self, cx: &App) -> Option<(u64, crate::workspace::StartupWorkspace)> {
         if self.vault_state != Some(VaultState::Unlocked) {
-            return;
+            return None;
         }
-        let Some(store) = &self.workspace_store else {
-            return;
-        };
+        let store = self.workspace_store.as_ref()?;
         let mut active = None;
         let connections = self
             .sessions
@@ -78,12 +78,25 @@ impl DbxApp {
             .into_iter()
             .map(|(_, connection)| connection)
             .collect();
+        Some((
+            store.register_startup(),
+            crate::workspace::StartupWorkspace {
+                connections,
+                active,
+            },
+        ))
+    }
+
+    pub(super) fn persist_startup_workspace(&mut self, cx: &mut Context<Self>) {
+        let Some((revision, startup)) = self.startup_snapshot(cx) else {
+            return;
+        };
+        let Some(store) = &self.workspace_store else {
+            return;
+        };
         // The startup index is small; saving through the vault atomically keeps
         // it in step with document writes and prevents stale shutdown saves.
-        if let Err(error) = store.save_startup(&crate::workspace::StartupWorkspace {
-            connections,
-            active,
-        }) {
+        if let Err(error) = store.save_startup_at(revision, &startup) {
             self.show_toast(ToastKind::Error, error, cx);
         }
     }
@@ -299,20 +312,35 @@ impl DbxApp {
         }
         self.workspace_documents
             .insert(key.clone(), document.clone());
-        self.persist_startup_workspace(cx);
         let revision = store.register(&key);
         let runtime = self.runtime.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(350))
                 .await;
+            // Typing supersedes earlier saves, so only the last edit in a burst
+            // builds the startup index and encrypts the vault.
+            if !store.is_current(&key, revision) {
+                return Ok(());
+            }
+            let startup = this.update(cx, |this, cx| this.startup_snapshot(cx))?;
             let result = runtime
-                .spawn_blocking(move || store.save(&key, revision, &document))
+                .spawn_blocking(move || {
+                    let startup = startup
+                        .map(|(revision, startup)| store.save_startup_at(revision, &startup))
+                        .transpose()
+                        .map_err(|error| format!("Startup layout: {error}"));
+                    startup.and(
+                        store
+                            .save(&key, revision, &document)
+                            .map_err(|error| format!("Draft recovery: {error}")),
+                    )
+                })
                 .await;
-            if let Ok(Err(error)) = result {
+            if let Ok(Err(message)) = result {
                 this.update(cx, |this, cx| {
                     if this.vault_state == Some(VaultState::Unlocked) {
-                        this.show_toast(ToastKind::Error, format!("Draft recovery: {error}"), cx);
+                        this.show_toast(ToastKind::Error, message, cx);
                     }
                 })?;
             }
@@ -550,6 +578,45 @@ impl DbxApp {
             }
         }
     }
+    pub(super) fn request_delete_saved_query_for(
+        &mut self,
+        session_id: SessionId,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ask_to_delete(
+            format!("Delete saved query “{name}”?"),
+            "The saved query will be removed from this connection.",
+            ConfirmationAction::DeleteSavedQuery { session_id, name },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn ask_to_delete(
+        &mut self,
+        title: String,
+        detail: &str,
+        action: ConfirmationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title,
+            detail: detail.into(),
+            confirm_label: "Delete",
+            tone: ConfirmationTone::Danger,
+            action,
+            focus: focus.clone(),
+            return_focus: window.focused(cx),
+            sql: None,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
     pub(super) fn delete_saved_query_for(
         &mut self,
         session_id: SessionId,
@@ -601,6 +668,9 @@ impl DbxApp {
         for id in ids {
             self.persist_query_workspace_for(id, cx);
         }
+        // Edits only schedule the startup index; quitting or locking must not
+        // wait for that debounce or the latest layout would be lost.
+        self.persist_startup_workspace(cx);
         if let Some(store) = &self.workspace_store {
             for (key, document) in &self.workspace_documents {
                 let revision = store.register(key);
