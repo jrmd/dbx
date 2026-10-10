@@ -162,6 +162,7 @@ pub fn connection_key(connection: &QueryHistoryConnection) -> String {
     let identity = serde_json::to_vec(connection).unwrap_or_default();
     format!("workspace-v1-{:x}", Sha256::digest(identity))
 }
+const STARTUP_KEY: &str = "workspace-startup-v1";
 pub struct WorkspaceStore {
     vault: Arc<CredentialVault>,
     revisions: Mutex<HashMap<String, u64>>,
@@ -179,7 +180,7 @@ impl WorkspaceStore {
     pub fn load_startup(&self) -> Result<StartupWorkspace, String> {
         match self
             .vault
-            .get("workspace-startup-v1")
+            .get(STARTUP_KEY)
             .map_err(|error| error.to_string())?
         {
             None => Ok(StartupWorkspace::default()),
@@ -190,11 +191,41 @@ impl WorkspaceStore {
     pub fn save_startup(&self, document: &StartupWorkspace) -> Result<(), String> {
         self.vault
             .set(
-                "workspace-startup-v1",
+                STARTUP_KEY,
                 serde_json::to_string(document).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())
     }
+    /// Claims the next startup-index revision. Only the newest claim may
+    /// write, so a delayed save can never overwrite a later layout change.
+    pub fn register_startup(&self) -> u64 {
+        self.register(STARTUP_KEY)
+    }
+
+    /// Whether `revision` is still the newest claim for `key`.
+    pub fn is_current(&self, key: &str, revision: u64) -> bool {
+        self.revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            == Some(&revision)
+    }
+
+    pub fn save_startup_at(
+        &self,
+        revision: u64,
+        document: &StartupWorkspace,
+    ) -> Result<(), String> {
+        let revisions = self
+            .revisions
+            .lock()
+            .map_err(|_| "Workspace save lock failed")?;
+        if revisions.get(STARTUP_KEY) != Some(&revision) {
+            return Ok(());
+        }
+        self.save_startup(document)
+    }
+
     pub fn load(&self, key: &str) -> Result<WorkspaceDocument, String> {
         match self.vault.get(key).map_err(|error| error.to_string())? {
             None => Ok(WorkspaceDocument::default()),
@@ -382,5 +413,24 @@ mod changeset_tests {
             .await
             .unwrap();
         assert!(recovered.validate(&engine, Some([1; 32])).await.is_err());
+    }
+
+    #[test]
+    fn a_delayed_startup_save_never_overwrites_a_newer_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = Arc::new(CredentialVault::at(directory.path().join("vault")));
+        vault.create("fixture passphrase").unwrap();
+        let store = WorkspaceStore::new(vault);
+        let layout = |active| StartupWorkspace {
+            connections: Vec::new(),
+            active,
+        };
+        let older = store.register_startup();
+        let newer = store.register_startup();
+        store.save_startup_at(newer, &layout(Some(2))).unwrap();
+        store.save_startup_at(older, &layout(Some(1))).unwrap();
+        assert_eq!(store.load_startup().unwrap().active, Some(2));
+        assert!(store.is_current(STARTUP_KEY, newer));
+        assert!(!store.is_current(STARTUP_KEY, older));
     }
 }

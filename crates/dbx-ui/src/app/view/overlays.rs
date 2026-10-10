@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::app::explorer::{MenuTone, TableMenuRow};
 
 impl DbxApp {
     pub(super) fn render_database_export_dialog(
@@ -617,21 +618,49 @@ impl DbxApp {
         let Some(menu) = self.table_context_menu.clone() else {
             return div().into_any_element();
         };
-        let destructive_enabled = self.session(menu.session_id).is_some_and(|session| {
-            session.kind.is_sql()
-                && !session.busy
-                && session.engine.is_some()
-                && menu.table.kind == EntityKind::Table
+        let rows = self.table_menu_rows_for(&menu);
+
+        let items = rows.into_iter().enumerate().map(|(index, row)| match row {
+            TableMenuRow::Separator => div()
+                .my(px(4.))
+                .border_t_1()
+                .border_color(theme().border)
+                .into_any_element(),
+            TableMenuRow::Item {
+                command,
+                label,
+                enabled,
+                tone,
+            } => {
+                let highlighted = enabled && menu.cursor == Some(index);
+                let highlight = if tone == MenuTone::Normal {
+                    theme().accent_soft
+                } else {
+                    theme().panel
+                };
+                div()
+                    .id(("table-menu-item", index))
+                    .px(px(8.))
+                    .py(px(7.))
+                    .rounded(px(5.))
+                    .text_color(match (enabled, tone) {
+                        (false, _) => theme().text_muted,
+                        (true, MenuTone::Normal) => theme().text,
+                        (true, MenuTone::Warning) => theme().warning,
+                        (true, MenuTone::Danger) => theme().danger,
+                    })
+                    .when(highlighted, |view| view.bg(highlight))
+                    .when(enabled, |view| {
+                        view.cursor_pointer()
+                            .hover(move |style| style.bg(highlight))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_table_menu_command(command, window, cx)
+                    }))
+                    .into_any_element()
+            }
         });
-        let transfer_enabled = destructive_enabled;
-        let open_table = menu.table.clone();
-        let open_structure = menu.table.clone();
-        let refresh_table = menu.table.clone();
-        let export_table_item = menu.table.clone();
-        let import_table_item = menu.table.clone();
-        let truncate_table = menu.table.clone();
-        let drop_table = menu.table.clone();
-        let session_id = menu.session_id;
 
         let menu_view = deferred(
             anchored()
@@ -640,6 +669,8 @@ impl DbxApp {
                 .child(
                     div()
                         .id("table-context-menu")
+                        .key_context("DbxTableMenu")
+                        .track_focus(&menu.focus)
                         .occlude()
                         .w(px(220.))
                         .p(px(6.))
@@ -662,195 +693,7 @@ impl DbxApp {
                                 .text_color(theme().text_muted)
                                 .child(table_sidebar_label(&menu.table, None)),
                         )
-                        .child(
-                            div()
-                                .id("context-open-structure")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme().accent_soft))
-                                .child("Open structure")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.table_context_menu = None;
-                                    this.open_structure_tab_for(
-                                        session_id,
-                                        open_structure.clone(),
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-open-table")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme().accent_soft))
-                                .child("Open data")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.table_context_menu = None;
-                                    this.select_table_for(
-                                        session_id,
-                                        open_table.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-refresh-table")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(theme().accent_soft))
-                                .child("Refresh table")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.table_context_menu = None;
-                                    this.select_table_for(
-                                        session_id,
-                                        refresh_table.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                })),
-                        )
-                        .child(div().my(px(4.)).border_t_1().border_color(theme().border))
-                        .child(
-                            div()
-                                .id("context-export-table")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .text_color(if transfer_enabled {
-                                    theme().text
-                                } else {
-                                    theme().text_muted
-                                })
-                                .when(transfer_enabled, |view| {
-                                    view.cursor_pointer()
-                                        .hover(|style| style.bg(theme().accent_soft))
-                                })
-                                .child("Export data…")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if transfer_enabled {
-                                        let table = export_table_item.clone();
-                                        this.table_context_menu = None;
-                                        this.begin_table_export(session_id, table, cx);
-                                    }
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-import-table")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .text_color(if transfer_enabled {
-                                    theme().text
-                                } else {
-                                    theme().text_muted
-                                })
-                                .when(transfer_enabled, |view| {
-                                    view.cursor_pointer()
-                                        .hover(|style| style.bg(theme().accent_soft))
-                                })
-                                .child("Import data…")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if transfer_enabled {
-                                        let table = import_table_item.clone();
-                                        this.table_context_menu = None;
-                                        this.begin_table_import(session_id, table, window, cx);
-                                    }
-                                })),
-                        )
-                        .children(
-                            [
-                                (0u8, "Capture table for cross-connection copy"),
-                                (1, "Append captured data…"),
-                                (2, "Compare with captured data…"),
-                            ]
-                            .into_iter()
-                            .map(|(action, label)| {
-                                let table = menu.table.clone();
-                                div()
-                                    .id(("context-data-copy", action as usize))
-                                    .px(px(8.))
-                                    .py(px(7.))
-                                    .rounded(px(5.))
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme().accent_soft))
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.table_context_menu = None;
-                                        this.copy_or_compare_table(
-                                            session_id,
-                                            table.clone(),
-                                            action,
-                                            window,
-                                            cx,
-                                        );
-                                    }))
-                            }),
-                        )
-                        .child(div().my(px(4.)).border_t_1().border_color(theme().border))
-                        .child(
-                            div()
-                                .id("context-truncate-table")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .text_color(if destructive_enabled {
-                                    theme().warning
-                                } else {
-                                    theme().text_muted
-                                })
-                                .when(destructive_enabled, |view| {
-                                    view.cursor_pointer().hover(|style| style.bg(theme().panel))
-                                })
-                                .child("Truncate table…")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if destructive_enabled {
-                                        this.confirm_table_action(
-                                            TableAction::Truncate,
-                                            session_id,
-                                            truncate_table.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("context-delete-table")
-                                .px(px(8.))
-                                .py(px(7.))
-                                .rounded(px(5.))
-                                .text_color(if destructive_enabled {
-                                    theme().danger
-                                } else {
-                                    theme().text_muted
-                                })
-                                .when(destructive_enabled, |view| {
-                                    view.cursor_pointer().hover(|style| style.bg(theme().panel))
-                                })
-                                .child("Delete table…")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if destructive_enabled {
-                                        this.confirm_table_action(
-                                            TableAction::Drop,
-                                            session_id,
-                                            drop_table.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                })),
-                        ),
+                        .children(items),
                 ),
         )
         .with_priority(10);

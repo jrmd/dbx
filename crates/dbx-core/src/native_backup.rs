@@ -234,6 +234,20 @@ pub async fn native_backup(
                 .ok_or_else(|| invalid("Native PostgreSQL socket paths must be UTF-8"))?,
             None => &host,
         };
+        // A line break would split the pgpass entry and silently break login.
+        if [
+            password_host,
+            database.as_str(),
+            user.as_str(),
+            password.as_str(),
+        ]
+        .iter()
+        .any(|field| field.contains(['\n', '\r']))
+        {
+            return Err(invalid(
+                "Native PostgreSQL backups cannot use connection values containing line breaks",
+            ));
+        }
         writeln!(
             secret_file,
             "{}:{}:{}:{}:{}",

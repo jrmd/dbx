@@ -150,6 +150,7 @@ fn main() {
             theme::set_system_appearance(cx.window_appearance());
             theme::sync_component_theme(None, cx);
             cx.bind_keys(editor::default_key_bindings());
+            cx.bind_keys(app::explorer_key_bindings());
             cx.bind_keys([
                 KeyBinding::new("tab", app::VaultFocusNext, Some("VaultGate")),
                 KeyBinding::new("shift-tab", app::VaultFocusPrevious, Some("VaultGate")),

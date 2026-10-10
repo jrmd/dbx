@@ -40,12 +40,25 @@ pub(super) type SidebarSelect = Entity<SelectState<SearchableVec<SharedString>>>
 
 /// The sidebar's database and schema dropdowns plus the cached list of rows
 /// they and the search field produce.
+/// The painted bounds of the explorer cursor row, tagged with its table id.
+pub(super) type CursorBounds = Rc<Cell<Option<(String, Bounds<Pixels>)>>>;
+
 pub(super) struct SidebarState {
     pub(super) database_select: SidebarSelect,
     pub(super) schema_select: SidebarSelect,
     pub(super) synced_databases: Vec<String>,
     pub(super) synced_schemas: Vec<Option<String>>,
     pub(super) list: SidebarList,
+    /// Keyboard focus for the table list (not the search box or selects).
+    pub(super) focus: FocusHandle,
+    pub(super) scroll: UniformListScrollHandle,
+    /// The keyboard cursor, kept as a table identity (`table_sidebar_id`)
+    /// because the visible rows are rebuilt as the search or schema changes.
+    pub(super) cursor: Option<String>,
+    /// Bounds painted for the cursor row and the list, used to place a menu
+    /// opened from the keyboard. The id guards against a stale row.
+    pub(super) cursor_bounds: CursorBounds,
+    pub(super) list_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub(super) _subscriptions: Vec<Subscription>,
 }
 
@@ -108,6 +121,11 @@ impl SidebarState {
             synced_databases: Vec::new(),
             synced_schemas: Vec::new(),
             list: SidebarList::default(),
+            focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            cursor: None,
+            cursor_bounds: Rc::default(),
+            list_bounds: Rc::default(),
             _subscriptions: vec![database_subscription, schema_subscription],
         }
     }

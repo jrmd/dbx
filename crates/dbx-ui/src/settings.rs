@@ -159,7 +159,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
         replace_file(&temporary_path, path)?;
-        sync_directory(parent)
+        // The new content is already in place; a failed directory sync only
+        // weakens durability and must not report the save as failed.
+        let _ = sync_directory(parent);
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);

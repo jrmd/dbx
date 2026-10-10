@@ -510,6 +510,42 @@ impl DbxApp {
         cx.notify();
     }
 
+    /// Staged changes can be large, so the Discard button asks first.
+    pub(super) fn request_discard_pending_edits_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((table, counts)) = self
+            .data_tab(session_id, tab_id)
+            .map(|data| (table_ref_label(&data.table), data.change_counts()))
+        else {
+            return;
+        };
+        if counts.total() == 0 {
+            self.discard_pending_edits_for(session_id, tab_id, cx);
+            return;
+        }
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: format!("Discard changes to {table}?"),
+            detail: format!(
+                "{} will be lost.",
+                counted(counts.total(), "staged change", "staged changes")
+            ),
+            confirm_label: "Discard",
+            tone: ConfirmationTone::Danger,
+            action: ConfirmationAction::DiscardEdits { session_id, tab_id },
+            focus: focus.clone(),
+            return_focus: window.focused(cx),
+            sql: None,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
     pub(super) fn discard_pending_edits_for(
         &mut self,
         session_id: SessionId,
@@ -1664,7 +1700,25 @@ mod tests {
                         .is_some()
                 );
                 app.cancel_cell_edit_for(session_id, tab_id, window, cx);
-                app.discard_pending_edits_for(session_id, tab_id, cx);
+                // The Discard button asks first and keeps the edits until confirmed.
+                app.request_discard_pending_edits_for(session_id, tab_id, window, cx);
+                assert!(matches!(
+                    app.confirmation_dialog
+                        .as_ref()
+                        .map(|dialog| &dialog.action),
+                    Some(ConfirmationAction::DiscardEdits { .. })
+                ));
+                assert!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .has_pending_edits()
+                );
+                app.confirm_pending_action(window, cx);
+                assert!(
+                    !app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .has_pending_edits()
+                );
                 assert!(
                     !app.data_tab(session_id, tab_id)
                         .unwrap()

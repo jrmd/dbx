@@ -111,6 +111,24 @@ pub struct QueryHistoryEntry {
     pub outcome: QueryHistoryOutcome,
 }
 
+/// Largest history file read into memory; legitimate files are far smaller.
+const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_limited(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_HISTORY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_HISTORY_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "query history file is too large",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Error)]
 pub enum QueryHistoryError {
     #[error("query history storage I/O error: {0}")]
@@ -263,7 +281,7 @@ impl QueryHistoryStore {
     }
 
     fn read_document(&self) -> QueryHistoryResult<QueryHistoryDocument> {
-        match fs::read(&self.path) {
+        match read_limited(&self.path) {
             Ok(bytes) => {
                 let document: QueryHistoryDocument = serde_json::from_slice(&bytes)?;
                 document.validate()?;
@@ -625,7 +643,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary_path, path)?;
-        sync_directory(parent)
+        // The new content is already in place; a failed directory sync only
+        // weakens durability and must not report the save as failed.
+        let _ = sync_directory(parent);
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);

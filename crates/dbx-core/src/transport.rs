@@ -404,7 +404,12 @@ async fn start_with_socket(
             .map_err(|_| invalid("Cannot inspect SSH process."))?
             .is_some()
         {
-            let error = std::fs::read_to_string(&log).unwrap_or_default();
+            let mut tail = Vec::new();
+            if let Ok(file) = std::fs::File::open(&log) {
+                use std::io::Read;
+                let _ = file.take(16 * 1024).read_to_end(&mut tail);
+            }
+            let error = String::from_utf8_lossy(&tail);
             let detail: String = error.chars().take(4096).collect();
             return Err(DbxError::Connection(format!(
                 "SSH tunnel failed: {}. Verify the host in a terminal with ssh first, and load encrypted keys into your SSH agent.",
@@ -431,12 +436,22 @@ async fn start_with_socket(
                 let restart_socket = local_socket.clone();
                 let supervisor = tokio::spawn(async move {
                     let _directory = directory;
+                    // Doubled before each wait, so the first reconnect still takes one second.
+                    let mut delay = Duration::from_millis(500);
                     loop {
+                        let started = tokio::time::Instant::now();
                         let _ = child.wait().await;
+                        // A tunnel that keeps dying straight away backs off
+                        // instead of respawning ssh every second forever.
+                        delay = if started.elapsed() >= Duration::from_secs(30) {
+                            Duration::from_secs(1)
+                        } else {
+                            (delay * 2).min(Duration::from_secs(30))
+                        };
                         // Re-establish only the transport, on the same forwarding
                         // port. Database statements are never replayed here.
                         loop {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::time::sleep(delay).await;
                             let _ = std::fs::remove_file(&control);
                             if let Some(socket) = &restart_socket {
                                 let _ = std::fs::remove_file(socket);
@@ -446,7 +461,7 @@ async fn start_with_socket(
                                     child = replacement;
                                     break;
                                 }
-                                Err(_) => continue,
+                                Err(_) => delay = (delay * 2).min(Duration::from_secs(30)),
                             }
                         }
                     }

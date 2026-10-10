@@ -20,6 +20,7 @@ mod connection;
 mod data_clipboard;
 mod data_import;
 mod diagnostics;
+mod explorer;
 mod find;
 mod mcp;
 mod profile_transfer;
@@ -37,9 +38,11 @@ mod view;
 mod workspace;
 
 use std::{
+    cell::Cell,
     collections::{BTreeSet, HashMap, HashSet},
     ops::Range,
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
 };
 
@@ -51,9 +54,10 @@ use dbx_core::{
     TableRef, UpdateRequest, detect_file_format, export_database, export_table, import_database,
     import_file,
 };
+use gpui::UniformListScrollHandle;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, CursorStyle, Decorations, Div, ElementId, Entity,
-    FocusHandle, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent,
+    AnyElement, App, Bounds, ClipboardItem, Context, CursorStyle, Decorations, Div, ElementId,
+    Entity, FocusHandle, Focusable as _, FontWeight, Image, ImageFormat, IntoElement, KeyDownEvent,
     MouseButton, PathPromptOptions, Pixels, Point, Render, ResizeEdge, Rgba, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement, Subscription, Window, WindowControlArea,
     WindowHandle, anchored, deferred, div, img, point, prelude::*, px, relative, uniform_list,
@@ -138,6 +142,20 @@ gpui::actions!(
         NextConnection,
         PreviousConnection,
         ToggleSidebar,
+        FocusExplorer,
+        NextTab,
+        PreviousTab,
+        ExplorerNext,
+        ExplorerPrevious,
+        ExplorerFirst,
+        ExplorerLast,
+        ExplorerOpen,
+        ExplorerContextMenu,
+        TableMenuNext,
+        TableMenuPrevious,
+        TableMenuFirst,
+        TableMenuLast,
+        TableMenuConfirm,
         CheckForUpdates,
         SubmitVault,
         ApplyFilters,
@@ -522,6 +540,10 @@ struct TableContextMenu {
     session_id: SessionId,
     table: TableInfo,
     position: Point<gpui::Pixels>,
+    /// Highlighted item (an index into the menu's rows); `None` until the
+    /// keyboard is used, so a right-click doesn't pre-select anything.
+    cursor: Option<usize>,
+    focus: FocusHandle,
 }
 
 struct DatabaseExportDialog {
@@ -595,6 +617,19 @@ enum ConfirmationAction {
         session_id: SessionId,
         tab_id: SecondaryTabId,
     },
+    DiscardEdits {
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+    },
+    DeleteSavedQuery {
+        session_id: SessionId,
+        name: String,
+    },
+    DeleteSavedFilter {
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        index: usize,
+    },
     NativeRestore {
         session_id: SessionId,
         path: PathBuf,
@@ -621,6 +656,9 @@ impl ConfirmationAction {
             | Self::Table { session_id, .. }
             | Self::CommitChanges { session_id, .. }
             | Self::DiscardDataTab { session_id, .. }
+            | Self::DiscardEdits { session_id, .. }
+            | Self::DeleteSavedQuery { session_id, .. }
+            | Self::DeleteSavedFilter { session_id, .. }
             | Self::NativeRestore { session_id, .. }
             | Self::DatabaseImport { session_id, .. }
             | Self::TableImport { session_id, .. } => Some(*session_id),
@@ -670,6 +708,11 @@ enum SettingsSection {
     Connections,
     Tags,
     Updates,
+}
+
+/// Key bindings for explorer, table-menu and tab navigation.
+pub fn explorer_key_bindings() -> Vec<gpui::KeyBinding> {
+    explorer::key_bindings()
 }
 
 pub struct DbxApp {
@@ -1243,7 +1286,7 @@ impl DbxApp {
         } else {
             self.database_export_dialog.take().is_some()
                 || std::mem::take(&mut self.settings_open)
-                || self.table_context_menu.take().is_some()
+                || self.dismiss_table_context_menu(window, cx)
                 || self.dismiss_connection_picker()
         };
         if dismissed {
@@ -2975,7 +3018,10 @@ impl DbxApp {
             self.toasts.remove(0);
         }
         let lifetime = match kind {
-            ToastKind::Error => std::time::Duration::from_secs(6),
+            // Long database errors need time to be read (and hovered in full).
+            ToastKind::Error => std::time::Duration::from_millis(
+                (6000 + 40 * self.toasts.last().map_or(0, |t| t.message.len()) as u64).min(20_000),
+            ),
             ToastKind::Info | ToastKind::Success => std::time::Duration::from_millis(3200),
         };
         cx.spawn(async move |this, cx| {
@@ -3802,21 +3848,6 @@ impl DbxApp {
         self.delete_rows_for(session_id, tab_id, None, cx);
     }
 
-    fn open_table_context_menu(
-        &mut self,
-        session_id: SessionId,
-        table: TableInfo,
-        position: Point<gpui::Pixels>,
-        cx: &mut Context<Self>,
-    ) {
-        self.table_context_menu = Some(TableContextMenu {
-            session_id,
-            table,
-            position,
-        });
-        cx.notify();
-    }
-
     fn close_table_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.table_context_menu.take().is_some() {
             cx.notify();
@@ -4006,6 +4037,17 @@ impl DbxApp {
                 self.discard_pending_edits_for(session_id, tab_id, cx);
                 self.close_secondary_tab_for(session_id, tab_id, cx);
             }
+            ConfirmationAction::DiscardEdits { session_id, tab_id } => {
+                self.discard_pending_edits_for(session_id, tab_id, cx);
+            }
+            ConfirmationAction::DeleteSavedQuery { session_id, name } => {
+                self.delete_saved_query_for(session_id, &name, cx);
+            }
+            ConfirmationAction::DeleteSavedFilter {
+                session_id,
+                tab_id,
+                index,
+            } => self.delete_saved_filter_for(session_id, tab_id, index, cx),
             ConfirmationAction::NativeRestore {
                 session_id,
                 path,
@@ -4798,6 +4840,9 @@ mod tests {
         assert_eq!(recovered.saved.len(), 1);
         assert_eq!(recovered.drafts[0].sql, "SELECT 'private unfinished draft'");
         assert_eq!(recovered.saved[0].name, "Unfinished investigation");
+        let startup = workspace.load_startup().unwrap();
+        assert_eq!(startup.connections.len(), 1);
+        assert_eq!(startup.connections[0].profile_id, profile_id);
     }
     #[gpui::test]
     fn workbench_renders_transaction_controls_result_tabs_and_saved_queries(
