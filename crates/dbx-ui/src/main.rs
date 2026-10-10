@@ -149,11 +149,12 @@ fn main() {
             theme::set_reduce_transparency(settings.reduce_transparency);
             theme::set_system_appearance(cx.window_appearance());
             theme::sync_component_theme(None, cx);
+            // First, so editor and grid bindings win ties with it: GPUI ranks a
+            // binding without a context as deepest and breaks ties by order.
+            cx.bind_keys(app::focus_key_bindings());
             cx.bind_keys(editor::default_key_bindings());
             cx.bind_keys(app::explorer_key_bindings());
             cx.bind_keys([
-                KeyBinding::new("tab", app::VaultFocusNext, Some("VaultGate")),
-                KeyBinding::new("shift-tab", app::VaultFocusPrevious, Some("VaultGate")),
                 KeyBinding::new("enter", app::SubmitVault, Some("VaultGate")),
                 KeyBinding::new("enter", app::ApplyFilters, Some("DbxFilters")),
                 KeyBinding::new("enter", app::CommitCellEdit, Some("DbxCellEditor")),

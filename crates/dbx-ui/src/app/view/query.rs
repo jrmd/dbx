@@ -443,6 +443,7 @@ impl DbxApp {
                             .child(
                         div()
                             .id("describe-query")
+                            .pressable()
                             .h(px(28.))
                             .px(px(10.))
                             .rounded_full()

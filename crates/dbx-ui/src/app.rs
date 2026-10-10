@@ -22,6 +22,8 @@ mod data_import;
 mod diagnostics;
 mod explorer;
 mod find;
+mod focus;
+pub use focus::focus_key_bindings;
 mod mcp;
 mod profile_transfer;
 mod query_language;
@@ -91,12 +93,12 @@ use crate::{
     },
     settings::{Settings, SettingsStore},
     theme::{
-        Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS,
-        RADIUS_PANEL, appearance, badge, button, connection_tab, database_logo, glass,
-        glass_icon_button, glass_raised, glass_shadow, icon, panel_header, reduce_transparency,
-        segment, segmented_track, set_appearance, set_reduce_transparency, set_system_appearance,
-        settings_group, settings_row, shortcut, sync_component_theme, theme, tip,
-        window_background,
+        Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, Pressable as _, RADIUS_CONTROL,
+        RADIUS_GLASS, RADIUS_PANEL, appearance, badge, button, connection_tab, database_logo,
+        glass, glass_icon_button, glass_raised, glass_shadow, icon, panel_header,
+        reduce_transparency, segment, segmented_track, set_appearance, set_reduce_transparency,
+        set_system_appearance, settings_group, settings_row, shortcut, sync_component_theme, theme,
+        tip, window_background,
     },
     vault::{VaultError, VaultState},
 };
@@ -134,8 +136,8 @@ gpui::actions!(
         DiagramResetView,
         DiagramFit,
         DiagramRefresh,
-        VaultFocusNext,
-        VaultFocusPrevious,
+        FocusNext,
+        FocusPrevious,
         NewConnection,
         NewQuery,
         CloseTab,
@@ -470,8 +472,6 @@ impl VaultEditors {
             cx.new(|cx| TextEditor::new(passphrase.clone(), false, window, cx).password());
         let confirmation_editor =
             cx.new(|cx| TextEditor::new(confirmation.clone(), false, window, cx).password());
-        let _ = passphrase_editor.read(cx).focus_handle().tab_stop(true);
-        let _ = confirmation_editor.read(cx).focus_handle().tab_stop(true);
 
         Self {
             passphrase,
@@ -556,6 +556,7 @@ struct DatabaseExportDialog {
     output_directory: PathBuf,
     output_name: Entity<String>,
     output_name_editor: Entity<TextEditor>,
+    focus: FocusHandle,
     _output_name_subscription: Subscription,
 }
 
@@ -771,6 +772,12 @@ pub struct DbxApp {
     /// Owns keyboard focus whenever no control does, so app shortcuts keep
     /// working after the focused element (e.g. a closed tab's editor) is gone.
     focus_handle: FocusHandle,
+    /// The topmost modal as of the last render, to notice when one opens.
+    last_modal_trap: Option<FocusHandle>,
+    /// A modal opened and hasn't been checked for focus since it painted.
+    modal_focus_pending: bool,
+    /// Focus was outside the app's tree on the previous render.
+    stray_focus_seen: bool,
     toasts: Vec<Toast>,
     next_toast_id: u64,
     window_drag_armed: bool,
@@ -909,6 +916,9 @@ impl DbxApp {
                 .map(|width| width as f32),
             pane_resizing: None,
             focus_handle: cx.focus_handle(),
+            last_modal_trap: None,
+            modal_focus_pending: false,
+            stray_focus_seen: false,
             toasts: Vec::new(),
             next_toast_id: 0,
             window_drag_armed: false,

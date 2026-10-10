@@ -7,8 +7,9 @@ use std::sync::{
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    BoxShadow, Div, ElementId, InteractiveElement, ParentElement, Rgba, SharedString, Styled, Svg,
-    WindowAppearance, WindowBackgroundAppearance, div, point, px, rgb, rgba, svg,
+    BoxShadow, Div, ElementId, InteractiveElement, ParentElement, Rgba, SharedString,
+    StatefulInteractiveElement, Styled, Svg, WindowAppearance, WindowBackgroundAppearance, div,
+    point, px, rgb, rgba, svg,
 };
 use gpui_component::{
     Sizable as _, Size,
@@ -638,6 +639,7 @@ pub fn glass_icon_button(
     let theme = theme();
     div()
         .id(id)
+        .pressable()
         .size(px(28.))
         .flex_none()
         .rounded_full()
@@ -662,6 +664,34 @@ pub fn glass_icon_button(
                 theme.text_muted
             },
         ))
+}
+
+/// Keyboard access for a clickable element that isn't a `Button`.
+///
+/// Tab reaches it, Enter and Space fire its `on_click` handler (GPUI turns
+/// them into a click on a focused element), and a ring marks it while the
+/// keyboard has focus. The ring is a shadow rather than a border, so focusing
+/// never changes a control's size.
+pub trait Pressable: StatefulInteractiveElement + Styled + Sized {
+    fn pressable(self) -> Self {
+        self.tab_index(0)
+            .focus_visible(|style| style.shadow(focus_ring()))
+    }
+}
+
+impl<T: StatefulInteractiveElement + Styled> Pressable for T {}
+
+/// The ring drawn around keyboard-focused controls that aren't `Button`s.
+pub fn focus_ring() -> Vec<BoxShadow> {
+    vec![BoxShadow {
+        color: theme().focus_ring.into(),
+        offset: point(px(0.), px(0.)),
+        blur_radius: px(0.),
+        spread_radius: px(2.),
+        // Inset: a plain shadow paints under the whole element, which fills a
+        // transparent control solid instead of outlining it.
+        inset: true,
+    }]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

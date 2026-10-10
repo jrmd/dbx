@@ -19,6 +19,8 @@ impl Render for DbxApp {
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle, cx);
         }
+        self.reclaim_stray_focus(window, cx);
+        self.ensure_modal_focus(window, cx);
         let unlocked = self.vault_state == Some(VaultState::Unlocked);
         // The vault fields keep focus after unlocking even though they are no
         // longer drawn, which would leave every shortcut without a target.
@@ -61,6 +63,14 @@ impl Render for DbxApp {
             .capture_key_down(cx.listener(|this, event, window, cx| {
                 this.dismiss_overlay_on_escape(event, window, cx)
             }))
+            .on_action(
+                cx.listener(|this, _: &FocusNext, window, cx| this.move_focus(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &FocusPrevious, window, cx| {
+                    this.move_focus(false, window, cx)
+                }),
+            )
             .on_action(cx.listener(Self::refresh_action))
             .on_action(cx.listener(Self::new_connection_action))
             .on_action(cx.listener(Self::new_query_action))

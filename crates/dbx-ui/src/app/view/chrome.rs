@@ -403,6 +403,7 @@ impl DbxApp {
                         connection_tab(kind, label, selected)
                             .debug_selector(|| "connection-tab".into())
                             .id(SharedString::from(format!("connection-tab-{session_id}")))
+                            .pressable()
                             .flex_none()
                             .cursor_pointer()
                             .when(busy, |tab| {
@@ -414,6 +415,7 @@ impl DbxApp {
                                     .id(SharedString::from(format!(
                                         "close-connection-tab-{session_id}"
                                     )))
+                                    .pressable()
                                     .size(px(18.))
                                     .rounded_full()
                                     .flex()
@@ -905,6 +907,7 @@ impl DbxApp {
                 .child(
                     div()
                         .id(SharedString::from(format!("close-document-{tab_id}")))
+                        .pressable()
                         .size(px(18.))
                         .rounded_full()
                         .flex()
@@ -1233,6 +1236,7 @@ impl DbxApp {
 fn document_tab(id: impl Into<ElementId>, kind: Icon, selected: bool) -> Stateful<Div> {
     div()
         .id(id)
+        .pressable()
         .h(px(28.))
         .pl(px(10.))
         .pr(px(4.))

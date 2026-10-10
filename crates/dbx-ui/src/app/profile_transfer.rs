@@ -9,6 +9,7 @@ pub(super) struct ProfileTransferDialog {
     preview: Option<crate::profile_transfer::ImportPreview>,
     pub(super) busy: bool,
     error: Option<String>,
+    pub(super) focus: FocusHandle,
 }
 impl DbxApp {
     pub(super) fn open_profile_transfer(
@@ -31,6 +32,7 @@ impl DbxApp {
             preview: None,
             busy: false,
             error: None,
+            focus: cx.focus_handle(),
         });
         cx.notify();
     }
@@ -174,7 +176,7 @@ impl DbxApp {
             1 => "Export encrypted connections and credentials",
             _ => "Review connection import",
         };
-        div().absolute().inset_0().bg(theme().overlay).flex().items_center().justify_center()
+        div().track_focus(&dialog.focus).absolute().inset_0().bg(theme().overlay).flex().items_center().justify_center()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(glass_raised(div(), RADIUS_GLASS).w(px(660.)).max_w(relative(0.95)).max_h(relative(0.9)).id("profile-transfer-dialog").overflow_y_scroll().p(px(20.)).flex().flex_col().gap(px(12.))
                 .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))

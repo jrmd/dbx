@@ -64,6 +64,7 @@ impl DbxApp {
                                 SETTINGS_SECTIONS.into_iter().map(|(section, label, _)| {
                                     segment(label, section == selected)
                                         .id(SharedString::from(format!("settings-section-{label}")))
+                                        .pressable()
                                         .debug_selector(move || format!("settings-section-{label}"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.show_settings_section(section, cx)
@@ -154,6 +155,7 @@ impl DbxApp {
                 let active = section == selected;
                 div()
                     .id(SharedString::from(format!("settings-section-{label}")))
+                    .pressable()
                     .debug_selector(move || format!("settings-section-{label}"))
                     .h(px(32.))
                     .px(px(10.))
@@ -209,6 +211,7 @@ impl DbxApp {
                     "settings-appearance-{}",
                     option.label()
                 )))
+                .pressable()
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_appearance_preference(option, window, cx)
                 }))
@@ -303,6 +306,7 @@ impl DbxApp {
         } else {
             div()
                 .id("new-tag")
+                .pressable()
                 .debug_selector(|| "new-tag".into())
                 .h(px(48.))
                 .px(px(16.))
@@ -468,6 +472,7 @@ impl DbxApp {
                         let chosen = current == Some(color);
                         div()
                             .id(SharedString::from(format!("tag-colour-{color:06x}")))
+                            .pressable()
                             .size(px(22.))
                             .flex_none()
                             .rounded_full()

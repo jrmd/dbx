@@ -124,6 +124,7 @@ impl DbxApp {
                         .id(SharedString::from(format!(
                             "schema-object-{session_id}-{index}"
                         )))
+                        .pressable()
                         .w_full()
                         .h(px(28.))
                         .px(px(8.))

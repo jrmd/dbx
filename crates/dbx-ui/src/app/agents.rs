@@ -311,6 +311,7 @@ impl DbxApp {
         let choices = AgentCli::ALL.into_iter().map(|cli| {
             segment(cli.label(), cli == selected)
                 .id(SharedString::from(format!("agent-choice-{cli:?}")))
+                .pressable()
                 .debug_selector(move || format!("agent-choice-{cli:?}"))
                 .on_click(cx.listener(move |this, _, _, cx| this.select_agent(cli, cx)))
         });

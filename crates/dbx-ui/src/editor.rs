@@ -375,7 +375,9 @@ impl TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus_handle = cx.focus_handle();
+        // Every field is reachable with Tab; `tab_stop` writes through to the
+        // window's handle registry, which the tracked shell element honours.
+        let focus_handle = cx.focus_handle().tab_stop(true);
         let observed = cx.observe(&value, |this, value, cx| {
             let text = value.read(cx);
             this.selected_range = clamp_range(text, this.selected_range.clone());
@@ -3039,6 +3041,8 @@ fn input_with_context(
         .bg(theme().canvas)
         .border_1()
         .border_color(theme().border_strong)
+        // Colour only: a width change would shift neighbouring controls.
+        .focus(|style| style.border_color(theme().focus_ring))
         .rounded(px(5.))
         .text_size(px(12.))
         .text_color(theme().text)
