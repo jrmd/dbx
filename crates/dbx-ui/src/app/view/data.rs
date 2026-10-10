@@ -1412,7 +1412,8 @@ impl DbxApp {
                             .items_end()
                             .gap(px(3.))
                             .when(can_navigate, |view| {
-                                view.cursor_pointer()
+                                view.pressable()
+                                    .cursor_pointer()
                                     .hover(|style| style.text_color(theme().text))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.navigate_to_foreign_key_for(

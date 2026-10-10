@@ -20,6 +20,7 @@ pub(super) struct DataImportDialog {
     mapping: Vec<Entity<TextEditor>>,
     pub(super) busy: bool,
     error: Option<String>,
+    pub(super) focus: FocusHandle,
 }
 impl DbxApp {
     pub(super) fn preview_data_import(
@@ -74,6 +75,7 @@ impl DbxApp {
                             mapping,
                             busy: false,
                             error: None,
+                            focus: cx.focus_handle(),
                         });
                     }
                     Err(error) => this.set_error(error.to_string()),
@@ -138,7 +140,7 @@ impl DbxApp {
                         if action == 0 { this.copied_table_data = Some(data); this.show_toast(ToastKind::Info, "Captured a consistent table snapshot. Choose another table’s ‘Append captured data’ or ‘Compare with captured data’. Limit: 100,000 rows / 64 MiB.", cx); }
                         else if action == 1 {
                             let mapping = data.default_mapping(&columns).into_iter().map(|name| { let value = cx.new(|_| name.unwrap_or_default()); cx.new(|cx| TextEditor::new(value, false, window, cx)) }).collect();
-                            this.data_import_dialog = Some(DataImportDialog { session_id: id, table, database, columns, data, mapping, busy: false, error: Some("Cross-connection copy can convert types. Review destination types and sample values; unsupported values fail and roll back the copy. Existing keys are not replaced.".into()) });
+                            this.data_import_dialog = Some(DataImportDialog { session_id: id, table, database, columns, data, mapping, busy: false, focus: cx.focus_handle(), error: Some("Cross-connection copy can convert types. Review destination types and sample values; unsupported values fail and roll back the copy. Existing keys are not replaced.".into()) });
                         } else {
                             let diff = diff.unwrap();
                             this.open_saved_query_for(id, crate::workspace::SavedQuery { name: "Data comparison".into(), sql: format!("-- Complete bounded snapshots compared by destination primary key. Types compare exactly; snapshots were captured at different times.\n-- Source only: {}\n-- Destination only: {}\n-- Changed: {}\n-- Equal: {}\n-- No synchronization writes were generated or executed.", diff.only_source, diff.only_target, diff.changed, diff.equal) }, window, cx);
@@ -237,7 +239,7 @@ impl DbxApp {
         let Some(dialog) = &self.data_import_dialog else {
             return div().into_any_element();
         };
-        div().absolute().inset_0().bg(theme().overlay).flex().items_center().justify_center().on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        div().track_focus(&dialog.focus).absolute().inset_0().bg(theme().overlay).flex().items_center().justify_center().on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(glass_raised(div(), RADIUS_GLASS).w(px(760.)).max_w(relative(0.95)).max_h(relative(0.9)).id("data-import-dialog").overflow_y_scroll().p(px(20.)).flex().flex_col().gap(px(12.))
                 .child(div().text_lg().child(format!("Review {} rows → {} / {}", dialog.data.rows.len(), dialog.database, table_sidebar_label(&dialog.table, None))))
                 .child(div().text_sm().child("Map each source field to a destination column. Leave blank to omit it and use the database default. CSV unquoted empty = NULL; quoted empty = empty text. JSON null = NULL; dates stay text; binary uses the destination’s supported binary format. Any failed row rolls back the entire import."))

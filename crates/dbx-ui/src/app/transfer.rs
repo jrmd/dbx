@@ -130,6 +130,7 @@ impl DbxApp {
             output_directory,
             output_name,
             output_name_editor,
+            focus: cx.focus_handle(),
             _output_name_subscription: output_name_subscription,
         });
         focus.focus(window, cx);

@@ -19,6 +19,7 @@ impl DbxApp {
         let gzipped = dialog.gzipped;
         let output_directory = dialog.output_directory.display().to_string();
         let output_name_editor = dialog.output_name_editor.clone();
+        let modal_focus = dialog.focus.clone();
         let output_name_focus = output_name_editor.read(cx).focus_handle();
         let output_name = dialog.output_name.read(cx).clone();
         let can_export = selected_count > 0 && !output_name.trim().is_empty();
@@ -354,7 +355,7 @@ impl DbxApp {
                                     ),
                             ),
                     )
-                    .focus_trap("database-export-focus-trap", &output_name_focus),
+                    .focus_trap("database-export-focus-trap", &modal_focus),
             );
 
         deferred(overlay).with_priority(30).into_any_element()

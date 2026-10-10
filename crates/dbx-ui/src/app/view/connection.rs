@@ -80,13 +80,15 @@ impl DbxApp {
                         .when(saved_connections.is_empty(), |view| view.child(div().p(px(10.)).text_size(px(12.)).text_color(theme().text_muted).child("No saved connections")))
                         .children(saved_connections.into_iter().map(|profile| {
                             let id = profile.id; let selected = selected_profile == Some(id); let choose = profile.clone();
-                            div().id(SharedString::from(format!("saved-connection-{id}"))).h(px(50.)).px(px(10.)).rounded(px(RADIUS_PANEL - 2.)).when(selected, |row| row.bg(theme().accent_soft)).when(!selected, |row| row.hover(|style| style.bg(theme().glass_hover))).cursor_pointer().flex().items_center().gap(px(10.))
+                            div().id(SharedString::from(format!("saved-connection-{id}"))).pressable().h(px(50.)).px(px(10.)).rounded(px(RADIUS_PANEL - 2.)).when(selected, |row| row.bg(theme().accent_soft)).when(!selected, |row| row.hover(|style| style.bg(theme().glass_hover))).cursor_pointer().flex().items_center().gap(px(10.))
                                 .child(database_logo(profile.kind, if selected { theme().accent } else { theme().text_muted }))
                                 .child(div().flex_1().min_w_0().flex().flex_col().gap(px(1.)).child(div().truncate().text_size(px(12.)).font_weight(FontWeight::MEDIUM).child(profile.name)).child(div().truncate().text_size(px(11.)).text_color(theme().text_muted).child(display_url(&profile.url))))
                                 .children(tag_badge(profile.tag.as_ref()))
                                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                                     let click_count = match event {
                                         gpui::ClickEvent::Mouse(mouse) => mouse.up.click_count,
+                                        // Enter opens the connection, like a double-click.
+                                        gpui::ClickEvent::Keyboard(key) if key.button == gpui::KeyboardButton::Enter => 2,
                                         gpui::ClickEvent::Keyboard(_) | gpui::ClickEvent::Touch(_) => 1,
                                     };
                                     match saved_connection_click_action(click_count) {
@@ -116,8 +118,8 @@ impl DbxApp {
                             .child(div().flex().flex_col().gap(px(5.)).child(div().text_size(px(11.)).text_color(theme().text_muted).child("Connection name")).child(editor::input(self.draft.connection_name_editor.clone(), name_focus, false)))
                             .child(tags_editor)
                             .when(kind.supports_details(), |view| view.child(div().flex().child(segmented_track()
-                                .child(div().id("connection-details-mode").flex().items_center().gap(px(5.)).px(px(12.)).h(px(26.)).rounded_full().when(details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if details { theme().text } else { theme().text_muted }).text_size(px(11.)).cursor_pointer().child("Details").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::Details, cx))))
-                                .child(div().id("connection-string-mode").flex().items_center().gap(px(5.)).px(px(12.)).h(px(26.)).rounded_full().when(!details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if !details { theme().text } else { theme().text_muted }).text_size(px(11.)).cursor_pointer().child("Connection string").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx)))))))
+                                .child(div().id("connection-details-mode").pressable().flex().items_center().gap(px(5.)).px(px(12.)).h(px(26.)).rounded_full().when(details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if details { theme().text } else { theme().text_muted }).text_size(px(11.)).cursor_pointer().child("Details").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::Details, cx))))
+                                .child(div().id("connection-string-mode").pressable().flex().items_center().gap(px(5.)).px(px(12.)).h(px(26.)).rounded_full().when(!details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if !details { theme().text } else { theme().text_muted }).text_size(px(11.)).cursor_pointer().child("Connection string").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx)))))))
                             .when(details, |view| view
                                 .child(div().flex().gap(px(8.)).child(div().flex_1().min_w_0().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Host")).child(editor::input(self.draft.host_editor.clone(), host_focus, false))).child(div().w(px(110.)).flex_none().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Port")).child(editor::input(self.draft.port_editor.clone(), port_focus, false))))
                                 .child(div().flex().gap(px(8.)).child(div().flex_1().min_w_0().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Username")).child(editor::input(self.draft.username_editor.clone(), username_focus, false))).child(div().flex_1().min_w_0().child(div().text_size(px(11.)).text_color(theme().text_muted).child("Password")).child(editor::input(self.draft.password_editor.clone(), password_focus.clone(), false))))
@@ -240,6 +242,7 @@ impl DbxApp {
                         kinds.iter().copied().map(|kind| {
                             div()
                                 .id(SharedString::from(format!("engine-{kind}")))
+                                .pressable()
                                 .w(px(120.))
                                 .h(px(72.))
                                 .rounded(px(RADIUS_PANEL))
@@ -294,6 +297,7 @@ impl DbxApp {
                         let choose = tag.clone();
                         div()
                             .id(SharedString::from(format!("tag-{}", tag.id)))
+                            .pressable()
                             .px(px(10.))
                             .h(px(26.))
                             .rounded_full()
@@ -480,6 +484,7 @@ impl DbxApp {
                                             .id(SharedString::from(format!(
                                                 "saved-connection-{id}"
                                             )))
+                                            .pressable()
                                             .h(px(50.))
                                             .flex_none()
                                             .px(px(10.))
@@ -531,6 +536,9 @@ impl DbxApp {
                                                         gpui::ClickEvent::Mouse(mouse) => {
                                                             mouse.up.click_count
                                                         }
+                                                        // Enter opens, like a double-click.
+                                                        gpui::ClickEvent::Keyboard(key)
+                                                            if key.button == gpui::KeyboardButton::Enter => 2,
                                                         gpui::ClickEvent::Keyboard(_)
                                                         | gpui::ClickEvent::Touch(_) => 1,
                                                     };
@@ -624,8 +632,6 @@ impl DbxApp {
             },
         );
         div().debug_selector(|| "vault-gate".into()).key_context("VaultGate")
-            .on_action(cx.listener(|_, _: &VaultFocusNext, window, cx| window.focus_next(cx)))
-            .on_action(cx.listener(|_, _: &VaultFocusPrevious, window, cx| window.focus_prev(cx)))
             .on_action(cx.listener(move |this, _: &SubmitVault, _, cx| {
                 if !this.vault_busy {
                     this.submit_vault_passphrase(creating, cx);

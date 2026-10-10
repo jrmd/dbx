@@ -11,6 +11,7 @@ const MAX_RESULTS: usize = 50;
 pub(super) struct QuickOpen {
     pub(super) query: Entity<TextEditor>,
     pub(super) selected: usize,
+    pub(super) focus: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -109,6 +110,7 @@ impl DbxApp {
         self.quick_open = Some(QuickOpen {
             query,
             selected: 0,
+            focus: cx.focus_handle(),
             _subscription: subscription,
         });
         cx.notify();
@@ -383,10 +385,12 @@ impl DbxApp {
         };
         let editor = open.query.clone();
         let focus = editor.read(cx).focus_handle();
+        let modal_focus = open.focus.clone();
         let items = self.quick_open_items(cx);
         let selected = open.selected.min(items.len().saturating_sub(1));
         div()
             .id("quick-open-overlay")
+            .track_focus(&modal_focus)
             .occlude()
             .absolute()
             .top_0()
