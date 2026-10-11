@@ -1,3 +1,4 @@
+mod accessibility;
 mod agents;
 mod app;
 mod assets;
@@ -7,6 +8,7 @@ mod diagram;
 mod editor;
 #[allow(dead_code)]
 mod filters;
+mod motion;
 mod popups;
 mod profile_transfer;
 mod profiles;
@@ -145,8 +147,10 @@ fn main() {
                     eprintln!("DBX could not load appearance settings: {error}");
                     settings::Settings::default()
                 });
+            motion::init(settings.motion, cx);
             theme::set_appearance(settings.appearance);
             theme::set_reduce_transparency(settings.reduce_transparency);
+            theme::set_text_scales(settings.ui_scale, settings.editor_scale);
             theme::set_system_appearance(cx.window_appearance());
             theme::sync_component_theme(None, cx);
             // First, so editor and grid bindings win ties with it: GPUI ranks a

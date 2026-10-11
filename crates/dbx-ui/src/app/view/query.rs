@@ -31,13 +31,11 @@ impl DbxApp {
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .child(
-                DataTable::new(&result_grid)
-                    .with_size(px(30.))
-                    .stripe(false)
-                    .bordered(false)
-                    .scrollbar_visible(true, true),
-            )
+            .child(crate::app::result_table::accessible_grid(
+                &result_grid,
+                "Query results",
+                false,
+            ))
             .into_any_element()
     }
 
@@ -64,12 +62,12 @@ impl DbxApp {
                 .id(SharedString::from(format!(
                     "sql-completion-{session_id}-{tab_id}-{index}"
                 )))
-                .h(px(28.))
-                .px(px(8.))
-                .rounded(px(4.))
+                .h(crate::theme::ui_px(28.))
+                .px(crate::theme::ui_px(8.))
+                .rounded(crate::theme::ui_px(4.))
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(crate::theme::ui_px(8.))
                 .cursor_pointer()
                 .bg(if index == selected {
                     theme().accent_soft
@@ -79,9 +77,9 @@ impl DbxApp {
                 .hover(|style| style.bg(theme().accent_soft))
                 .child(
                     div()
-                        .w(px(52.))
+                        .w(crate::theme::ui_px(52.))
                         .flex_none()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(theme().text_muted)
                         .child(item_kind.label()),
                 )
@@ -95,9 +93,9 @@ impl DbxApp {
                 )
                 .child(
                     div()
-                        .max_w(px(190.))
+                        .max_w(crate::theme::ui_px(190.))
                         .truncate()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(theme().text_muted)
                         .child(detail),
                 )
@@ -116,23 +114,23 @@ impl DbxApp {
         deferred(
             anchored()
                 .position(anchor)
-                .snap_to_window_with_margin(px(8.))
+                .snap_to_window_with_margin(crate::theme::ui_px(8.))
                 .child(
                     div()
                         .id("sql-completion-menu")
                         .debug_selector(|| "sql-completion-menu".into())
-                        .w(px(420.))
-                        .max_h(px(300.))
-                        .p(px(5.))
-                        .rounded(px(7.))
+                        .w(crate::theme::ui_px(420.))
+                        .max_h(crate::theme::ui_px(300.))
+                        .p(crate::theme::ui_px(5.))
+                        .rounded(crate::theme::ui_px(7.))
                         .border_1()
                         .border_color(theme().border_strong)
                         .bg(theme().panel_raised)
-                        .text_size(px(12.))
+                        .text_size(crate::theme::ui_px(12.))
                         .child(
                             div()
                                 .id("sql-completion-items")
-                                .max_h(px(252.))
+                                .max_h(crate::theme::ui_px(252.))
                                 .overflow_y_scroll()
                                 .children(rows),
                         ),
@@ -260,7 +258,7 @@ impl DbxApp {
             .relative()
             .flex_1()
             .min_h_0()
-            .p(px(10.))
+            .p(crate::theme::ui_px(10.))
             .key_context(editor::SQL_EDITOR_CONTEXT)
             .capture_key_down(completion_key_listener)
             .on_action(cx.listener(move |this, _: &CompletionUp, window, cx| {
@@ -310,7 +308,7 @@ impl DbxApp {
                 this.cancel_query_for(session_id, cx);
                 cx.stop_propagation();
             }))
-            .child(editor::sql_input_fill(query_editor, query_focus));
+            .child(editor::sql_input_fill(query_editor, query_focus, cx));
         if let Some(completion_element) = completion_element {
             editor_panel = editor_panel.child(completion_element);
         }
@@ -327,9 +325,9 @@ impl DbxApp {
             None
         };
         let result_color = if error.is_some() {
-            theme().danger
+            theme().danger_text
         } else if busy || results_stale || truncated {
-            theme().warning
+            theme().warning_text
         } else {
             theme().text_muted
         };
@@ -399,9 +397,9 @@ impl DbxApp {
             }))
             .child(
                 div()
-                    .h(px(38.))
+                    .h(crate::theme::ui_px(38.))
                     .flex_none()
-                    .px(px(9.))
+                    .px(crate::theme::ui_px(9.))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -414,23 +412,23 @@ impl DbxApp {
                             .flex_1()
                             .min_w_0()
                             .items_center()
-                            .gap(px(6.))
+                            .gap(crate::theme::ui_px(6.))
                             .child(
-                                div().w(px(180.)).min_w(px(72.)).flex_shrink(1.).child(
+                                div().w(crate::theme::ui_px(180.)).min_w(crate::theme::ui_px(72.)).flex_shrink(1.).child(
                                     editor::input_with_key_context(
                                         name_editor,
                                         name_focus,
                                         false,
                                         editor::TEXT_EDITOR_CONTEXT,
-                                    )
-                                    .h(px(28.))
-                                    .py(px(5.)),
+                                     cx)
+                                    .h(crate::theme::ui_px(28.))
+                                    .py(crate::theme::ui_px(5.)),
                                 ),
                             )
                             .child(
                                 button("save-named-query", "Save", ButtonKind::Quiet)
                                     .debug_selector(|| "save-named-query".into())
-                                    .tooltip("Save this query to the connection")
+                                    .accessible_name("Save this query to the connection").tooltip("Save this query to the connection")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.save_named_query_for(session_id, cx)
                                     })),
@@ -441,18 +439,18 @@ impl DbxApp {
                             .flex()
                             .flex_none()
                             .items_center()
-                            .gap(px(7.))
+                            .gap(crate::theme::ui_px(7.))
                             .child(
                         div()
                             .id("describe-query")
-                            .pressable()
-                            .h(px(28.))
-                            .px(px(10.))
+                            .pressable("Describe query with assistant")
+                            .h(crate::theme::ui_px(28.))
+                            .px(crate::theme::ui_px(10.))
                             .rounded_full()
                             .flex()
                             .items_center()
-                            .gap(px(6.))
-                            .text_size(px(12.))
+                            .gap(crate::theme::ui_px(6.))
+                            .text_size(crate::theme::ui_px(12.))
                             .cursor_pointer()
                             .when(agent_open, |toggle| {
                                 toggle
@@ -485,7 +483,7 @@ impl DbxApp {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(7.))
+                            .gap(crate::theme::ui_px(7.))
                             .when(transactions_supported && !busy, |actions| {
                                 if in_transaction {
                                     actions
@@ -497,7 +495,7 @@ impl DbxApp {
                                             .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "ROLLBACK", cx))))
                                 } else {
                                     actions.child(button("begin-query", "Begin", ButtonKind::Quiet)
-                                        .tooltip("Begin a transaction in this query tab")
+                                        .accessible_name("Begin a transaction in this query tab").tooltip("Begin a transaction in this query tab")
                                         .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "BEGIN", cx))))
                                 }
                             })
@@ -519,7 +517,7 @@ impl DbxApp {
                             .when(busy, |actions| {
                                 actions.child(
                                     button("cancel-query", "Cancel", ButtonKind::Quiet)
-                                        .tooltip("Cancel (Esc)")
+                                        .accessible_name("Cancel (Esc)").tooltip("Cancel (Esc)")
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.cancel_query_for(session_id, cx);
@@ -532,7 +530,7 @@ impl DbxApp {
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
-                                    .tooltip("Query options")
+                                    .accessible_name("Query options").tooltip("Query options")
                                     .child(icon(Icon::More, theme().text_muted))
                                     .dropdown_menu({
                                         let options = std::rc::Rc::new(QueryOptions {
@@ -553,12 +551,12 @@ impl DbxApp {
                     ),
                     ),
             )
-            .when(in_transaction, |view| view.child(div().px(px(10.)).py(px(4.)).text_xs().text_color(theme().warning)
+            .when(in_transaction, |view| view.child(div().px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.)).text_xs().text_color(theme().warning_text)
                 .child("Transaction open in this tab · Commit to save or Rollback to discard. Closing the tab rolls it back.")))
-            .when_some(vim_mode, |view, mode| view.child(div().px(px(10.)).py(px(4.)).text_xs().text_color(theme().accent)
+            .when_some(vim_mode, |view, mode| view.child(div().px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.)).text_xs().text_color(theme().accent_text)
                 .debug_selector(|| "vim-mode-indicator".into())
                 .child(format!("{} · i to insert · Esc for Normal · F6 to leave editor", mode.label()))))
-            .when(statement_labels.len() > 1, |view| view.child(div().flex().gap(px(4.)).px(px(8.)).py(px(4.))
+            .when(statement_labels.len() > 1, |view| view.child(div().flex().gap(crate::theme::ui_px(4.)).px(crate::theme::ui_px(8.)).py(crate::theme::ui_px(4.))
                 .children(statement_labels.into_iter().enumerate().map(|(index, label)| {
                     button(SharedString::from(format!("statement-result-{index}")), label,
                         if index == active_result { ButtonKind::Primary } else { ButtonKind::Quiet })
@@ -568,11 +566,11 @@ impl DbxApp {
             .when_some(agent_panel, |view, panel| view.child(panel))
             .when_some(parameter_prompt, |view, prompt| view.child(prompt))
             .when_some(find_bar, |view, bar| view.child(bar))
-            .when(has_rowset, |view| view.child(div().flex().items_center().gap(px(8.)).px(px(10.)).py(px(4.))
-                .child(div().text_size(px(11.)).child("INSERT export target table:"))
-                .child(div().w(px(220.)).child(export_target))))
+            .when(has_rowset, |view| view.child(div().flex().items_center().gap(crate::theme::ui_px(8.)).px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.))
+                .child(div().text_size(crate::theme::ui_px(11.)).child("INSERT export target table:"))
+                .child(div().w(crate::theme::ui_px(220.)).child(export_target))))
             .when_some(inspected_value, |view, value| view.child(
-                div().id("query-value-viewer").max_h(px(300.)).overflow_y_scroll().p(px(10.))
+                div().id("query-value-viewer").max_h(crate::theme::ui_px(300.)).overflow_y_scroll().p(crate::theme::ui_px(10.))
                     .child(div().flex().justify_between().child("Value")
                         .child(button("copy-query-value", "Copy full value", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(value) = this.active_query_tab(session_id).and_then(|query| query.inspected_value.as_ref()) {
@@ -591,8 +589,8 @@ impl DbxApp {
                 .with_state(&split_state)
                 .child(
                     gpui_component::resizable::resizable_panel()
-                        .size(px(224.))
-                        .size_range(px(164.)..px(520.))
+                        .size(crate::theme::ui_px(224.))
+                        .size_range(crate::theme::ui_px(164.)..crate::theme::ui_px(520.))
                         .child(editor_panel),
                 )
                 .child(
@@ -606,9 +604,9 @@ impl DbxApp {
                             .on_action(cx.listener(Self::copy_query_selection_action))
                             .child(
                                 div()
-                                    .h(px(30.))
+                                    .h(crate::theme::ui_px(30.))
                                     .flex_none()
-                                    .px(px(10.))
+                                    .px(crate::theme::ui_px(10.))
                                     .flex()
                                     .items_center()
                                     .justify_between()
@@ -620,11 +618,11 @@ impl DbxApp {
                                             .flex()
                                             .min_w_0()
                                             .items_center()
-                                            .gap(px(7.))
+                                            .gap(crate::theme::ui_px(7.))
                                             .when(result_label.is_some(), |strip| {
                                                 strip.child(
                                                     div()
-                                                        .size(px(6.))
+                                                        .size(crate::theme::ui_px(6.))
                                                         .flex_none()
                                                         .rounded_full()
                                                         .bg(result_color),
@@ -632,19 +630,15 @@ impl DbxApp {
                                             })
                                             .when_some(result_label, |strip, label| {
                                                 strip.child(
-                                                    div()
-                                                        .flex_none()
-                                                        .text_size(px(11.))
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(theme().text)
+                                                    crate::accessibility::announcement("query-outcome", label, error.is_some())
+                                                        .flex_none().text_size(crate::theme::ui_px(11.))
+                                                        .font_weight(FontWeight::MEDIUM).text_color(theme().text)
                                                         .child(label),
                                                 )
                                             })
                                             .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_size(px(10.))
+                                                crate::accessibility::announcement("query-status", if error.is_some() { String::new() } else { status.clone() }, false)
+                                                    .min_w_0().truncate().text_size(crate::theme::ui_px(10.))
                                                     .text_color(theme().text_muted)
                                                     .child(if error.is_some() || busy {
                                                         SharedString::default()
@@ -656,9 +650,9 @@ impl DbxApp {
                                     .when_some(executed_database, |strip, database| {
                                         strip.child(
                                             div()
-                                                .ml(px(10.))
+                                                .ml(crate::theme::ui_px(10.))
                                                 .flex_none()
-                                                .text_size(px(10.))
+                                                .text_size(crate::theme::ui_px(10.))
                                                 .text_color(theme().text_muted)
                                                 .child(database),
                                         )
@@ -666,30 +660,28 @@ impl DbxApp {
                             )
                             .when_some(error.clone(), |panel, error| {
                                 panel.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "query-error-{session_id}-{tab_id}"
-                                        )))
-                                        .mx(px(10.))
-                                        .mt(px(8.))
-                                        .mb(px(4.))
-                                        .px(px(9.))
-                                        .py(px(7.))
-                                        .rounded(px(5.))
+                                    crate::accessibility::announcement(SharedString::from(format!(
+                                            "query-error-{session_id}-{tab_id}")), error.clone(), true)
+                                        .mx(crate::theme::ui_px(10.))
+                                        .mt(crate::theme::ui_px(8.))
+                                        .mb(crate::theme::ui_px(4.))
+                                        .px(crate::theme::ui_px(9.))
+                                        .py(crate::theme::ui_px(7.))
+                                        .rounded(crate::theme::ui_px(5.))
                                         .border_1()
                                         .border_color(theme().danger)
                                         .bg(theme().panel_raised)
-                                        .max_h(px(180.))
+                                        .max_h(crate::theme::ui_px(180.))
                                         .overflow_y_scroll()
                                         .whitespace_normal()
-                                        .text_size(px(11.))
+                                        .text_size(crate::theme::ui_px(11.))
                                         .text_color(theme().text)
                                         .child(error)
                                         .child(
                                             div()
-                                                .mt(px(6.))
+                                                .mt(crate::theme::ui_px(6.))
                                                 .flex()
-                                                .gap(px(6.))
+                                                .gap(crate::theme::ui_px(6.))
                                                 .child(
                                                     button(
                                                         "copy-query-error",

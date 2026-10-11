@@ -51,7 +51,10 @@ impl DbxApp {
         div()
             .id(id)
             .debug_selector(move || id.into())
-            .pressable()
+            .pressable(match pane {
+                PaneResize::Explorer => "Explorer width",
+                PaneResize::Inspector => "Inspector width",
+            })
             .role(gpui::Role::Splitter)
             .aria_label(match pane {
                 PaneResize::Explorer => "Explorer width",
@@ -61,11 +64,11 @@ impl DbxApp {
             .absolute()
             .top_0()
             .bottom_0()
-            .w(px(HANDLE_WIDTH))
+            .w(crate::theme::ui_px(HANDLE_WIDTH))
             // The explorer's handle fills the gap beside the glass; the
             // inspector's straddles its border with the grid.
             .map(|handle| match pane {
-                PaneResize::Explorer => handle.right(px(-HANDLE_WIDTH)),
+                PaneResize::Explorer => handle.right(crate::theme::ui_px(-HANDLE_WIDTH)),
                 PaneResize::Inspector => handle.left(px(-HANDLE_WIDTH / 2.)),
             })
             .flex()
@@ -75,7 +78,7 @@ impl DbxApp {
             .child(
                 div()
                     .h_full()
-                    .w(px(2.))
+                    .w(crate::theme::ui_px(2.))
                     .when(resizing, |line| line.bg(theme().accent))
                     .when(!resizing, |line| {
                         line.group_hover(group, |line| line.bg(theme().border_strong))

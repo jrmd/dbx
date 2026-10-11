@@ -21,6 +21,7 @@ pub(super) struct DataImportDialog {
     pub(super) busy: bool,
     error: Option<String>,
     pub(super) focus: FocusHandle,
+    pub(super) return_focus: Option<FocusHandle>,
 }
 impl DbxApp {
     pub(super) fn preview_data_import(
@@ -34,6 +35,7 @@ impl DbxApp {
         let Some(engine) = self.session(session_id).and_then(|s| s.engine.clone()) else {
             return;
         };
+        let return_focus = window.focused(cx);
         let runtime = self.runtime.clone();
         cx.spawn_in(window, async move |this, cx| {
             let target = table_ref(&table);
@@ -55,14 +57,21 @@ impl DbxApp {
                 }
                 match result {
                     Ok((data, columns, database)) => {
-                        let mapping = data
-                            .default_mapping(&columns)
-                            .into_iter()
-                            .map(|name| {
-                                let value = cx.new(|_| name.unwrap_or_default());
-                                cx.new(|cx| TextEditor::new(value, false, window, cx))
-                            })
-                            .collect::<Vec<_>>();
+                        let mapping =
+                            data.default_mapping(&columns)
+                                .into_iter()
+                                .enumerate()
+                                .map(|(index, name)| {
+                                    let value = cx.new(|_| name.unwrap_or_default());
+                                    cx.new(|cx| {
+                                        TextEditor::new(value, false, window, cx)
+                                            .accessibility_label(format!(
+                                                "Destination column for source column {}",
+                                                index + 1
+                                            ))
+                                    })
+                                })
+                                .collect::<Vec<_>>();
                         if let Some(first) = mapping.first() {
                             first.read(cx).focus_handle().focus(window, cx);
                         }
@@ -76,6 +85,7 @@ impl DbxApp {
                             busy: false,
                             error: None,
                             focus: cx.focus_handle(),
+                            return_focus,
                         });
                     }
                     Err(error) => this.set_error(error.to_string()),
@@ -105,6 +115,7 @@ impl DbxApp {
             self.show_toast(ToastKind::Info, "Capture the source table first", cx);
             return;
         }
+        let return_focus = window.focused(cx);
         let source = self.copied_table_data.clone();
         let task = self.runtime.spawn(async move {
             let reference = table_ref(&table);
@@ -139,8 +150,8 @@ impl DbxApp {
                     Ok((table, data, columns, database, diff)) => {
                         if action == 0 { this.copied_table_data = Some(data); this.show_toast(ToastKind::Info, "Captured a consistent table snapshot. Choose another table’s ‘Append captured data’ or ‘Compare with captured data’. Limit: 100,000 rows / 64 MiB.", cx); }
                         else if action == 1 {
-                            let mapping = data.default_mapping(&columns).into_iter().map(|name| { let value = cx.new(|_| name.unwrap_or_default()); cx.new(|cx| TextEditor::new(value, false, window, cx)) }).collect();
-                            this.data_import_dialog = Some(DataImportDialog { session_id: id, table, database, columns, data, mapping, busy: false, focus: cx.focus_handle(), error: Some("Cross-connection copy can convert types. Review destination types and sample values; unsupported values fail and roll back the copy. Existing keys are not replaced.".into()) });
+                            let mapping = data.default_mapping(&columns).into_iter().enumerate().map(|(index, name)| { let value = cx.new(|_| name.unwrap_or_default()); cx.new(|cx| TextEditor::new(value, false, window, cx).accessibility_label(format!("Destination column for source column {}", index + 1))) }).collect();
+                            this.data_import_dialog = Some(DataImportDialog { session_id: id, table, database, columns, data, mapping, busy: false, focus: cx.focus_handle(), return_focus, error: Some("Cross-connection copy can convert types. Review destination types and sample values; unsupported values fail and roll back the copy. Existing keys are not replaced.".into()) });
                         } else {
                             let diff = diff.unwrap();
                             this.open_saved_query_for(id, crate::workspace::SavedQuery { name: "Data comparison".into(), sql: format!("-- Complete bounded snapshots compared by destination primary key. Types compare exactly; snapshots were captured at different times.\n-- Source only: {}\n-- Destination only: {}\n-- Changed: {}\n-- Equal: {}\n-- No synchronization writes were generated or executed.", diff.only_source, diff.only_target, diff.changed, diff.equal) }, window, cx);
@@ -153,7 +164,7 @@ impl DbxApp {
             Ok::<(), anyhow::Error>(())
         }).detach();
     }
-    fn execute_previewed_import(&mut self, cx: &mut Context<Self>) {
+    fn execute_previewed_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = &self.data_import_dialog else {
             return;
         };
@@ -202,11 +213,11 @@ impl DbxApp {
             .await
         });
         self.session_mut(id).unwrap().track_background_task(&task);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = task
                 .await
                 .unwrap_or_else(|e| Err(dbx_core::DbxError::Io(e.to_string())));
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 let Some(session) = this.session_mut(id) else {
                     return;
                 };
@@ -217,7 +228,7 @@ impl DbxApp {
                 session.transfer_control = None;
                 match result {
                     Ok(rows) => {
-                        this.data_import_dialog = None;
+                        this.close_data_import(window, cx);
                         this.show_toast(ToastKind::Success, format!("Imported {rows} rows"), cx);
                         this.refresh_tables_for(id, cx);
                     }
@@ -235,23 +246,34 @@ impl DbxApp {
         .detach();
         cx.notify();
     }
+    pub(super) fn close_data_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.data_import_dialog.take() {
+            dialog
+                .return_focus
+                .unwrap_or_else(|| self.focus_handle.clone())
+                .focus(window, cx);
+            cx.notify();
+        }
+    }
     pub(super) fn render_data_import(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(dialog) = &self.data_import_dialog else {
             return div().into_any_element();
         };
-        div().track_focus(&dialog.focus).absolute().inset_0().bg(theme().overlay).flex().items_center().justify_center().on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(glass_raised(div(), RADIUS_GLASS).w(px(760.)).max_w(relative(0.95)).max_h(relative(0.9)).id("data-import-dialog").overflow_y_scroll().p(px(20.)).flex().flex_col().gap(px(12.))
+        div().id("data-import-overlay").role(gpui::Role::Dialog).aria_label(format!("Review {} rows for import", dialog.data.rows.len())).aria_description("Map source fields to destination columns. Failed rows roll back the import.")
+            .a11y_synthetic_children({ let background = self.modal_is_background(&dialog.focus); move |builder| { let node = builder.parent_node(); node.set_modal(); if background { node.set_hidden(); } } })
+            .track_focus(&dialog.focus).absolute().inset_0().bg(theme().overlay).flex().items_center().justify_center().on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .child(glass_raised(div(), RADIUS_GLASS).w(crate::theme::ui_px(760.)).max_w(relative(0.95)).max_h(relative(0.9)).id("data-import-dialog").overflow_y_scroll().p(crate::theme::ui_px(20.)).flex().flex_col().gap(crate::theme::ui_px(12.))
                 .child(div().text_lg().child(format!("Review {} rows → {} / {}", dialog.data.rows.len(), dialog.database, table_sidebar_label(&dialog.table, None))))
                 .child(div().text_sm().child("Map each source field to a destination column. Leave blank to omit it and use the database default. CSV unquoted empty = NULL; quoted empty = empty text. JSON null = NULL; dates stay text; binary uses the destination’s supported binary format. Any failed row rolls back the entire import."))
                 .child(div().text_sm().text_color(theme().text_muted).child(format!("Destination columns: {}", dialog.columns.iter().map(|c| format!("{} ({})", c.name, c.data_type)).collect::<Vec<_>>().join(", "))))
-                .child(div().id("data-import-fields").max_h(px(300.)).overflow_y_scroll().flex().flex_col().gap(px(8.)).children(dialog.data.headers.iter().enumerate().map(|(index, name)| {
+                .child(div().id("data-import-fields").max_h(crate::theme::ui_px(300.)).overflow_y_scroll().flex().flex_col().gap(crate::theme::ui_px(8.)).children(dialog.data.headers.iter().enumerate().map(|(index, name)| {
                     let samples = dialog.data.rows.iter().take(3).map(|row| preview_cell(&row[index])).collect::<Vec<_>>().join(" · ");
-                    div().flex().gap(px(12.)).items_center().child(div().w(px(300.)).text_sm().child(format!("{name}: {samples}"))).child(div().flex_1().child(editor::input(dialog.mapping[index].clone(), dialog.mapping[index].read(cx).focus_handle(), false)))
+                    div().flex().gap(crate::theme::ui_px(12.)).items_center().child(div().w(crate::theme::ui_px(300.)).text_sm().child(format!("{name}: {samples}"))).child(div().flex_1().child(editor::input(dialog.mapping[index].clone(), dialog.mapping[index].read(cx).focus_handle(), false, cx)))
                 })))
-                .when_some(dialog.error.clone(), |view, error| view.child(div().text_sm().text_color(theme().danger).child(error)))
-                .child(div().flex().justify_end().gap(px(8.))
-                    .child(button("data-import-cancel", if dialog.busy { "Cancel import" } else { "Cancel" }, ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| { if let Some(dialog) = &this.data_import_dialog && dialog.busy { this.cancel_transfer_for(dialog.session_id, cx); return; } this.data_import_dialog = None; this.focus_handle.focus(window, cx); cx.notify(); })))
-                    .child(button("data-import-run", "Append reviewed rows", ButtonKind::Primary).disabled(dialog.busy).on_click(cx.listener(|this, _, _, cx| this.execute_previewed_import(cx))))))
+                .when_some(dialog.error.clone(), |view, error| view.child(crate::accessibility::announcement("data_import-error", error.clone(), true).text_sm().text_color(theme().danger_text).child(error)))
+                .child(div().flex().justify_end().gap(crate::theme::ui_px(8.))
+                    .child(button("data-import-cancel", if dialog.busy { "Cancel import" } else { "Cancel" }, ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| { if let Some(dialog) = &this.data_import_dialog && dialog.busy { this.cancel_transfer_for(dialog.session_id, cx); return; } this.close_data_import(window, cx); })))
+                    .child(button("data-import-run", "Append reviewed rows", ButtonKind::Primary).disabled(dialog.busy).on_click(cx.listener(|this, _, window, cx| this.execute_previewed_import(window, cx))))))
             .into_any_element()
     }
 }

@@ -14,14 +14,43 @@ use super::*;
 
 impl Render for DbxApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.compact_layout = window.bounds().size.width < px(900.);
-        self.narrow_workspace = window.bounds().size.width < px(1180.);
+        crate::theme::set_text_scales(self.ui_scale, self.editor_scale);
+        window.set_rem_size(gpui::px(16. * crate::theme::ui_scale()));
+        self.compact_layout = window.bounds().size.width < crate::theme::ui_px(900.);
+        self.narrow_workspace = window.bounds().size.width < crate::theme::ui_px(1180.);
+        // Preserve focused details when resizing into the compact layout,
+        // before computing the explorer and main-pane arrangement.
+        if self.narrow_workspace
+            && let Some((session_id, tab_id)) = self.active_session().and_then(|session| {
+                session
+                    .active_data_tab_id()
+                    .map(|tab_id| (session.id, tab_id))
+            })
+            && let Some(data) = self.data_tab_mut(session_id, tab_id)
+            && data.inspector_open
+            && data.inspector_focus.contains_focused(window, cx)
+        {
+            data.inspector_expanded = true;
+        }
         if window.focused(cx).is_none() {
             window.focus(&self.focus_handle, cx);
         }
         self.reclaim_stray_focus(window, cx);
         self.ensure_modal_focus(window, cx);
         let unlocked = self.vault_state == Some(VaultState::Unlocked);
+        if std::mem::take(&mut self.connection_form_focus_pending)
+            && unlocked
+            && !self.settings_open
+            && (self.connection_picker_open || self.active_session().is_none())
+            && self.modal_traps().is_empty()
+        {
+            let editor = if self.draft.choosing_kind {
+                &self.draft.import_url_editor
+            } else {
+                &self.draft.connection_name_editor
+            };
+            editor.read(cx).focus_handle().focus(window, cx);
+        }
         // The vault fields keep focus after unlocking even though they are no
         // longer drawn, which would leave every shortcut without a target.
         if unlocked
@@ -52,7 +81,12 @@ impl Render for DbxApp {
             && self
                 .active_session()
                 .is_some_and(|session| session.engine.is_some());
+        let modal_open = !self.modal_traps().is_empty();
+        let workspace_drawn = self.workspace_screen_drawn();
         div()
+            .id("dbx-app")
+            .role(gpui::Role::Application)
+            .aria_label("DBX")
             .size_full()
             .relative()
             .flex()
@@ -63,6 +97,7 @@ impl Render for DbxApp {
             .capture_key_down(cx.listener(|this, event, window, cx| {
                 this.dismiss_overlay_on_escape(event, window, cx)
             }))
+            .capture_key_down(cx.listener(Self::change_text_scale_on_key))
             .on_action(
                 cx.listener(|this, _: &FocusNext, window, cx| this.move_focus(true, window, cx)),
             )
@@ -94,18 +129,39 @@ impl Render for DbxApp {
             .on_action(cx.listener(Self::table_menu_last_action))
             .on_action(cx.listener(Self::table_menu_confirm_action))
             .on_action(cx.listener(|this, _: &CheckForUpdates, _, cx| this.check_for_updates(cx)))
-            .child(self.render_topbar(window, cx))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
+                    .id("app-background")
+                    .role(gpui::Role::Pane)
+                    .aria_label("DBX workspace")
+                    .a11y_synthetic_children(move |builder| {
+                        if modal_open {
+                            builder.parent_node().set_hidden();
+                        }
+                    })
                     .flex()
-                    .when(connected, |view| view.child(self.render_app_rail(cx)))
-                    .when(!connected, |view| view.pl(px(GLASS_INSET)))
-                    .child(content),
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(self.render_topbar(window, cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .flex()
+                            .when(connected, |view| view.child(self.render_app_rail(cx)))
+                            .when(!connected, |view| view.pl(crate::theme::ui_px(GLASS_INSET)))
+                            .child(content),
+                    ),
             )
             .child(self.render_toasts(cx))
+            .when(workspace_drawn, |view| {
+                view.child(self.render_table_context_menu(window, cx))
+                    .child(self.render_database_export_dialog(window, cx))
+                    .child(self.render_mutation_error_dialog(cx))
+            })
             .when(unlocked, |view| {
                 view.child(self.render_quick_open(cx))
                     .child(self.render_confirmation_dialog(cx))
@@ -119,15 +175,24 @@ impl Render for DbxApp {
 impl DbxApp {
     /// Glass capsules stacked above the status bar; click to dismiss early.
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let background = !self.modal_traps().is_empty();
         div()
+            .id("notifications")
+            .role(gpui::Role::Pane)
+            .aria_label("Notifications")
+            .a11y_synthetic_children(move |builder| {
+                if background {
+                    builder.parent_node().set_hidden();
+                }
+            })
             .absolute()
             .left_0()
             .right_0()
-            .bottom(px(76.))
+            .bottom(crate::theme::ui_px(76.))
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(8.))
+            .gap(crate::theme::ui_px(8.))
             .children(self.toasts.iter().map(|toast| {
                 let id = toast.id;
                 let accent = match toast.kind {
@@ -135,24 +200,49 @@ impl DbxApp {
                     ToastKind::Success => theme().success,
                     ToastKind::Error => theme().danger,
                 };
-                glass_raised(div(), RADIUS_GLASS + 4.)
-                    .id(SharedString::from(format!("toast-{id}")))
-                    .rounded_full()
-                    .max_w(px(520.))
-                    .h(px(36.))
-                    .pl(px(14.))
-                    .pr(px(18.))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .occlude()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(div().size(px(8.)).flex_none().rounded_full().bg(accent))
-                    .child(div().truncate().child(toast.message.clone()))
-                    .tooltip(tip(toast.message.clone()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)))
+                glass_raised(
+                    div().id(SharedString::from(format!("toast-{id}"))),
+                    RADIUS_GLASS + 4.,
+                )
+                .rounded_full()
+                .max_w(crate::theme::ui_px(520.))
+                .h(crate::theme::ui_px(36.))
+                .pl(crate::theme::ui_px(14.))
+                .pr(crate::theme::ui_px(18.))
+                .flex()
+                .items_center()
+                .gap(crate::theme::ui_px(10.))
+                .occlude()
+                .cursor_pointer()
+                .text_size(crate::theme::ui_px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(
+                    div()
+                        .size(crate::theme::ui_px(8.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(accent),
+                )
+                // Keep dismissal outside the live region. Readers otherwise
+                // prefer the button descendant and announce only "Dismiss
+                // notification" instead of the operation's outcome.
+                .child(
+                    crate::accessibility::announcement(
+                        SharedString::from(format!("toast-message-{id}")),
+                        toast.message.clone(),
+                        matches!(toast.kind, ToastKind::Error),
+                    )
+                    .min_w_0()
+                    .truncate()
+                    .child(toast.message.clone()),
+                )
+                .child(
+                    glass_icon_button(("dismiss-toast", id), Icon::Close, false)
+                        .aria_label("Dismiss notification")
+                        .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx))),
+                )
+                .tooltip(tip(toast.message.clone()))
+                .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)))
             }))
     }
 }
@@ -185,9 +275,9 @@ fn resize_edges(window: &Window) -> Vec<Stateful<Div>> {
         edges.push(
             handle("resize-top", ResizeEdge::Top, CursorStyle::ResizeUpDown)
                 .top_0()
-                .left(px(CORNER))
-                .right(px(CORNER))
-                .h(px(EDGE)),
+                .left(crate::theme::ui_px(CORNER))
+                .right(crate::theme::ui_px(CORNER))
+                .h(crate::theme::ui_px(EDGE)),
         );
     }
     if !tiling.bottom {
@@ -198,9 +288,9 @@ fn resize_edges(window: &Window) -> Vec<Stateful<Div>> {
                 CursorStyle::ResizeUpDown,
             )
             .bottom_0()
-            .left(px(CORNER))
-            .right(px(CORNER))
-            .h(px(EDGE)),
+            .left(crate::theme::ui_px(CORNER))
+            .right(crate::theme::ui_px(CORNER))
+            .h(crate::theme::ui_px(EDGE)),
         );
     }
     if !tiling.left {
@@ -211,9 +301,9 @@ fn resize_edges(window: &Window) -> Vec<Stateful<Div>> {
                 CursorStyle::ResizeLeftRight,
             )
             .left_0()
-            .top(px(CORNER))
-            .bottom(px(CORNER))
-            .w(px(EDGE)),
+            .top(crate::theme::ui_px(CORNER))
+            .bottom(crate::theme::ui_px(CORNER))
+            .w(crate::theme::ui_px(EDGE)),
         );
     }
     if !tiling.right {
@@ -224,9 +314,9 @@ fn resize_edges(window: &Window) -> Vec<Stateful<Div>> {
                 CursorStyle::ResizeLeftRight,
             )
             .right_0()
-            .top(px(CORNER))
-            .bottom(px(CORNER))
-            .w(px(EDGE)),
+            .top(crate::theme::ui_px(CORNER))
+            .bottom(crate::theme::ui_px(CORNER))
+            .w(crate::theme::ui_px(EDGE)),
         );
     }
     let corners = [
@@ -259,7 +349,7 @@ fn resize_edges(window: &Window) -> Vec<Stateful<Div>> {
         if !enabled {
             continue;
         }
-        let corner = handle(id, edge, cursor).size(px(CORNER));
+        let corner = handle(id, edge, cursor).size(crate::theme::ui_px(CORNER));
         edges.push(match edge {
             ResizeEdge::TopLeft => corner.top_0().left_0(),
             ResizeEdge::TopRight => corner.top_0().right_0(),

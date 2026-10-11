@@ -111,8 +111,10 @@ impl DbxApp {
             .or_else(|| (!session_name.trim().is_empty()).then_some(session_name))
             .unwrap_or_else(|| "database".into());
         let output_name = cx.new(|_| format!("{}_export", transfer_name_stem(&base_name)));
-        let output_name_editor =
-            cx.new(|cx| TextEditor::new(output_name.clone(), false, window, cx));
+        let output_name_editor = cx.new(|cx| {
+            TextEditor::new(output_name.clone(), false, window, cx)
+                .accessibility_label("Export file name")
+        });
         let output_name_subscription = cx.observe(&output_name, |_, _, cx| cx.notify());
         let focus = output_name_editor.read(cx).focus_handle();
         let output_directory = dirs::download_dir()
@@ -131,6 +133,7 @@ impl DbxApp {
             output_name,
             output_name_editor,
             focus: cx.focus_handle(),
+            return_focus: window.focused(cx),
             _output_name_subscription: output_name_subscription,
         });
         focus.focus(window, cx);
@@ -228,14 +231,25 @@ impl DbxApp {
         .detach();
     }
 
-    pub(super) fn cancel_database_export(&mut self, cx: &mut Context<Self>) {
-        if self.database_export_dialog.take().is_some() {
+    pub(super) fn cancel_database_export(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(dialog) = self.database_export_dialog.take() {
+            dialog
+                .return_focus
+                .unwrap_or_else(|| self.focus_handle.clone())
+                .focus(window, cx);
             self.error = None;
             cx.notify();
+            true
+        } else {
+            false
         }
     }
 
-    pub(super) fn execute_database_export(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn execute_database_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = self.database_export_dialog.as_ref() else {
             return;
         };
@@ -278,7 +292,7 @@ impl DbxApp {
             return;
         }
 
-        self.database_export_dialog = None;
+        self.cancel_database_export(window, cx);
         let runtime = self.runtime.clone();
         let Some(session) = self.session_mut(session_id) else {
             return;

@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/dbx-core", "crates/dbx-ui"]
 resolver = "2"
+exclude = ["vendor/gpui-component", "vendor/accesskit_atspi_common", "vendor/accesskit_unix"]
 
 [workspace.package]
 version = "0.7.3"
@@ -47,9 +48,17 @@ gpui = { git = "https://github.com/zed-industries/zed" }
 getrandom = "0.4"
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+gpui-base = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch."https://github.com/longbridge/gpui-component"]
+gpui-component = { path = "vendor/gpui-component" }
+
+[patch.crates-io]
+accesskit_atspi_common = { path = "vendor/accesskit_atspi_common" }
+accesskit_unix = { path = "vendor/accesskit_unix" }

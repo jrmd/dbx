@@ -29,7 +29,7 @@ impl DbxApp {
     /// Whether the workspace is the screen being drawn, which is where the
     /// export dialog, mutation error and table menu live. Mirrors the choice
     /// `render` makes between settings, the connection list and the workspace.
-    fn workspace_screen_drawn(&self) -> bool {
+    pub(super) fn workspace_screen_drawn(&self) -> bool {
         self.vault_state == Some(VaultState::Unlocked)
             && !self.settings_open
             && !self.connection_picker_open
@@ -40,7 +40,7 @@ impl DbxApp {
     /// modal's container element. Only modals that are painted are listed: a
     /// handle nothing draws can't hold focus, and chasing one would fight
     /// `reclaim_stray_focus` every frame.
-    fn modal_traps(&self) -> Vec<FocusHandle> {
+    pub(super) fn modal_traps(&self) -> Vec<FocusHandle> {
         if self.vault_state != Some(VaultState::Unlocked) {
             return Vec::new();
         }
@@ -65,6 +65,10 @@ impl DbxApp {
             traps.extend(self.table_context_menu.as_ref().map(|m| m.focus.clone()));
         }
         traps
+    }
+
+    pub(super) fn modal_is_background(&self, focus: &FocusHandle) -> bool {
+        self.modal_traps().first().is_some_and(|top| top != focus)
     }
 
     /// Pull focus back to the window root when it sits on a handle that isn't
@@ -363,6 +367,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn new_connection_steps_focus_the_drawn_field_and_keep_it(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Unlocked);
+                app.saved_connections.clear();
+                app.begin_new_connection(cx);
+            })
+        });
+        let import =
+            cx.update(|_, cx| app.read(cx).draft.import_url_editor.read(cx).focus_handle());
+        for _ in 0..3 {
+            settle(cx);
+            assert_eq!(focused(cx), Some(import.clone()));
+        }
+        cx.update(|_, cx| app.update(cx, |app, cx| app.select_kind(DatabaseKind::PostgreSQL, cx)));
+        let name = cx.update(|_, cx| {
+            app.read(cx)
+                .draft
+                .connection_name_editor
+                .read(cx)
+                .focus_handle()
+        });
+        for _ in 0..3 {
+            settle(cx);
+            assert_eq!(focused(cx), Some(name.clone()));
+        }
+        cx.simulate_keystrokes("tab");
+        let moved = focused(cx);
+        assert_ne!(moved, Some(name));
+        settle(cx);
+        assert_eq!(focused(cx), moved, "ordinary redraws must not steal focus");
+        cx.update(|_, cx| app.update(cx, |app, cx| app.change_connection_kind(cx)));
+        for _ in 0..3 {
+            settle(cx);
+            assert_eq!(focused(cx), Some(import.clone()));
+        }
+    }
+
+    #[gpui::test]
     fn tab_walks_the_connection_form_fields(cx: &mut TestAppContext) {
         bind_keys(cx);
         let (app, cx) = cx.add_window_view(DbxApp::new);
@@ -467,8 +512,10 @@ mod tests {
             app
         });
         settle(cx);
-        // Settings opens on its close control; the next Tab reaches Vim mode.
-        walk(cx, "tab", 1);
+        let switch = control_focus(cx, "settings-vim-mode");
+        cx.update(|window, cx| app.read(cx).settings_focus.clone().focus(window, cx));
+        let reached = (0..100).any(|_| walk(cx, "tab", 1)[0] == Some(switch.clone()));
+        assert!(reached, "Tab must reach the Vim mode switch");
         cx.simulate_keystrokes("enter");
         cx.simulate_event(gpui::KeyUpEvent {
             keystroke: gpui::Keystroke::parse("enter").unwrap(),
@@ -538,9 +585,10 @@ mod tests {
         });
         settle(cx);
         assert!(cx.update(|_, cx| app.read(cx).draft.choosing_kind));
-        // The engine grid is a run of div tiles, not buttons. Eight stops in
-        // is past the top bar and inside the grid, where Enter must choose.
-        walk(cx, "tab", 8);
+        let engine = control_focus(cx, "engine-PostgreSQL");
+        cx.update(|window, cx| app.read(cx).focus_handle.clone().focus(window, cx));
+        let reached = (0..100).any(|_| walk(cx, "tab", 1)[0] == Some(engine.clone()));
+        assert!(reached, "Tab must reach the PostgreSQL engine tile");
         // GPUI fires the keyboard click on release; the harness only sends
         // the press.
         cx.simulate_keystrokes("enter");
@@ -611,7 +659,7 @@ mod tests {
             div()
                 .size_full()
                 .on_action(cx.listener(|this, _: &FocusNext, _, _| this.focus_moves += 1))
-                .child(editor::sql_input_fill(self.editor.clone(), focus))
+                .child(editor::sql_input_fill(self.editor.clone(), focus, cx))
         }
     }
 
@@ -665,6 +713,31 @@ mod tests {
                 app.open_quick_open_action(&OpenQuickOpen, window, cx);
                 assert_eq!(app.modal_traps().len(), 1);
             })
+        });
+    }
+
+    #[gpui::test]
+    fn closing_profile_transfer_restores_its_opener(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        let opener = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Unlocked);
+                app.saved_connections.clear();
+                app.select_kind(DatabaseKind::PostgreSQL, cx);
+                let opener = app.draft.connection_name_editor.read(cx).focus_handle();
+                opener.focus(window, cx);
+                opener
+            })
+        });
+        settle(cx);
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_profile_transfer(1, window, cx)));
+        settle(cx);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        cx.update(|window, cx| {
+            assert!(app.read(cx).profile_transfer_dialog.is_none());
+            assert!(opener.is_focused(window));
         });
     }
 

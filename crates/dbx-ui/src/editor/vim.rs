@@ -834,7 +834,7 @@ mod tests {
                 .w(px(480.))
                 .h(px(240.))
                 .on_action(cx.listener(|this, _: &crate::app::RunQuery, _, _| this.runs += 1))
-                .child(sql_input_fill(self.editor.clone(), focus))
+                .child(sql_input_fill(self.editor.clone(), focus, cx))
         }
     }
 

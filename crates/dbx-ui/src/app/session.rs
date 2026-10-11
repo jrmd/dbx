@@ -13,10 +13,15 @@ pub(super) struct SessionEditors {
 impl SessionEditors {
     pub(super) fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let filter_text = cx.new(|_| String::new());
-        let filter_editor = cx.new(|cx| TextEditor::new(filter_text.clone(), false, window, cx));
+        let filter_editor = cx.new(|cx| {
+            TextEditor::new(filter_text.clone(), false, window, cx)
+                .accessibility_label("Filter rows")
+        });
         let sidebar_search = cx.new(|_| String::new());
-        let sidebar_search_editor =
-            cx.new(|cx| TextEditor::new(sidebar_search.clone(), false, window, cx));
+        let sidebar_search_editor = cx.new(|cx| {
+            TextEditor::new(sidebar_search.clone(), false, window, cx)
+                .accessibility_label("Search tables")
+        });
         let subscriptions = vec![
             cx.observe(&filter_text, |_, _, cx| cx.notify()),
             cx.observe(&sidebar_search, |_, _, cx| cx.notify()),
@@ -420,7 +425,9 @@ impl QueryTab {
         cx: &mut Context<DbxApp>,
     ) -> Self {
         let name = cx.new(|_| "Untitled".to_owned());
-        let name_editor = cx.new(|cx| TextEditor::new(name.clone(), false, window, cx));
+        let name_editor = cx.new(|cx| {
+            TextEditor::new(name.clone(), false, window, cx).accessibility_label("Query name")
+        });
         let query_text = cx.new(|_| DbxApp::default_query(kind).to_owned());
         let app = cx.entity().downgrade();
         let query_editor = cx.new(|cx| match query_editor_language(kind) {
@@ -434,7 +441,7 @@ impl QueryTab {
             editor::EditorLanguage::Redis => TextEditor::new_redis(query_text.clone(), window, cx),
             editor::EditorLanguage::Json => TextEditor::new_json(query_text.clone(), window, cx),
             editor::EditorLanguage::PlainText => {
-                TextEditor::new(query_text.clone(), true, window, cx)
+                TextEditor::new(query_text.clone(), true, window, cx).accessibility_label("Query")
             }
         });
         let split_state = cx.new(|_| ResizableState::default());
@@ -495,7 +502,9 @@ impl QueryTab {
             in_transaction: false,
             execution_override: None,
             prepared_parameters: None,
-            export_target: cx.new(|cx| TextEditor::empty(false, window, cx)),
+            export_target: cx.new(|cx| {
+                TextEditor::empty(false, window, cx).accessibility_label("SQL export target table")
+            }),
             inspected_value: None,
             parameter_values: HashMap::new(),
             parameter_prompt: None,
@@ -663,6 +672,8 @@ pub(super) struct DiagramTab {
     pub(super) error: Option<String>,
     pub(super) zoom: f32,
     pub(super) selected_node: Option<String>,
+    pub(super) list_view: bool,
+    pub(super) list_scroll: ScrollHandle,
     pub(super) scroll_handle: ScrollHandle,
     pub(super) focus: FocusHandle,
     pub(super) drag_anchor: Option<DiagramDragAnchor>,
@@ -708,6 +719,8 @@ impl DiagramTab {
             error: None,
             zoom: 1.0,
             selected_node: None,
+            list_view: false,
+            list_scroll: ScrollHandle::new(),
             scroll_handle: ScrollHandle::new(),
             focus: cx.focus_handle().tab_stop(true),
             drag_anchor: None,
@@ -790,6 +803,11 @@ pub(super) struct DataTab {
     pub(super) selected_row: Option<usize>,
     pub(super) selected_column: usize,
     pub(super) inspector_open: bool,
+    /// Explicit inspection/editing takes the data sheet on narrow windows;
+    /// ordinary row selection keeps the grid available.
+    pub(super) inspector_expanded: bool,
+    pub(super) inspector_focus: FocusHandle,
+    pub(super) inspector_scroll: ScrollHandle,
     pub(super) draft_mode: DraftMode,
     pub(super) row_draft: Option<RowDraftModel>,
     pub(super) row_draft_subscriptions: Vec<Subscription>,
@@ -857,6 +875,9 @@ impl DataTab {
             selected_row: None,
             selected_column: 0,
             inspector_open: false,
+            inspector_expanded: false,
+            inspector_focus: cx.focus_handle(),
+            inspector_scroll: ScrollHandle::new(),
             draft_mode: DraftMode::Update,
             row_draft: None,
             row_draft_subscriptions: Vec::new(),
@@ -892,8 +913,10 @@ impl DataTab {
         let tables = tables.to_vec();
         let (sortable, sort) = (self.sortable, self.sort.clone());
         let row_offset = self.table_page as usize * TABLE_BROWSE_PAGE_SIZE as usize;
+        let table_columns = self.table_columns.clone();
         self.data_grid.update(cx, move |table, cx| {
             let delegate = table.delegate_mut();
+            delegate.set_table_columns(&table_columns);
             delegate.set_server_sort(sortable, sort.as_ref());
             delegate.set_row_offset(row_offset);
             delegate.set_result(

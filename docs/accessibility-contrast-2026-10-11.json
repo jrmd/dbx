@@ -1,0 +1,326 @@
+{
+  "scope": "Actual GPUI rendering, controlled black/white backgrounds inside opaque QA windows; nominal foreground tokens against sampled flat background pixels",
+  "theme_source_sha256": "d810806d65ed22e9ab26a94d743d3862138ecaad3778f631f756adc5aeab3dd4",
+  "screenshots": {
+    "dark": "/tmp/dbx-contrast-dark.png",
+    "light": "/tmp/dbx-contrast-light.png"
+  },
+  "palettes": {
+    "dark": {
+      "foreground_rgb": {
+        "text": [
+          241,
+          245,
+          249
+        ],
+        "muted": [
+          148,
+          163,
+          184
+        ],
+        "blue": [
+          130,
+          177,
+          255
+        ],
+        "error": [
+          255,
+          129,
+          138
+        ],
+        "success": [
+          34,
+          197,
+          94
+        ],
+        "warning": [
+          245,
+          158,
+          11
+        ],
+        "input_edge": [
+          123,
+          135,
+          155
+        ],
+        "focus": [
+          96,
+          165,
+          250
+        ]
+      },
+      "surfaces": {
+        "black root": {
+          "background_rgb": [
+            10,
+            12,
+            16
+          ],
+          "contrast": {
+            "text": 17.8653,
+            "muted": 7.6332,
+            "blue": 9.0235,
+            "error": 8.1634,
+            "success": 8.5893,
+            "warning": 9.113,
+            "input_edge": 5.3879,
+            "focus": 7.6981
+          }
+        },
+        "white root": {
+          "background_rgb": [
+            22,
+            24,
+            29
+          ],
+          "contrast": {
+            "text": 16.2105,
+            "muted": 6.9261,
+            "blue": 8.1877,
+            "error": 7.4072,
+            "success": 7.7937,
+            "warning": 8.2689,
+            "input_edge": 4.8888,
+            "focus": 6.985
+          }
+        },
+        "black glass": {
+          "background_rgb": [
+            16,
+            17,
+            19
+          ],
+          "contrast": {
+            "text": 17.2443,
+            "muted": 7.3678,
+            "blue": 8.7099,
+            "error": 7.8796,
+            "success": 8.2908,
+            "warning": 8.7963,
+            "input_edge": 5.2006,
+            "focus": 7.4305
+          }
+        },
+        "white glass": {
+          "background_rgb": [
+            22,
+            22,
+            25
+          ],
+          "contrast": {
+            "text": 16.4836,
+            "muted": 7.0428,
+            "blue": 8.3256,
+            "error": 7.532,
+            "success": 7.925,
+            "warning": 8.4082,
+            "input_edge": 4.9712,
+            "focus": 7.1027
+          }
+        },
+        "black raised": {
+          "background_rgb": [
+            30,
+            35,
+            47
+          ],
+          "contrast": {
+            "text": 14.341,
+            "muted": 6.1273,
+            "blue": 7.2434,
+            "error": 6.553,
+            "success": 6.8949,
+            "warning": 7.3153,
+            "input_edge": 4.325,
+            "focus": 6.1794
+          }
+        },
+        "white raised": {
+          "background_rgb": [
+            31,
+            36,
+            47
+          ],
+          "contrast": {
+            "text": 14.1819,
+            "muted": 6.0594,
+            "blue": 7.1631,
+            "error": 6.4803,
+            "success": 6.8184,
+            "warning": 7.2341,
+            "input_edge": 4.277,
+            "focus": 6.1109
+          }
+        }
+      },
+      "minimum": {
+        "text": 14.1819,
+        "muted": 6.0594,
+        "blue": 7.1631,
+        "error": 6.4803,
+        "success": 6.8184,
+        "warning": 7.2341,
+        "input_edge": 4.277,
+        "focus": 6.1109
+      }
+    },
+    "light": {
+      "foreground_rgb": {
+        "text": [
+          22,
+          32,
+          47
+        ],
+        "muted": [
+          70,
+          91,
+          115
+        ],
+        "blue": [
+          23,
+          79,
+          179
+        ],
+        "error": [
+          172,
+          37,
+          50
+        ],
+        "success": [
+          16,
+          107,
+          49
+        ],
+        "warning": [
+          136,
+          73,
+          0
+        ],
+        "input_edge": [
+          101,
+          114,
+          135
+        ],
+        "focus": [
+          11,
+          99,
+          206
+        ]
+      },
+      "surfaces": {
+        "black root": {
+          "background_rgb": [
+            225,
+            229,
+            233
+          ],
+          "contrast": {
+            "text": 12.9399,
+            "muted": 5.5205,
+            "blue": 5.9114,
+            "error": 5.4117,
+            "success": 5.233,
+            "warning": 5.5289,
+            "input_edge": 3.8481,
+            "focus": 4.4946
+          }
+        },
+        "white root": {
+          "background_rgb": [
+            236,
+            239,
+            244
+          ],
+          "contrast": {
+            "text": 14.2144,
+            "muted": 6.0642,
+            "blue": 6.4936,
+            "error": 5.9447,
+            "success": 5.7485,
+            "warning": 6.0734,
+            "input_edge": 4.2271,
+            "focus": 4.9373
+          }
+        },
+        "black glass": {
+          "background_rgb": [
+            226,
+            227,
+            230
+          ],
+          "contrast": {
+            "text": 12.7668,
+            "muted": 5.4467,
+            "blue": 5.8323,
+            "error": 5.3393,
+            "success": 5.163,
+            "warning": 5.4549,
+            "input_edge": 3.7967,
+            "focus": 4.4344
+          }
+        },
+        "white glass": {
+          "background_rgb": [
+            230,
+            231,
+            234
+          ],
+          "contrast": {
+            "text": 13.2497,
+            "muted": 5.6527,
+            "blue": 6.0529,
+            "error": 5.5413,
+            "success": 5.3583,
+            "warning": 5.6613,
+            "input_edge": 3.9403,
+            "focus": 4.6022
+          }
+        },
+        "black raised": {
+          "background_rgb": [
+            251,
+            252,
+            253
+          ],
+          "contrast": {
+            "text": 15.9502,
+            "muted": 6.8048,
+            "blue": 7.2866,
+            "error": 6.6707,
+            "success": 6.4504,
+            "warning": 6.8151,
+            "input_edge": 4.7433,
+            "focus": 5.5402
+          }
+        },
+        "white raised": {
+          "background_rgb": [
+            251,
+            252,
+            253
+          ],
+          "contrast": {
+            "text": 15.9502,
+            "muted": 6.8048,
+            "blue": 7.2866,
+            "error": 6.6707,
+            "success": 6.4504,
+            "warning": 6.8151,
+            "input_edge": 4.7433,
+            "focus": 5.5402
+          }
+        }
+      },
+      "minimum": {
+        "text": 12.7668,
+        "muted": 5.4467,
+        "blue": 5.8323,
+        "error": 5.3393,
+        "success": 5.163,
+        "warning": 5.4549,
+        "input_edge": 3.7967,
+        "focus": 4.4344
+      }
+    }
+  }
+}

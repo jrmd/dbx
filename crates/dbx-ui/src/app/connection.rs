@@ -594,6 +594,7 @@ impl DbxApp {
         self.draft.read_only = false;
         self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
+        self.connection_form_focus_pending = true;
         self.hydrate_connection_fields(kind, Self::default_url(kind).to_owned(), cx);
         self.error = None;
         cx.notify();
@@ -627,6 +628,7 @@ impl DbxApp {
 
     pub(super) fn change_connection_kind(&mut self, cx: &mut Context<Self>) {
         self.draft.choosing_kind = true;
+        self.connection_form_focus_pending = true;
         self.error = None;
         cx.notify();
     }
@@ -1423,6 +1425,7 @@ impl DbxApp {
         self.draft.cloud_auth = None;
         self.draft.tag = Some(default_tags().remove(3));
         self.draft.choosing_kind = true;
+        self.connection_form_focus_pending = true;
         self.settings_open = false;
         self.draft.connection_name.update(cx, |name, cx| {
             name.clear();

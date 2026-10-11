@@ -15,24 +15,32 @@ struct SetupField {
 }
 
 impl SetupField {
-    fn new(text: String, window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
-        Self::with_multiline(text, false, window, cx)
+    fn new(
+        text: String,
+        label: &'static str,
+        window: &mut Window,
+        cx: &mut Context<DbxApp>,
+    ) -> Self {
+        Self::with_multiline(text, false, label, window, cx)
     }
     fn with_multiline(
         text: String,
         multiline: bool,
+        label: &'static str,
         window: &mut Window,
         cx: &mut Context<DbxApp>,
     ) -> Self {
         let value = cx.new(|_| text);
-        let editor = cx.new(|cx| TextEditor::new(value.clone(), multiline, window, cx));
+        let editor = cx.new(|cx| {
+            TextEditor::new(value.clone(), multiline, window, cx).accessibility_label(label)
+        });
         Self { value, editor }
     }
     fn focus_handle(&self, cx: &Context<DbxApp>) -> FocusHandle {
         self.editor.read(cx).focus_handle()
     }
     fn input(&self, cx: &Context<DbxApp>) -> impl IntoElement {
-        editor::input(self.editor.clone(), self.focus_handle(cx), false)
+        editor::input(self.editor.clone(), self.focus_handle(cx), false, cx)
     }
     fn text(&self, cx: &Context<DbxApp>) -> String {
         self.value.read(cx).trim().to_owned()
@@ -72,9 +80,10 @@ impl AgentSetup {
             .map(|settings| settings.agents)
             .unwrap_or_default();
         let config = configuration(&preferences, preferences.default_cli);
-        let executable = SetupField::new(config.executable, window, cx);
-        let model = SetupField::new(config.model, window, cx);
-        let provider = SetupField::new(config.provider, window, cx);
+        let executable =
+            SetupField::new(config.executable, "Assistant executable path", window, cx);
+        let model = SetupField::new(config.model, "Assistant model", window, cx);
+        let provider = SetupField::new(config.provider, "Assistant provider", window, cx);
         // Edits save themselves; there is no separate Save step to forget.
         let _subscriptions = [&executable, &model, &provider]
             .into_iter()
@@ -143,7 +152,13 @@ pub(super) struct AgentQuery {
 
 impl AgentQuery {
     pub fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
-        let prompt = SetupField::with_multiline(String::new(), true, window, cx);
+        let prompt = SetupField::with_multiline(
+            String::new(),
+            true,
+            "Describe the query to generate",
+            window,
+            cx,
+        );
         let subscription = cx.observe(&prompt.value, |_, _, cx| cx.notify());
         Self {
             open: false,
@@ -312,7 +327,13 @@ impl DbxApp {
         let choices = AgentCli::ALL.into_iter().map(|cli| {
             segment(cli.label(), cli == selected)
                 .id(SharedString::from(format!("agent-choice-{cli:?}")))
-                .pressable()
+                .pressable(cli.label())
+                .role(gpui::Role::RadioButton)
+                .aria_toggled(if cli == selected {
+                    gpui::accesskit::Toggled::True
+                } else {
+                    gpui::accesskit::Toggled::False
+                })
                 .debug_selector(move || format!("agent-choice-{cli:?}"))
                 .on_click(cx.listener(move |this, _, _, cx| this.select_agent(cli, cx)))
         });
@@ -320,7 +341,7 @@ impl DbxApp {
             None => ("Not checked", None, theme().text_muted),
             Some(CliStatus::Checking) => ("Checking…", None, theme().text_muted),
             Some(CliStatus::Ready(version)) => {
-                ("Installed", Some(version.clone()), theme().success)
+                ("Installed", Some(version.clone()), theme().success_text)
             }
             Some(CliStatus::Failed(error)) => (
                 "Unavailable",
@@ -328,7 +349,7 @@ impl DbxApp {
                     "{error} Install and sign in to {} in a terminal.",
                     selected.label()
                 )),
-                theme().danger,
+                theme().danger_text,
             ),
         };
         let checking = matches!(self.agent_setup.status, Some(CliStatus::Checking));
@@ -339,7 +360,7 @@ impl DbxApp {
         } else {
             "A model_provider ID from your Codex configuration"
         };
-        let field = |input| div().w(px(260.)).child(input);
+        let field = |input| div().w(crate::theme::ui_px(260.)).child(input);
         let mut advanced_rows = vec![
             settings_row(
                 "Advanced",
@@ -382,39 +403,46 @@ impl DbxApp {
             .debug_selector(|| "agents-settings".into())
             .flex()
             .flex_col()
-            .gap(px(24.))
+            .gap(crate::theme::ui_px(24.))
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(8.))
-                    .child(settings_group([
-                        settings_row("CLI", None, segmented_track().children(choices))
-                            .into_any_element(),
-                        settings_row(
-                            div()
-                                .id("agent-cli-status")
-                                .debug_selector(|| "agent-cli-status".into())
-                                .text_color(color)
-                                .child(status_title),
-                            detail.map(SharedString::from),
-                            button("recheck-agent-cli", "Check again", ButtonKind::Quiet)
-                                .disabled(checking)
-                                .loading(checking)
-                                .on_click(cx.listener(|this, _, _, cx| this.check_agent_cli(cx))),
-                        )
-                        .into_any_element(),
-                        settings_row(
-                            "Model",
-                            Some("Blank uses the CLI’s default".into()),
-                            field(self.agent_setup.model.input(cx)),
-                        )
-                        .into_any_element(),
-                    ]))
+                    .gap(crate::theme::ui_px(8.))
+                    .child(
+                        self.scrolling_settings_group(
+                            "settings-agent-basic",
+                            [
+                                settings_row("CLI", None, segmented_track().children(choices))
+                                    .into_any_element(),
+                                settings_row(
+                                    div()
+                                        .id("agent-cli-status")
+                                        .debug_selector(|| "agent-cli-status".into())
+                                        .text_color(color)
+                                        .child(status_title),
+                                    detail.map(SharedString::from),
+                                    button("recheck-agent-cli", "Check again", ButtonKind::Quiet)
+                                        .disabled(checking)
+                                        .loading(checking)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.check_agent_cli(cx)),
+                                        ),
+                                )
+                                .into_any_element(),
+                                settings_row(
+                                    "Model",
+                                    Some("Blank uses the CLI’s default".into()),
+                                    field(self.agent_setup.model.input(cx)),
+                                )
+                                .into_any_element(),
+                            ],
+                        ),
+                    )
                     .child(
                         div()
-                            .px(px(16.))
-                            .text_size(px(11.))
+                            .px(crate::theme::ui_px(16.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(theme().text_muted)
                             .child(
                                 "Your description and schema are sent through the CLI to its \
@@ -422,17 +450,23 @@ impl DbxApp {
                             ),
                     ),
             )
-            .child(settings_group(advanced_rows))
+            .child(self.scrolling_settings_group("settings-agent-advanced", advanced_rows))
             .when_some(self.agent_setup.save_error.clone(), |view, error| {
-                view.child(settings_group([settings_row(
-                    div()
-                        .text_color(theme().danger)
-                        .child("Changes could not be saved"),
-                    Some(error.into()),
-                    button("retry-agent-save", "Retry", ButtonKind::Quiet)
-                        .on_click(cx.listener(|this, _, _, cx| this.commit_agent_fields(cx))),
+                view.child(
+                    self.scrolling_settings_group(
+                        "settings-agent-error",
+                        [settings_row(
+                            div()
+                                .text_color(theme().danger_text)
+                                .child("Changes could not be saved"),
+                            Some(error.into()),
+                            button("retry-agent-save", "Retry", ButtonKind::Quiet).on_click(
+                                cx.listener(|this, _, _, cx| this.commit_agent_fields(cx)),
+                            ),
+                        )
+                        .into_any_element()],
+                    ),
                 )
-                .into_any_element()]))
             })
     }
 
@@ -593,6 +627,7 @@ impl DbxApp {
             .ghost()
             .label(agent_label)
             .disabled(busy)
+            .accessible_name("Choose query assistant")
             .tooltip("Choose query assistant")
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu;
@@ -617,6 +652,7 @@ impl DbxApp {
         let action =
             if busy {
                 button("cancel-agent-query", "Stop", ButtonKind::Quiet)
+                    .accessible_name("Stop generation (Esc)")
                     .tooltip("Stop generation (Esc)")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(agent) = this.agent_query_mut(session_id, tab_id) {
@@ -639,6 +675,7 @@ impl DbxApp {
                 .when(prompt_empty || unavailable || !connected, |button| {
                     button.opacity(0.45)
                 })
+                .accessible_name("Generate query (Enter). Shift+Enter adds a line.")
                 .tooltip("Generate query (Enter). Shift+Enter adds a line.")
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.generate_agent_query(session_id, tab_id, cx)
@@ -651,14 +688,14 @@ impl DbxApp {
                 .flex_none()
                 .max_h(px(if self.compact_layout { 360. } else { 460. }))
                 .overflow_y_scroll()
-                .px(px(12.))
-                .py(px(10.))
+                .px(crate::theme::ui_px(12.))
+                .py(crate::theme::ui_px(10.))
                 .border_b_1()
                 .border_color(theme().border)
                 .bg(theme().panel)
                 .flex()
                 .flex_col()
-                .gap(px(10.))
+                .gap(crate::theme::ui_px(10.))
                 .on_action(cx.listener(move |this, _: &SubmitQueryAgent, _, cx| {
                     this.generate_agent_query(session_id, tab_id, cx);
                     cx.stop_propagation();
@@ -671,11 +708,11 @@ impl DbxApp {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(crate::theme::ui_px(8.))
                         .child(icon(Icon::Sparkles, theme().accent))
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(crate::theme::ui_px(12.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child("Query assistant"),
                         )
@@ -684,7 +721,7 @@ impl DbxApp {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.))
+                                .text_size(crate::theme::ui_px(11.))
                                 .text_color(theme().text_muted)
                                 .child(context_label),
                         )
@@ -693,6 +730,7 @@ impl DbxApp {
                                 .with_size(Size::XSmall)
                                 .compact()
                                 .ghost()
+                                .accessible_name("Close assistant")
                                 .tooltip("Close assistant")
                                 .child(icon(Icon::Close, theme().text_muted))
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -714,12 +752,13 @@ impl DbxApp {
                                 prompt_focus,
                                 true,
                                 AGENT_PROMPT_CONTEXT,
+                                cx,
                             )
-                            .h(px(76.)),
+                            .h(crate::theme::ui_px(76.)),
                         )
                         .when(prompt_empty, |view| {
-                            view.child(div().absolute().top(px(10.)).left(px(11.))
-                    .text_size(px(12.)).text_color(theme().text_muted)
+                            view.child(div().absolute().top(crate::theme::ui_px(10.)).left(crate::theme::ui_px(11.))
+                    .text_size(crate::theme::ui_px(12.)).text_color(theme().text_muted)
                     .child("Describe the data you want, including filters and sorting…"))
                         }),
                 )
@@ -727,7 +766,7 @@ impl DbxApp {
                     prompt_empty && !busy && result.is_none() && !unavailable,
                     |view| {
                         view.when_some(examples, |view, examples| {
-                            view.child(div().flex().flex_wrap().gap(px(6.)).children(
+                            view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(6.)).children(
                                 examples.into_iter().enumerate().map(|(index, example)| {
                                     button(
                                         SharedString::from(format!("agent-example-{index}")),
@@ -755,13 +794,13 @@ impl DbxApp {
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(crate::theme::ui_px(8.))
                         .child(agent_menu)
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(140.))
-                                .text_size(px(10.))
+                                .min_w(crate::theme::ui_px(140.))
+                                .text_size(crate::theme::ui_px(10.))
                                 .text_color(theme().text_muted)
                                 .child(if busy {
                                     "Reading schema and generating…"
@@ -777,13 +816,13 @@ impl DbxApp {
                             .flex()
                             .flex_wrap()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(crate::theme::ui_px(8.))
                             .child(
                                 div()
                                     .flex_1()
-                                    .min_w(px(180.))
-                                    .text_size(px(11.))
-                                    .text_color(theme().warning)
+                                    .min_w(crate::theme::ui_px(180.))
+                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_color(theme().warning_text)
                                     .child(format!(
                                         "{} is unavailable. Check its executable in settings.",
                                         cli.label()
@@ -801,22 +840,22 @@ impl DbxApp {
                     view.child(
                         div()
                             .id("agent-query-error")
-                            .p(px(10.))
-                            .rounded(px(RADIUS_CONTROL))
+                            .p(crate::theme::ui_px(10.))
+                            .rounded(crate::theme::ui_px(RADIUS_CONTROL))
                             .border_1()
                             .border_color(theme().danger.alpha(0.3))
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(crate::theme::ui_px(6.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
-                                    .text_color(theme().danger)
+                                    .text_size(crate::theme::ui_px(12.))
+                                    .text_color(theme().danger_text)
                                     .child("Could not generate a query"),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .text_color(theme().text_muted)
                                     .child(error),
                             )
@@ -838,7 +877,7 @@ impl DbxApp {
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .rounded(px(RADIUS_CONTROL))
+                            .rounded(crate::theme::ui_px(RADIUS_CONTROL))
                             .border_1()
                             .border_color(theme().border)
                             .bg(theme().canvas)
@@ -846,12 +885,12 @@ impl DbxApp {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(8.))
-                                    .px(px(10.))
-                                    .py(px(6.))
+                                    .gap(crate::theme::ui_px(8.))
+                                    .px(crate::theme::ui_px(10.))
+                                    .py(crate::theme::ui_px(6.))
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_size(crate::theme::ui_px(11.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .child("Generated query"),
                                     )
@@ -860,7 +899,7 @@ impl DbxApp {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(theme().text_muted)
                                             .child(generated_by.unwrap_or_default()),
                                     )
@@ -880,20 +919,20 @@ impl DbxApp {
                                 div()
                                     .id("generated-query-preview")
                                     .debug_selector(|| "generated-query-preview".into())
-                                    .max_h(px(140.))
+                                    .max_h(crate::theme::ui_px(140.))
                                     .overflow_y_scroll()
-                                    .px(px(10.))
-                                    .py(px(8.))
+                                    .px(crate::theme::ui_px(10.))
+                                    .py(crate::theme::ui_px(8.))
                                     .font_family("monospace")
-                                    .text_size(px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .text_color(theme().text)
                                     .child(result.query),
                             )
                             .child(
                                 div()
-                                    .px(px(10.))
-                                    .pb(px(8.))
-                                    .text_size(px(11.))
+                                    .px(crate::theme::ui_px(10.))
+                                    .pb(crate::theme::ui_px(8.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .text_color(theme().text_muted)
                                     .child(result.explanation),
                             )
@@ -902,16 +941,16 @@ impl DbxApp {
                                     .flex()
                                     .flex_wrap()
                                     .items_center()
-                                    .gap(px(6.))
-                                    .px(px(10.))
-                                    .py(px(8.))
+                                    .gap(crate::theme::ui_px(6.))
+                                    .px(crate::theme::ui_px(10.))
+                                    .py(crate::theme::ui_px(8.))
                                     .border_t_1()
                                     .border_color(theme().hairline)
                                     .child(
                                         div()
                                             .flex_1()
-                                            .min_w(px(120.))
-                                            .text_size(px(10.))
+                                            .min_w(crate::theme::ui_px(120.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(theme().text_muted)
                                             .child("Replaces the current editor query"),
                                     )
@@ -942,6 +981,7 @@ impl DbxApp {
                                         .debug_selector(|| "run-generated-query".into())
                                         .disabled(!can_apply)
                                         .when(!can_apply, |button| button.opacity(0.45))
+                                        .accessible_name("Replace the editor query and execute it")
                                         .tooltip("Replace the editor query and execute it")
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {
@@ -960,6 +1000,7 @@ impl DbxApp {
                                         .debug_selector(|| "use-generated-query".into())
                                         .disabled(!can_apply)
                                         .when(!can_apply, |button| button.opacity(0.45))
+                                        .accessible_name("Replace the editor query for review")
                                         .tooltip("Replace the editor query for review")
                                         .on_click(
                                             cx.listener(move |this, _, window, cx| {

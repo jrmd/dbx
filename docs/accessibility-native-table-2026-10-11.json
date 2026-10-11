@@ -1,0 +1,316 @@
+{
+  "schema": 1,
+  "scope": "Disposable SQLite DBX native Linux AT-SPI Table/TableCell query and sort validation. Not an Orca workflow or virtualized offscreen coverage.",
+  "dimensions": {
+    "rows_including_header": 4,
+    "columns_including_row_number": 3
+  },
+  "cells_before_sort": [
+    {
+      "value": "zeta",
+      "position": [
+        1,
+        2
+      ],
+      "row_headers": [
+        "Row 1"
+      ],
+      "column_headers": [
+        "name"
+      ],
+      "containing_table_matches": true
+    },
+    {
+      "value": "alpha",
+      "position": [
+        2,
+        2
+      ],
+      "row_headers": [
+        "Row 2"
+      ],
+      "column_headers": [
+        "name"
+      ],
+      "containing_table_matches": true
+    },
+    {
+      "value": "mu",
+      "position": [
+        3,
+        2
+      ],
+      "row_headers": [
+        "Row 3"
+      ],
+      "column_headers": [
+        "name"
+      ],
+      "containing_table_matches": true
+    }
+  ],
+  "sort": {
+    "order": [
+      "alpha",
+      "mu",
+      "zeta"
+    ],
+    "stable_native_objects": true,
+    "updated_positions_and_row_headers": true
+  },
+  "partial_cell_selection_is_not_full_row": true,
+  "unsupported_atomic_row_selection_returns_false": true,
+  "nested_cell_legacy_child_index": -1,
+  "orca": {
+    "version": "50.2",
+    "scope": "Real object event processing and default visible full-row speech, isolated silent QA sink",
+    "speech": [
+      {
+        "time": 37730.439541971,
+        "kind": "speech",
+        "text": "DBX",
+        "focus": "DBX",
+        "role": "frame"
+      },
+      {
+        "time": 37730.672734595,
+        "kind": "speech",
+        "text": "DBX embedded",
+        "focus": "a11y_identity",
+        "role": "list item"
+      },
+      {
+        "time": 37730.673378549,
+        "kind": "speech",
+        "text": "DBX workspace",
+        "focus": "a11y_identity",
+        "role": "list item"
+      },
+      {
+        "time": 37730.674008345,
+        "kind": "speech",
+        "text": "landmark Database explorer",
+        "focus": "a11y_identity",
+        "role": "list item"
+      },
+      {
+        "time": 37730.674639664,
+        "kind": "speech",
+        "text": "Database objects List with 6 items",
+        "focus": "a11y_identity",
+        "role": "list item"
+      },
+      {
+        "time": 37730.675291883,
+        "kind": "speech",
+        "text": "a11y_identity.",
+        "focus": "a11y_identity",
+        "role": "list item"
+      },
+      {
+        "time": 37733.755320664,
+        "kind": "speech",
+        "text": "Table data.",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.755349229,
+        "kind": "speech",
+        "text": "table with 4 rows 3 columns",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.755365289,
+        "kind": "speech",
+        "text": "Row 1.",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.755378895,
+        "kind": "speech",
+        "text": "not selected Row 1, column 1 of 3. #",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.755390657,
+        "kind": "speech",
+        "text": "2.",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.75540291,
+        "kind": "speech",
+        "text": "not selected Row 1, column 2 of 3. id  INTEGER.",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.755413891,
+        "kind": "speech",
+        "text": "alpha.",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37733.755424391,
+        "kind": "speech",
+        "text": "Row 1, column 3 of 3. name  TEXT.",
+        "focus": "alpha",
+        "role": "table cell"
+      },
+      {
+        "time": 37734.599113477,
+        "kind": "speech",
+        "text": "Row 2.",
+        "focus": "mu",
+        "role": "table cell"
+      },
+      {
+        "time": 37734.599142031,
+        "kind": "speech",
+        "text": "not selected Row 2, column 1 of 3. #",
+        "focus": "mu",
+        "role": "table cell"
+      },
+      {
+        "time": 37734.599156468,
+        "kind": "speech",
+        "text": "3.",
+        "focus": "mu",
+        "role": "table cell"
+      },
+      {
+        "time": 37734.599169393,
+        "kind": "speech",
+        "text": "not selected Row 2, column 2 of 3. id  INTEGER.",
+        "focus": "mu",
+        "role": "table cell"
+      },
+      {
+        "time": 37734.599182678,
+        "kind": "speech",
+        "text": "mu.",
+        "focus": "mu",
+        "role": "table cell"
+      },
+      {
+        "time": 37734.599193519,
+        "kind": "speech",
+        "text": "Row 2, column 3 of 3. name  TEXT.",
+        "focus": "mu",
+        "role": "table cell"
+      },
+      {
+        "time": 37735.467051423,
+        "kind": "speech",
+        "text": "Row 3.",
+        "focus": "zeta",
+        "role": "table cell"
+      },
+      {
+        "time": 37735.467082132,
+        "kind": "speech",
+        "text": "not selected Row 3, column 1 of 3. #",
+        "focus": "zeta",
+        "role": "table cell"
+      },
+      {
+        "time": 37735.467096269,
+        "kind": "speech",
+        "text": "1.",
+        "focus": "zeta",
+        "role": "table cell"
+      },
+      {
+        "time": 37735.467108933,
+        "kind": "speech",
+        "text": "not selected Row 3, column 2 of 3. id  INTEGER.",
+        "focus": "zeta",
+        "role": "table cell"
+      },
+      {
+        "time": 37735.467120224,
+        "kind": "speech",
+        "text": "zeta.",
+        "focus": "zeta",
+        "role": "table cell"
+      },
+      {
+        "time": 37735.467130774,
+        "kind": "speech",
+        "text": "Row 3, column 3 of 3. name  TEXT.",
+        "focus": "zeta",
+        "role": "table cell"
+      }
+    ]
+  },
+  "source_sha256": {
+    "crates/dbx-ui/src/app/result_table.rs": "1216dfbaeb7781bdcc4e85a3d7e1a09a4594f3953a7a1ef04a2169296a99db41",
+    "crates/dbx-ui/src/app/result_table/accessibility.rs": "496e71cd4cfd638c253c556a98b5f375619d0f432aae2b9a4ca887701112377c",
+    "crates/dbx-ui/src/app/result_table/accessibility/virtualized.rs": "139d68cd968fadba17e50e22622b9b70762449d3667e8734ccff6f8be054a49c",
+    "vendor/accesskit_atspi_common/src/lib.rs": "f258ee404fa540d1f4c14e2c8d0f6d322780e1b1c84916140c7097110758f7ff",
+    "vendor/accesskit_atspi_common/src/node.rs": "00ddd2e02de82652fdb8ea57b90897d1444ced79a244cc4ad4a2cb23875f543d",
+    "vendor/accesskit_atspi_common/src/table.rs": "8834f30d5427d10e4f4e0f24cd60dc50bd615e9f805576b72fc517378240a165",
+    "vendor/accesskit_unix/src/atspi/bus.rs": "6f2ce7d76b806a193fab2a36456fb19b1fb46e5cd07b000c54d124121b96f959",
+    "vendor/accesskit_unix/src/atspi/interfaces/mod.rs": "49edc10150cac24cee1d08d91ed2ccac8eb0a2843cef658b613745722add2c1a",
+    "vendor/accesskit_unix/src/atspi/interfaces/table.rs": "46d56caabf1756cc3d81c2ef24201c122e840726f7c0bf0c59a6220d5437a37d",
+    "vendor/accesskit_unix/src/atspi/interfaces/table_cell.rs": "6641811af6f79f18dc47dd95273cbb15a0119f633e36d60231c67211f67a1123",
+    "patches/accesskit-atspi-tables.patch": "11147b741c9079d999965c2ae5f6809c93fbdbae4480a28f4b44119bc7aa3fb4"
+  },
+  "verification": {
+    "ui_tests_passed": 401,
+    "ui_existing_ignored": 2,
+    "ui_seconds": 87.55,
+    "adapter_common_tests_passed": 13,
+    "adapter_unix_schema_tests_passed": 2,
+    "strict_all_target_clippy_ui_and_adapters": true,
+    "format_checks_workspace_and_adapters": true,
+    "git_diff_check": true,
+    "seven_file_adapter_patch_reproduced_byte_for_byte": true
+  },
+  "cleanup": {
+    "qa_app_pid_absent": 946426,
+    "isolated_reader_pid_absent": 954451,
+    "desktop_accessibility_flags_restored_and_read_back": {
+      "IsEnabled": false,
+      "ScreenReaderEnabled": false
+    }
+  },
+  "cache_build_native_validation": {
+    "scope": "Native protocol/sorting or loaded row/horizontal reveal checks repeated on current cache and row-width build; historical reader evidence retains its earlier source hashes",
+    "source_sha256": {
+      "vendor/accesskit_atspi_common/src/adapter.rs": "90c4ddf53b69194e51e52dbce04f33bca7a79991ada7b2dc86d5a22df20e6d61",
+      "vendor/accesskit_atspi_common/src/context.rs": "c6be71db128dd19f63a4ce978709f232833ec9a2c90cd0fa94d0ea2b931dde76",
+      "vendor/accesskit_atspi_common/src/lib.rs": "f258ee404fa540d1f4c14e2c8d0f6d322780e1b1c84916140c7097110758f7ff",
+      "vendor/accesskit_atspi_common/src/node.rs": "9f09b74722003f6911f36940d9c882f6e0633e2764c5ba2ed204a1484a45fb61",
+      "vendor/accesskit_atspi_common/src/table.rs": "c7f21a29ca5176a1c65c8a50473af969e60ce3b70a5cc7df90483132bb89f378",
+      "vendor/accesskit_unix/src/atspi/bus.rs": "6f2ce7d76b806a193fab2a36456fb19b1fb46e5cd07b000c54d124121b96f959",
+      "vendor/accesskit_unix/src/atspi/interfaces/mod.rs": "49edc10150cac24cee1d08d91ed2ccac8eb0a2843cef658b613745722add2c1a",
+      "vendor/accesskit_unix/src/atspi/interfaces/table.rs": "46d56caabf1756cc3d81c2ef24201c122e840726f7c0bf0c59a6220d5437a37d",
+      "vendor/accesskit_unix/src/atspi/interfaces/table_cell.rs": "6641811af6f79f18dc47dd95273cbb15a0119f633e36d60231c67211f67a1123",
+      "patches/accesskit-atspi-tables.patch": "5b7a40fe732feda65194f410c57f2ccc0c112a77edcab13c002b7cbee306393f",
+      "crates/dbx-ui/src/app/result_table.rs": "0b77b608b49244b804c3d861bcebc00202c62210cde7418ca572839910d8347d",
+      "crates/dbx-ui/src/app/result_table/accessibility.rs": "496e71cd4cfd638c253c556a98b5f375619d0f432aae2b9a4ca887701112377c",
+      "crates/dbx-ui/src/app/result_table/accessibility/virtualized.rs": "139d68cd968fadba17e50e22622b9b70762449d3667e8734ccff6f8be054a49c",
+      "crates/dbx-ui/src/app.rs": "ac6a2a43059280e49dda8ff993553dfda409be3f5e30a19912806ec5dda7db1e"
+    },
+    "passed": true
+  },
+  "latest_qa_cleanup": {
+    "qa_app_confirmed_absent": 991846,
+    "app_exit_cause": "unknown; empty log and no matching system coredump metadata",
+    "isolated_readers_stopped_and_verified": [
+      980913,
+      983426
+    ],
+    "desktop_accessibility_flags_restored_and_read_back": {
+      "IsEnabled": false,
+      "ScreenReaderEnabled": false
+    }
+  }
+}

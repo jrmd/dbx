@@ -74,13 +74,13 @@ fn byte_size(length: usize) -> String {
 
 fn monospace_block(text: String) -> Div {
     div()
-        .p(px(7.))
-        .rounded(px(5.))
+        .p(crate::theme::ui_px(7.))
+        .rounded(crate::theme::ui_px(5.))
         .bg(theme().panel_raised)
         .border_1()
         .border_color(theme().border)
         .font_family("monospace")
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(theme().text)
         .whitespace_normal()
         .child(text)
@@ -91,14 +91,14 @@ fn monospace_block(text: String) -> Div {
 pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
     let Some(value) = value else {
         return div()
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .text_color(theme().text_muted)
             .child("—")
             .into_any_element();
     };
     match value {
         CellValue::Null => div()
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .italic()
             .text_color(theme().text_muted)
             .child("NULL")
@@ -108,10 +108,10 @@ pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(5.))
+                .gap(crate::theme::ui_px(5.))
                 .child(
                     div()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(theme().text_muted)
                         .child(match format {
                             Some(format) => {
@@ -124,7 +124,7 @@ pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
                     view.child(
                         img(Arc::new(Image::from_bytes(format, bytes.clone())))
                             .max_w_full()
-                            .max_h(px(240.))
+                            .max_h(crate::theme::ui_px(240.))
                             .object_fit(gpui::ObjectFit::Contain),
                     )
                 })
@@ -136,7 +136,7 @@ pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
         value => match json_preview(value) {
             Some(json) => monospace_block(truncate_preview(json)).into_any_element(),
             None => div()
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .text_color(theme().text)
                 .whitespace_normal()
                 .child(truncate_preview(value.to_string()))

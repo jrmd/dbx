@@ -45,14 +45,24 @@ pub struct Theme {
     pub panel_raised: Rgba,
     pub border: Rgba,
     pub border_strong: Rgba,
+    /// Essential input edges, independent of decorative separators.
+    pub input_border: Rgba,
     pub text: Rgba,
     pub text_muted: Rgba,
     pub accent: Rgba,
+    pub accent_hover: Rgba,
+    pub accent_active: Rgba,
+    /// Small blue text needs more contrast than a filled primary button.
+    pub accent_text: Rgba,
     pub accent_foreground: Rgba,
     pub accent_soft: Rgba,
     pub success: Rgba,
+    pub success_text: Rgba,
     pub danger: Rgba,
+    /// Error text can need a brighter red than a status dot or filled control.
+    pub danger_text: Rgba,
     pub warning: Rgba,
+    pub warning_text: Rgba,
     pub grid_alternate: Rgba,
     pub rail: Rgba,
     pub focus_ring: Rgba,
@@ -90,14 +100,21 @@ pub static DARK_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
     panel_raised: rgb(0x171a20),
     border: rgb(0x1f232b),
     border_strong: rgb(0x343b47),
+    input_border: rgb(0x7b879b),
     text: rgb(0xf1f5f9),
     text_muted: rgb(0x94a3b8),
     accent: rgb(0x2563eb),
+    accent_hover: rgb(0x1d4ed8),
+    accent_active: rgb(0x1e40af),
+    accent_text: rgb(0x82b1ff),
     accent_foreground: rgb(0xffffff),
     accent_soft: rgb(0x10294d),
     success: rgb(0x22c55e),
+    success_text: rgb(0x22c55e),
     danger: rgb(0xef4444),
+    danger_text: rgb(0xff818a),
     warning: rgb(0xf59e0b),
+    warning_text: rgb(0xf59e0b),
     grid_alternate: rgb(0x0e1116),
     rail: rgb(0x0d1016),
     focus_ring: rgb(0x60a5fa),
@@ -133,14 +150,21 @@ pub static LIGHT_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
     panel_raised: rgb(0xf0f4f8),
     border: rgb(0xd8dee8),
     border_strong: rgb(0xb6c2d1),
+    input_border: rgb(0x657287),
     text: rgb(0x16202f),
-    text_muted: rgb(0x52657b),
+    text_muted: rgb(0x465b73),
     accent: rgb(0x1d5fd1),
+    accent_hover: rgb(0x174fb3),
+    accent_active: rgb(0x124293),
+    accent_text: rgb(0x174fb3),
     accent_foreground: rgb(0xffffff),
     accent_soft: rgb(0xe5f0ff),
     success: rgb(0x16803c),
+    success_text: rgb(0x106b31),
     danger: rgb(0xc3333f),
+    danger_text: rgb(0xac2532),
     warning: rgb(0xa85e00),
+    warning_text: rgb(0x884900),
     grid_alternate: rgb(0xf1f5f9),
     rail: rgb(0xebf0f6),
     focus_ring: rgb(0x0b63ce),
@@ -230,6 +254,29 @@ static CURRENT_APPEARANCE: AtomicU8 = AtomicU8::new(Appearance::System as u8);
 static SYSTEM_IS_DARK: AtomicBool = AtomicBool::new(true);
 static REDUCE_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    static UI_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
+    static EDITOR_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
+}
+
+pub fn set_text_scales(ui: u16, editor: u16) {
+    UI_SCALE.set(ui.clamp(100, 200));
+    EDITOR_SCALE.set(editor.clamp(100, 200));
+}
+
+pub fn ui_scale() -> f32 {
+    UI_SCALE.get() as f32 / 100.
+}
+pub fn editor_scale() -> f32 {
+    EDITOR_SCALE.get() as f32 / 100.
+}
+
+/// Design-space measurements scale together; measured screen coordinates stay
+/// ordinary Pixels, avoiding double scaling in hit testing and dragging.
+pub fn ui_px(value: f32) -> gpui::Pixels {
+    gpui::px(value * ui_scale())
+}
+
 /// Set the appearance preference used by DBX's semantic primitives.
 pub fn set_appearance(appearance: Appearance) {
     CURRENT_APPEARANCE.store(appearance as u8, Ordering::Release);
@@ -303,9 +350,16 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     );
     let palette = theme();
     let component = gpui_component::Theme::global_mut(cx);
-    component.radius = px(RADIUS_CONTROL);
-    component.radius_lg = px(RADIUS_PANEL);
+    component.radius = crate::theme::ui_px(RADIUS_CONTROL);
+    component.radius_lg = crate::theme::ui_px(RADIUS_PANEL);
     component.shadow = true;
+    component.colors.background = palette.canvas.into();
+    component.colors.foreground = palette.text.into();
+    component.colors.input = palette.input_border.into();
+    component.input_background_override = Some(palette.canvas.into());
+    // DBX uses outlined destructive buttons. Keep their text red while the
+    // interaction wash moves toward canvas instead of tinting red behind red.
+    component.colors.danger = palette.danger_text.into();
     component.colors.popover = palette.glass_raised.into();
     component.colors.popover_foreground = palette.text.into();
     component.colors.border = palette.hairline.into();
@@ -313,8 +367,8 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     component.colors.accent_foreground = palette.text.into();
     component.colors.primary = palette.accent.into();
     component.colors.primary_foreground = palette.accent_foreground.into();
-    component.colors.primary_hover = gpui::Hsla::from(palette.accent).opacity(0.9);
-    component.colors.primary_active = gpui::Hsla::from(palette.accent).opacity(0.8);
+    component.colors.primary_hover = palette.accent_hover.into();
+    component.colors.primary_active = palette.accent_active.into();
     component.colors.secondary_hover = palette.glass_hover.into();
     component.colors.muted_foreground = palette.text_muted.into();
     component.colors.ring = palette.focus_ring.into();
@@ -334,6 +388,11 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     let colors = component.colors;
     let tokens = &mut component.tokens;
     tokens.popover = colors.popover.into();
+    tokens.background = colors.background.into();
+    tokens.input = colors.input.into();
+    tokens.danger = gpui::Hsla::from(palette.canvas).into();
+    tokens.danger_hover = gpui::Hsla::from(palette.canvas).into();
+    tokens.danger_active = gpui::Hsla::from(palette.canvas).into();
     tokens.popover_foreground = colors.popover_foreground.into();
     tokens.border = colors.border.into();
     tokens.accent = colors.accent.into();
@@ -353,6 +412,9 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     tokens.button_primary_foreground = colors.button_primary_foreground.into();
     tokens.button_primary_hover = colors.button_primary_hover.into();
     tokens.button_primary_active = colors.button_primary_active.into();
+    // Base owns a separate snapshot. Publishing only styled-component colors
+    // leaves its focus rings and unstyled controls on the stock palette.
+    gpui_component::Theme::sync_base(cx);
 }
 
 /// A keyboard shortcut label in the platform's own notation, e.g.
@@ -380,16 +442,16 @@ pub fn glass_shadow(elevation: f32) -> Vec<BoxShadow> {
     vec![
         BoxShadow {
             color: theme.shadow.into(),
-            offset: point(px(0.), px(elevation * 0.5)),
+            offset: point(crate::theme::ui_px(0.), px(elevation * 0.5)),
             blur_radius: px(elevation * 2.),
-            spread_radius: px(0.),
+            spread_radius: crate::theme::ui_px(0.),
             inset: false,
         },
         BoxShadow {
             color: theme.rim.into(),
-            offset: point(px(0.), px(1.)),
-            blur_radius: px(0.),
-            spread_radius: px(0.),
+            offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
+            blur_radius: crate::theme::ui_px(0.),
+            spread_radius: crate::theme::ui_px(0.),
             inset: true,
         },
     ]
@@ -503,7 +565,10 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
         Icon::ChevronDown => assets::ICON_CHEVRON_DOWN,
     };
 
-    svg().path(path).size(px(16.)).text_color(color)
+    svg()
+        .path(path)
+        .size(crate::theme::ui_px(16.))
+        .text_color(color)
 }
 
 /// Draw the brand mark for a database engine. Like [`icon`], consumers provide
@@ -527,7 +592,10 @@ pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
         DatabaseKind::Snowflake => assets::LOGO_SNOWFLAKE,
     };
 
-    svg().path(path).size(px(16.)).text_color(color)
+    svg()
+        .path(path)
+        .size(crate::theme::ui_px(16.))
+        .text_color(color)
 }
 
 /// Compact, label-first panel title treatment for panes and inspectors.
@@ -537,17 +605,17 @@ pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedStri
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(SPACE_2))
+        .gap(crate::theme::ui_px(SPACE_2))
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(crate::theme::ui_px(13.))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(title.into()),
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(crate::theme::ui_px(11.))
                 .text_color(theme.text_muted)
                 .child(detail.into()),
         )
@@ -558,14 +626,14 @@ pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedStri
 pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active: bool) -> Div {
     let theme = theme();
     div()
-        .h(px(28.))
-        .pl(px(10.))
-        .pr(px(5.))
+        .h(crate::theme::ui_px(28.))
+        .pl(crate::theme::ui_px(10.))
+        .pr(crate::theme::ui_px(5.))
         .rounded_full()
-        .text_size(px(12.))
+        .text_size(crate::theme::ui_px(12.))
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(crate::theme::ui_px(6.))
         .when(active, |tab| {
             tab.bg(theme.glass_selected)
                 .border_1()
@@ -593,13 +661,13 @@ pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active
 pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
     let theme = theme();
     div()
-        .h(px(26.))
-        .px(px(11.))
+        .h(crate::theme::ui_px(26.))
+        .px(crate::theme::ui_px(11.))
         .rounded_full()
         .flex()
         .items_center()
-        .gap(px(6.))
-        .text_size(px(12.))
+        .gap(crate::theme::ui_px(6.))
+        .text_size(crate::theme::ui_px(12.))
         .cursor_pointer()
         .when(selected, |view| {
             view.bg(theme.glass_selected)
@@ -620,14 +688,14 @@ pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
 pub fn segmented_track() -> Div {
     let theme = theme();
     div()
-        .p(px(2.))
+        .p(crate::theme::ui_px(2.))
         .rounded_full()
         .bg(theme.glass_hover)
         .border_1()
         .border_color(theme.hairline)
         .flex()
         .items_center()
-        .gap(px(2.))
+        .gap(crate::theme::ui_px(2.))
 }
 
 /// A compact icon-only control that sits on glass.
@@ -639,8 +707,8 @@ pub fn glass_icon_button(
     let theme = theme();
     div()
         .id(id)
-        .pressable()
-        .size(px(28.))
+        .pressable(kind.label())
+        .size(crate::theme::ui_px(28.))
         .flex_none()
         .rounded_full()
         .flex()
@@ -673,21 +741,131 @@ pub fn glass_icon_button(
 /// keyboard has focus. The ring is a shadow rather than a border, so focusing
 /// never changes a control's size.
 pub trait Pressable: StatefulInteractiveElement + Styled + Sized {
-    fn pressable(self) -> Self {
-        self.tab_index(0)
+    fn pressable(self, label: impl Into<SharedString>) -> Self {
+        self.role(gpui::Role::Button)
+            .aria_label(label)
+            .tab_index(0)
             .focus_visible(|style| style.shadow(focus_ring()))
     }
 }
 
 impl<T: StatefulInteractiveElement + Styled> Pressable for T {}
 
+impl Icon {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Database => "Connections",
+            Self::Table => "Data",
+            Self::Query => "Query",
+            Self::Structure => "Structure",
+            Self::Diagram => "Diagram",
+            Self::Search => "Search",
+            Self::Refresh => "Refresh",
+            Self::Settings => "Settings",
+            Self::Sun => "Light theme",
+            Self::Moon => "Dark theme",
+            Self::Add => "Add",
+            Self::Close => "Close",
+            Self::More => "More actions",
+            Self::ArrowRight => "Open",
+            Self::Minimize => "Minimize window",
+            Self::Maximize => "Maximize window",
+            Self::Restore => "Restore window",
+            Self::Sidebar => "Toggle explorer",
+            Self::Appearance => "Appearance",
+            Self::Lock => "Lock vault",
+            Self::Sparkles => "Query assistant",
+            Self::Trash => "Delete",
+            Self::Pencil => "Edit",
+            Self::Tag => "Tags",
+            Self::Download => "Export",
+            Self::ChevronUp => "Previous",
+            Self::ChevronDown => "Next",
+        }
+    }
+}
+
+/// Add metadata to the library button's existing interactive node. Keeping
+/// the same node preserves its disabled, focus, and click behavior.
+pub trait ButtonAccessibility {
+    fn accessible_name(self, label: impl Into<SharedString>) -> Self;
+}
+
+struct ButtonSemantics<'a>(&'a mut Button);
+impl InteractiveElement for ButtonSemantics<'_> {
+    fn interactivity(&mut self) -> &mut gpui::Interactivity {
+        self.0.interactivity()
+    }
+}
+impl StatefulInteractiveElement for ButtonSemantics<'_> {}
+impl ButtonAccessibility for Button {
+    fn accessible_name(mut self, label: impl Into<SharedString>) -> Self {
+        let label = label.into();
+        ButtonSemantics(&mut self)
+            .aria_label(label.clone())
+            .a11y_synthetic_children(move |builder| {
+                builder.parent_node().set_label(label.to_string());
+            });
+        self
+    }
+}
+
+/// A labelled switch for settings rows that already render their own title.
+pub fn settings_switch(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    checked: bool,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .pressable(label)
+        .role(gpui::Role::Switch)
+        .aria_toggled(if checked {
+            gpui::accesskit::Toggled::True
+        } else {
+            gpui::accesskit::Toggled::False
+        })
+        .w(crate::theme::ui_px(36.))
+        .h(crate::theme::ui_px(28.))
+        .flex()
+        .items_center()
+        .cursor_pointer()
+        .child(
+            div()
+                .w(crate::theme::ui_px(36.))
+                .h(crate::theme::ui_px(20.))
+                .rounded_full()
+                .border_1()
+                .border_color(theme().input_border)
+                .bg(if checked {
+                    theme().accent
+                } else {
+                    theme().canvas
+                })
+                .flex()
+                .items_center()
+                .px(crate::theme::ui_px(2.))
+                .when(checked, |view| view.justify_end())
+                .child(
+                    div()
+                        .size(crate::theme::ui_px(14.))
+                        .rounded_full()
+                        .bg(if checked {
+                            theme().accent_foreground
+                        } else {
+                            theme().text_muted
+                        }),
+                ),
+        )
+}
+
 /// The ring drawn around keyboard-focused controls that aren't `Button`s.
 pub fn focus_ring() -> Vec<BoxShadow> {
     vec![BoxShadow {
         color: theme().focus_ring.into(),
-        offset: point(px(0.), px(0.)),
-        blur_radius: px(0.),
-        spread_radius: px(2.),
+        offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(0.)),
+        blur_radius: crate::theme::ui_px(0.),
+        spread_radius: crate::theme::ui_px(2.),
         // Inset: a plain shadow paints under the whole element, which fills a
         // transparent control solid instead of outlining it.
         inset: true,
@@ -710,7 +888,7 @@ pub fn button(
     let (background, border, text) = match kind {
         ButtonKind::Primary => (theme.accent, theme.accent, theme.accent_foreground),
         ButtonKind::Quiet => (theme.glass_hover, theme.hairline, theme.text),
-        ButtonKind::Danger => (theme.glass_hover, theme.hairline, theme.danger),
+        ButtonKind::Danger => (theme.glass_hover, theme.hairline, theme.danger_text),
     };
 
     // gpui-component sizes the label from the button's `Size`, not from the
@@ -718,7 +896,7 @@ pub fn button(
     let button = Button::new(id)
         .label(label)
         .with_size(Size::XSmall)
-        .h(px(28.))
+        .h(crate::theme::ui_px(28.))
         .px(px(SPACE_3 + 2.))
         .rounded_full()
         .border_1()
@@ -730,9 +908,9 @@ pub fn button(
     match kind {
         ButtonKind::Primary => button.primary().shadow(vec![BoxShadow {
             color: rgba(0xffffff33).into(),
-            offset: point(px(0.), px(1.)),
-            blur_radius: px(0.),
-            spread_radius: px(0.),
+            offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
+            blur_radius: crate::theme::ui_px(0.),
+            spread_radius: crate::theme::ui_px(0.),
             inset: true,
         }]),
         ButtonKind::Quiet => button.outline(),
@@ -747,7 +925,7 @@ pub fn settings_group(rows: impl IntoIterator<Item = gpui::AnyElement>) -> Div {
     div()
         .flex()
         .flex_col()
-        .rounded(px(RADIUS_PANEL))
+        .rounded(crate::theme::ui_px(RADIUS_PANEL))
         .border_1()
         .border_color(theme.hairline)
         .bg(theme.panel)
@@ -770,24 +948,30 @@ pub fn settings_row(
 ) -> Div {
     let theme = theme();
     div()
-        .min_h(px(48.))
-        .px(px(SPACE_4))
-        .py(px(SPACE_2))
+        .min_h(crate::theme::ui_px(48.))
+        .px(crate::theme::ui_px(SPACE_4))
+        .py(crate::theme::ui_px(SPACE_2))
         .flex()
         .items_center()
-        .gap(px(SPACE_4))
+        .gap(crate::theme::ui_px(SPACE_4))
+        .when(ui_scale() > 1.25, |view| view.flex_col().items_start())
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(2.))
-                .child(div().text_size(px(13.)).text_color(theme.text).child(label))
+                .gap(crate::theme::ui_px(2.))
+                .child(
+                    div()
+                        .text_size(crate::theme::ui_px(13.))
+                        .text_color(theme.text)
+                        .child(label),
+                )
                 .when_some(detail, |view, detail| {
                     view.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(theme.text_muted)
                             .child(detail),
                     )
@@ -795,10 +979,12 @@ pub fn settings_row(
         )
         .child(
             div()
+                .min_w_0()
+                .when(ui_scale() > 1.25, |view| view.w_full())
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(SPACE_2))
+                .gap(crate::theme::ui_px(SPACE_2))
                 .child(control),
         )
 }
@@ -806,11 +992,11 @@ pub fn settings_row(
 pub fn badge(label: impl Into<SharedString>, color: Rgba) -> Div {
     let theme = theme();
     div()
-        .px(px(SPACE_2))
-        .py(px(2.))
+        .px(crate::theme::ui_px(SPACE_2))
+        .py(crate::theme::ui_px(2.))
         .rounded_full()
         .bg(theme.glass_hover)
-        .text_size(px(10.))
+        .text_size(crate::theme::ui_px(10.))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color)
         .child(label.into())
@@ -835,6 +1021,209 @@ mod tests {
         let foreground = relative_luminance(foreground);
         let background = relative_luminance(background);
         (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    fn composite(foreground: Rgba, background: Rgba) -> Rgba {
+        Rgba {
+            r: foreground.r * foreground.a + background.r * (1. - foreground.a),
+            g: foreground.g * foreground.a + background.g * (1. - foreground.a),
+            b: foreground.b * foreground.a + background.b * (1. - foreground.a),
+            a: 1.,
+        }
+    }
+
+    /// Actual root tint, pane and control layers. Include colored as well as
+    /// black/white desktop pixels; never compare an uncomposited alpha token.
+    fn composed_surfaces(palette: &Theme, desktop: Rgba) -> Vec<(&'static str, Rgba)> {
+        let window = composite(palette.window, desktop);
+        let glass = composite(palette.glass, window);
+        let raised = composite(palette.glass_raised, window);
+        // GPUI paints a pane's drop shadow beneath its translucent fill. The
+        // interior can receive the full shadow, as the native QA view confirms.
+        let shadowed = composite(palette.shadow, window);
+        let shadowed_glass = composite(palette.glass, shadowed);
+        let shadowed_raised = composite(palette.glass_raised, shadowed);
+        vec![
+            ("window", window),
+            ("glass", glass),
+            ("raised", raised),
+            ("shadowed glass", shadowed_glass),
+            ("shadowed raised", shadowed_raised),
+            (
+                "shadowed glass control",
+                composite(palette.glass_hover, shadowed_glass),
+            ),
+            (
+                "shadowed raised control",
+                composite(palette.glass_hover, shadowed_raised),
+            ),
+            ("glass control", composite(palette.glass_hover, glass)),
+            ("raised control", composite(palette.glass_hover, raised)),
+            ("canvas", palette.canvas),
+            ("panel", palette.panel),
+            ("panel raised", palette.panel_raised),
+            (
+                "panel control",
+                composite(palette.glass_hover, palette.panel),
+            ),
+        ]
+    }
+
+    #[test]
+    fn composited_materials_preserve_text_and_control_contrast() {
+        let mut failures = Vec::new();
+        for (name, palette) in [
+            ("dark glass", &*DARK_THEME),
+            ("light glass", &*LIGHT_THEME),
+            ("dark solid", &*DARK_SOLID_THEME),
+            ("light solid", &*LIGHT_SOLID_THEME),
+        ] {
+            // The macOS workbench currently enforces opaque materials.
+            if cfg!(target_os = "macos") && name.ends_with("glass") {
+                continue;
+            }
+            for desktop in [
+                rgb(0x000000),
+                rgb(0xffffff),
+                rgb(0xff0000),
+                rgb(0x00ff00),
+                rgb(0x0000ff),
+            ] {
+                for (surface_name, surface) in composed_surfaces(palette, desktop) {
+                    for (token, foreground, minimum) in [
+                        ("text", palette.text, 4.5),
+                        ("muted text", palette.text_muted, 4.5),
+                        ("blue text", palette.accent_text, 4.5),
+                        ("error text", palette.danger_text, 4.5),
+                        ("success text", palette.success_text, 4.5),
+                        ("warning text", palette.warning_text, 4.5),
+                        ("input edge", palette.input_border, 3.0),
+                        ("focus", palette.focus_ring, 3.0),
+                    ] {
+                        let measured = contrast(foreground, surface);
+                        if measured < minimum {
+                            failures.push(format!(
+                                "{name} {surface_name} {token}: {measured:.3}:1 < {minimum}:1"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        failures.sort();
+        failures.dedup();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[gpui::test]
+    fn resolved_input_materials_have_readable_fill_and_distinct_edges(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            set_appearance(appearance);
+            cx.update(|cx| sync_component_theme(None, cx));
+            cx.update(|cx| {
+                let component = gpui_component::Theme::global(cx);
+                let edge = Rgba::from(component.colors.input);
+                let fill = Rgba::from(component.input_background());
+                let text = Rgba::from(component.colors.foreground);
+                let placeholder = Rgba::from(component.colors.muted_foreground);
+                let palette = theme();
+                for (_, surface) in composed_surfaces(palette, rgb(0xffffff)) {
+                    let painted_fill = composite(fill, surface);
+                    let painted_edge = composite(edge, surface);
+                    assert!(
+                        contrast(painted_edge, surface) >= 3.0,
+                        "{appearance:?} input edge against outside"
+                    );
+                    assert!(
+                        contrast(painted_edge, painted_fill) >= 3.0,
+                        "{appearance:?} input edge against fill"
+                    );
+                    assert!(
+                        contrast(text, painted_fill) >= 4.5,
+                        "{appearance:?} input value"
+                    );
+                    assert!(
+                        contrast(placeholder, painted_fill) >= 4.5,
+                        "{appearance:?} input placeholder"
+                    );
+                }
+                let base = &gpui_base::Theme::global(cx).tokens.colors;
+                assert_eq!(
+                    base.input, component.colors.input,
+                    "Base controls must use the resolved input edge"
+                );
+                assert_eq!(
+                    base.ring, component.colors.ring,
+                    "Base controls must use the resolved focus ring"
+                );
+            });
+        }
+        set_appearance(Appearance::Dark);
+    }
+
+    #[gpui::test]
+    fn resolved_destructive_outline_states_keep_error_labels_readable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            set_appearance(appearance);
+            cx.update(|cx| sync_component_theme(None, cx));
+            cx.update(|cx| {
+                let component = gpui_component::Theme::global(cx);
+                let foreground = Rgba::from(component.colors.danger);
+                for (_, surface) in composed_surfaces(theme(), rgb(0xffffff)) {
+                    for (token, alpha) in [
+                        (component.tokens.danger, 0.1),
+                        (component.tokens.danger_hover, 0.2),
+                        (component.tokens.danger_active, 0.4),
+                    ] {
+                        // The pinned ButtonVariant::outline_background applies
+                        // these opacities before painting its normal/hover/press.
+                        let fill = Rgba::from(gpui::Hsla::from(token).opacity(alpha));
+                        assert!(contrast(foreground, composite(fill, surface)) >= 4.5);
+                    }
+                }
+            });
+        }
+        set_appearance(Appearance::Dark);
+    }
+
+    #[gpui::test]
+    fn resolved_primary_button_states_keep_white_labels_readable(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            set_appearance(appearance);
+            cx.update(|cx| sync_component_theme(None, cx));
+            cx.update(|cx| {
+                let palette = theme();
+                let tokens = &gpui_component::Theme::global(cx).tokens;
+                for (state, fill) in [
+                    (
+                        "normal",
+                        Rgba::from(gpui::Hsla::from(tokens.button_primary)),
+                    ),
+                    (
+                        "hover",
+                        Rgba::from(gpui::Hsla::from(tokens.button_primary_hover)),
+                    ),
+                    (
+                        "pressed",
+                        Rgba::from(gpui::Hsla::from(tokens.button_primary_active)),
+                    ),
+                ] {
+                    for surface in [palette.canvas, palette.panel, palette.panel_raised] {
+                        let measured =
+                            contrast(palette.accent_foreground, composite(fill, surface));
+                        assert!(measured >= 4.5, "{appearance:?} {state}: {measured:.3}:1");
+                    }
+                }
+            });
+        }
+        set_appearance(Appearance::Dark);
     }
 
     #[test]
@@ -866,6 +1255,7 @@ mod tests {
             for foreground in [
                 palette.text,
                 palette.text_muted,
+                palette.accent_text,
                 palette.sql_keyword,
                 palette.sql_string,
                 palette.sql_comment,
@@ -927,7 +1317,34 @@ mod tests {
             for surface in [palette.window, palette.glass, palette.glass_raised] {
                 assert!(contrast(palette.text, surface) >= 7.0);
                 assert!(contrast(palette.text_muted, surface) >= 4.5);
+                assert!(contrast(palette.accent_text, surface) >= 4.5);
             }
         }
+    }
+
+    #[test]
+    fn essential_field_edges_and_focus_have_non_text_contrast() {
+        for palette in [&*DARK_THEME, &*LIGHT_THEME] {
+            for surface in [palette.canvas, palette.panel, palette.panel_raised] {
+                assert!(contrast(palette.input_border, surface) >= 3.0);
+                assert!(contrast(palette.focus_ring, surface) >= 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_controls_publish_names_roles_and_switch_state() {
+        use gpui::Element;
+        let button = glass_icon_button("test-close", Icon::Close, false);
+        let mut node = gpui::accesskit::Node::new(button.a11y_role().unwrap());
+        button.write_a11y_info(&mut node);
+        assert_eq!(node.role(), gpui::Role::Button);
+        assert_eq!(node.label(), Some("Close"));
+        let switch = settings_switch("test-switch", "SQL Vim mode", true);
+        let mut node = gpui::accesskit::Node::new(switch.a11y_role().unwrap());
+        switch.write_a11y_info(&mut node);
+        assert_eq!(node.role(), gpui::Role::Switch);
+        assert_eq!(node.label(), Some("SQL Vim mode"));
+        assert_eq!(node.toggled(), Some(gpui::accesskit::Toggled::True));
     }
 }

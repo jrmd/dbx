@@ -344,15 +344,15 @@ impl DbxApp {
         };
         Some(
             div()
-                .p(px(12.))
+                .p(crate::theme::ui_px(12.))
                 .border_1()
                 .border_color(theme().border)
-                .rounded(px(6.))
+                .rounded(crate::theme::ui_px(6.))
                 .flex()
                 .flex_col()
-                .gap(px(8.))
+                .gap(crate::theme::ui_px(8.))
                 .child(
-                    div().flex().flex_wrap().gap(px(6.)).children(
+                    div().flex().flex_wrap().gap(crate::theme::ui_px(6.)).children(
                         [
                             "Add column",
                             "Rename column",
@@ -397,11 +397,13 @@ impl DbxApp {
                     ),
                 )
                 .children(labels.into_iter().zip(fields).map(|(label, editor)| {
+                    editor.update(cx, |editor, cx| editor.set_accessibility_label(label, cx));
+                    let focus = editor.read(cx).focus_handle();
                     div()
                         .flex()
-                        .gap(px(8.))
-                        .child(div().w(px(200.)).child(label))
-                        .child(editor)
+                        .gap(crate::theme::ui_px(8.))
+                        .child(div().w(crate::theme::ui_px(200.)).child(label))
+                        .child(editor::input(editor, focus, false, cx))
                 }))
                 .when(action == 0 || action == 3 || action == 5, |view| {
                     view.child(
@@ -442,7 +444,7 @@ impl DbxApp {
                 .when(
                     !structure.columns.is_empty() && matches!(action, 1 | 2 | 5),
                     |view| {
-                        view.child(div().flex().flex_wrap().gap(px(4.)).children(
+                        view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
                             structure.columns.iter().map(|column| {
                                 let name = column.name.clone();
                                 let data_type = column.data_type.clone();
@@ -484,18 +486,18 @@ impl DbxApp {
                         ))
                     },
                 )
-                .when(matches!(action, 0 | 5), |view| view.child(div().flex().flex_wrap().gap(px(4.)).children(
+                .when(matches!(action, 0 | 5), |view| view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
                     ["integer", "bigint", "text", "varchar(255)", "boolean", "numeric(12,2)", "timestamp"].into_iter().map(|value| {
                         button(SharedString::from(format!("designer-type-{value}")), value, ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.set_designer_field(session_id, 1, value.into(), cx)))
                     })
                 )))
-                .when(matches!(action, 3 | 6 | 7), |view| view.child(div().flex().flex_wrap().gap(px(4.)).children(
+                .when(matches!(action, 3 | 6 | 7), |view| view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
                     structure.columns.iter().map(|column| {
                         let name = column.name.clone();
                         button(SharedString::from(format!("designer-local-{name}")), name.clone(), ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.append_designer_column(session_id, 1, name.clone(), cx)))
                     })
                 )))
-                .when(action == 7, |view| view.child(div().max_h(px(120.)).id("designer-reference-tables").overflow_y_scroll().flex().flex_wrap().gap(px(4.)).children(
+                .when(action == 7, |view| view.child(div().max_h(crate::theme::ui_px(120.)).id("designer-reference-tables").overflow_y_scroll().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
                     session.tables.iter().filter(|table| table.kind == EntityKind::Table).map(|table| {
                         let table = table.clone();
                         button(SharedString::from(format!("designer-ref-{:?}-{}", table.schema, table.name)), match &table.schema { Some(schema) => format!("{schema}.{}", table.name), None => table.name.clone() }, ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
@@ -504,7 +506,7 @@ impl DbxApp {
                             this.set_designer_field(session_id, 3, String::new(), cx);
                         }))
                     })
-                )).child(div().flex().flex_wrap().gap(px(4.)).children(
+                )).child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
                     session.completion_columns.get(&completion_table_key(&TableRef { name: designer.fields[2].read(cx).text(cx).trim().into(), schema: { let schema = designer.fields[4].read(cx).text(cx); (!schema.trim().is_empty()).then(|| schema.trim().into()) } })).into_iter().flatten().map(|column| {
                         let name = column.name.clone();
                         button(SharedString::from(format!("designer-ref-column-{name}")), name.clone(), ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.append_designer_column(session_id, 3, name.clone(), cx)))
@@ -514,7 +516,7 @@ impl DbxApp {
                     if let Some(designer) = this.designer_mut(session_id) { designer.drafts.clear(); }
                     cx.notify();
                 }))))
-                .when(session.kind == DatabaseKind::MySQL && action == 5, |view| view.child(div().text_sm().text_color(theme().warning).child("MODIFY replaces the complete column definition. Existing AUTO_INCREMENT, COLLATE, COMMENT and ON UPDATE attributes are preserved from metadata. Generated columns require manual SQL.")))
+                .when(session.kind == DatabaseKind::MySQL && action == 5, |view| view.child(div().text_sm().text_color(theme().warning_text).child("MODIFY replaces the complete column definition. Existing AUTO_INCREMENT, COLLATE, COMMENT and ON UPDATE attributes are preserved from metadata. Generated columns require manual SQL.")))
                 .child(
                     button(
                         "designer-queue",

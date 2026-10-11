@@ -24,6 +24,7 @@ impl DbxApp {
         let output_name = dialog.output_name.read(cx).clone();
         let can_export = selected_count > 0 && !output_name.trim().is_empty();
         let app = cx.entity();
+        let background = self.modal_is_background(&modal_focus);
 
         let table_rows =
             tables.into_iter().map(|table| {
@@ -34,10 +35,10 @@ impl DbxApp {
                     "database-export-{}",
                     table_sidebar_id(&table)
                 )))
-                .h(px(30.))
+                .h(crate::theme::ui_px(30.))
                 .w_full()
-                .px(px(8.))
-                .rounded(px(5.))
+                .px(crate::theme::ui_px(8.))
+                .rounded(crate::theme::ui_px(5.))
                 .with_size(Size::Small)
                 .compact()
                 .ghost()
@@ -55,8 +56,8 @@ impl DbxApp {
                 .cursor_pointer()
                 .child(
                     div()
-                        .size(px(14.))
-                        .rounded(px(3.))
+                        .size(crate::theme::ui_px(14.))
+                        .rounded(crate::theme::ui_px(3.))
                         .border_1()
                         .border_color(if selected {
                             theme().accent
@@ -70,7 +71,7 @@ impl DbxApp {
                         })
                         .flex(),
                 )
-                .child(icon(Icon::Table, theme().text_muted).size(px(14.)))
+                .child(icon(Icon::Table, theme().text_muted).size(crate::theme::ui_px(14.)))
                 .child(div().flex_1().truncate().child(label))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_database_export_table(key.clone(), cx)
@@ -85,8 +86,8 @@ impl DbxApp {
                     "database-export-format-{choice}"
                 )))
                 .label(choice.to_string())
-                .px(px(10.))
-                .rounded(px(5.))
+                .px(crate::theme::ui_px(10.))
+                .rounded(crate::theme::ui_px(5.))
                 .with_size(Size::XSmall)
                 .compact()
                 .ghost()
@@ -97,11 +98,11 @@ impl DbxApp {
                     theme().panel_raised
                 })
                 .text_color(if selected {
-                    theme().accent
+                    theme().accent_text
                 } else {
                     theme().text_muted
                 })
-                .text_size(px(10.))
+                .text_size(crate::theme::ui_px(10.))
                 .cursor_pointer()
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.set_database_export_format(choice, cx)),
@@ -139,10 +140,10 @@ impl DbxApp {
             .occlude()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .absolute()
-            .top(px(0.))
-            .right(px(0.))
-            .bottom(px(0.))
-            .left(px(0.))
+            .top(crate::theme::ui_px(0.))
+            .right(crate::theme::ui_px(0.))
+            .bottom(crate::theme::ui_px(0.))
+            .left(crate::theme::ui_px(0.))
             .flex()
             .items_center()
             .justify_center()
@@ -150,9 +151,9 @@ impl DbxApp {
             .child(
                 div()
                     .id("database-export-dialog")
-                    .w(px(560.))
-                    .max_h(px(680.))
-                    .rounded(px(RADIUS_GLASS))
+                    .w(crate::theme::ui_px(560.))
+                    .max_h(crate::theme::ui_px(680.))
+                    .rounded(crate::theme::ui_px(RADIUS_GLASS))
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
@@ -162,8 +163,8 @@ impl DbxApp {
                     .flex_col()
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(14.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(14.))
                             .border_b_1()
                             .border_color(theme().border)
                             .flex()
@@ -172,7 +173,7 @@ impl DbxApp {
                             .child(
                                 div().flex().flex_col().child(
                                     div()
-                                        .text_size(px(16.))
+                                        .text_size(crate::theme::ui_px(16.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme().text)
                                         .child("Export database"),
@@ -183,24 +184,25 @@ impl DbxApp {
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
+                                    .accessible_name("Close export")
                                     .tooltip("Close export")
                                     .child(icon(Icon::Close, theme().text_muted))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_database_export(cx)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_database_export(window, cx);
                                     })),
                             ),
                     )
                     .child(
                         div()
-                            .px(px(16.))
-                            .pt(px(14.))
-                            .pb(px(8.))
+                            .px(crate::theme::ui_px(16.))
+                            .pt(crate::theme::ui_px(14.))
+                            .pb(crate::theme::ui_px(8.))
                             .flex()
                             .items_center()
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text_muted)
                                     .child(format!("TABLES · {selected_count} selected")),
@@ -211,7 +213,7 @@ impl DbxApp {
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
-                                    .text_color(theme().accent)
+                                    .text_color(theme().accent_text)
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_all_database_export_tables(cx)
@@ -221,52 +223,57 @@ impl DbxApp {
                     .child(
                         div()
                             .id("database-export-table-list")
-                            .mx(px(16.))
-                            .h(px(190.))
-                            .p(px(5.))
-                            .rounded(px(6.))
+                            .mx(crate::theme::ui_px(16.))
+                            .h(crate::theme::ui_px(190.))
+                            .p(crate::theme::ui_px(5.))
+                            .rounded(crate::theme::ui_px(6.))
                             .border_1()
                             .border_color(theme().border)
                             .bg(theme().canvas)
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
+                            .gap(crate::theme::ui_px(2.))
                             .children(table_rows),
                     )
                     .child(
                         div()
-                            .px(px(16.))
-                            .pt(px(12.))
+                            .px(crate::theme::ui_px(16.))
+                            .pt(crate::theme::ui_px(12.))
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(crate::theme::ui_px(6.))
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text_muted)
                                     .child("OUTPUT FORMAT"),
                             )
-                            .child(div().flex().gap(px(5.)).children(format_choices))
                             .child(
                                 div()
                                     .flex()
-                                    .gap(px(16.))
+                                    .gap(crate::theme::ui_px(5.))
+                                    .children(format_choices),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(crate::theme::ui_px(16.))
                                     .child(schema_toggle)
                                     .child(gzip_toggle),
                             ),
                     )
                     .child(
                         div()
-                            .px(px(16.))
-                            .pt(px(12.))
+                            .px(crate::theme::ui_px(16.))
+                            .pt(crate::theme::ui_px(12.))
                             .flex()
                             .flex_col()
-                            .gap(px(5.))
+                            .gap(crate::theme::ui_px(5.))
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text_muted)
                                     .child("OUTPUT NAME"),
@@ -275,20 +282,21 @@ impl DbxApp {
                                 output_name_editor,
                                 output_name_focus.clone(),
                                 false,
+                                cx,
                             )),
                     )
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(12.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(12.))
                             .flex()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(crate::theme::ui_px(8.))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .text_color(theme().text_muted)
                                     .truncate()
                                     .child(output_directory),
@@ -307,8 +315,8 @@ impl DbxApp {
                     )
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(12.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(12.))
                             .border_t_1()
                             .border_color(theme().border)
                             .flex()
@@ -318,7 +326,7 @@ impl DbxApp {
                             .child(
                                 div()
                                     .flex()
-                                    .gap(px(7.))
+                                    .gap(crate::theme::ui_px(7.))
                                     .child(
                                         button(
                                             "cancel-database-export",
@@ -327,8 +335,8 @@ impl DbxApp {
                                         )
                                         .cursor_pointer()
                                         .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.cancel_database_export(cx)
+                                            cx.listener(|this, _, window, cx| {
+                                                this.cancel_database_export(window, cx);
                                             }),
                                         ),
                                     )
@@ -346,8 +354,8 @@ impl DbxApp {
                                             can_export,
                                             |button| {
                                                 button.cursor_pointer().on_click(cx.listener(
-                                                    |this, _, _, cx| {
-                                                        this.execute_database_export(cx)
+                                                    |this, _, window, cx| {
+                                                        this.execute_database_export(window, cx)
                                                     },
                                                 ))
                                             },
@@ -355,7 +363,14 @@ impl DbxApp {
                                     ),
                             ),
                     )
-                    .focus_trap("database-export-focus-trap", &modal_focus),
+                    .focus_trap("database-export-focus-trap", &modal_focus)
+                    .accessible_dialog(
+                        "export-dialog",
+                        "Export database",
+                        "Choose tables, output format, and destination.",
+                        background,
+                        false,
+                    ),
             );
 
         deferred(overlay).with_priority(30).into_any_element()
@@ -376,6 +391,12 @@ impl DbxApp {
             40
         };
         let focus = dialog.focus.clone();
+        let background = self.modal_is_background(&focus);
+        let accessible_title = title.clone();
+        let accessible_detail = match &sql {
+            Some(sql) => format!("{detail}\nSQL: {sql}"),
+            None => detail.clone(),
+        };
         let confirm_kind = match tone {
             ConfirmationTone::Warning => ButtonKind::Primary,
             ConfirmationTone::Danger => ButtonKind::Danger,
@@ -386,10 +407,10 @@ impl DbxApp {
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .id("confirmation-overlay")
             .absolute()
-            .top(px(0.))
-            .right(px(0.))
-            .bottom(px(0.))
-            .left(px(0.))
+            .top(crate::theme::ui_px(0.))
+            .right(crate::theme::ui_px(0.))
+            .bottom(crate::theme::ui_px(0.))
+            .left(crate::theme::ui_px(0.))
             .flex()
             .items_center()
             .justify_center()
@@ -398,40 +419,47 @@ impl DbxApp {
                 div()
                     .id("confirmation-dialog")
                     .debug_selector(|| "confirmation-dialog".into())
-                    .w(px(if sql.is_some() { 640. } else { 420. }))
-                    .max_h(px(560.))
+                    .w(crate::theme::ui_px(if sql.is_some() { 640. } else { 420. }))
+                    .max_w(relative(0.95))
+                    .max_h(relative(0.9))
                     .flex()
                     .flex_col()
-                    .rounded(px(RADIUS_GLASS))
+                    .rounded(crate::theme::ui_px(RADIUS_GLASS))
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
                     .shadow(glass_shadow(28.))
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(14.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(14.))
                             .border_b_1()
                             .border_color(theme().border)
                             .flex()
                             .items_start()
                             .justify_between()
-                            .gap(px(12.))
+                            .gap(crate::theme::ui_px(12.))
                             .child(
-                                div().min_w_0().flex().items_center().gap(px(7.)).child(
-                                    div()
-                                        .text_size(px(15.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme().text)
-                                        .child(title),
-                                ),
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(7.))
+                                    .child(
+                                        div()
+                                            .text_size(crate::theme::ui_px(15.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme().text)
+                                            .child(title),
+                                    ),
                             )
                             .child(
                                 Button::new("close-confirmation")
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
+                                    .accessible_name("Close confirmation")
                                     .tooltip("Cancel")
                                     .child(icon(Icon::Close, theme().text_muted))
                                     .on_click(cx.listener(|this, _, window, cx| {
@@ -442,9 +470,9 @@ impl DbxApp {
                     .when(!detail.is_empty(), |dialog| {
                         dialog.child(
                             div()
-                                .px(px(16.))
-                                .py(px(16.))
-                                .text_size(px(12.))
+                                .px(crate::theme::ui_px(16.))
+                                .py(crate::theme::ui_px(16.))
+                                .text_size(crate::theme::ui_px(12.))
                                 .text_color(theme().text_muted)
                                 .line_height(gpui::relative(1.5))
                                 .child(detail),
@@ -457,11 +485,11 @@ impl DbxApp {
                                 .flex_1()
                                 .min_h_0()
                                 .overflow_scroll()
-                                .px(px(16.))
-                                .py(px(12.))
+                                .px(crate::theme::ui_px(16.))
+                                .py(crate::theme::ui_px(12.))
                                 .bg(theme().canvas)
                                 .font_family("monospace")
-                                .text_size(px(11.))
+                                .text_size(crate::theme::ui_px(11.))
                                 .text_color(theme().text)
                                 .line_height(gpui::relative(1.5))
                                 .children(
@@ -475,14 +503,14 @@ impl DbxApp {
                     })
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(12.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(12.))
                             .border_t_1()
                             .border_color(theme().border)
                             .flex()
                             .items_center()
                             .justify_end()
-                            .gap(px(8.))
+                            .gap(crate::theme::ui_px(8.))
                             .child(
                                 button("cancel-confirmation", "Cancel", ButtonKind::Quiet)
                                     .debug_selector(|| "cancel-confirmation".into())
@@ -500,7 +528,14 @@ impl DbxApp {
                                     })),
                             ),
                     )
-                    .focus_trap("confirmation-focus-trap", &focus),
+                    .focus_trap("confirmation-focus-trap", &focus)
+                    .accessible_dialog(
+                        "confirmation-dialog",
+                        accessible_title,
+                        accessible_detail,
+                        background,
+                        true,
+                    ),
             );
 
         deferred(overlay).with_priority(priority).into_any_element()
@@ -513,15 +548,18 @@ impl DbxApp {
         let title = dialog.title.clone();
         let detail = dialog.detail.clone();
         let focus = dialog.focus.clone();
+        let background = self.modal_is_background(&focus);
+        let accessible_title = title.clone();
+        let accessible_detail = detail.clone();
 
         let overlay = div()
             .occlude()
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .absolute()
-            .top(px(0.))
-            .right(px(0.))
-            .bottom(px(0.))
-            .left(px(0.))
+            .top(crate::theme::ui_px(0.))
+            .right(crate::theme::ui_px(0.))
+            .bottom(crate::theme::ui_px(0.))
+            .left(crate::theme::ui_px(0.))
             .flex()
             .items_center()
             .justify_center()
@@ -529,30 +567,31 @@ impl DbxApp {
             .child(
                 div()
                     .id("mutation-error-dialog")
-                    .w(px(460.))
-                    .max_h(px(520.))
-                    .rounded(px(RADIUS_GLASS))
+                    .w(crate::theme::ui_px(460.))
+                    .max_w(relative(0.95))
+                    .max_h(relative(0.9))
+                    .rounded(crate::theme::ui_px(RADIUS_GLASS))
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
                     .shadow(glass_shadow(28.))
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(14.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(14.))
                             .border_b_1()
                             .border_color(theme().border)
                             .flex()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(crate::theme::ui_px(8.))
                             .child(
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .text_size(px(15.))
+                                    .text_size(crate::theme::ui_px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text)
                                     .child(title),
@@ -563,35 +602,35 @@ impl DbxApp {
                             .id("mutation-error-scroll")
                             .flex_1()
                             .min_h_0()
-                            .px(px(16.))
-                            .py(px(16.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(16.))
                             .overflow_y_scroll()
                             .flex()
                             .flex_col()
-                            .gap(px(12.))
+                            .gap(crate::theme::ui_px(12.))
                             .child(
                                 div()
-                                    .p(px(12.))
-                                    .rounded(px(6.))
+                                    .p(crate::theme::ui_px(12.))
+                                    .rounded(crate::theme::ui_px(6.))
                                     .border_1()
                                     .border_color(theme().border)
                                     .bg(theme().canvas)
-                                    .text_size(px(11.))
-                                    .text_color(theme().danger)
+                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_color(theme().danger_text)
                                     .line_height(gpui::relative(1.5))
                                     .child(detail),
                             ),
                     )
                     .child(
                         div()
-                            .px(px(16.))
-                            .py(px(12.))
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(12.))
                             .border_t_1()
                             .border_color(theme().border)
                             .flex()
                             .items_center()
                             .justify_between()
-                            .gap(px(12.))
+                            .gap(crate::theme::ui_px(12.))
                             .child(div())
                             .child(
                                 button(
@@ -605,7 +644,14 @@ impl DbxApp {
                                 )),
                             ),
                     )
-                    .focus_trap("mutation-error-focus-trap", &focus),
+                    .focus_trap("mutation-error-focus-trap", &focus)
+                    .accessible_dialog(
+                        "mutation-error-dialog",
+                        accessible_title,
+                        accessible_detail,
+                        background,
+                        true,
+                    ),
             );
 
         deferred(overlay).with_priority(50).into_any_element()
@@ -621,9 +667,10 @@ impl DbxApp {
         };
         let rows = self.table_menu_rows_for(&menu);
 
+        let app = cx.entity().downgrade();
         let items = rows.into_iter().enumerate().map(|(index, row)| match row {
             TableMenuRow::Separator => div()
-                .my(px(4.))
+                .my(crate::theme::ui_px(4.))
                 .border_t_1()
                 .border_color(theme().border)
                 .into_any_element(),
@@ -641,14 +688,34 @@ impl DbxApp {
                 };
                 div()
                     .id(("table-menu-item", index))
-                    .px(px(8.))
-                    .py(px(7.))
-                    .rounded(px(5.))
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(label)
+                    .a11y_synthetic_children(move |builder| {
+                        if !enabled {
+                            builder.parent_node().set_disabled();
+                        }
+                    })
+                    .when(highlighted && menu.focus.is_focused(window), |view| {
+                        view.aria_active_descendant()
+                    })
+                    .on_a11y_action(gpui::AccessibleAction::Click, {
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            if enabled {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.run_table_menu_command(command, window, cx)
+                                });
+                            }
+                        }
+                    })
+                    .px(crate::theme::ui_px(8.))
+                    .py(crate::theme::ui_px(7.))
+                    .rounded(crate::theme::ui_px(5.))
                     .text_color(match (enabled, tone) {
                         (false, _) => theme().text_muted,
                         (true, MenuTone::Normal) => theme().text,
-                        (true, MenuTone::Warning) => theme().warning,
-                        (true, MenuTone::Danger) => theme().danger,
+                        (true, MenuTone::Warning) => theme().warning_text,
+                        (true, MenuTone::Danger) => theme().danger_text,
                     })
                     .when(highlighted, |view| view.bg(highlight))
                     .when(enabled, |view| {
@@ -666,30 +733,40 @@ impl DbxApp {
         let menu_view = deferred(
             anchored()
                 .position(menu.position)
-                .snap_to_window_with_margin(px(8.))
+                .snap_to_window_with_margin(crate::theme::ui_px(8.))
                 .child(
                     div()
                         .id("table-context-menu")
+                        .role(gpui::Role::Menu)
+                        .aria_label(table_sidebar_label(&menu.table, None))
+                        .a11y_synthetic_children({
+                            let background = self.modal_is_background(&menu.focus);
+                            move |builder| {
+                                if background {
+                                    builder.parent_node().set_hidden();
+                                }
+                            }
+                        })
                         .key_context("DbxTableMenu")
                         .track_focus(&menu.focus)
                         .occlude()
-                        .w(px(220.))
-                        .p(px(6.))
-                        .rounded(px(RADIUS_PANEL))
+                        .w(crate::theme::ui_px(220.))
+                        .p(crate::theme::ui_px(6.))
+                        .rounded(crate::theme::ui_px(RADIUS_PANEL))
                         .border_1()
                         .border_color(theme().hairline)
                         .bg(theme().glass_raised)
                         .shadow(glass_shadow(18.))
-                        .text_size(px(12.))
+                        .text_size(crate::theme::ui_px(12.))
                         .on_mouse_down_out(
                             cx.listener(|this, _, _, cx| this.close_table_context_menu(cx)),
                         )
                         .child(
                             div()
-                                .px(px(8.))
-                                .pt(px(5.))
-                                .pb(px(7.))
-                                .text_size(px(10.))
+                                .px(crate::theme::ui_px(8.))
+                                .pt(crate::theme::ui_px(5.))
+                                .pb(crate::theme::ui_px(7.))
+                                .text_size(crate::theme::ui_px(10.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme().text_muted)
                                 .child(table_sidebar_label(&menu.table, None)),

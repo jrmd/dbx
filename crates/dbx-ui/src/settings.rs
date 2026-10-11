@@ -25,6 +25,12 @@ pub struct Settings {
     /// Replace glass materials with opaque surfaces.
     #[serde(default)]
     pub reduce_transparency: bool,
+    #[serde(default)]
+    pub motion: crate::motion::MotionPreference,
+    #[serde(default = "text_scale_default")]
+    pub ui_scale: u16,
+    #[serde(default = "text_scale_default")]
+    pub editor_scale: u16,
     /// Keep the vault key in the system keychain so launches skip the
     /// passphrase.
     #[serde(default = "remember_device_default")]
@@ -39,6 +45,10 @@ pub struct Settings {
     pub explorer_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspector_width: Option<u32>,
+}
+
+fn text_scale_default() -> u16 {
+    100
 }
 
 fn remember_device_default() -> bool {
@@ -57,6 +67,9 @@ impl Settings {
             version: SETTINGS_FILE_VERSION,
             appearance,
             reduce_transparency: false,
+            motion: crate::motion::MotionPreference::System,
+            ui_scale: 100,
+            editor_scale: 100,
             remember_device: true,
             agents: crate::agents::AgentPreferences::default(),
             vim_mode: false,
@@ -261,6 +274,9 @@ mod tests {
         let settings = store.load().expect("load earlier settings");
         assert_eq!(settings.appearance, Appearance::Dark);
         assert!(!settings.reduce_transparency);
+        assert_eq!(settings.ui_scale, 100);
+        assert_eq!(settings.motion, crate::motion::MotionPreference::System);
+        assert_eq!(settings.editor_scale, 100);
     }
 
     #[test]
@@ -274,6 +290,20 @@ mod tests {
         assert!(json.contains("\"version\": 1"));
         assert!(json.contains("\"appearance\": \"light\""));
         assert!(!store.path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn independent_text_scales_survive_relaunch() {
+        let (_directory, store) = test_store();
+        let settings = Settings {
+            ui_scale: 200,
+            editor_scale: 150,
+            ..Default::default()
+        };
+        store.save(settings).unwrap();
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.ui_scale, 200);
+        assert_eq!(reloaded.editor_scale, 150);
     }
 
     #[test]
