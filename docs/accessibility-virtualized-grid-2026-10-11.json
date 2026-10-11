@@ -1,0 +1,194 @@
+{
+  "scope": "Disposable native Linux loaded grid virtualization",
+  "loaded_rows": 1000,
+  "native_dimensions": [
+    1001,
+    2
+  ],
+  "unpainted_cell_row": 500,
+  "before_reveal_bounds": [
+    -1,
+    -1,
+    -1,
+    -1
+  ],
+  "after_reveal_bounds": [
+    600,
+    826,
+    216,
+    70
+  ],
+  "same_native_cell_object_after_reveal": true,
+  "previous_first_row_bounds_cleared": true,
+  "native_selection_follows_focus": true,
+  "native_focused_state_follows_reveal": true,
+  "showing_state_tracks_actual_painting": true,
+  "horizontal": {
+    "native_dimensions": [
+      6,
+      41
+    ],
+    "unpainted_column": 40,
+    "header_name": "column 39",
+    "value": "r0c39",
+    "before_cell_and_header_bounds": [
+      -1,
+      -1,
+      -1,
+      -1
+    ],
+    "after_cell_bounds": [
+      1717,
+      377,
+      300,
+      70
+    ],
+    "after_header_bounds": [
+      1717,
+      305,
+      252,
+      70
+    ],
+    "same_native_cell_and_header_after_reveal": true,
+    "previous_first_column_bounds_cleared": true,
+    "trigger": "Native Component.ScrollTo on the logical column header"
+  },
+  "orca": {
+    "version": "50.2",
+    "invocation": "Real TableNavigator commands called programmatically; supported per-cell preference in memory settings; silent DBX-only sink",
+    "last_cell_speech": [
+      {
+        "time": 37799.992907939,
+        "kind": "speech",
+        "text": "Row 1000 row header name column header item 1000.",
+        "focus": "item 1000",
+        "role": "table cell"
+      },
+      {
+        "time": 37799.992940221,
+        "kind": "speech",
+        "text": "Row 1000, column 3 of 3. name  TEXT.",
+        "focus": "item 1000",
+        "role": "table cell"
+      },
+      {
+        "time": 37799.992953686,
+        "kind": "speech",
+        "text": "blank",
+        "focus": "item 1000",
+        "role": "table cell"
+      },
+      {
+        "time": 37799.993148587,
+        "kind": "speech",
+        "text": "Row 1002, column 4.",
+        "focus": "item 1000",
+        "role": "table cell"
+      }
+    ],
+    "first_cell_header_speech": [
+      {
+        "time": 37801.002191279,
+        "kind": "speech",
+        "text": "Row number column header.",
+        "focus": "Row number",
+        "role": "column header"
+      },
+      {
+        "time": 37801.002225494,
+        "kind": "speech",
+        "text": "Column 1 of 3. ",
+        "focus": "Row number",
+        "role": "column header"
+      },
+      {
+        "time": 37801.002400046,
+        "kind": "speech",
+        "text": "Row 1, column 1.",
+        "focus": "Row number",
+        "role": "column header"
+      }
+    ],
+    "native_header_focus_verified": true,
+    "limitations": [
+      "Programmatic default full-row presentation can run before the Showing update and omit the far value",
+      "Last-cell coordinate announcement uses counts plus one, despite verified native zero-based coordinates",
+      "Blank suffix after valid speech; generator first empty context list confirmed in diagnostic; extra label leaves removed",
+      "Physical keyboard delivery, audible synthesis and Braille unverified",
+      "Cold reader startup and large-grid latency still need investigation"
+    ]
+  },
+  "schema": 1,
+  "source_sha256": {
+    "crates/dbx-ui/src/app/result_table.rs": "1216dfbaeb7781bdcc4e85a3d7e1a09a4594f3953a7a1ef04a2169296a99db41",
+    "crates/dbx-ui/src/app/result_table/accessibility.rs": "496e71cd4cfd638c253c556a98b5f375619d0f432aae2b9a4ca887701112377c",
+    "crates/dbx-ui/src/app/result_table/accessibility/virtualized.rs": "139d68cd968fadba17e50e22622b9b70762449d3667e8734ccff6f8be054a49c",
+    "vendor/accesskit_atspi_common/src/lib.rs": "f258ee404fa540d1f4c14e2c8d0f6d322780e1b1c84916140c7097110758f7ff",
+    "vendor/accesskit_atspi_common/src/node.rs": "00ddd2e02de82652fdb8ea57b90897d1444ced79a244cc4ad4a2cb23875f543d",
+    "vendor/accesskit_atspi_common/src/table.rs": "8834f30d5427d10e4f4e0f24cd60dc50bd615e9f805576b72fc517378240a165",
+    "vendor/accesskit_unix/src/atspi/bus.rs": "6f2ce7d76b806a193fab2a36456fb19b1fb46e5cd07b000c54d124121b96f959",
+    "vendor/accesskit_unix/src/atspi/interfaces/mod.rs": "49edc10150cac24cee1d08d91ed2ccac8eb0a2843cef658b613745722add2c1a",
+    "vendor/accesskit_unix/src/atspi/interfaces/table.rs": "46d56caabf1756cc3d81c2ef24201c122e840726f7c0bf0c59a6220d5437a37d",
+    "vendor/accesskit_unix/src/atspi/interfaces/table_cell.rs": "6641811af6f79f18dc47dd95273cbb15a0119f633e36d60231c67211f67a1123",
+    "patches/accesskit-atspi-tables.patch": "11147b741c9079d999965c2ae5f6809c93fbdbae4480a28f4b44119bc7aa3fb4"
+  },
+  "verification": {
+    "ui_tests_passed": 401,
+    "ui_existing_ignored": 2,
+    "ui_seconds": 87.55,
+    "adapter_common_tests_passed": 13,
+    "adapter_unix_schema_tests_passed": 2,
+    "strict_all_target_clippy_ui_and_adapters": true,
+    "format_checks_workspace_and_adapters": true,
+    "git_diff_check": true,
+    "seven_file_adapter_patch_reproduced_byte_for_byte": true
+  },
+  "cleanup": {
+    "qa_app_pid_absent": 946426,
+    "isolated_reader_pid_absent": 954451,
+    "desktop_accessibility_flags_restored_and_read_back": {
+      "IsEnabled": false,
+      "ScreenReaderEnabled": false
+    }
+  },
+  "orca_generator_diagnostic": {
+    "scope": "Diagnostic only, unchanged generator functions wrapped with metadata-preserving tracing, filtered to QA process; final reader verification has no diagnostic wrappers",
+    "valid_cell_text": "item 1000",
+    "first_generated_item_type": "list",
+    "first_generated_item_truthy": false,
+    "blank_appended_despite_later_valid_value": true,
+    "extra_cell_label_nodes_removed": true
+  },
+  "cache_build_native_validation": {
+    "scope": "Native protocol/sorting or loaded row/horizontal reveal checks repeated on current cache and row-width build; historical reader evidence retains its earlier source hashes",
+    "source_sha256": {
+      "vendor/accesskit_atspi_common/src/adapter.rs": "90c4ddf53b69194e51e52dbce04f33bca7a79991ada7b2dc86d5a22df20e6d61",
+      "vendor/accesskit_atspi_common/src/context.rs": "c6be71db128dd19f63a4ce978709f232833ec9a2c90cd0fa94d0ea2b931dde76",
+      "vendor/accesskit_atspi_common/src/lib.rs": "f258ee404fa540d1f4c14e2c8d0f6d322780e1b1c84916140c7097110758f7ff",
+      "vendor/accesskit_atspi_common/src/node.rs": "9f09b74722003f6911f36940d9c882f6e0633e2764c5ba2ed204a1484a45fb61",
+      "vendor/accesskit_atspi_common/src/table.rs": "c7f21a29ca5176a1c65c8a50473af969e60ce3b70a5cc7df90483132bb89f378",
+      "vendor/accesskit_unix/src/atspi/bus.rs": "6f2ce7d76b806a193fab2a36456fb19b1fb46e5cd07b000c54d124121b96f959",
+      "vendor/accesskit_unix/src/atspi/interfaces/mod.rs": "49edc10150cac24cee1d08d91ed2ccac8eb0a2843cef658b613745722add2c1a",
+      "vendor/accesskit_unix/src/atspi/interfaces/table.rs": "46d56caabf1756cc3d81c2ef24201c122e840726f7c0bf0c59a6220d5437a37d",
+      "vendor/accesskit_unix/src/atspi/interfaces/table_cell.rs": "6641811af6f79f18dc47dd95273cbb15a0119f633e36d60231c67211f67a1123",
+      "patches/accesskit-atspi-tables.patch": "5b7a40fe732feda65194f410c57f2ccc0c112a77edcab13c002b7cbee306393f",
+      "crates/dbx-ui/src/app/result_table.rs": "0b77b608b49244b804c3d861bcebc00202c62210cde7418ca572839910d8347d",
+      "crates/dbx-ui/src/app/result_table/accessibility.rs": "496e71cd4cfd638c253c556a98b5f375619d0f432aae2b9a4ca887701112377c",
+      "crates/dbx-ui/src/app/result_table/accessibility/virtualized.rs": "139d68cd968fadba17e50e22622b9b70762449d3667e8734ccff6f8be054a49c",
+      "crates/dbx-ui/src/app.rs": "ac6a2a43059280e49dda8ff993553dfda409be3f5e30a19912806ec5dda7db1e"
+    },
+    "passed": true
+  },
+  "latest_qa_cleanup": {
+    "qa_app_confirmed_absent": 991846,
+    "app_exit_cause": "unknown; empty log and no matching system coredump metadata",
+    "isolated_readers_stopped_and_verified": [
+      980913,
+      983426
+    ],
+    "desktop_accessibility_flags_restored_and_read_back": {
+      "IsEnabled": false,
+      "ScreenReaderEnabled": false
+    }
+  }
+}

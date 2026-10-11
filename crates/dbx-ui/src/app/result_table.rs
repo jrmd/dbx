@@ -1,3 +1,8 @@
+use gpui_component::ElementExt;
+use std::rc::Rc;
+mod accessibility;
+pub(super) use accessibility::accessible_grid;
+
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
@@ -30,7 +35,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use crate::diagram::display_type;
 use crate::row_drafts::{FieldValueKind, field_value_kind};
-use crate::theme::{Icon, icon, theme};
+use crate::theme::{ButtonAccessibility as _, Icon, icon, theme};
 
 #[derive(Clone, Copy)]
 enum RowAction {
@@ -84,7 +89,7 @@ fn finish_resize(
 }
 
 /// Report widths the way the table's own resize does, so owners remember them.
-fn emit_widths(
+pub(super) fn emit_widths(
     table: &mut TableState<ResultTableDelegate>,
     cx: &mut Context<TableState<ResultTableDelegate>>,
 ) {
@@ -219,6 +224,11 @@ pub(super) struct ResultTableDelegate {
     cell_text: Vec<Option<SharedString>>,
     foreign_keys: Vec<ForeignKeyInfo>,
     row_actions: Option<(WeakEntity<DbxApp>, SessionId, SecondaryTabId, bool)>,
+    /// Catalog primary keys identify table rows, but can repeat in query joins.
+    is_data_result: bool,
+    table_columns: Vec<ColumnInfo>,
+    accessible_revision: u64,
+    accessible_dataset_revision: u64,
     sorting: ResultSorting,
     /// Unsorted rows behind a locally sorted result, restored when the sort
     /// returns to its default state.
@@ -231,6 +241,21 @@ pub(super) struct ResultTableDelegate {
     changes: GridChanges,
     /// Absolute number of the first loaded row, so page two starts at 1,001.
     row_offset: usize,
+    /// Built only while assistive technology is active. Table primary keys
+    /// survive reloads; ambiguous results are scoped to their snapshot and page.
+    /// Typed values and occurrence keys distinguish duplicates during sorting.
+    accessible_rows: Vec<u64>,
+    accessible_insert_keys: Vec<u64>,
+    next_accessible_insert_key: u64,
+    accessible_selected_cell: Option<(usize, usize)>,
+    accessible_selected_row: Option<usize>,
+    accessible_focused: bool,
+    accessible_editable: bool,
+    /// The semantic model covers loaded cells independently of visual virtualization.
+    accessible_logical_tree: bool,
+    accessible_header_focus: Option<SharedString>,
+    accessible_header_selection: Option<(usize, usize)>,
+    accessible_geometry: Rc<std::cell::RefCell<accessibility::GridGeometry>>,
     /// Result column shown at each display position after the row number.
     /// Pinned columns come first; hidden columns are absent.
     order: Vec<usize>,
@@ -256,17 +281,32 @@ impl Default for ResultTableDelegate {
     fn default() -> Self {
         Self {
             result: None,
-            columns: vec![Self::row_number_column()],
+            columns: vec![Self::row_number_column(0)],
             numeric: Vec::new(),
             cell_text: Vec::new(),
             foreign_keys: Vec::new(),
             row_actions: None,
+            is_data_result: false,
+            table_columns: Vec::new(),
+            accessible_revision: 0,
+            accessible_dataset_revision: 0,
             sorting: ResultSorting::Disabled,
             unsorted: None,
             sort: None,
             server_order: None,
             changes: GridChanges::default(),
             row_offset: 0,
+            accessible_rows: Vec::new(),
+            accessible_insert_keys: Vec::new(),
+            next_accessible_insert_key: 1,
+            accessible_selected_cell: None,
+            accessible_selected_row: None,
+            accessible_focused: false,
+            accessible_editable: false,
+            accessible_logical_tree: false,
+            accessible_header_focus: None,
+            accessible_header_selection: None,
+            accessible_geometry: Rc::new(std::cell::RefCell::new(Default::default())),
             order: Vec::new(),
             context_column: None,
             resizing: None,
@@ -284,12 +324,21 @@ impl ResultTableDelegate {
     ) -> Self {
         Self {
             row_actions: Some((app, session, tab, is_data)),
+            is_data_result: is_data,
             sorting: if is_data {
                 ResultSorting::Disabled
             } else {
                 ResultSorting::Local
             },
             ..Self::default()
+        }
+    }
+
+    pub(super) fn scale_column_widths(&mut self, ratio: f32) {
+        for column in &mut self.columns {
+            column.width *= ratio;
+            column.min_width *= ratio;
+            column.max_width *= ratio;
         }
     }
 
@@ -309,12 +358,52 @@ impl ResultTableDelegate {
         changes: GridChanges,
         editing: Option<(usize, usize, Entity<TextEditor>)>,
     ) {
+        if changes.inserts.len() != self.changes.inserts.len() {
+            let mut used = std::collections::HashSet::new();
+            self.accessible_insert_keys = changes
+                .inserts
+                .iter()
+                .map(|insert| {
+                    let previous = self
+                        .changes
+                        .inserts
+                        .iter()
+                        .enumerate()
+                        .find(|(index, old)| !used.contains(index) && *old == insert)
+                        .map(|(index, _)| index);
+                    if let Some(index) = previous {
+                        used.insert(index);
+                        self.accessible_insert_keys[index]
+                    } else {
+                        let key = self.next_accessible_insert_key;
+                        self.next_accessible_insert_key += 1;
+                        key
+                    }
+                })
+                .collect();
+        }
         self.changes = changes;
         self.editing = editing;
     }
 
+    pub(super) fn set_table_columns(&mut self, columns: &[ColumnInfo]) {
+        if self.table_columns != columns {
+            self.table_columns = columns.to_vec();
+            self.accessible_rows.clear();
+            self.accessible_revision = self.accessible_revision.wrapping_add(1);
+        }
+    }
+
     pub(super) fn set_row_offset(&mut self, row_offset: usize) {
-        self.row_offset = row_offset;
+        if self.row_offset != row_offset {
+            self.row_offset = row_offset;
+            let last_row = row_offset.saturating_add(self.loaded_rows());
+            if let Some(column) = self.columns.first_mut() {
+                *column = Self::row_number_column(last_row);
+            }
+            self.accessible_rows.clear();
+            self.accessible_revision = self.accessible_revision.wrapping_add(1);
+        }
     }
 
     /// The result column a grid column shows. Column 0 is the row number.
@@ -474,6 +563,8 @@ impl ResultTableDelegate {
     }
 
     fn replace_rows(&mut self, result: Arc<QueryResult>) {
+        self.accessible_revision = self.accessible_revision.wrapping_add(1);
+        self.accessible_rows.clear();
         self.cell_text = vec![None; result.rows.len() * result.columns.len()];
         self.result = Some(result);
     }
@@ -642,15 +733,19 @@ impl ResultTableDelegate {
         self.result.as_deref().map(json_result)
     }
 
-    fn row_number_column() -> DataColumn {
+    fn row_number_column(last_row: usize) -> DataColumn {
+        // Numeric position needs room for its complete digits and the same
+        // scaled padding as a data cell, including later database pages.
+        let digits = last_row.max(1).ilog10() + 1;
+        let width = crate::theme::ui_px((digits as f32 * 8. + 16.).max(44.));
         DataColumn::new(ROW_NUMBER_COLUMN_KEY, "#")
-            .width(44.)
+            .width(width)
             .fixed_left()
             .resizable(false)
             .movable(false)
             .selectable(false)
-            .min_width(44.)
-            .max_width(44.)
+            .min_width(width)
+            .max_width(width)
             .p_0()
     }
 
@@ -674,7 +769,9 @@ impl ResultTableDelegate {
             .unwrap_or_default();
 
         // This is an initial width, not a prison sentence. The user can resize it.
-        px(((header_chars.max(value_chars) as f32 * 7.0) + 20.0).clamp(80.0, 420.0))
+        crate::theme::ui_px(
+            ((header_chars.max(value_chars) as f32 * 7.0) + 20.0).clamp(80.0, 420.0),
+        )
     }
 
     pub(super) fn set_result(
@@ -685,7 +782,20 @@ impl ResultTableDelegate {
         foreign_keys: &[ForeignKeyInfo],
         tables: &[TableInfo],
     ) {
-        let mut columns = vec![Self::row_number_column()];
+        // Layout changes can reuse the same result; a new source snapshot
+        // invalidates ambiguous row identities while table primary keys survive.
+        let same_source = match (&self.result, &result) {
+            (Some(before), Some(after)) => Arc::ptr_eq(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_source {
+            self.accessible_dataset_revision = self.accessible_dataset_revision.wrapping_add(1);
+        }
+        let last_row = self
+            .row_offset
+            .saturating_add(result.as_ref().map_or(0, |result| result.rows.len()));
+        let mut columns = vec![Self::row_number_column(last_row)];
         self.unsorted = None;
         self.sort = match self.sorting {
             ResultSorting::Server => self.server_order.as_ref().and_then(|order| {
@@ -732,8 +842,8 @@ impl ResultTableDelegate {
                         .width(width)
                         .resizable(true)
                         .movable(position >= pinned)
-                        .min_width(MIN_COLUMN_WIDTH)
-                        .max_width(MAX_COLUMN_WIDTH)
+                        .min_width(MIN_COLUMN_WIDTH * crate::theme::ui_scale())
+                        .max_width(MAX_COLUMN_WIDTH * crate::theme::ui_scale())
                         .p_0();
                 if position < pinned {
                     data_column = data_column.fixed_left();
@@ -765,6 +875,8 @@ impl ResultTableDelegate {
             vec![None; result.rows.len() * result.columns.len()]
         });
         self.result = result;
+        self.accessible_revision = self.accessible_revision.wrapping_add(1);
+        self.accessible_rows.clear();
         self.columns = columns;
         self.foreign_keys = foreign_keys
             .iter()
@@ -809,7 +921,10 @@ impl ResultTableDelegate {
         let Some(column) = self.columns.get_mut(col_ix) else {
             return false;
         };
-        let width = width.clamp(px(MIN_COLUMN_WIDTH), px(MAX_COLUMN_WIDTH));
+        let width = width.clamp(
+            crate::theme::ui_px(MIN_COLUMN_WIDTH),
+            crate::theme::ui_px(MAX_COLUMN_WIDTH),
+        );
         if column.width == width {
             return false;
         }
@@ -1073,6 +1188,9 @@ impl TableDelegate for ResultTableDelegate {
     ) -> Stateful<Div> {
         div()
             .id("dbx-result-header")
+            .when(!self.accessible_logical_tree, |row| {
+                row.role(gpui::Role::Row).aria_row_index(0)
+            })
             .bg(theme().panel_raised)
             .border_color(theme().border_strong)
     }
@@ -1084,23 +1202,106 @@ impl TableDelegate for ResultTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let index = self.result_column(col_ix);
-        let column = index.and_then(|index| self.result.as_ref()?.columns.get(index));
+        let column = index.and_then(|index| {
+            let result_column = self.result.as_ref()?.columns.get(index)?;
+            if self.is_data_result {
+                self.table_columns
+                    .iter()
+                    .find(|column| column.name == result_column.name)
+                    .or(Some(result_column))
+            } else {
+                Some(result_column)
+            }
+        });
         let numeric = index
             .and_then(|index| self.numeric.get(index).copied())
             .unwrap_or(false);
+        let label = column.map_or_else(|| "Row number".to_owned(), |column| column.name.clone());
+        let key = self.columns[col_ix].key.clone();
+        let sort = index.and_then(|index| self.column_sort(index));
+        let author_id = format!("dbx-grid-{}-header-{key}", cx.entity_id());
+        let position = format!("Column {} of {}. ", col_ix + 1, self.columns.len());
+        let sort_description = match sort {
+            Some(ColumnSort::Ascending) => ". Sorted ascending",
+            Some(ColumnSort::Descending) => ". Sorted descending",
+            _ => "",
+        };
+        let geometry = self.accessible_geometry.clone();
+        let geometry_key = accessibility::GridNodeKey::Header(key.clone());
         let cell = div()
+            .id(SharedString::from(format!("dbx-result-header-{key}")))
+            .on_prepaint(move |bounds, window, _| {
+                geometry
+                    .borrow_mut()
+                    .record(geometry_key.clone(), bounds, window)
+            })
+            .when(!self.accessible_logical_tree, |cell| {
+                cell.role(gpui::Role::ColumnHeader)
+            })
+            .aria_label(label)
+            .aria_column_index(col_ix)
+            .aria_row_index(0)
+            .aria_description(column.map_or_else(
+                || position.clone(),
+                |column| {
+                    format!(
+                        "{position}{}{}{sort_description}",
+                        column.data_type,
+                        if column.primary_key {
+                            ", primary key"
+                        } else {
+                            ""
+                        }
+                    )
+                },
+            ))
+            .a11y_synthetic_children(move |builder| {
+                builder.parent_node().set_author_id(author_id.clone());
+                if let Some(sort) = sort {
+                    let direction = match sort {
+                        ColumnSort::Ascending => Some(gpui::accesskit::SortDirection::Ascending),
+                        ColumnSort::Descending => Some(gpui::accesskit::SortDirection::Descending),
+                        ColumnSort::Default => None,
+                    };
+                    if let Some(direction) = direction {
+                        builder.parent_node().set_sort_direction(direction);
+                    }
+                }
+            })
+            .when(!self.accessible_logical_tree && sort.is_some(), |cell| {
+                let table = cx.entity();
+                let key = key.clone();
+                cell.on_a11y_action(gpui::AccessibleAction::Click, move |_, window, cx| {
+                    table.update(cx, |table, cx| {
+                        let delegate = table.delegate_mut();
+                        let Some(column) =
+                            delegate.columns.iter().position(|column| column.key == key)
+                        else {
+                            return;
+                        };
+                        let next = match delegate.columns[column].sort {
+                            Some(ColumnSort::Ascending) => ColumnSort::Descending,
+                            Some(ColumnSort::Descending) => ColumnSort::Default,
+                            _ => ColumnSort::Ascending,
+                        };
+                        delegate.perform_sort(column, next, window, cx);
+                        table.refresh(cx);
+                    });
+                })
+            })
             .size_full()
             .flex()
             .items_center()
-            .gap(px(5.))
-            .px(px(8.))
+            .gap(crate::theme::ui_px(5.))
+            .px(crate::theme::ui_px(8.))
             .overflow_hidden()
             .when(numeric, |cell| cell.justify_end());
         let Some(column) = column else {
             return cell
-                .text_size(px(10.))
+                .text_size(crate::theme::ui_px(10.))
                 .text_color(theme().text_muted)
-                .child(self.columns[col_ix].name.clone());
+                .child(self.columns[col_ix].name.clone())
+                .into_any_element();
         };
         let resizing = self.resizing == Some(col_ix);
         let table = cx.entity().entity_id();
@@ -1117,9 +1318,9 @@ impl TableDelegate for ResultTableDelegate {
                 cell.child(
                     div()
                         .flex_none()
-                        .text_size(px(8.))
+                        .text_size(crate::theme::ui_px(8.))
                         .font_weight(FontWeight::BOLD)
-                        .text_color(theme().warning)
+                        .text_color(theme().warning_text)
                         .child("PK"),
                 )
             })
@@ -1128,7 +1329,7 @@ impl TableDelegate for ResultTableDelegate {
                     .flex_shrink(1.)
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme().text)
                     .child(column.name.clone()),
@@ -1136,7 +1337,7 @@ impl TableDelegate for ResultTableDelegate {
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(9.))
+                    .text_size(crate::theme::ui_px(9.))
                     .text_color(theme().text_muted)
                     .child(display_type(&column.data_type)),
             );
@@ -1155,7 +1356,7 @@ impl TableDelegate for ResultTableDelegate {
                     .top_0()
                     .bottom_0()
                     .right(px(-trailing))
-                    .w(px(RESIZE_HANDLE_WIDTH))
+                    .w(crate::theme::ui_px(RESIZE_HANDLE_WIDTH))
                     .flex()
                     .justify_end()
                     .cursor_col_resize()
@@ -1163,7 +1364,7 @@ impl TableDelegate for ResultTableDelegate {
                     .child(
                         div()
                             .h_full()
-                            .w(px(2.))
+                            .w(crate::theme::ui_px(2.))
                             .when(resizing, |line| line.bg(theme().accent))
                             .when(!resizing, |line| {
                                 line.group_hover("dbx-column-resize", |line| {
@@ -1206,13 +1407,14 @@ impl TableDelegate for ResultTableDelegate {
                     cx.notify();
                 }),
             )
+            .into_any_element()
     }
 
     fn render_tr(
         &mut self,
         row_ix: usize,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
         let base = if row_ix.is_multiple_of(2) {
             theme().canvas
@@ -1228,8 +1430,33 @@ impl TableDelegate for ResultTableDelegate {
         } else {
             base
         };
+        let row_key = self.accessible_row_key(row_ix);
+        let author_id = format!("dbx-grid-{}-row-{row_key}", cx.entity_id());
+        let row_index_text = (self.row_offset + row_ix + 1).to_string();
         let row = div()
-            .id(("dbx-result-row", row_ix))
+            .id(SharedString::from(format!("dbx-result-row-{row_key}")))
+            .a11y_synthetic_children(move |builder| {
+                builder.parent_node().set_author_id(author_id.clone());
+                builder
+                    .parent_node()
+                    .set_row_index_text(row_index_text.clone());
+            })
+            .when(!self.accessible_logical_tree, |row| {
+                row.role(gpui::Role::Row).aria_row_index(row_ix + 1)
+            })
+            // A named row wrapper replaces its cells in Orca's full-row speech.
+            // The row-header cell supplies the absolute row name.
+            .aria_selected(
+                self.accessible_selected_row == Some(row_ix)
+                    || self.changes.marked.contains(&row_ix),
+            )
+            .when(
+                !self.accessible_logical_tree
+                    && self.accessible_focused
+                    && self.accessible_selected_cell.is_none()
+                    && self.accessible_selected_row == Some(row_ix),
+                |row| row.aria_active_descendant(),
+            )
             .debug_selector(move || format!("dbx-result-row-{row_ix}"))
             .border_color(theme().border)
             .bg(background);
@@ -1454,13 +1681,14 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let semantic_cell = self.accessible_cell(row_ix, col_ix, cx);
         if let Some((_, _, editor)) = self.editing.as_ref().filter(|(row, column, _)| {
             *row == row_ix && Some(*column) == self.result_column(col_ix)
         }) {
             let focus = editor.read(cx).focus_handle();
             // Size the input to its text line and center it just like the
             // display cell. Its border plus padding keeps the same 8px inset.
-            return div()
+            return semantic_cell
                 .size_full()
                 .flex()
                 .items_center()
@@ -1470,11 +1698,12 @@ impl TableDelegate for ResultTableDelegate {
                         focus,
                         false,
                         super::cell_edits::CELL_EDITOR_CONTEXT,
+                        cx,
                     )
                     .h_auto()
-                    .py(px(0.))
-                    .px(px(7.))
-                    .text_size(px(11.)),
+                    .py(crate::theme::ui_px(0.))
+                    .px(crate::theme::ui_px(7.))
+                    .text_size(crate::theme::ui_px(11.)),
                 )
                 .into_any_element();
         }
@@ -1500,12 +1729,12 @@ impl TableDelegate for ResultTableDelegate {
                     .map(|value| staged_text(&value)),
             };
             let muted = text.is_none() || col_ix == 0;
-            return div()
+            return semantic_cell
                 .size_full()
                 .flex()
                 .items_center()
-                .px(px(8.))
-                .text_size(px(11.))
+                .px(crate::theme::ui_px(8.))
+                .text_size(crate::theme::ui_px(11.))
                 .text_color(if muted {
                     theme().text_muted
                 } else {
@@ -1527,13 +1756,13 @@ impl TableDelegate for ResultTableDelegate {
         if let Some(value) = staged.filter(|_| !deleted) {
             let muted =
                 !matches!(&value, MutationValue::Parameter(value) if *value != CellValue::Null);
-            return div()
+            return semantic_cell
                 .size_full()
                 .flex()
                 .items_center()
-                .px(px(8.))
+                .px(crate::theme::ui_px(8.))
                 .bg(theme().warning.alpha(0.16))
-                .text_size(px(11.))
+                .text_size(crate::theme::ui_px(11.))
                 .text_color(if muted {
                     theme().text_muted
                 } else {
@@ -1554,9 +1783,9 @@ impl TableDelegate for ResultTableDelegate {
                 None => None,
                 Some(CellValue::Null) => {
                     null = true;
-                    Some(theme().text_muted.alpha(0.7))
+                    Some(theme().text_muted)
                 }
-                Some(CellValue::Boolean(true)) => Some(theme().success),
+                Some(CellValue::Boolean(true)) => Some(theme().success_text),
                 Some(CellValue::Boolean(false)) => Some(theme().text_muted),
                 Some(_) => Some(theme().text),
             };
@@ -1592,15 +1821,15 @@ impl TableDelegate for ResultTableDelegate {
             .and_then(|index| self.numeric.get(index).copied())
             .unwrap_or(false);
 
-        let mut cell = div()
+        let mut cell = semantic_cell
             .size_full()
             .on_mouse_down(MouseButton::Right, remember_column)
             .flex()
             .items_center()
-            .px(px(8.))
+            .px(crate::theme::ui_px(8.))
             .whitespace_nowrap()
             .truncate()
-            .text_size(px(11.))
+            .text_size(crate::theme::ui_px(11.))
             .text_color(if deleted {
                 theme().text_muted
             } else {
@@ -1626,8 +1855,9 @@ impl TableDelegate for ResultTableDelegate {
                     .with_size(gpui_component::Size::XSmall)
                     .compact()
                     .ghost()
+                    .accessible_name("Open referenced row")
                     .tooltip("Open referenced row")
-                    .text_color(theme().accent)
+                    .text_color(theme().accent_text)
                     .child(icon(Icon::ArrowRight, theme().accent))
                     .on_click(cx.listener(move |table, _, window, cx| {
                         cx.stop_propagation();
@@ -2074,7 +2304,7 @@ mod tests {
     }
     impl gpui::Render for RowMenuHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            gpui_component::table::DataTable::new(&self.grid).with_size(px(30.))
+            accessible_grid(&self.grid, "Test results", false)
         }
     }
 
@@ -2104,6 +2334,108 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
         assert_eq!(value["rows"].as_array().unwrap().len(), 1);
         assert_eq!(value["rows"][0][0], 8);
+    }
+
+    #[gpui::test]
+    fn row_wrappers_do_not_replace_cell_content_in_screen_reader_row_presentation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
+            grid: cx.new(|cx| TableState::new(delegate_with_export_result(), window, cx)),
+        });
+        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
+        cx.update(|window, cx| {
+            grid.update(cx, |table, cx| {
+                table.delegate_mut().set_row_offset(1000);
+                let row = table.delegate_mut().render_tr(0, window, cx);
+                let mut row_node = gpui::accesskit::Node::new(gpui::Role::Row);
+                row.write_a11y_info(&mut row_node);
+                assert_eq!(row_node.row_index(), Some(1));
+                // Orca reads a named row wrapper as the whole row, skipping its cells.
+                // The real row header retains the absolute row name instead.
+                assert_eq!(row_node.label(), None);
+                let row_header = table.delegate().accessible_cell(0, 0, cx);
+                let mut header_node = gpui::accesskit::Node::new(gpui::Role::RowHeader);
+                row_header.write_a11y_info(&mut header_node);
+                assert_eq!(header_node.label(), Some("Row 1001"));
+                let cell = table.delegate().accessible_cell(0, 1, cx);
+                let mut cell_node = gpui::accesskit::Node::new(gpui::Role::GridCell);
+                cell.write_a11y_info(&mut cell_node);
+                assert_eq!(cell_node.label(), Some("7"));
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn grid_semantics_preserve_focus_and_keyboard_resize_without_extra_tab_stops(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Focusable;
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
+            grid: cx.new(|cx| TableState::new(delegate_with_export_result(), window, cx)),
+        });
+        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
+        let before = cx.update(|window, cx| {
+            grid.update(cx, |table, cx| {
+                table.set_selected_cell(0, 1, cx);
+                table.focus_handle(cx).focus(window, cx);
+                table.delegate().columns[1].width
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("ctrl-shift-right");
+        cx.update(|window, cx| {
+            grid.update(cx, |table, cx| {
+                assert_eq!(table.delegate().columns[1].width, before + px(20.));
+                assert_eq!(table.selected_cell(), Some((0, 1)));
+                assert!(table.focus_handle(cx).is_focused(window));
+                assert_eq!(window.focused(cx), Some(table.focus_handle(cx)));
+            })
+        });
+        cx.simulate_keystrokes("ctrl-shift-left");
+        cx.update(|_, cx| assert_eq!(grid.read(cx).delegate().columns[1].width, before));
+    }
+
+    #[gpui::test]
+    fn virtualized_grid_keyboard_navigation_reveals_rows_beyond_the_viewport(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Focusable;
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = delegate_with_export_result();
+            let mut result = export_result();
+            result.rows = (0..100)
+                .map(|n| {
+                    RowData::new(vec![
+                        CellValue::Integer(n),
+                        CellValue::Null,
+                        CellValue::Text(format!("Row {n}")),
+                    ])
+                })
+                .collect();
+            delegate.set_result(Some(Arc::new(result)), &HashMap::new(), None, &[], &[]);
+            RowMenuHarness {
+                grid: cx.new(|cx| TableState::new(delegate, window, cx)),
+            }
+        });
+        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
+        cx.update(|window, cx| {
+            grid.update(cx, |table, cx| {
+                table.set_selected_cell(0, 1, cx);
+                table.focus_handle(cx).focus(window, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("dbx-result-row-99").is_none());
+        for _ in 0..30 {
+            cx.simulate_keystrokes("pagedown");
+        }
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| assert_eq!(grid.read(cx).selected_cell(), Some((99, 1))));
+        assert!(cx.debug_bounds("dbx-result-row-99").is_some());
     }
 
     #[test]

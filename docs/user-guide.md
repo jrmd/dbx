@@ -67,10 +67,41 @@ Cmd/Ctrl-click a table to open it, or an alias or CTE to jump to its definition.
 Folding also works from the chevrons beside the line numbers. Rename and
 occurrence highlighting cover the current statement only.
 
+### Vim bindings
+
+Enable **Settings → Editor → Vim mode** for SQL query tabs. The preference is
+off by default, survives relaunch, and applies to open and newly created SQL
+tabs. Other inputs and query languages keep their ordinary editing behavior.
+
+SQL tabs start in **Normal** mode with a block caret. Press `i` to type in
+**Insert** mode, and `Escape` or `Ctrl-[` to return to Normal. The mode indicator
+stays visible below the query toolbar. Completion appears in Insert mode.
+
+| Task | Keys |
+| --- | --- |
+| Move | `h/j/k/l`, arrows, `w/b/e`, `W/B/E`, `0`, `^`, `$`, `gg`, `G` |
+| Repeat a motion or operator by count | `3w`, `2dd`, `d2w`, `2d3w` |
+| Insert | `i/a/I/A`, `o/O` (retains indentation) |
+| Select | `v` for characters, `V` for lines; `o` swaps the selection endpoint |
+| Delete, change, yank | `d/c/y` followed by a motion, or `dd/cc/yy`; also works on a Visual selection |
+| Edit characters / line remainder | `x/X`, `r` followed by a character, `D/C` |
+| Put | `p/P` |
+| Undo / redo | `u`, `Ctrl-R`; one Insert session is one undo step |
+| Move by about half a page | `Ctrl-U/Ctrl-D` |
+| Leave the editor | `F6/Shift-F6`; Normal mode also supports `Tab/Shift-Tab` |
+
+Query execution and clipboard shortcuts remain available in every mode.
+Use the existing Cmd/Ctrl-F find bar for search. This binding set covers the
+commands above; dot repeat, text objects, named registers, macros, Ex commands
+and block Visual mode are not implemented.
+
 ## Navigate by keyboard
 
 | Action | macOS | Linux |
 | --- | --- | --- |
+| Next / previous control | Tab / Shift-Tab | Tab / Shift-Tab |
+| Leave an editor that uses Tab for indentation | F6 / Shift-F6 | F6 / Shift-F6 |
+| Open a focused menu or activate a button | Enter or Space | Enter or Space |
 | Focus the table explorer | Cmd-Shift-E | Ctrl-Shift-E |
 | Move through tables | Up / Down, Home / End | Up / Down, Home / End |
 | Open the table under the cursor | Enter | Enter |
@@ -82,6 +113,12 @@ Down in the explorer's search box continues into the list. In the table menu,
 Up / Down / Home / End move over the available items, Enter runs one, and
 Escape closes the menu and returns to the list. Items that the connection
 cannot perform are skipped.
+
+Quick Open and Settings return focus to their opener when dismissed. Closing a
+tab through its focused close control continues to a nearby control. The
+diagram's schema-filter popover keeps Tab and Shift-Tab within its controls;
+Escape returns to the filter button. Focus a pane splitter with Tab and use
+Left/Right to resize it in 10-pixel steps, or Home to restore its default width.
 
 ## Edit safely and resume work
 

@@ -15,7 +15,7 @@ fn row_field_heading(
     div()
         .flex()
         .items_center()
-        .gap(px(8.))
+        .gap(crate::theme::ui_px(8.))
         .child(
             div()
                 .debug_selector(move || label_selector.to_string())
@@ -23,16 +23,16 @@ fn row_field_heading(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(2.))
+                .gap(crate::theme::ui_px(2.))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(crate::theme::ui_px(11.))
                         .text_color(theme().text)
                         .child(name),
                 )
                 .child(
                     div()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(theme().text_muted)
                         .child(metadata),
                 ),
@@ -41,8 +41,8 @@ fn row_field_heading(
             view.child(
                 div()
                     .debug_selector(move || state_selector.to_string())
-                    .w(px(88.))
-                    .h(px(20.))
+                    .w(crate::theme::ui_px(88.))
+                    .h(crate::theme::ui_px(20.))
                     .flex_none()
                     .child(control),
             )
@@ -119,6 +119,13 @@ impl DbxApp {
         else {
             return div().into_any_element();
         };
+        let inspector_page = self.inspector_page();
+        let has_draft = self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.row_draft.is_some());
+        let has_selected_row = self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.selected_row.is_some());
         let has_filter_rows = !filter_rows.is_empty();
         let app = cx.entity().downgrade();
         let columns_app = app.clone();
@@ -131,31 +138,35 @@ impl DbxApp {
             }))
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .flex()
             .flex_col()
+            .when(!inspector_page, |view| view
             .child(
                 div()
                     .key_context("DbxFilters")
                     .on_action(cx.listener(move |this, _: &ApplyFilters, _, cx| {
                         this.refresh_table_for(session_id, tab_id, cx)
                     }))
-                    .px(px(8.))
-                    .py(px(6.))
+                    .px(crate::theme::ui_px(8.))
+                    .py(crate::theme::ui_px(6.))
                     .flex()
                     .flex_col()
-                    .gap(px(7.))
+                    .gap(crate::theme::ui_px(7.))
                     .border_b_1()
                     .border_color(theme().border)
                     .bg(theme().panel)
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
+                            .min_w_0()
                             .items_center()
-                            .justify_between()
+                            .gap(crate::theme::ui_px(6.))
                             .child(
-                                div().flex().items_center().gap(px(7.)).child(
+                                div().flex_none().flex().items_center().gap(crate::theme::ui_px(7.)).child(
                                     div()
-                                        .text_size(px(12.))
+                                        .text_size(crate::theme::ui_px(12.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme().text)
                                         .child(if kind.is_sql() {
@@ -171,9 +182,13 @@ impl DbxApp {
                             )
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
-                                    .gap(px(6.))
+                                    .justify_end()
+                                    .gap(crate::theme::ui_px(6.))
                                     .when(kind.is_sql() && !has_filter_rows, |view| {
                                         view.child(
                                             button("add-filter", "Add filter", ButtonKind::Quiet)
@@ -324,16 +339,24 @@ impl DbxApp {
                                             ),
                                         )
                                     })
+                                    .when(self.narrow_workspace && has_selected_row && !has_draft, |view| {
+                                        view.child(button("show-row-details", "Row details", ButtonKind::Quiet)
+                                            .debug_selector(|| "show-row-details".into())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_inspector_for(session_id, tab_id, window, cx)
+                                            })))
+                                    })
                                     .when(can_mutate, |view| {
                                         view.child(
                                             div()
-                                                .mx(px(2.))
-                                                .h(px(18.))
+                                                .mx(crate::theme::ui_px(2.))
+                                                .h(crate::theme::ui_px(18.))
                                                 .border_l_1()
                                                 .border_color(theme().border),
                                         )
                                         .child(
-                                            button("add-row", "New row", ButtonKind::Quiet)
+                                            button("add-row", if has_draft { "Continue row draft" } else { "New row" }, ButtonKind::Quiet)
+                                                .debug_selector(|| "add-row".into())
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
@@ -351,7 +374,7 @@ impl DbxApp {
                             redis_filter_editor,
                             redis_filter_focus,
                             false,
-                        )))
+                         cx)))
                     })
                     .when(kind.is_sql() && has_filter_rows, |view| {
                         view.child(
@@ -359,11 +382,11 @@ impl DbxApp {
                                 .id("filter-rows-scroll")
                                 .w_full()
                                 .min_w_0()
-                                .max_h(px(132.))
+                                .max_h(crate::theme::ui_px(132.))
                                 .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
-                                .gap(px(6.))
+                                .gap(crate::theme::ui_px(6.))
                                 .children(filter_rows.into_iter().map(
                                     |(
                                         row_id,
@@ -379,34 +402,36 @@ impl DbxApp {
                                             .min_w_0()
                                             .flex()
                                             .items_center()
-                                            .gap(px(7.))
+                                            .gap(crate::theme::ui_px(7.))
                                             .child(
-                                                div().flex_1().min_w_0().max_w(px(240.)).child(
+                                                div().flex_1().min_w_0().max_w(crate::theme::ui_px(240.)).child(
                                                     Select::new(&column_selector)
                                                         .with_size(Size::Small)
-                                                        .h(px(FILTER_CONTROL_HEIGHT))
-                                                        .rounded(px(5.))
+                                                        .h(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                        .rounded(crate::theme::ui_px(5.))
                                                         .w_full()
-                                                        .menu_max_h(px(220.))
+                                                        .menu_max_h(crate::theme::ui_px(220.))
                                                         .placeholder("Column")
-                                                        .text_size(px(11.))
+                                                        .text_size(crate::theme::ui_px(11.))
                                                         .bg(theme().panel_raised)
                                                         .border_color(theme().border_strong)
-                                                        .text_color(theme().text),
+                                                        .text_color(theme().text)
+                                                .accessible_select("Filter column", &column_selector),
                                                 ),
                                             )
                                             .child(
-                                                div().flex_1().min_w_0().max_w(px(220.)).child(
+                                                div().flex_1().min_w_0().max_w(crate::theme::ui_px(220.)).child(
                                                     Select::new(&operator_selector)
                                                         .with_size(Size::Small)
-                                                        .h(px(FILTER_CONTROL_HEIGHT))
-                                                        .rounded(px(5.))
+                                                        .h(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                        .rounded(crate::theme::ui_px(5.))
                                                         .w_full()
-                                                        .menu_max_h(px(220.))
-                                                        .text_size(px(11.))
+                                                        .menu_max_h(crate::theme::ui_px(220.))
+                                                        .text_size(crate::theme::ui_px(11.))
                                                         .bg(theme().panel_raised)
                                                         .border_color(theme().border_strong)
-                                                        .text_color(theme().text),
+                                                        .text_color(theme().text)
+                                                .accessible_select("Filter operator", &operator_selector),
                                                 ),
                                             )
                                             .child(
@@ -420,17 +445,17 @@ impl DbxApp {
                                                                 value_editor,
                                                                 value_focus,
                                                                 false,
-                                                            ))
+                                                             cx))
                                                         },
                                                     )
                                                     .when(
                                                         !operator_requires_value(operator),
                                                         |view| {
-                                                            view.h(px(FILTER_CONTROL_HEIGHT))
-                                                                .px(px(9.))
+                                                            view.h(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                                .px(crate::theme::ui_px(9.))
                                                                 .flex()
                                                                 .items_center()
-                                                                .rounded(px(5.))
+                                                                .rounded(crate::theme::ui_px(5.))
                                                                 .bg(theme().panel_raised)
                                                                 .text_color(theme().text_muted)
                                                                 .child("No value")
@@ -442,12 +467,12 @@ impl DbxApp {
                                                     "remove-filter-{row_id}"
                                                 )))
                                                 .flex_none()
-                                                .size(px(FILTER_CONTROL_HEIGHT))
+                                                .size(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
                                                 .with_size(Size::XSmall)
                                                 .compact()
                                                 .ghost()
-                                                .rounded(px(5.))
-                                                .tooltip("Remove filter")
+                                                .rounded(crate::theme::ui_px(5.))
+                                                .accessible_name("Remove filter").tooltip("Remove filter")
                                                 .child(icon(Icon::Close, theme().text_muted))
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.remove_filter_for(
@@ -463,7 +488,7 @@ impl DbxApp {
                                         .with_size(Size::XSmall)
                                         .compact()
                                         .ghost()
-                                        .text_color(theme().accent)
+                                        .text_color(theme().accent_text)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.add_filter_for(session_id, tab_id, window, cx)
                                         })),
@@ -471,13 +496,14 @@ impl DbxApp {
                         )
                     }),
             )
+            )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.render_grid(session_id, tab_id, cx))
-                    .when(!self.narrow_workspace && inspector_open, |view| {
+                    .when(!inspector_page, |view| view.child(self.render_grid(session_id, tab_id, cx)))
+                    .when(inspector_open && (!self.narrow_workspace || inspector_page), |view| {
                         view.child(self.render_inspector(session_id, tab_id, cx))
                     }),
             )
@@ -533,9 +559,13 @@ impl DbxApp {
         .join(" · ");
         div()
             .id("grid")
+            .debug_selector(|| "data-grid".into())
             .key_context("DbxDataGrid")
             .flex_1()
-            .min_w(px(GRID_MIN_WIDTH))
+            .min_w_0()
+            .when(!self.narrow_workspace, |view| {
+                view.min_w(crate::theme::ui_px(GRID_MIN_WIDTH))
+            })
             .min_h_0()
             .flex()
             .flex_col()
@@ -567,16 +597,16 @@ impl DbxApp {
                     view.child(
                         div()
                             .flex_none()
-                            .h(px(260.))
-                            .p(px(10.))
+                            .h(crate::theme::ui_px(260.))
+                            .p(crate::theme::ui_px(10.))
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
+                            .gap(crate::theme::ui_px(6.))
                             .child(
                                 div().flex().justify_between().child("JSON editor").child(
                                     div()
                                         .flex()
-                                        .gap(px(6.))
+                                        .gap(crate::theme::ui_px(6.))
                                         .child(
                                             button("cancel-json-edit", "Cancel", ButtonKind::Quiet)
                                                 .on_click(cx.listener(
@@ -620,27 +650,30 @@ impl DbxApp {
                 view.child(
                     div()
                         .flex_none()
-                        .px(px(8.))
-                        .py(px(5.))
+                        .px(crate::theme::ui_px(8.))
+                        .py(crate::theme::ui_px(5.))
                         .flex()
                         .items_center()
                         .justify_between()
-                        .gap(px(8.))
+                        .gap(crate::theme::ui_px(8.))
                         .border_b_1()
                         .border_color(theme().border)
                         .bg(theme().panel)
-                        .child(div().text_size(px(11.)).text_color(theme().text).child(
-                            if recovered {
-                                format!("Recovered draft · {summary} · review required")
-                            } else {
-                                summary
-                            },
-                        ))
+                        .child(
+                            div()
+                                .text_size(crate::theme::ui_px(11.))
+                                .text_color(theme().text)
+                                .child(if recovered {
+                                    format!("Recovered draft · {summary} · review required")
+                                } else {
+                                    summary
+                                }),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .items_center()
-                                .gap(px(6.))
+                                .gap(crate::theme::ui_px(6.))
                                 .child(
                                     button("discard-cell-edits", "Discard", ButtonKind::Quiet)
                                         .cursor_pointer()
@@ -678,13 +711,16 @@ impl DbxApp {
                 )
             })
             .child(
-                div().flex_1().min_h_0().child(
-                    DataTable::new(&result_grid)
-                        .with_size(px(30.))
-                        .stripe(false)
-                        .bordered(false)
-                        .scrollbar_visible(true, true),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(crate::app::result_table::accessible_grid(
+                        &result_grid,
+                        "Table data",
+                        self.editable_table_for(session_id, tab_id).is_some()
+                            && !busy
+                            && !recovered,
+                    )),
             )
             .into_any_element()
     }
@@ -769,12 +805,38 @@ impl DbxApp {
             return div().into_any_element();
         };
         let has_draft = !draft_fields.is_empty();
+        let data = self.data_tab(session_id, tab_id).unwrap();
+        let scroll = data.inspector_scroll.clone();
+        let focus = data.inspector_focus.clone();
+        let label = match draft_mode {
+            DraftMode::Insert => "New row",
+            DraftMode::Update if has_draft => "Edit row",
+            DraftMode::Update => "Row details",
+        };
+        let description = table_ref_label(&data.table);
+        let multiline_height = if scroll.bounds().size.height > px(0.) {
+            (scroll.bounds().size.height - crate::theme::ui_px(60.))
+                .clamp(crate::theme::ui_px(48.), crate::theme::ui_px(204.))
+        } else {
+            crate::theme::ui_px(128.)
+        };
+
         div()
+            .id(SharedString::from(format!("row-inspector-{tab_id}")))
+            .debug_selector(|| "row-inspector".into())
+            .role(gpui::Role::Region)
+            .aria_label(label)
+            .aria_description(description)
+            .track_focus(&focus)
             .relative()
-            .w(px(self.inspector_width()))
-            // Give way to the grid when the window narrows after a drag.
-            .flex_shrink_1()
-            .min_w(px(INSPECTOR_MIN_WIDTH))
+            .when(self.narrow_workspace, |view| {
+                view.w_full().min_w_0().flex_1()
+            })
+            .when(!self.narrow_workspace, |view| {
+                view.w(px(self.inspector_width()))
+                    .flex_shrink_1()
+                    .min_w(crate::theme::ui_px(INSPECTOR_MIN_WIDTH))
+            })
             .flex()
             .flex_col()
             .min_h_0()
@@ -783,15 +845,15 @@ impl DbxApp {
             .bg(theme().panel)
             .child(
                 div()
-                    .px(px(14.))
-                    .pt(px(14.))
-                    .pb(px(10.))
+                    .px(crate::theme::ui_px(14.))
+                    .pt(crate::theme::ui_px(14.))
+                    .pb(crate::theme::ui_px(10.))
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(crate::theme::ui_px(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme().text)
                             .child(match draft_mode {
@@ -804,7 +866,7 @@ impl DbxApp {
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(5.))
+                            .gap(crate::theme::ui_px(5.))
                             // The title already says new/edit/details; only
                             // read-only adds information.
                             .when(
@@ -819,10 +881,11 @@ impl DbxApp {
                                     .with_size(Size::XSmall)
                                     .compact()
                                     .ghost()
-                                    .tooltip("Close")
+                                    .accessible_name("Close row inspector")
+                                    .tooltip("Close row inspector")
                                     .child(icon(Icon::Close, theme().text_muted))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.close_inspector_for(session_id, tab_id, cx)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.close_inspector_for(session_id, tab_id, window, cx)
                                     })),
                             ),
                     ),
@@ -830,22 +893,24 @@ impl DbxApp {
             .child(
                 div()
                     .id("row-fields-scroll")
+                    .debug_selector(|| "row-fields-scroll".into())
+                    .track_scroll(&scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px(px(10.))
-                    .pb(px(10.))
+                    .px(crate::theme::ui_px(10.))
+                    .pb(crate::theme::ui_px(10.))
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
+                    .gap(crate::theme::ui_px(2.))
                     .when(
                         !has_draft && static_fields.is_empty() && draft_mode == DraftMode::Update,
                         |view| {
                             view.child(
                                 div()
-                                    .px(px(5.))
-                                    .py(px(12.))
-                                    .text_size(px(12.))
+                                    .px(crate::theme::ui_px(5.))
+                                    .py(crate::theme::ui_px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .text_color(theme().text_muted)
                                     .child("No row selected"),
                             )
@@ -874,46 +939,86 @@ impl DbxApp {
                                 .map(|selector| {
                                     div()
                                         .w_full()
-                                        .h(px(32.))
+                                        .h(crate::theme::ui_px(32.))
                                         .flex_none()
-                                        .child(
+                                        .child(crate::accessibility::focus_reveal(
+                                            SharedString::from(format!("row-value-{field_id}")),
+                                            &scroll,
                                             Select::new(&selector)
                                                 .with_size(Size::Medium)
                                                 .w_full()
-                                                .menu_max_h(px(220.))
-                                                .text_size(px(11.))
+                                                .menu_max_h(crate::theme::ui_px(220.))
+                                                .text_size(crate::theme::ui_px(11.))
                                                 .bg(theme().canvas)
                                                 .border_color(theme().border_strong)
-                                                .text_color(theme().text),
-                                        )
+                                                .text_color(theme().text)
+                                                .accessible_select(
+                                                    format!("{name} value"),
+                                                    &selector,
+                                                ),
+                                        ))
                                         .into_any_element()
                                 })
                                 .unwrap_or_else(|| {
-                                    editor::input(field_editor, field_focus, is_json)
-                                        .into_any_element()
-                                });
-                            let sql_control =
-                                editor::input(sql_editor, sql_focus, false).into_any_element();
-                            let state_control = state_selector.map(|selector| {
-                                Select::new(&selector)
-                                    .with_size(Size::XSmall)
-                                    .w_full()
-                                    .menu_max_h(px(132.))
-                                    .text_size(px(10.))
-                                    .bg(theme().panel_raised)
-                                    .border_color(theme().border)
-                                    .text_color(theme().text)
+                                    crate::accessibility::focus_reveal(
+                                        SharedString::from(format!("row-value-{field_id}")),
+                                        &scroll,
+                                        editor::input_with_height(
+                                            field_editor,
+                                            field_focus,
+                                            is_json,
+                                            if is_json {
+                                                multiline_height
+                                            } else {
+                                                crate::theme::ui_px(32.)
+                                            },
+                                            cx,
+                                        )
+                                        .debug_selector(move || format!("row-value-{field_id}")),
+                                    )
                                     .into_any_element()
+                                });
+                            let sql_control = crate::accessibility::focus_reveal(
+                                SharedString::from(format!("row-sql-{field_id}")),
+                                &scroll,
+                                editor::input(sql_editor, sql_focus, false, cx),
+                            )
+                            .into_any_element();
+                            let state_control = state_selector.map(|selector| {
+                                crate::accessibility::focus_reveal(
+                                    SharedString::from(format!("row-state-{field_id}")),
+                                    &scroll,
+                                    Select::new(&selector)
+                                        .with_size(Size::XSmall)
+                                        .w_full()
+                                        .menu_max_h(crate::theme::ui_px(132.))
+                                        .text_size(crate::theme::ui_px(10.))
+                                        .bg(theme().panel_raised)
+                                        .border_color(theme().border)
+                                        .text_color(theme().text)
+                                        .accessible_select(
+                                            format!("{name} value state"),
+                                            &selector,
+                                        ),
+                                )
+                                .into_any_element()
                             });
                             div()
                                 .id(SharedString::from(format!("row-field-{field_id}")))
-                                .px(px(9.))
-                                .py(px(8.))
+                                .role(gpui::Role::Group)
+                                .aria_label(name.clone())
+                                .aria_description(format!(
+                                    "{data_type}. {}{}",
+                                    if nullable { "Nullable" } else { "Required" },
+                                    if primary_key { ". Primary key" } else { "" }
+                                ))
+                                .px(crate::theme::ui_px(9.))
+                                .py(crate::theme::ui_px(8.))
                                 .border_b_1()
                                 .border_color(theme().border)
                                 .flex()
                                 .flex_col()
-                                .gap(px(6.))
+                                .gap(crate::theme::ui_px(6.))
                                 .child(row_field_heading(
                                     field_id,
                                     name,
@@ -949,13 +1054,13 @@ impl DbxApp {
                                     |view| {
                                         view.child(
                                             div()
-                                                .h(px(32.))
-                                                .px(px(9.))
+                                                .h(crate::theme::ui_px(32.))
+                                                .px(crate::theme::ui_px(9.))
                                                 .flex()
                                                 .items_center()
-                                                .rounded(px(6.))
+                                                .rounded(crate::theme::ui_px(6.))
                                                 .bg(theme().panel_raised)
-                                                .text_size(px(11.))
+                                                .text_size(crate::theme::ui_px(11.))
                                                 .text_color(theme().text_muted)
                                                 .child(if state == FieldValueState::Null {
                                                     "NULL"
@@ -973,28 +1078,46 @@ impl DbxApp {
                                 let copy_text = value
                                     .as_ref()
                                     .map(crate::app::value_view::value_clipboard_text);
+                                let accessible_value = match value.as_ref() {
+                                    None => "No value".to_owned(),
+                                    Some(CellValue::Text(text)) if text.is_empty() => {
+                                        "Empty text".to_owned()
+                                    }
+                                    Some(value) => {
+                                        crate::app::value_view::value_clipboard_text(value)
+                                    }
+                                };
+                                let copy_name = format!("Copy {name} value");
                                 div()
-                                    .px(px(9.))
-                                    .py(px(9.))
+                                    .id(SharedString::from(format!("row-detail-{tab_id}-{index}")))
+                                    .role(gpui::Role::Group)
+                                    .aria_label(name.clone())
+                                    .aria_description(format!("{data_type}. {accessible_value}"))
+                                    .px(crate::theme::ui_px(9.))
+                                    .py(crate::theme::ui_px(9.))
                                     .border_b_1()
                                     .border_color(theme().border)
                                     .flex()
                                     .flex_col()
-                                    .gap(px(4.))
+                                    .gap(crate::theme::ui_px(4.))
                                     .child(
                                         div()
                                             .flex()
                                             .items_center()
                                             .justify_between()
-                                            .child(div().text_size(px(11.)).child(name))
+                                            .child(
+                                                div()
+                                                    .text_size(crate::theme::ui_px(11.))
+                                                    .child(name),
+                                            )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
-                                                    .gap(px(4.))
+                                                    .gap(crate::theme::ui_px(4.))
                                                     .child(
                                                         div()
-                                                            .text_size(px(9.))
+                                                            .text_size(crate::theme::ui_px(9.))
                                                             .text_color(theme().text_muted)
                                                             .child(display_type(&data_type)),
                                                     )
@@ -1004,6 +1127,7 @@ impl DbxApp {
                                                                 format!("inspector-copy-{index}"),
                                                             ))
                                                             .label("Copy")
+                                                            .accessible_name(copy_name.clone())
                                                             .with_size(Size::XSmall)
                                                             .compact()
                                                             .ghost()
@@ -1026,7 +1150,7 @@ impl DbxApp {
             .child(
                 div()
                     .flex_none()
-                    .p(px(12.))
+                    .p(crate::theme::ui_px(12.))
                     .border_t_1()
                     .border_color(theme().border)
                     .flex()
@@ -1035,7 +1159,7 @@ impl DbxApp {
                     .when(!(has_draft || (has_selected_row && can_edit)), |view| {
                         view.hidden()
                     })
-                    .gap(px(9.))
+                    .gap(crate::theme::ui_px(9.))
                     .when(has_draft, |view| {
                         view.child(
                             div()
@@ -1045,8 +1169,10 @@ impl DbxApp {
                                 .child(
                                     button("cancel-row-draft", "Cancel", ButtonKind::Quiet)
                                         .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.cancel_row_draft_for(session_id, tab_id, cx)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.cancel_row_draft_for(
+                                                session_id, tab_id, window, cx,
+                                            )
                                         })),
                                 )
                                 .child(
@@ -1086,7 +1212,7 @@ impl DbxApp {
                                         .with_size(Size::XSmall)
                                         .compact()
                                         .ghost()
-                                        .text_color(theme().danger)
+                                        .text_color(theme().danger_text)
                                         .cursor_pointer()
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.request_delete_selected_for(
@@ -1108,7 +1234,9 @@ impl DbxApp {
                         )
                     }),
             )
-            .child(self.pane_resize_handle(PaneResize::Inspector, cx))
+            .when(!self.narrow_workspace, |view| {
+                view.child(self.pane_resize_handle(PaneResize::Inspector, cx))
+            })
             .on_drag_move(
                 cx.listener(|this, event, _, cx| {
                     this.resize_pane(PaneResize::Inspector, event, cx)
@@ -1180,7 +1308,7 @@ impl DbxApp {
             .id("structure-scroll")
             .flex_1()
             .overflow_y_scroll()
-            .p(px(12.))
+            .p(crate::theme::ui_px(12.))
             .flex()
             .flex_col()
             .child(panel_header(
@@ -1203,26 +1331,26 @@ impl DbxApp {
             .when(error.is_some(), |view| {
                 view.child(
                     div()
-                        .mt(px(8.))
-                        .text_color(theme().danger)
+                        .mt(crate::theme::ui_px(8.))
+                        .text_color(theme().danger_text)
                         .child(error.clone().unwrap_or_default()),
                 )
             })
             .child(
                 div()
-                    .mt(px(12.))
-                    .rounded(px(RADIUS_PANEL))
+                    .mt(crate::theme::ui_px(12.))
+                    .rounded(crate::theme::ui_px(RADIUS_PANEL))
                     .border_1()
                     .border_color(theme().border)
                     .overflow_hidden()
                     .child(
                         structure_row()
-                            .h(px(30.))
+                            .h(crate::theme::ui_px(30.))
                             .follow_top_corners(RADIUS_PANEL)
                             .bg(theme().panel_raised)
                             .border_b_1()
                             .border_color(theme().border_strong)
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme().text_muted)
                             .child(structure_cell(STRUCTURE_ORDINAL_WIDTH).child("#"))
@@ -1255,8 +1383,8 @@ impl DbxApp {
                         let foreign = reference.is_some();
                         structure_row()
                             .id(SharedString::from(format!("structure-column-{index}")))
-                            .h(px(32.))
-                            .text_size(px(12.))
+                            .h(crate::theme::ui_px(32.))
+                            .text_size(crate::theme::ui_px(12.))
                             .when(index > 0, |row| {
                                 row.border_t_1().border_color(theme().border)
                             })
@@ -1267,16 +1395,16 @@ impl DbxApp {
                             .hover(|style| style.bg(theme().glass_hover))
                             .child(
                                 structure_cell(STRUCTURE_ORDINAL_WIDTH)
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .text_color(theme().text_muted)
                                     .child(format!("{}", index + 1)),
                             )
                             .child(
                                 structure_cell(STRUCTURE_KEY_WIDTH)
                                     .flex()
-                                    .gap(px(3.))
+                                    .gap(crate::theme::ui_px(3.))
                                     .when(column.primary_key, |cell| {
-                                        cell.child(key_badge("PK", theme().warning))
+                                        cell.child(key_badge("PK", theme().warning_text))
                                     })
                                     .when(foreign, |cell| {
                                         cell.child(key_badge("FK", theme().focus_ring))
@@ -1316,7 +1444,7 @@ impl DbxApp {
                                     .min_w_0()
                                     .truncate()
                                     .font_family("monospace")
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .text_color(theme().text_muted)
                                     .when_some(column.default_value.clone(), |cell, default| {
                                         cell.child(default)
@@ -1334,19 +1462,23 @@ impl DbxApp {
                             )
                     })),
             )
-            .child(div().mt(px(18.)).child(panel_header("Foreign keys", "")))
+            .child(
+                div()
+                    .mt(crate::theme::ui_px(18.))
+                    .child(panel_header("Foreign keys", "")),
+            )
             .when(
                 foreign_keys.is_empty() && !busy && error.is_none(),
                 |view| {
                     view.child(
                         div()
-                            .mt(px(8.))
-                            .px(px(10.))
-                            .py(px(12.))
+                            .mt(crate::theme::ui_px(8.))
+                            .px(crate::theme::ui_px(10.))
+                            .py(crate::theme::ui_px(12.))
                             .border_1()
                             .border_color(theme().border)
-                            .rounded(px(6.))
-                            .text_size(px(11.))
+                            .rounded(crate::theme::ui_px(6.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(theme().text_muted)
                             .child("No foreign keys"),
                     )
@@ -1367,13 +1499,13 @@ impl DbxApp {
                 let can_navigate = foreign_key_target_table(&tables, foreign_key).is_some();
                 let foreign_key = foreign_key.clone();
                 div()
-                    .min_h(px(44.))
-                    .px(px(10.))
-                    .py(px(7.))
+                    .min_h(crate::theme::ui_px(44.))
+                    .px(crate::theme::ui_px(10.))
+                    .py(crate::theme::ui_px(7.))
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap(px(12.))
+                    .gap(crate::theme::ui_px(12.))
                     .border_b_1()
                     .border_color(theme().border)
                     .child(
@@ -1381,11 +1513,11 @@ impl DbxApp {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .gap(px(3.))
+                            .gap(crate::theme::ui_px(3.))
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .font_weight(FontWeight::MEDIUM)
                                     .child(
                                         foreign_key
@@ -1396,7 +1528,7 @@ impl DbxApp {
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .text_color(theme().text_muted)
                                     .child(source),
                             ),
@@ -1410,9 +1542,10 @@ impl DbxApp {
                             .flex()
                             .flex_col()
                             .items_end()
-                            .gap(px(3.))
+                            .gap(crate::theme::ui_px(3.))
                             .when(can_navigate, |view| {
-                                view.cursor_pointer()
+                                view.pressable("Open referenced row")
+                                    .cursor_pointer()
                                     .hover(|style| style.text_color(theme().text))
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.navigate_to_foreign_key_for(
@@ -1427,13 +1560,13 @@ impl DbxApp {
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(5.))
+                                    .gap(crate::theme::ui_px(5.))
                                     .child(
                                         div()
                                             .truncate()
-                                            .text_size(px(11.))
+                                            .text_size(crate::theme::ui_px(11.))
                                             .text_color(if can_navigate {
-                                                theme().accent
+                                                theme().accent_text
                                             } else {
                                                 theme().text_muted
                                             })
@@ -1446,7 +1579,7 @@ impl DbxApp {
                             .when(!actions.is_empty(), |view| {
                                 view.child(
                                     div()
-                                        .text_size(px(9.))
+                                        .text_size(crate::theme::ui_px(9.))
                                         .text_color(theme().text_muted)
                                         .child(actions),
                                 )
@@ -1454,31 +1587,35 @@ impl DbxApp {
                     )
             }))
             .when(!indexes.is_empty(), |view| {
-                view.child(div().mt(px(18.)).child(panel_header("Indexes", "")))
-                    .children(indexes.into_iter().map(|index| {
-                        let mut traits = Vec::new();
-                        if index.primary {
-                            traits.push("PRIMARY".to_owned());
-                        } else if index.unique {
-                            traits.push("UNIQUE".to_owned());
-                        }
-                        if let Some(method) = index.method {
-                            traits.push(method.to_ascii_uppercase());
-                        }
-                        structure_detail_row(
-                            index.name,
-                            index.columns.join(", "),
-                            traits.join(" · "),
-                            index
-                                .predicate
-                                .map(|predicate| format!("WHERE {predicate}")),
-                        )
-                    }))
+                view.child(
+                    div()
+                        .mt(crate::theme::ui_px(18.))
+                        .child(panel_header("Indexes", "")),
+                )
+                .children(indexes.into_iter().map(|index| {
+                    let mut traits = Vec::new();
+                    if index.primary {
+                        traits.push("PRIMARY".to_owned());
+                    } else if index.unique {
+                        traits.push("UNIQUE".to_owned());
+                    }
+                    if let Some(method) = index.method {
+                        traits.push(method.to_ascii_uppercase());
+                    }
+                    structure_detail_row(
+                        index.name,
+                        index.columns.join(", "),
+                        traits.join(" · "),
+                        index
+                            .predicate
+                            .map(|predicate| format!("WHERE {predicate}")),
+                    )
+                }))
             })
             .when(!checks.is_empty(), |view| {
                 view.child(
                     div()
-                        .mt(px(18.))
+                        .mt(crate::theme::ui_px(18.))
                         .child(panel_header("Check constraints", "")),
                 )
                 .children(checks.into_iter().map(|check| {
@@ -1491,21 +1628,25 @@ impl DbxApp {
                 }))
             })
             .when_some(definition, |view, definition| {
-                view.child(div().mt(px(18.)).child(panel_header("Definition", "")))
-                    .child(
-                        div()
-                            .mt(px(8.))
-                            .p(px(10.))
-                            .rounded(px(6.))
-                            .border_1()
-                            .border_color(theme().border)
-                            .bg(theme().panel_raised)
-                            .font_family("monospace")
-                            .text_size(px(11.))
-                            .text_color(theme().text)
-                            .whitespace_normal()
-                            .child(definition),
-                    )
+                view.child(
+                    div()
+                        .mt(crate::theme::ui_px(18.))
+                        .child(panel_header("Definition", "")),
+                )
+                .child(
+                    div()
+                        .mt(crate::theme::ui_px(8.))
+                        .p(crate::theme::ui_px(10.))
+                        .rounded(crate::theme::ui_px(6.))
+                        .border_1()
+                        .border_color(theme().border)
+                        .bg(theme().panel_raised)
+                        .font_family("monospace")
+                        .text_size(crate::theme::ui_px(11.))
+                        .text_color(theme().text)
+                        .whitespace_normal()
+                        .child(definition),
+                )
             })
     }
 }
@@ -1519,12 +1660,12 @@ fn structure_detail_row(
     predicate: Option<String>,
 ) -> Div {
     div()
-        .min_h(px(44.))
-        .px(px(10.))
-        .py(px(7.))
+        .min_h(crate::theme::ui_px(44.))
+        .px(crate::theme::ui_px(10.))
+        .py(crate::theme::ui_px(7.))
         .flex()
         .flex_col()
-        .gap(px(3.))
+        .gap(crate::theme::ui_px(3.))
         .border_b_1()
         .border_color(theme().border)
         .child(
@@ -1532,19 +1673,19 @@ fn structure_detail_row(
                 .flex()
                 .items_center()
                 .justify_between()
-                .gap(px(12.))
+                .gap(crate::theme::ui_px(12.))
                 .child(
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.))
+                        .text_size(crate::theme::ui_px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(name),
                 )
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(theme().text_muted)
                         .child(traits),
                 ),
@@ -1552,7 +1693,7 @@ fn structure_detail_row(
         .child(
             div()
                 .font_family("monospace")
-                .text_size(px(10.))
+                .text_size(crate::theme::ui_px(10.))
                 .text_color(theme().text_muted)
                 .child(body),
         )
@@ -1560,7 +1701,7 @@ fn structure_detail_row(
             row.child(
                 div()
                     .font_family("monospace")
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(theme().text_muted)
                     .child(predicate),
             )
@@ -1575,7 +1716,11 @@ const STRUCTURE_KEY_WIDTH: f32 = 56.0;
 const STRUCTURE_NULL_WIDTH: f32 = 84.0;
 
 fn structure_row() -> Div {
-    div().px(px(12.)).flex().items_center().gap(px(12.))
+    div()
+        .px(crate::theme::ui_px(12.))
+        .flex()
+        .items_center()
+        .gap(crate::theme::ui_px(12.))
 }
 
 fn structure_cell(width: f32) -> Div {
@@ -1585,11 +1730,11 @@ fn structure_cell(width: f32) -> Div {
 /// A compact PK/FK marker shared by the structure grid and diagram cards.
 fn key_badge(label: &'static str, color: Rgba) -> Div {
     div()
-        .px(px(5.))
-        .py(px(1.))
-        .rounded(px(4.))
+        .px(crate::theme::ui_px(5.))
+        .py(crate::theme::ui_px(1.))
+        .rounded(crate::theme::ui_px(4.))
         .bg(color.alpha(0.14))
-        .text_size(px(9.))
+        .text_size(crate::theme::ui_px(9.))
         .font_weight(FontWeight::BOLD)
         .text_color(color)
         .child(label)
@@ -1622,6 +1767,259 @@ mod tests {
                 ),
             ))
         }
+    }
+
+    #[gpui::test]
+    fn compact_row_inspector_reveals_fields_preserves_drafts_and_returns_to_grid(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.settings_store = None;
+            app.ui_scale = 200;
+            app.editor_scale = 100;
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Inspector test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            session.tables = vec![TableInfo::table("projects", None)];
+            let table = TableRef::new("projects");
+            let mut data = DataTab::new(session_id, tab_id, table.clone(), false, window, cx);
+            data.table_columns = (0..20)
+                .map(|index| ColumnInfo::result(format!("field_{index}"), index, "TEXT"))
+                .collect();
+            data.set_result(
+                Some(QueryResult {
+                    columns: data.table_columns.clone(),
+                    rows: vec![dbx_core::RowData::new(vec![CellValue::Null; 20])],
+                    ..QueryResult::empty(None, 0)
+                }),
+                &session.tables,
+                cx,
+            );
+            data.result_table = Some(table);
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Data(Box::new(data)),
+            });
+            session.active_secondary_tab = Some(tab_id);
+            session.recent_data_tab = Some(tab_id);
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app.connection_picker_open = false;
+            app
+        });
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| app.update(cx, |app, cx| app.select_row_for(session_id, tab_id, 0, cx)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("data-grid").is_some(),
+            "ordinary selection keeps the grid"
+        );
+        assert!(cx.debug_bounds("row-inspector").is_none());
+        for control in ["add-row", "show-row-details"] {
+            let bounds = cx
+                .debug_bounds(control)
+                .expect("compact table action drawn");
+            assert!(
+                bounds.left() >= px(0.) && bounds.right() <= px(800.),
+                "{control} must fit the scaled compact window: {bounds:?}"
+            );
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_inspector_for(session_id, tab_id, window, cx)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("row-inspector").is_some(),
+            "explicit details opens the compact inspector"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.close_inspector_for(session_id, tab_id, window, cx)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let add = cx.debug_bounds("add-row").unwrap();
+        cx.simulate_click(add.center(), gpui::Modifiers::none());
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        let inspector = cx
+            .debug_bounds("row-inspector")
+            .expect("new-row controls must remain available at 200%");
+        assert!(inspector.left() >= px(0.) && inspector.right() <= px(800.));
+        assert!(inspector.top() >= px(0.) && inspector.bottom() <= px(600.));
+        assert!(cx.debug_bounds("data-grid").is_none());
+        let (field_id, editor) = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let field = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .row_draft
+                    .as_ref()
+                    .unwrap()
+                    .fields()
+                    .last()
+                    .unwrap();
+                let id = field.id;
+                let editor = field.editor.clone();
+                app.set_row_field_state_for(
+                    session_id,
+                    tab_id,
+                    id,
+                    FieldValueState::Value,
+                    window,
+                    cx,
+                );
+                editor.update(cx, |editor, cx| editor.set_text("Retained draft", cx));
+                (id, editor)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let selector: &'static str = Box::leak(format!("row-value-{field_id}").into_boxed_str());
+        let before = cx.debug_bounds(selector).unwrap();
+        let viewport = cx.debug_bounds("row-fields-scroll").unwrap();
+        assert!(
+            before.top() > viewport.bottom(),
+            "fixture needs an offscreen field"
+        );
+        cx.update(|window, cx| editor.read(cx).focus_handle().focus(window, cx));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        let after = cx.debug_bounds(selector).unwrap();
+        assert!(
+            after.top() >= viewport.top() && after.bottom() <= viewport.bottom(),
+            "focused field must be revealed: {after:?}, viewport {viewport:?}"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.close_inspector_for(session_id, tab_id, window, cx)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("data-grid").is_some());
+        cx.update(|window, cx| {
+            let data = app.read(cx).data_tab(session_id, tab_id).unwrap();
+            assert!(data.data_grid.focus_handle(cx).is_focused(window));
+            assert!(data.row_draft.is_some());
+            assert_eq!(editor.read(cx).text(cx), "Retained draft");
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.begin_insert_for(session_id, tab_id, window, cx)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("row-inspector").is_some());
+        cx.update(|_, cx| assert_eq!(editor.read(cx).text(cx), "Retained draft"));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.save_draft_for(session_id, tab_id, window, cx)
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.debug_bounds("data-grid").is_some(),
+            "staging returns to the changeset"
+        );
+        cx.update(|window, cx| {
+            let data = app.read(cx).data_tab(session_id, tab_id).unwrap();
+            assert!(data.row_draft.is_none());
+            assert_eq!(data.pending_inserts.len(), 1);
+            assert!(data.data_grid.focus_handle(cx).is_focused(window));
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.begin_insert_for(session_id, tab_id, window, cx)
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.cancel_row_draft_for(session_id, tab_id, window, cx)
+            })
+        });
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        assert!(cx.debug_bounds("data-grid").is_some());
+        cx.update(|window, cx| {
+            let data = app.read(cx).data_tab(session_id, tab_id).unwrap();
+            assert!(data.row_draft.is_none());
+            assert_eq!(
+                data.pending_inserts.len(),
+                1,
+                "cancel preserves previously staged changes"
+            );
+            assert!(data.data_grid.focus_handle(cx).is_focused(window));
+        });
+        // A reader already in wide-pane details must retain them when scaling
+        // makes the workspace compact, including the first layout frame.
+        cx.simulate_resize(gpui::size(px(1600.), px(900.)));
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.ui_scale = 100;
+                app.select_row_for(session_id, tab_id, 0, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            let data = app.read(cx).data_tab(session_id, tab_id).unwrap();
+            assert!(!data.inspector_expanded);
+            let focus = data.inspector_focus.clone();
+            focus.focus(window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.set_text_scale(200, false, window, cx))
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("row-inspector").is_some());
+        assert!(cx.debug_bounds("data-grid").is_none());
+        cx.update(|window, cx| {
+            let app = app.read(cx);
+            assert!(app.inspector_page());
+            assert!(
+                !app.sidebar_hidden,
+                "temporary inspector layout preserves the explorer preference"
+            );
+            assert!(
+                app.data_tab(session_id, tab_id)
+                    .unwrap()
+                    .inspector_focus
+                    .is_focused(window)
+            );
+        });
+        crate::theme::set_text_scales(100, 100);
     }
 
     #[gpui::test]

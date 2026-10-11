@@ -10,15 +10,15 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let sidebar_visible = !self.sidebar_hidden;
-        let workspace = div()
+        let sidebar_visible = !self.sidebar_hidden && !self.inspector_page();
+        div()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .flex()
-            .pr(px(GLASS_INSET))
-            .pb(px(GLASS_INSET))
-            .gap(px(GLASS_INSET))
+            .pr(crate::theme::ui_px(GLASS_INSET))
+            .pb(crate::theme::ui_px(GLASS_INSET))
+            .gap(crate::theme::ui_px(GLASS_INSET))
             .when(sidebar_visible, |view| {
                 view.child(
                     div()
@@ -42,25 +42,14 @@ impl DbxApp {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .rounded(px(RADIUS_PANEL))
+                    .rounded(crate::theme::ui_px(RADIUS_PANEL))
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().canvas)
                     .shadow(glass_shadow(10.))
                     .child(self.render_main(window, cx))
                     .child(self.render_status(cx)),
-            );
-        // Overlays live outside the gapped row so they never take up layout.
-        div()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .child(workspace)
-            .child(self.render_table_context_menu(window, cx))
-            .child(self.render_database_export_dialog(window, cx))
-            .child(self.render_mutation_error_dialog(cx))
+            )
     }
 
     pub(super) fn render_app_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -69,20 +58,23 @@ impl DbxApp {
             session.busy || session.active_data_tab().is_some_and(|data| data.busy)
         });
         div()
-            .w(px(48.))
+            .id("workspace-navigation")
+            .role(gpui::Role::Navigation)
+            .aria_label("Workspace views")
+            .w(crate::theme::ui_px(48.))
             .flex_none()
             .flex()
             .flex_col()
             .items_center()
-            .pb(px(GLASS_INSET))
+            .pb(crate::theme::ui_px(GLASS_INSET))
             .child(
                 div()
                     .flex_1()
-                    .pt(px(2.))
+                    .pt(crate::theme::ui_px(2.))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(6.))
+                    .gap(crate::theme::ui_px(6.))
                     .child(self.rail_button(
                         "rail-data",
                         Icon::Table,
@@ -117,7 +109,7 @@ impl DbxApp {
                 rail.child(
                     div()
                         .id("rail-connection-health")
-                        .size(px(8.))
+                        .size(crate::theme::ui_px(8.))
                         .rounded_full()
                         .bg(theme().warning)
                         .tooltip(tip("Working…")),
@@ -232,34 +224,47 @@ impl DbxApp {
                     .h_full()
                     .flex_none()
                     .pl(px(if cfg!(target_os = "macos") { 80. } else { 14. }))
-                    .pr(px(6.))
+                    .pr(crate::theme::ui_px(6.))
                     .flex()
                     .items_center()
-                    .gap(px(8.)),
+                    .gap(crate::theme::ui_px(8.)),
                 cx,
             )
             .when(!has_sessions, |view| {
-                view.child(img(self.logo.clone()).id("topbar-logo").size(px(18.)))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("DBX"),
-                    )
+                view.child(
+                    img(self.logo.clone())
+                        .id("topbar-logo")
+                        .size(crate::theme::ui_px(18.)),
+                )
+                .child(
+                    div()
+                        .text_size(crate::theme::ui_px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("DBX"),
+                )
             })
             .when(show_sidebar_toggle, |view| {
                 view.child(
                     glass_icon_button("toggle-sidebar", Icon::Sidebar, false)
-                        .tooltip(tip(if self.sidebar_hidden {
+                        .aria_label(if self.inspector_page() {
+                            "Back to table"
+                        } else {
+                            "Toggle explorer"
+                        })
+                        .tooltip(tip(if self.inspector_page() {
+                            "Back to table"
+                        } else if self.sidebar_hidden {
                             "Show explorer"
                         } else {
                             "Hide explorer"
                         }))
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_sidebar_action(&ToggleSidebar, window, cx)
+                        })),
                 )
             });
         div()
-            .h(px(46.))
+            .h(crate::theme::ui_px(46.))
             .flex_none()
             .flex()
             .items_center()
@@ -278,10 +283,10 @@ impl DbxApp {
             .child(
                 div()
                     .flex_none()
-                    .pr(px(10.))
+                    .pr(crate::theme::ui_px(10.))
                     .flex()
                     .items_center()
-                    .gap(px(4.))
+                    .gap(crate::theme::ui_px(4.))
                     .when(self.vault_state == Some(VaultState::Unlocked), |view| {
                         view.child(
                             glass_icon_button("lock-vault", Icon::Lock, false)
@@ -297,11 +302,11 @@ impl DbxApp {
                     .child(
                         glass_icon_button("open-settings", Icon::Settings, self.settings_open)
                             .tooltip(tip("Settings"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 if this.settings_open {
-                                    this.close_settings(cx);
+                                    this.close_settings(window, cx);
                                 } else {
-                                    this.open_settings(cx);
+                                    this.open_settings(window, cx);
                                 }
                             })),
                     )
@@ -319,8 +324,8 @@ impl DbxApp {
         div()
             .flex()
             .items_center()
-            .gap(px(6.))
-            .ml(px(4.))
+            .gap(crate::theme::ui_px(6.))
+            .ml(crate::theme::ui_px(4.))
             .when(controls.minimize, |view| {
                 view.child(
                     window_control_button("window-minimize", Icon::Minimize, false)
@@ -388,25 +393,35 @@ impl DbxApp {
         let has_sessions = !sessions.is_empty();
         div()
             .id("connection-tabs-scroll")
+            .role(gpui::Role::TabList)
+            .aria_label("Connections")
             .flex_shrink(1.)
             .min_w_0()
             .h_full()
             .flex()
             .items_center()
-            .gap(px(4.))
+            .gap(crate::theme::ui_px(4.))
             .overflow_x_scroll()
             .children(
                 sessions
                     .into_iter()
                     .map(|(session_id, label, busy, kind, _saved, tag)| {
                         let selected = active_session_id == Some(session_id);
-                        connection_tab(kind, label, selected)
+                        connection_tab(kind, label.clone(), selected)
                             .debug_selector(|| "connection-tab".into())
                             .id(SharedString::from(format!("connection-tab-{session_id}")))
+                            .pressable(label.clone())
+                            .role(gpui::Role::Tab)
+                            .aria_selected(selected)
                             .flex_none()
                             .cursor_pointer()
                             .when(busy, |tab| {
-                                tab.child(div().size(px(6.)).rounded_full().bg(theme().warning))
+                                tab.child(
+                                    div()
+                                        .size(crate::theme::ui_px(6.))
+                                        .rounded_full()
+                                        .bg(theme().warning),
+                                )
                             })
                             .children(tag_badge(tag.as_ref()))
                             .child(
@@ -414,7 +429,11 @@ impl DbxApp {
                                     .id(SharedString::from(format!(
                                         "close-connection-tab-{session_id}"
                                     )))
-                                    .size(px(18.))
+                                    .debug_selector(move || {
+                                        format!("close-connection-tab-{session_id}")
+                                    })
+                                    .pressable(format!("Close connection {label}"))
+                                    .size(crate::theme::ui_px(24.))
                                     .rounded_full()
                                     .flex()
                                     .items_center()
@@ -422,11 +441,23 @@ impl DbxApp {
                                     .cursor_pointer()
                                     .hover(|style| style.bg(theme().glass_hover))
                                     .tooltip(tip("Close connection"))
-                                    .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.close_session(session_id, cx)
-                                    })),
+                                    .child(
+                                        icon(Icon::Close, theme().text_muted)
+                                            .size(crate::theme::ui_px(12.)),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, event: &gpui::ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.close_session(session_id, cx);
+                                            if event.is_keyboard()
+                                                && this.session(session_id).is_none()
+                                            {
+                                                // Walk the still-painted tab order before the removed
+                                                // close control disappears and focus falls to the root.
+                                                window.focus_next(cx);
+                                            }
+                                        },
+                                    )),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.activate_session(session_id, cx)
@@ -437,6 +468,7 @@ impl DbxApp {
             .when(has_sessions && !self.connection_picker_open, |view| {
                 view.child(
                     glass_icon_button("add-connection-tab", Icon::Add, false)
+                        .aria_label("New connection")
                         .tooltip(tip("New connection"))
                         .on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx))),
                 )
@@ -536,7 +568,7 @@ impl DbxApp {
                 }
             }
         });
-        glass(div(), RADIUS_GLASS, 8.)
+        glass(div(), RADIUS_GLASS, 8.).id(SharedString::from(format!("database-explorer-{session_id}"))).role(gpui::Role::Region).aria_label("Database explorer")
             .w(px(self.explorer_width()))
             .flex_none()
             .flex()
@@ -544,28 +576,34 @@ impl DbxApp {
             .overflow_hidden()
             .child(
                 div()
-                    .px(px(10.))
-                    .pt(px(8.))
-                    .pb(px(8.))
+                    .px(crate::theme::ui_px(10.))
+                    .pt(crate::theme::ui_px(8.))
+                    .pb(crate::theme::ui_px(8.))
                     .flex()
                     .flex_col()
-                    .gap(px(7.))
+                    .gap(crate::theme::ui_px(7.))
                     .border_b_1()
                     .border_color(theme().hairline)
                     .child(
                         div()
+                            .id("explorer-header")
+                            .debug_selector(|| "explorer-header".into())
+                            .min_w_0()
                             .flex()
+                            .flex_wrap()
+                            .gap(crate::theme::ui_px(6.))
                             .items_center()
                             .justify_between()
                             .child(
                                 div()
+                                    .flex_none().min_w_0().max_w_full()
                                     .flex()
                                     .items_center()
-                                    .gap(px(7.))
+                                    .gap(crate::theme::ui_px(7.))
                                     .child(icon(Icon::Database, theme().text_muted))
                                     .child(
-                                        div()
-                                            .text_size(px(12.))
+                                        div().id("explorer-title").debug_selector(|| "explorer-title".into()).min_w_0().truncate()
+                                            .text_size(crate::theme::ui_px(12.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme().text)
                                             .child(if kind == DatabaseKind::Redis {
@@ -583,14 +621,17 @@ impl DbxApp {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
+                                    .max_w_full()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .child(
                                         Button::new("refresh-tables")
                                             .with_size(Size::XSmall)
                                             .compact()
                                             .ghost()
-                                            .tooltip("Refresh explorer")
+                                            .accessible_name("Refresh explorer").tooltip("Refresh explorer")
                                             .child(icon(Icon::Refresh, theme().text_muted))
                                             .on_click(cx.listener(move |this, _, _window, cx| {
                                                 this.refresh_tables_for(session_id, cx)
@@ -606,7 +647,7 @@ impl DbxApp {
                                                 .with_size(Size::XSmall)
                                                 .compact()
                                                 .ghost()
-                                                .tooltip("New table")
+                                                .accessible_name("New table").tooltip("New table")
                                                 .child(icon(Icon::Add, theme().text_muted))
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
@@ -621,7 +662,8 @@ impl DbxApp {
                                                 .with_size(Size::XSmall)
                                                 .compact()
                                                 .ghost()
-                                                .tooltip("Explorer actions")
+                                                .debug_selector(|| "explorer-more".into())
+                                                .accessible_name("Explorer actions").tooltip("Explorer actions")
                                                 .child(icon(Icon::More, theme().text_muted))
                                                 .dropdown_menu(move |menu, _, _| {
                                                     let backup = export_database.clone();
@@ -721,26 +763,26 @@ impl DbxApp {
                     .when(show_database_select, |view| {
                         view.child(
                             div()
-                                .id("database-select")
-                                .child(sidebar_select(&database_select)),
+                                .id("database-select").role(gpui::Role::Group).aria_label("Database")
+                                .child(sidebar_select(&database_select, "Database")),
                         )
                     })
                     .when(show_schema_select, |view| {
                         view.child(
                             div()
-                                .id("schema-select")
-                                .child(sidebar_select(&schema_select)),
+                                .id("schema-select").role(gpui::Role::Group).aria_label("Schema filter")
+                                .child(sidebar_select(&schema_select, "Schema filter")),
                         )
                     })
                     .when(kind != DatabaseKind::Redis, |view| {
                         view.child(
                             div()
-                                .h(px(SIDEBAR_CONTROL_HEIGHT))
-                                .px(px(8.))
+                                .h(crate::theme::ui_px(SIDEBAR_CONTROL_HEIGHT))
+                                .px(crate::theme::ui_px(8.))
                                 .flex()
                                 .items_center()
-                                .gap(px(6.))
-                                .rounded(px(RADIUS_CONTROL))
+                                .gap(crate::theme::ui_px(6.))
+                                .rounded(crate::theme::ui_px(RADIUS_CONTROL))
                                 .bg(theme().glass_hover)
                                 .border_1()
                                 .border_color(theme().hairline)
@@ -759,19 +801,23 @@ impl DbxApp {
                                     search_editor,
                                     search_focus,
                                     px(SIDEBAR_CONTROL_HEIGHT - 2.),
-                                ))),
+                                 cx))),
                         )
                     }),
             )
             .child(
                 div()
                     .id("explorer-list")
+                    .role(gpui::Role::ListBox).aria_label("Database objects")
+                    .aria_description(format!("{table_count} objects. Arrow keys move the cursor, Enter opens the object, and the context menu key opens object actions."))
+                    .on_a11y_action(gpui::AccessibleAction::ScrollDown, { let app = cx.entity(); move |_, window, cx| app.update(cx, |this, cx| this.scroll_explorer_accessibly(session_id, 20, window, cx)) })
+                    .on_a11y_action(gpui::AccessibleAction::ScrollUp, { let app = cx.entity(); move |_, window, cx| app.update(cx, |this, cx| this.scroll_explorer_accessibly(session_id, -20, window, cx)) })
                     .key_context("DbxExplorer")
                     .track_focus(&explorer_focus)
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .py(px(6.))
+                    .py(crate::theme::ui_px(6.))
                     .child(
                         gpui::canvas(
                             move |bounds, _, _| list_bounds.set(Some(bounds)),
@@ -782,10 +828,10 @@ impl DbxApp {
                     )
                     .child(
                     if let Some(note) = empty_note {
-                        div()
-                            .px(px(12.))
-                            .py(px(8.))
-                            .text_size(px(11.))
+                        crate::accessibility::announcement("explorer-empty", note, false)
+                            .px(crate::theme::ui_px(12.))
+                            .py(crate::theme::ui_px(8.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(theme().text_muted)
                             .child(note)
                             .into_any_element()
@@ -820,7 +866,7 @@ impl DbxApp {
             .into_any_element()
     }
 
-    fn render_main(&mut self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self
             .active_session()
             .map(|session| session.pane)
@@ -882,13 +928,15 @@ impl DbxApp {
             .unwrap_or_default();
         div()
             .id("document-tabs")
-            .h(px(40.))
+            .role(gpui::Role::TabList)
+            .aria_label("Documents")
+            .h(crate::theme::ui_px(40.))
             .flex_none()
-            .px(px(8.))
+            .px(crate::theme::ui_px(8.))
             .flex()
             .min_w_0()
             .items_center()
-            .gap(px(4.))
+            .gap(crate::theme::ui_px(4.))
             .overflow_x_scroll()
             .border_b_1()
             .border_color(theme().border)
@@ -900,27 +948,42 @@ impl DbxApp {
                     SharedString::from(format!("document-{tab_id}")),
                     kind,
                     selected,
+                    label.clone(),
                 )
-                .child(label)
+                .child(label.clone())
                 .child(
                     div()
                         .id(SharedString::from(format!("close-document-{tab_id}")))
-                        .size(px(18.))
+                        .debug_selector(move || format!("close-document-{tab_id}"))
+                        .pressable(format!("Close document {label}"))
+                        .size(crate::theme::ui_px(24.))
                         .rounded_full()
                         .flex()
                         .items_center()
                         .justify_center()
                         .hover(|style| style.bg(theme().glass_hover))
                         .tooltip(tip("Close tab"))
-                        .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if let Some(session_id) = session_id {
-                                this.request_close_secondary_tab_for(
-                                    session_id, tab_id, window, cx,
-                                );
-                            }
-                        })),
+                        .child(icon(Icon::Close, theme().text_muted).size(crate::theme::ui_px(12.)))
+                        .on_click(cx.listener(
+                            move |this, event: &gpui::ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(session_id) = session_id {
+                                    this.request_close_secondary_tab_for(
+                                        session_id, tab_id, window, cx,
+                                    );
+                                    if event.is_keyboard()
+                                        && this.session(session_id).is_some_and(|session| {
+                                            !session
+                                                .secondary_tabs
+                                                .iter()
+                                                .any(|tab| tab.id == tab_id)
+                                        })
+                                    {
+                                        window.focus_next(cx);
+                                    }
+                                }
+                            },
+                        )),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(session_id) = session_id {
@@ -930,6 +993,7 @@ impl DbxApp {
             }))
             .child(
                 glass_icon_button("add-query-document", Icon::Add, false)
+                    .aria_label("New query document")
                     .tooltip(tip("New query"))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(session_id) = session_id {
@@ -1101,7 +1165,7 @@ impl DbxApp {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(4.))
+                    .gap(crate::theme::ui_px(4.))
                     .when_some(count_button, |view, (label, enabled)| {
                         view.child(
                             div()
@@ -1138,34 +1202,36 @@ impl DbxApp {
                         }),
                     ))
             });
+        let has_error = error.is_some();
+        let message = error.unwrap_or(status);
         div()
-            .h(px(30.))
+            .h(crate::theme::ui_px(30.))
             .flex_none()
-            .px(px(12.))
+            .px(crate::theme::ui_px(12.))
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(12.))
+            .gap(crate::theme::ui_px(12.))
             .border_t_1()
             .border_color(theme().border)
             .follow_bottom_corners(RADIUS_PANEL)
             .bg(theme().panel)
-            .text_size(px(11.))
+            .text_size(crate::theme::ui_px(11.))
             .text_color(theme().text_muted)
             .child(
-                div()
+                crate::accessibility::announcement("workbench-status", message.clone(), has_error)
                     .min_w_0()
                     .flex_1()
                     .truncate()
-                    .when(error.is_some(), |view| view.text_color(theme().danger))
-                    .child(error.unwrap_or(status)),
+                    .when(has_error, |view| view.text_color(theme().danger_text))
+                    .child(message),
             )
             .child(
                 div()
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(crate::theme::ui_px(8.))
                     .when_some(
                         self.active_session_id.filter(|id| {
                             self.session(*id)
@@ -1183,7 +1249,14 @@ impl DbxApp {
                             )
                         },
                     )
-                    .child(result_summary)
+                    .child(
+                        crate::accessibility::announcement(
+                            "result-summary",
+                            result_summary.clone(),
+                            false,
+                        )
+                        .child(result_summary),
+                    )
                     .when_some(pagination_controls, |view, controls| view.child(controls)),
             )
     }
@@ -1198,8 +1271,8 @@ impl DbxApp {
         Button::new(id)
             .label(label)
             .with_size(Size::XSmall)
-            .h(px(22.))
-            .px(px(10.))
+            .h(crate::theme::ui_px(22.))
+            .px(crate::theme::ui_px(10.))
             .rounded_full()
             .outline()
             .disabled(!enabled)
@@ -1223,25 +1296,35 @@ impl DbxApp {
         listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         glass_icon_button(id, kind, selected)
-            .size(px(34.))
+            .size(crate::theme::ui_px(34.))
+            .aria_label(label)
+            .aria_selected(selected)
             .tooltip(tip(label))
             .on_click(listener)
     }
 }
 
 /// A pill-shaped document tab on the content sheet's tab strip.
-fn document_tab(id: impl Into<ElementId>, kind: Icon, selected: bool) -> Stateful<Div> {
+fn document_tab(
+    id: impl Into<ElementId>,
+    kind: Icon,
+    selected: bool,
+    label: impl Into<SharedString>,
+) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(28.))
-        .pl(px(10.))
-        .pr(px(4.))
+        .pressable(label)
+        .role(gpui::Role::Tab)
+        .aria_selected(selected)
+        .h(crate::theme::ui_px(28.))
+        .pl(crate::theme::ui_px(10.))
+        .pr(crate::theme::ui_px(4.))
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(6.))
+        .gap(crate::theme::ui_px(6.))
         .rounded_full()
-        .text_size(px(12.))
+        .text_size(crate::theme::ui_px(12.))
         .cursor_pointer()
         .when(selected, |tab| {
             tab.bg(theme().glass_selected)
@@ -1269,7 +1352,8 @@ fn document_tab(id: impl Into<ElementId>, kind: Icon, selected: bool) -> Statefu
 fn window_control_button(id: &'static str, kind: Icon, destructive: bool) -> Stateful<Div> {
     div()
         .id(id)
-        .size(px(24.))
+        .pressable(kind.label())
+        .size(crate::theme::ui_px(28.))
         .flex_none()
         .rounded_full()
         .flex()
@@ -1284,20 +1368,21 @@ fn window_control_button(id: &'static str, kind: Icon, destructive: bool) -> Sta
                 style.bg(theme().glass_selected)
             }
         })
-        .child(icon(kind, theme().text).size(px(12.)))
+        .child(icon(kind, theme().text).size(crate::theme::ui_px(12.)))
 }
 
-fn sidebar_select(state: &SidebarSelect) -> impl IntoElement {
+fn sidebar_select(state: &SidebarSelect, name: &'static str) -> impl IntoElement {
     Select::new(state)
         .with_size(Size::Small)
-        .h(px(SIDEBAR_CONTROL_HEIGHT))
-        .rounded(px(RADIUS_CONTROL))
+        .h(crate::theme::ui_px(SIDEBAR_CONTROL_HEIGHT))
+        .rounded(crate::theme::ui_px(RADIUS_CONTROL))
         .w_full()
-        .menu_max_h(px(260.))
-        .text_size(px(12.))
+        .menu_max_h(crate::theme::ui_px(260.))
+        .text_size(crate::theme::ui_px(12.))
         .bg(theme().glass_hover)
         .border_color(theme().hairline)
         .text_color(theme().text)
+        .accessible_select(name, state)
 }
 
 fn sidebar_row(
@@ -1317,26 +1402,43 @@ fn sidebar_row(
     let label = table_sidebar_label(table, selected_schema);
     let menu_table = table.clone();
     let table_ref = table.clone();
-    div().w_full().px(px(6.)).child(
+    div().w_full().px(crate::theme::ui_px(6.)).child(
         div()
             .id(SharedString::from(row_id.clone()))
+            .role(gpui::Role::ListBoxOption)
+            .aria_label(table_sidebar_label(table, None))
+            .aria_selected(selected)
+            .when(at_cursor, |row| row.aria_active_descendant())
+            .on_a11y_action(gpui::AccessibleAction::Focus, {
+                let table = table.clone();
+                let app = cx.entity();
+                move |_, window, cx| {
+                    app.update(cx, |this, cx| {
+                        this.set_explorer_cursor(session_id, &table, cx);
+                        if let Some(session) = this.session(session_id) {
+                            session.sidebar.focus.focus(window, cx);
+                        }
+                        cx.notify();
+                    })
+                }
+            })
             .relative()
             .w_full()
-            .h(px(28.))
-            .px(px(8.))
-            .rounded(px(RADIUS_CONTROL))
+            .h(crate::theme::ui_px(28.))
+            .px(crate::theme::ui_px(8.))
+            .rounded(crate::theme::ui_px(RADIUS_CONTROL))
             .when(selected, |row| {
                 row.bg(theme().accent_soft).font_weight(FontWeight::MEDIUM)
             })
             .text_color(if selected {
-                theme().accent
+                theme().accent_text
             } else {
                 theme().text
             })
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .flex()
             .items_center()
-            .gap(px(7.))
+            .gap(crate::theme::ui_px(7.))
             .cursor_pointer()
             .when(at_cursor, |row| {
                 row.border_1().border_color(theme().focus_ring).child(

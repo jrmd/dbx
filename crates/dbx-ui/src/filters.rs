@@ -323,7 +323,10 @@ impl FilterRow {
     ) -> Self {
         let selected_column = selected_column.into();
         let value = cx.new(|_| initial_value.into());
-        let editor = cx.new(|editor_cx| TextEditor::new(value.clone(), false, window, editor_cx));
+        let editor = cx.new(|editor_cx| {
+            TextEditor::new(value.clone(), false, window, editor_cx)
+                .accessibility_label(format!("Filter value for {selected_column}"))
+        });
         let column_items = SearchableVec::new(
             columns
                 .iter()

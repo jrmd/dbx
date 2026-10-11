@@ -128,7 +128,10 @@ impl DbxApp {
             .into_iter()
             .map(|name| {
                 let value = cx.new(|_| remembered.get(&name).cloned().unwrap_or_default());
-                let editor = cx.new(|cx| TextEditor::new(value, false, window, cx));
+                let editor = cx.new(|cx| {
+                    TextEditor::new(value, false, window, cx)
+                        .accessibility_label(parameter_label(&name))
+                });
                 (name, editor)
             })
             .collect::<Vec<_>>();
@@ -257,11 +260,11 @@ impl DbxApp {
         Some(
             div()
                 .flex_none()
-                .px(px(10.))
-                .py(px(8.))
+                .px(crate::theme::ui_px(10.))
+                .py(crate::theme::ui_px(8.))
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(crate::theme::ui_px(6.))
                 .border_b_1()
                 .border_color(theme().border)
                 .bg(theme().panel)
@@ -284,14 +287,14 @@ impl DbxApp {
                         .justify_between()
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(crate::theme::ui_px(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme().text)
                                 .child("Parameters"),
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(crate::theme::ui_px(10.))
                                 .text_color(theme().text_muted)
                                 .child("Bound values: text, 42, true, null, or JSON"),
                         ),
@@ -301,14 +304,14 @@ impl DbxApp {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(crate::theme::ui_px(8.))
                         .child(
                             div()
-                                .w(px(140.))
+                                .w(crate::theme::ui_px(140.))
                                 .flex_none()
                                 .truncate()
                                 .font_family("monospace")
-                                .text_size(px(11.))
+                                .text_size(crate::theme::ui_px(11.))
                                 .text_color(theme().text)
                                 .child(parameter_label(&name)),
                         )
@@ -321,6 +324,7 @@ impl DbxApp {
                                     focus,
                                     false,
                                     PARAMETER_PROMPT_CONTEXT,
+                                    cx,
                                 )),
                         )
                 }))
@@ -328,7 +332,7 @@ impl DbxApp {
                     div()
                         .flex()
                         .justify_end()
-                        .gap(px(6.))
+                        .gap(crate::theme::ui_px(6.))
                         .child(
                             button("cancel-query-parameters", "Cancel", ButtonKind::Quiet)
                                 .cursor_pointer()

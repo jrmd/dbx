@@ -1,0 +1,996 @@
+--- a/src/select.rs
++++ b/src/select.rs
+@@ -76,6 +76,7 @@
+ // MARK: SelectOptions (builder only — applied to SearchableListState during render)
+ 
+ struct SelectOptions {
++    accessibility_label: Option<SharedString>,
+     style: StyleRefinement,
+     size: Size,
+     icon: Option<Icon>,
+@@ -93,6 +94,7 @@
+ impl Default for SelectOptions {
+     fn default() -> Self {
+         Self {
++            accessibility_label: None,
+             style: StyleRefinement::default(),
+             size: Size::default(),
+             icon: None,
+@@ -329,8 +331,9 @@
+     where
+         D: SearchableListDelegate + 'static,
+     {
+-        self.state.list.update(cx, |list, _| {
++        self.state.list.update(cx, |list, cx| {
+             list.delegate_mut().delegate = items;
++            list.invalidate_accessible_items(cx);
+         });
+     }
+ 
+@@ -367,16 +370,26 @@
+         cx.notify();
+     }
+ 
++    /// Toggle the live menu state from an accessibility request. Dispatching a
++    /// keyboard action immediately after moving focus can use the previous
++    /// frame's focus path, so activation must use the same state transition as
++    /// pointer activation directly.
++    pub fn toggle_menu_accessibly(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        if self.state.disabled {
++            return;
++        }
++        self.set_open(!self.state.open, cx);
++        if self.state.open {
++            self.state.list.focus_handle(cx).focus(window, cx);
++        } else {
++            self.focus(window, cx);
++        }
++        window.refresh();
++    }
++
+     fn toggle_menu(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+         cx.stop_propagation();
+-
+-        self.set_open(!self.state.open, cx);
+-
+-        if self.state.open {
+-            self.state.list.focus_handle(cx).focus(window, cx);
+-        }
+-
+-        cx.notify();
++        self.toggle_menu_accessibly(window, cx);
+     }
+ 
+     fn escape(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+@@ -641,6 +654,12 @@
+         self
+     }
+ 
++    /// Name the trigger, its search field and its option list for assistive technology.
++    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
++        self.options.accessibility_label = Some(label.into());
++        self
++    }
++
+     /// Set a custom closure that renders the empty-state element.
+     pub fn empty<E: IntoElement + 'static>(
+         mut self,
+@@ -733,8 +752,12 @@
+         let focus_handle = self.state.read(cx).state.focus_handle.clone();
+         let empty = self.empty;
+         let opts = self.options;
+-
+-        self.state.update(cx, |this, _| {
++        let accessibility_label = opts.accessibility_label.clone();
++
++        self.state.update(cx, |this, cx| {
++            this.state.list.update(cx, |list, cx| {
++                list.set_accessibility_label(opts.accessibility_label, cx);
++            });
+             this.state.style = opts.style;
+             this.state.size = opts.size;
+             this.state.cleanable = opts.cleanable;
+@@ -758,6 +781,9 @@
+         let open_state = self.state.clone();
+ 
+         BaseSelect::new(self.id)
++            .when_some(accessibility_label, |this, label| {
++                this.accessibility_label(label)
++            })
+             .open(is_open)
+             .disabled(disabled)
+             .focus_handle(&focus_handle)
+@@ -774,6 +800,7 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    use crate::list::ListDelegate as _;
+     use gpui::{AppContext as _, TestAppContext};
+ 
+     use crate::{
+@@ -862,4 +889,163 @@
+             );
+         });
+     }
+-}
++
++    struct A11yHarness<D: crate::searchable_list::SearchableListDelegate + 'static>
++    where
++        <D::Item as crate::searchable_list::SearchableListItem>::Value: PartialEq + Clone,
++    {
++        state: gpui::Entity<SelectState<D>>,
++    }
++    impl<D: crate::searchable_list::SearchableListDelegate + 'static> gpui::Render for A11yHarness<D>
++    where
++        <D::Item as crate::searchable_list::SearchableListItem>::Value: PartialEq + Clone,
++    {
++        fn render(
++            &mut self,
++            _: &mut gpui::Window,
++            _: &mut gpui::Context<Self>,
++        ) -> impl gpui::IntoElement {
++            use gpui::Styled as _;
++            super::Select::new(&self.state)
++                .accessibility_label("Country")
++                .w(gpui::px(200.))
++        }
++    }
++
++    #[gpui::test]
++    fn dbx_accessibility_named_cursor_search_and_stale_actions(cx: &mut TestAppContext) {
++        cx.update(crate::init);
++        let (view, cx) = cx.add_window_view(|window, cx| A11yHarness {
++            state: cx.new(|cx| {
++                SelectState::new(
++                    SearchableVec::new(vec!["UK", "France", "Germany"]),
++                    Some(IndexPath::new(0)),
++                    window,
++                    cx,
++                )
++                .searchable(true)
++            }),
++        });
++        let state = view.read_with(cx, |view, _| view.state.clone());
++        let list = state.read_with(cx, |state, _| state.state.list.clone());
++        cx.update(|window, cx| {
++            state.update(cx, |state, cx| state.set_open(true, cx));
++            window.draw(cx).clear(cx);
++            list.update(cx, |list, cx| list.set_query("France", window, cx));
++            window.draw(cx).clear(cx);
++            list.update(cx, |list, cx| {
++                assert_eq!(
++                    list.delegate()
++                        .item_accessibility_label(IndexPath::new(0), cx)
++                        .as_deref(),
++                    Some("France")
++                );
++                assert_eq!(
++                    list.accessible_cursor_description(cx).as_ref(),
++                    "France, option 1 of 1"
++                );
++                list.request_accessible_item(IndexPath::new(0), &"UK".into(), true, window, cx);
++            });
++            assert_eq!(state.read(cx).selected_value(), Some(&"UK"));
++            list.update(cx, |list, cx| {
++                list.request_accessible_item(IndexPath::new(0), &"France".into(), true, window, cx)
++            });
++        });
++        cx.update(|_, cx| assert_eq!(state.read(cx).selected_value(), Some(&"France")));
++        cx.update(|window, cx| {
++            state.update(cx, |state, cx| state.set_open(true, cx));
++            list.update(cx, |list, cx| list.set_query("not-a-country", window, cx));
++            window.draw(cx).clear(cx);
++            assert_eq!(
++                list.read(cx).accessible_cursor_description(cx).as_ref(),
++                "No matching options"
++            );
++        });
++    }
++
++    #[gpui::test]
++    fn dbx_accessibility_disabled_options_cannot_activate_and_arrows_skip_them(
++        cx: &mut TestAppContext,
++    ) {
++        use crate::searchable_list::SearchableListItem;
++        #[derive(Clone)]
++        struct Choice(&'static str, bool);
++        impl SearchableListItem for Choice {
++            type Value = &'static str;
++            fn title(&self) -> gpui::SharedString {
++                self.0.into()
++            }
++            fn value(&self) -> &Self::Value {
++                &self.0
++            }
++            fn disabled(&self) -> bool {
++                self.1
++            }
++        }
++        cx.update(crate::init);
++        let (view, cx) = cx.add_window_view(|window, cx| A11yHarness {
++            state: cx.new(|cx| {
++                SelectState::new(
++                    SearchableVec::new(vec![
++                        Choice("UK", false),
++                        Choice("France", true),
++                        Choice("Germany", false),
++                    ]),
++                    Some(IndexPath::new(0)),
++                    window,
++                    cx,
++                )
++            }),
++        });
++        let state = view.read_with(cx, |view, _| view.state.clone());
++        cx.update(|window, cx| {
++            state.update(cx, |state, cx| state.set_open(true, cx));
++            window.draw(cx).clear(cx);
++            let list = state.read(cx).state.list.clone();
++            list.update(cx, |list, cx| {
++                list.request_accessible_item(IndexPath::new(1), &"France".into(), true, window, cx);
++                assert_eq!(list.selected_index(), Some(IndexPath::new(0)));
++                list.on_action_select_next(&crate::actions::SelectDown, window, cx);
++                assert_eq!(list.selected_index(), Some(IndexPath::new(2)));
++                list.on_action_select_prev(&crate::actions::SelectUp, window, cx);
++                assert_eq!(list.selected_index(), Some(IndexPath::new(0)));
++            });
++            assert_eq!(state.read(cx).selected_value(), Some(&"UK"));
++        });
++    }
++    #[gpui::test]
++    fn dbx_accessibility_toggle_uses_live_state_and_restores_trigger_focus(
++        cx: &mut TestAppContext,
++    ) {
++        cx.update(crate::init);
++        let (view, cx) = cx.add_window_view(|window, cx| A11yHarness {
++            state: cx.new(|cx| {
++                SelectState::new(
++                    SearchableVec::new(vec!["UK", "France"]),
++                    Some(IndexPath::new(0)),
++                    window,
++                    cx,
++                )
++                .searchable(true)
++            }),
++        });
++        let state = view.read_with(cx, |view, _| view.state.clone());
++        cx.update(|window, cx| {
++            use gpui::Focusable as _;
++            window.draw(cx).clear(cx);
++            let trigger = state.focus_handle(cx);
++            state.update(cx, |state, cx| state.toggle_menu_accessibly(window, cx));
++            assert!(state.read(cx).state.open);
++            window.draw(cx).clear(cx);
++            assert_eq!(window.focused(cx), Some(state.focus_handle(cx)));
++            state.update(cx, |state, cx| state.toggle_menu_accessibly(window, cx));
++            assert!(!state.read(cx).state.open);
++            assert_eq!(window.focused(cx), Some(trigger));
++            state.update(cx, |state, cx| {
++                state.state.disabled = true;
++                state.toggle_menu_accessibly(window, cx);
++                assert!(!state.state.open);
++            });
++        });
++    }
++}
+--- a/src/list/list.rs
++++ b/src/list/list.rs
+@@ -71,6 +71,8 @@
+     pub(crate) focus_handle: FocusHandle,
+     pub(crate) query_input: Entity<InputState>,
+     options: ListOptions,
++    accessibility_label: Option<SharedString>,
++    accessibility_revision: u64,
+     delegate: D,
+     last_query: Option<String>,
+     scroll_handle: VirtualListScrollHandle,
+@@ -101,6 +103,8 @@
+         Self {
+             focus_handle: cx.focus_handle(),
+             options: ListOptions::default(),
++            accessibility_label: None,
++            accessibility_revision: 0,
+             delegate,
+             rows_cache: RowsCache::default(),
+             query_input,
+@@ -119,6 +123,77 @@
+         }
+     }
+ 
++    /// Set the persistent name independently of presentation options.
++    pub fn set_accessibility_label(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
++        if self.accessibility_label != label {
++            self.accessibility_label = label;
++            cx.notify();
++        }
++    }
++
++    pub(crate) fn invalidate_accessible_items(&mut self, cx: &mut Context<Self>) {
++        self.accessibility_revision = self.accessibility_revision.wrapping_add(1);
++        cx.notify();
++    }
++
++    /// Describe the live keyboard cursor, including its position after search.
++    pub fn accessible_cursor_description(&self, cx: &App) -> SharedString {
++        if self.rows_cache.items_count() == 0 {
++            return if self.query_input.read(cx).value().is_empty() {
++                "No options available".into()
++            } else {
++                "No matching options".into()
++            };
++        }
++
++        let Some(ix) = self.selected_index else {
++            return "No option selected".into();
++        };
++        let Some(label) = self.delegate.item_accessibility_label(ix, cx) else {
++            return "No option selected".into();
++        };
++        let position = (0..ix.section)
++            .map(|section| self.delegate.items_count(section, cx))
++            .sum::<usize>()
++            + ix.row
++            + 1;
++        format!(
++            "{label}, option {position} of {}",
++            self.rows_cache.items_count()
++        )
++        .into()
++    }
++
++    fn accessible_item_is_current(&self, ix: IndexPath, label: &SharedString, cx: &App) -> bool {
++        self.selectable
++            && self.delegate.item_accessibility_enabled(ix, cx)
++            && self.delegate.item_accessibility_label(ix, cx).as_ref() == Some(label)
++    }
++
++    pub(crate) fn request_accessible_item(
++        &mut self,
++        ix: IndexPath,
++        label: &SharedString,
++        activate: bool,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if !self.accessible_item_is_current(ix, label, cx) {
++            return;
++        }
++        self._set_selected_index(Some(ix), window, cx);
++        if activate {
++            self.on_action_confirm(&Confirm { secondary: false }, window, cx);
++        } else {
++            self.focus(window, cx);
++        }
++        // Deferred popup views can retain the old accessibility tree even
++        // after their entity is notified. Publish the action without requiring
++        // an unrelated keyboard event.
++        cx.notify();
++        window.refresh();
++    }
++
+     /// Sets whether the list is searchable, default is `false`.
+     ///
+     /// When `true`, there will be a search input at the top of the list.
+@@ -288,6 +363,7 @@
+ 
+     fn start_search(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+         self.set_searching(true, window, cx);
++        self.invalidate_accessible_items(cx);
+         let search = self.delegate.perform_search(&query, window, cx);
+ 
+         if self.rows_cache.len() > 0 {
+@@ -377,6 +453,9 @@
+             return;
+         };
+ 
++        if !self.delegate.item_accessibility_enabled(ix, cx) {
++            return;
++        }
+         self.delegate
+             .set_selected_index(self.selected_index, window, cx);
+         self.delegate.confirm(confirm.secondary, window, cx);
+@@ -406,8 +485,15 @@
+             return;
+         }
+ 
+-        let prev_ix = self.rows_cache.prev(self.selected_index);
+-        self.select_item(prev_ix, window, cx);
++        let mut candidate = self.selected_index;
++        for _ in 0..self.rows_cache.items_count() {
++            let ix = self.rows_cache.prev(candidate);
++            if self.delegate.item_accessibility_enabled(ix, cx) {
++                self.select_item(ix, window, cx);
++                return;
++            }
++            candidate = Some(ix);
++        }
+     }
+ 
+     pub(crate) fn on_action_select_next(
+@@ -420,8 +506,15 @@
+             return;
+         }
+ 
+-        let next_ix = self.rows_cache.next(self.selected_index);
+-        self.select_item(next_ix, window, cx);
++        let mut candidate = self.selected_index;
++        for _ in 0..self.rows_cache.items_count() {
++            let ix = self.rows_cache.next(candidate);
++            if self.delegate.item_accessibility_enabled(ix, cx) {
++                self.select_item(ix, window, cx);
++                return;
++            }
++            candidate = Some(ix);
++        }
+     }
+ 
+     fn prepare_items_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+@@ -468,14 +561,64 @@
+             .mouse_right_clicked_index
+             .map(|s| s.eq_row(ix))
+             .unwrap_or(false);
+-        let id = SharedString::from(format!("list-item-{}", ix));
++        let accessibility_revision = self.accessibility_revision;
++        let id = SharedString::from(if self.accessibility_label.is_some() {
++            format!("list-item-{ix}-revision-{accessibility_revision}")
++        } else {
++            format!("list-item-{ix}")
++        });
+ 
+         let total_items = self.rows_cache.items_count();
++        let named_options = self.accessibility_label.is_some();
++        let label = self.delegate.item_accessibility_label(ix, cx);
++        let enabled = self.selectable && self.delegate.item_accessibility_enabled(ix, cx);
++        let active = named_options && !self.searchable && selected && self.is_focused(window, cx);
++        let position = (0..ix.section)
++            .map(|section| self.delegate.items_count(section, cx))
++            .sum::<usize>()
++            + ix.row
++            + 1;
+ 
+         div()
+             .id(id)
+-            .role(Role::ListItem)
+-            .aria_position_in_set(ix.row + 1)
++            .role(if named_options {
++                Role::ListBoxOption
++            } else {
++                Role::ListItem
++            })
++            .when(active, |this| this.aria_active_descendant())
++            .when_some(label, |this, label| {
++                this.aria_label(label.clone())
++                    .a11y_synthetic_children(move |builder| {
++                        if !enabled {
++                            builder.parent_node().set_disabled();
++                        }
++                    })
++                    .when(enabled, |this| {
++                        this.on_a11y_action(gpui::AccessibleAction::Focus, {
++                            let label = label.clone();
++                            let entity = cx.entity();
++                            move |_, window, cx| {
++                                entity.update(cx, |this, cx| {
++                                    if this.accessibility_revision == accessibility_revision {
++                                        this.request_accessible_item(ix, &label, false, window, cx);
++                                    }
++                                })
++                            }
++                        })
++                        .on_a11y_action(gpui::AccessibleAction::Click, {
++                            let entity = cx.entity();
++                            move |_, window, cx| {
++                                entity.update(cx, |this, cx| {
++                                    if this.accessibility_revision == accessibility_revision {
++                                        this.request_accessible_item(ix, &label, true, window, cx);
++                                    }
++                                })
++                            }
++                        })
++                    })
++            })
++            .aria_position_in_set(position)
+             .aria_size_of_set(total_items)
+             .aria_selected(selected)
+             .w_full()
+@@ -652,6 +795,10 @@
+             .key_context("List")
+             .id("list-state")
+             .track_focus(&self.focus_handle)
++            .when_some(self.accessibility_label.clone(), |this, label| {
++                this.role(Role::ListBox)
++                    .aria_label(format!("{label} options"))
++            })
+             .size_full()
+             .relative()
+             .overflow_hidden()
+@@ -666,6 +813,9 @@
+                         .border_color(cx.theme().border)
+                         .child(
+                             Input::new(&input)
++                                .when_some(self.accessibility_label.clone(), |this, label| {
++                                    this.aria_label(format!("Search {label}"))
++                                })
+                                 .with_size(self.options.size)
+                                 .prefix(
+                                     Icon::new(IconName::Search)
+@@ -697,6 +847,25 @@
+                         }))
+                     })
+             })
++            .when(
++                self.accessibility_label.is_some() && self.is_focused(window, cx),
++                |this| {
++                    this.child(
++                        div()
++                            .id("list-active-option")
++                            .role(Role::Status)
++                            .aria_label(self.accessible_cursor_description(cx))
++                            .a11y_synthetic_children(|builder| {
++                                builder
++                                    .parent_node()
++                                    .set_live(gpui::accesskit::Live::Polite);
++                                builder.parent_node().set_live_atomic();
++                            })
++                            .absolute()
++                            .size(px(0.)),
++                    )
++                },
++            )
+             .children(loading_view)
+     }
+ }
+@@ -778,3 +947,67 @@
+             .child(self.state.clone())
+     }
+ }
++
++#[cfg(test)]
++mod dbx_accessibility_tests {
++    use super::*;
++    use crate::list::ListItem;
++    struct SameTitle;
++    impl ListDelegate for SameTitle {
++        type Item = ListItem;
++        fn items_count(&self, _: usize, _: &App) -> usize {
++            1
++        }
++        fn item_accessibility_label(&self, _: IndexPath, _: &App) -> Option<SharedString> {
++            Some("Same title".into())
++        }
++        fn render_item(
++            &mut self,
++            _: IndexPath,
++            _: &mut Window,
++            _: &mut Context<ListState<Self>>,
++        ) -> Option<Self::Item> {
++            Some(ListItem::new(0).child("Same title"))
++        }
++        fn set_selected_index(
++            &mut self,
++            _: Option<IndexPath>,
++            _: &mut Window,
++            _: &mut Context<ListState<Self>>,
++        ) {
++        }
++    }
++    #[gpui::test]
++    fn dbx_accessibility_replacing_or_filtering_items_changes_option_identity(
++        cx: &mut gpui::TestAppContext,
++    ) {
++        use gpui::Element as _;
++        cx.update(crate::init);
++        let cx = cx.add_empty_window();
++        cx.update(|window, cx| {
++            let list = cx.new(|cx| ListState::new(SameTitle, window, cx));
++            list.update(cx, |list, cx| {
++                list.set_accessibility_label(Some("Country".into()), cx);
++                let before = list
++                    .render_list_item(IndexPath::new(0), window, cx)
++                    .into_element()
++                    .id();
++                list.set_query("same", window, cx);
++                let searched = list
++                    .render_list_item(IndexPath::new(0), window, cx)
++                    .into_element()
++                    .id();
++                assert_ne!(
++                    before, searched,
++                    "even equal labels must not reuse a stale option node"
++                );
++                list.invalidate_accessible_items(cx);
++                let replaced = list
++                    .render_list_item(IndexPath::new(0), window, cx)
++                    .into_element()
++                    .id();
++                assert_ne!(searched, replaced);
++            });
++        });
++    }
++}
+--- a/src/list/delegate.rs
++++ b/src/list/delegate.rs
+@@ -33,6 +33,17 @@
+     /// NOTE: Only the sections with items_count > 0 will be rendered. If the section has 0 items,
+     /// the section header and footer will also be skipped.
+     fn items_count(&self, section: usize, cx: &App) -> usize;
++
++    /// Accessible name for an item. Return None for delegates that have not
++    /// supplied a name; do not derive a label from private visual elements.
++    fn item_accessibility_label(&self, _ix: IndexPath, _cx: &App) -> Option<gpui::SharedString> {
++        None
++    }
++
++    /// Whether assistive technology may focus/activate this item.
++    fn item_accessibility_enabled(&self, _ix: IndexPath, _cx: &App) -> bool {
++        true
++    }
+ 
+     /// Render the item at the given index.
+     ///
+--- a/src/searchable_list/adapter.rs
++++ b/src/searchable_list/adapter.rs
+@@ -98,6 +98,16 @@
+         )
+     }
+ 
++    fn item_accessibility_label(&self, ix: IndexPath, _: &App) -> Option<gpui::SharedString> {
++        self.delegate.item(ix).map(|item| item.title())
++    }
++
++    fn item_accessibility_enabled(&self, ix: IndexPath, cx: &App) -> bool {
++        self.delegate
++            .item(ix)
++            .is_some_and(|item| self.delegate.is_item_enabled(ix, item, cx))
++    }
++
+     fn render_item(
+         &mut self,
+         ix: IndexPath,
+--- a/src/input/input.rs
++++ b/src/input/input.rs
+@@ -492,12 +492,11 @@
+         if input_focused {
+             sync_native_content_type(window, content_type, presentation.is_editable());
+         }
+-        let frame_focus_handle = window
+-            .use_keyed_state(("input-frame-focus", state.entity_id()), cx, |_, cx| {
+-                cx.focus_handle()
+-            })
+-            .read(cx)
+-            .clone();
++        // Publish accessibility focus on the same handle used by the actual
++        // editor. The former frame-only handle could expose a named field
++        // while its focused editor had no node, leaving the native tree with
++        // no focused search field. The inner editor still owns input handling.
++        let frame_focus_handle = presentation.focus_handle().clone();
+         let focused = input_focused
+             || (frame_focus_handle.contains_focused(window, cx) && !presentation.is_disabled());
+ 
+@@ -997,4 +996,50 @@
+             assert_eq!(cx.update(|window, cx| window.focused_input(cx)), None);
+         }
+     }
++    #[gpui::test]
++    fn dbx_accessibility_editor_focus_does_not_add_a_duplicate_tab_stop(
++        cx: &mut gpui::TestAppContext,
++    ) {
++        use gpui::{
++            AppContext as _, Focusable as _, ParentElement as _, StatefulInteractiveElement as _,
++            Styled as _,
++        };
++        struct Harness {
++            state: gpui::Entity<InputState>,
++            after: gpui::FocusHandle,
++        }
++        impl gpui::Render for Harness {
++            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
++                gpui::div()
++                    .flex()
++                    .child(
++                        Input::new(&self.state)
++                            .aria_label("Search Country")
++                            .w(px(200.)),
++                    )
++                    .child(
++                        gpui::div()
++                            .id("after-input")
++                            .track_focus(&self.after)
++                            .size(px(30.)),
++                    )
++            }
++        }
++        cx.update(crate::init);
++        let (view, cx) = cx.add_window_view(|window, cx| Harness {
++            state: cx.new(|cx| InputState::new(window, cx)),
++            after: cx.focus_handle().tab_stop(true),
++        });
++        cx.update(|window, cx| {
++            window.draw(cx).clear(cx);
++            let input = view.read(cx).state.focus_handle(cx);
++            let after = view.read(cx).after.clone();
++            input.focus(window, cx);
++            window.draw(cx).clear(cx);
++            window.focus_next(cx);
++            assert_eq!(window.focused(cx), Some(after));
++            window.focus_prev(cx);
++            assert_eq!(window.focused(cx), Some(input));
++        });
++    }
+ }
+--- a/src/table/state.rs
++++ b/src/table/state.rs
+@@ -1439,7 +1439,10 @@
+             .h_full()
+             .child(
+                 self.render_cell(None, col_ix, window, cx)
+-                    .id(("col-header", col_ix))
++                    .id(SharedString::from(format!(
++                        "col-header:{}",
++                        col_group.column.key
++                    )))
+                     .on_click(cx.listener(move |this, _, window, cx| {
+                         this.on_col_head_click(col_ix, window, cx);
+                     }))
+@@ -1846,7 +1849,10 @@
+                                         self.render_col_wrap(Some(row_ix), col_ix, window, cx)
+                                             .child(
+                                                 self.render_cell(Some(row_ix), col_ix, window, cx)
+-                                                    .id(format!("table-cell:{}:{}", row_ix, col_ix))
++                                                    .id(format!(
++                                                        "table-cell:{}",
++                                                        self.col_groups[col_ix].column.key
++                                                    ))
+                                                     .relative()
+                                                     .child(self.measure_render_td(
+                                                         row_ix, col_ix, window, cx,
+@@ -1928,7 +1934,7 @@
+                         .child(
+                             crate::virtual_list::virtual_list(
+                                 view,
+-                                row_ix,
++                                "table-row-columns",
+                                 Axis::Horizontal,
+                                 col_sizes,
+                                 {
+@@ -1963,8 +1969,8 @@
+                                                             cx,
+                                                         )
+                                                         .id(format!(
+-                                                            "table-cell-{}:{}",
+-                                                            row_ix, col_ix
++                                                            "table-cell:{}",
++                                                            table.col_groups[col_ix].column.key
+                                                         ))
+                                                         .relative()
+                                                         .child(table.measure_render_td(
+@@ -2420,3 +2426,150 @@
+             })
+     }
+ }
++
++#[cfg(test)]
++mod identity_tests {
++    use super::*;
++    use crate::table::Column;
++    use gpui::{Entity, RenderOnce, SharedString};
++    use std::{cell::RefCell, collections::HashMap};
++
++    type FocusRecords = Rc<RefCell<HashMap<String, FocusHandle>>>;
++
++    #[derive(gpui::IntoElement)]
++    struct FocusProbe {
++        name: String,
++        records: FocusRecords,
++    }
++    impl RenderOnce for FocusProbe {
++        fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
++            let state = window.use_keyed_state("identity-probe", cx, |_, cx| cx.focus_handle());
++            let focus = state.read(cx).clone();
++            self.records
++                .borrow_mut()
++                .insert(self.name.clone(), focus.clone());
++            div()
++                .id("probe")
++                .size_full()
++                .track_focus(&focus)
++                .tab_index(0)
++                .child(self.name)
++        }
++    }
++
++    struct Delegate {
++        rows: Vec<&'static str>,
++        columns: Vec<Column>,
++        records: FocusRecords,
++    }
++    impl TableDelegate for Delegate {
++        fn columns_count(&self, _: &App) -> usize {
++            self.columns.len()
++        }
++        fn rows_count(&self, _: &App) -> usize {
++            self.rows.len()
++        }
++        fn column(&self, col: usize, _: &App) -> Column {
++            self.columns[col].clone()
++        }
++        fn render_tr(
++            &mut self,
++            row: usize,
++            _: &mut Window,
++            _: &mut Context<TableState<Self>>,
++        ) -> Stateful<Div> {
++            div().id(SharedString::from(
++                self.rows
++                    .get(row)
++                    .map(|name| format!("row-{name}"))
++                    .unwrap_or_else(|| format!("empty-{row}")),
++            ))
++        }
++        fn render_th(
++            &mut self,
++            col: usize,
++            _: &mut Window,
++            _: &mut Context<TableState<Self>>,
++        ) -> impl IntoElement {
++            FocusProbe {
++                name: format!("header:{}", self.columns[col].key),
++                records: self.records.clone(),
++            }
++        }
++        fn render_td(
++            &mut self,
++            row: usize,
++            col: usize,
++            _: &mut Window,
++            _: &mut Context<TableState<Self>>,
++        ) -> impl IntoElement {
++            FocusProbe {
++                name: format!("{}:{}", self.rows[row], self.columns[col].key),
++                records: self.records.clone(),
++            }
++        }
++    }
++    struct Harness {
++        table: Entity<TableState<Delegate>>,
++    }
++    impl Render for Harness {
++        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
++            super::super::DataTable::new(&self.table)
++        }
++    }
++
++    #[gpui::test]
++    fn table_cell_and_header_state_follow_stable_rows_and_columns(cx: &mut gpui::TestAppContext) {
++        cx.update(crate::init);
++        let records = FocusRecords::default();
++        let (view, cx) = cx.add_window_view(|window, cx| Harness {
++            table: cx.new(|cx| {
++                TableState::new(
++                    Delegate {
++                        rows: vec!["a", "b"],
++                        columns: vec![
++                            Column::new("fixed", "Fixed")
++                                .width(px(100.))
++                                .fixed(ColumnFixed::Left),
++                            Column::new("left", "Left").width(px(100.)),
++                            Column::new("right", "Right").width(px(100.)),
++                        ],
++                        records: records.clone(),
++                    },
++                    window,
++                    cx,
++                )
++            }),
++        });
++        cx.simulate_resize(gpui::size(px(500.), px(300.)));
++        cx.update(|window, cx| window.draw(cx).clear(cx));
++        let before = records.borrow().clone();
++        assert_eq!(before.len(), 9, "three headers and both rows must render");
++        cx.update(|_, cx| {
++            let table = view.read(cx).table.clone();
++            table.update(cx, |table, cx| {
++                table.delegate_mut().rows.reverse();
++                table.refresh(cx);
++            });
++        });
++        cx.update(|window, cx| window.draw(cx).clear(cx));
++        assert_eq!(
++            *records.borrow(),
++            before,
++            "sorting must retain each logical cell's scoped state"
++        );
++        cx.update(|_, cx| {
++            let table = view.read(cx).table.clone();
++            table.update(cx, |table, cx| {
++                table.delegate_mut().columns.swap(1, 2);
++                table.refresh(cx);
++            });
++        });
++        cx.update(|window, cx| window.draw(cx).clear(cx));
++        assert_eq!(
++            *records.borrow(),
++            before,
++            "reordering must retain cells and header state by column key"
++        );
++    }
++}
+--- a/src/dock/mod.rs
++++ b/src/dock/mod.rs
+@@ -248,7 +248,7 @@
+ 
+     #[test]
+     fn every_base_dock_export_is_reachable_from_here() {
+-        let base = include_str!("../../../base/src/dock/mod.rs");
++        let base = include_str!("../../tests/upstream/base-dock-mod.rs");
+         let skin = include_str!("mod.rs");
+ 
+         let exported = exported_names(base, "pub use ");
+--- a/src/theme/schema.rs
++++ b/src/theme/schema.rs
+@@ -1232,7 +1232,7 @@
+     #[test]
+     fn test_aurora_theme_parses_gradient_backgrounds() {
+         let theme_set =
+-            serde_json::from_str::<ThemeSet>(include_str!("../../../../themes/aurora.json"))
++            serde_json::from_str::<ThemeSet>(include_str!("../../tests/upstream/aurora.json"))
+                 .unwrap();
+         assert_eq!(theme_set.themes.len(), 1);
+         assert!(theme_set.themes.iter().all(|theme| !theme.mode.is_dark()));
+--- a/src/theme/mod.rs
++++ b/src/theme/mod.rs
+@@ -123,6 +123,10 @@
+     #[serde(default = "default_true")]
+     pub focus_ring: bool,
+     pub transparent: Hsla,
++    /// Optional application-owned fill, independent of the input edge color.
++    /// Without this override the upstream dark tint behavior is preserved.
++    #[serde(skip)]
++    pub input_background_override: Option<Hsla>,
+     /// Show the scrollbar mode, default: Scrolling
+     #[serde(alias = "scrollbar_show")]
+     pub scrollbar_mode: ScrollbarMode,
+@@ -315,6 +319,9 @@
+     /// otherwise use the `cx.theme().background` color.
+     #[inline]
+     pub fn input_background(&self) -> Hsla {
++        if let Some(background) = self.input_background_override {
++            return background;
++        }
+         if self.is_dark() {
+             self.input.mix_oklab(self.transparent, 0.3)
+         } else {
+@@ -486,7 +493,24 @@
+ mod semantic_token_tests {
+     use gpui::{Hsla, IsZero as _, px};
+ 
+-    use super::{RADIUS_FULL, Theme};
++    use super::{Colorize as _, RADIUS_FULL, Theme};
++
++    #[test]
++    fn input_fill_override_does_not_change_the_edge_or_legacy_default() {
++        let mut theme = Theme::default();
++        theme.mode = super::ThemeMode::Dark;
++        let edge = theme.input;
++        let legacy_fill = theme.input.mix_oklab(theme.transparent, 0.3);
++        assert_eq!(theme.input_background(), legacy_fill);
++        let fill = Hsla::default().alpha(1.);
++        theme.input_background_override = Some(fill);
++        assert_eq!(theme.input_background(), fill);
++        assert_eq!(theme.input, edge);
++        theme.input_background_override = None;
++        assert_eq!(theme.input_background(), legacy_fill);
++        theme.mode = super::ThemeMode::Light;
++        assert_eq!(theme.input_background(), theme.background);
++    }
+ 
+     #[test]
+     fn semantic_colors_are_a_live_projection_of_legacy_fields() {
+@@ -556,6 +580,7 @@
+         Theme {
+             mode: ThemeMode::default(),
+             transparent: Hsla::transparent_black(),
++            input_background_override: None,
+             font_family: ".SystemUIFont".into(),
+             font_size: px(16.),
+             mono_font_family: if cfg!(target_os = "macos") {

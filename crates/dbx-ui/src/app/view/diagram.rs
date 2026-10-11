@@ -1,11 +1,14 @@
+mod accessibility;
+
 use super::super::*;
 use crate::diagram::{
     DiagramPalette, EDGE_CORNER_RADIUS, HEADER_HEIGHT, ROW_HEIGHT, RouteStep, edge_markers,
     rounded_route,
 };
+use crate::popups::DropdownMenu as _;
 use gpui::{BoxShadow, CursorStyle, MouseButton, PathBuilder, canvas};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::PopupMenuItem;
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::tooltip::Tooltip;
@@ -45,7 +48,7 @@ impl DiagramColors {
             text: color_hex(theme().text),
             muted_text: color_hex(theme().text_muted),
             accent: color_hex(theme().accent),
-            key: color_hex(theme().warning),
+            key: color_hex(theme().warning_text),
             relation: color_hex(theme().text_muted),
         }
     }
@@ -77,6 +80,9 @@ impl DbxApp {
             error,
             zoom,
             selected_node,
+            list_view,
+            list_scroll,
+            source_schema,
             scroll_handle,
             focus,
             dragging,
@@ -98,6 +104,9 @@ impl DbxApp {
                 diagram.error.clone(),
                 diagram.zoom,
                 diagram.selected_node.clone(),
+                diagram.list_view,
+                diagram.list_scroll.clone(),
+                diagram.source_schema.clone(),
                 diagram.scroll_handle.clone(),
                 diagram.focus.clone(),
                 diagram.drag_anchor.is_some(),
@@ -121,14 +130,15 @@ impl DbxApp {
 
         let refresh = cx.entity().downgrade();
         let scroll_offset = scroll_handle.offset();
-        let viewport_at_origin = scroll_offset.x == px(0.) && scroll_offset.y == px(0.);
+        let viewport_at_origin = scroll_offset.x == crate::theme::ui_px(0.)
+            && scroll_offset.y == crate::theme::ui_px(0.);
         let window_size = window.bounds().size;
         let sidebar_width = self.explorer_width();
         let pane_width = (f32::from(window_size.width) - sidebar_width - 46.0).max(0.0);
         // Prefer the measured viewport; the window-derived estimate only
         // covers the first frame, before the scroller has been laid out.
         let measured = scroll_handle.bounds().size;
-        let (available_width, available_height) = if measured.width > px(0.) {
+        let (available_width, available_height) = if measured.width > crate::theme::ui_px(0.) {
             (f32::from(measured.width), f32::from(measured.height))
         } else {
             (
@@ -180,20 +190,11 @@ impl DbxApp {
 
             let popover = Popover::new("diagram-schema-filter")
                 .p_0()
-                .w(px(220.))
-                .trigger(
-                    button(
-                        "diagram-schema-filter-trigger",
-                        format!("Schemas · {summary}"),
-                        ButtonKind::Quiet,
-                    )
-                    .selected(schema_filter_active)
-                    .tooltip("Schemas"),
-                )
+                .w(crate::theme::ui_px(220.))
                 .child(
                     div()
-                        .px(px(10.))
-                        .py(px(8.))
+                        .px(crate::theme::ui_px(10.))
+                        .py(crate::theme::ui_px(8.))
                         .flex()
                         .items_center()
                         .justify_between()
@@ -201,22 +202,22 @@ impl DbxApp {
                         .border_color(theme().border)
                         .child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(crate::theme::ui_px(10.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme().text)
                                 .child("Schemas in diagram"),
                         )
                         .child(
                             div()
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .text_color(theme().text_muted)
                                 .child(format!("{selected_count}/{}", available_schemas.len())),
                         ),
                 )
                 .child(
                     div()
-                        .px(px(9.))
-                        .py(px(7.))
+                        .px(crate::theme::ui_px(9.))
+                        .py(crate::theme::ui_px(7.))
                         .border_b_1()
                         .border_color(theme().border)
                         .child(
@@ -235,25 +236,37 @@ impl DbxApp {
                 .child(
                     div()
                         .id("diagram-schema-options")
-                        .max_h(px(260.))
+                        .max_h(crate::theme::ui_px(260.))
                         .overflow_y_scrollbar()
-                        .px(px(9.))
-                        .py(px(6.))
+                        .px(crate::theme::ui_px(9.))
+                        .py(crate::theme::ui_px(6.))
                         .flex()
                         .flex_col()
-                        .gap(px(3.))
+                        .gap(crate::theme::ui_px(3.))
                         .children(schema_rows),
                 );
             crate::popups::ScrollBlockingPopover::new("diagram-schema-filter", popover)
+                .trap_focus()
+                .trigger(
+                    button(
+                        "diagram-schema-filter-trigger",
+                        format!("Schemas · {summary}"),
+                        ButtonKind::Quiet,
+                    )
+                    .selected(schema_filter_active)
+                    .accessible_name("Schemas")
+                    .tooltip("Schemas"),
+                )
         });
         let toolbar = div()
-            .h(px(48.))
+            .min_h(crate::theme::ui_px(48.))
+            .flex_wrap()
             .flex_none()
-            .px(px(12.))
+            .px(crate::theme::ui_px(12.))
             .flex()
             .items_center()
             .justify_between()
-            .gap(px(12.))
+            .gap(crate::theme::ui_px(12.))
             .border_b_1()
             .border_color(theme().border)
             .bg(theme().panel)
@@ -262,23 +275,23 @@ impl DbxApp {
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap(px(9.))
+                    .gap(crate::theme::ui_px(9.))
                     .when(busy || stale, |view| {
                         view.child(
                             div()
-                                .px(px(6.))
-                                .py(px(2.))
-                                .rounded(px(4.))
+                                .px(crate::theme::ui_px(6.))
+                                .py(crate::theme::ui_px(2.))
+                                .rounded(crate::theme::ui_px(4.))
                                 .bg(if stale {
                                     theme().warning.alpha(0.12)
                                 } else {
                                     theme().accent_soft
                                 })
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .text_color(if stale {
                                     theme().warning
                                 } else {
-                                    theme().accent
+                                    theme().accent_text
                                 })
                                 .child(if busy {
                                     if stale { "Refreshing" } else { "Loading" }
@@ -290,10 +303,33 @@ impl DbxApp {
             )
             .child(
                 div()
-                    .flex_none()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .gap(px(5.))
+                    .gap(crate::theme::ui_px(5.))
+                    .child(
+                        glass_icon_button("diagram-list-view", Icon::Table, list_view)
+                            .aria_label(if list_view {
+                                "Show diagram canvas"
+                            } else {
+                                "Show table and relationship list"
+                            })
+                            .debug_selector(|| "diagram-list-view".into())
+                            .role(gpui::Role::Button)
+                            .aria_toggled(if list_view {
+                                gpui::accesskit::Toggled::True
+                            } else {
+                                gpui::accesskit::Toggled::False
+                            })
+                            .tooltip(tip("Table and relationship list"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(diagram) = this.active_diagram_tab_mut(session_id) {
+                                    diagram.list_view = !diagram.list_view;
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .when_some(schema_filter_control, |actions, control| {
                         actions.child(control)
                     })
@@ -313,8 +349,8 @@ impl DbxApp {
                         actions
                             .child(
                                 div()
-                                    .h(px(DIAGRAM_TOOLBAR_CONTROL_HEIGHT))
-                                    .px(px(1.))
+                                    .h(crate::theme::ui_px(DIAGRAM_TOOLBAR_CONTROL_HEIGHT))
+                                    .px(crate::theme::ui_px(1.))
                                     .flex()
                                     .items_center()
                                     .rounded_full()
@@ -323,7 +359,10 @@ impl DbxApp {
                                     .bg(theme().glass_hover)
                                     .child(
                                         toolbar_icon_button("diagram-zoom-out")
-                                            .size(px(DIAGRAM_TOOLBAR_CONTROL_HEIGHT - 4.))
+                                            .size(crate::theme::ui_px(
+                                                DIAGRAM_TOOLBAR_CONTROL_HEIGHT - 4.,
+                                            ))
+                                            .accessible_name("Zoom out (−)")
                                             .tooltip("Zoom out (−)")
                                             .label("−")
                                             .disabled(zoom <= 0.35)
@@ -339,15 +378,18 @@ impl DbxApp {
                                     )
                                     .child(
                                         div()
-                                            .w(px(40.))
+                                            .w(crate::theme::ui_px(40.))
                                             .text_center()
-                                            .text_size(px(11.))
+                                            .text_size(crate::theme::ui_px(11.))
                                             .text_color(theme().text)
                                             .child(format!("{:.0}%", zoom * 100.0)),
                                     )
                                     .child(
                                         toolbar_icon_button("diagram-zoom-in")
-                                            .size(px(DIAGRAM_TOOLBAR_CONTROL_HEIGHT - 4.))
+                                            .size(crate::theme::ui_px(
+                                                DIAGRAM_TOOLBAR_CONTROL_HEIGHT - 4.,
+                                            ))
+                                            .accessible_name("Zoom in (=)")
                                             .tooltip("Zoom in (=)")
                                             .label("+")
                                             .disabled(zoom >= 2.0)
@@ -364,6 +406,7 @@ impl DbxApp {
                             )
                             .child(
                                 button("diagram-fit", "Fit", ButtonKind::Quiet)
+                                    .accessible_name("Fit (F) · reset zoom (0)")
                                     .tooltip("Fit (F) · reset zoom (0)")
                                     .disabled((zoom - fit_zoom).abs() < 0.01 && viewport_at_origin)
                                     .on_click(move |_, _, cx| {
@@ -380,6 +423,7 @@ impl DbxApp {
                                         "Auto layout",
                                         ButtonKind::Quiet,
                                     )
+                                    .accessible_name("Discard hand-arranged positions")
                                     .tooltip("Discard hand-arranged positions")
                                     .on_click(
                                         move |_, _, cx| {
@@ -455,7 +499,8 @@ impl DbxApp {
                     })
                     .child(
                         toolbar_icon_button("diagram-refresh")
-                            .size(px(DIAGRAM_TOOLBAR_CONTROL_HEIGHT))
+                            .size(crate::theme::ui_px(DIAGRAM_TOOLBAR_CONTROL_HEIGHT))
+                            .accessible_name("Refresh (R)")
                             .tooltip("Refresh (R)")
                             .child(icon(Icon::Refresh, theme().text_muted))
                             .disabled(busy)
@@ -467,6 +512,25 @@ impl DbxApp {
                     ),
             );
 
+        let selection_summary = document
+            .as_ref()
+            .and_then(|document| {
+                let selected = selected_node.as_deref()?;
+                let node = document.nodes.iter().find(|node| node.id == selected)?;
+                Some(format!(
+                    "{} selected. Card position {}, {}.",
+                    table_sidebar_label(&node.table, None),
+                    node.x,
+                    node.y
+                ))
+            })
+            .unwrap_or_else(|| {
+                if busy {
+                    "Loading diagram.".into()
+                } else {
+                    "No table selected.".into()
+                }
+            });
         let body_content = match document {
             Some(document) if document.nodes.is_empty() => div()
                 .flex_1()
@@ -489,6 +553,16 @@ impl DbxApp {
                         )),
                 )
                 .into_any_element(),
+            Some(document) if list_view => self.render_diagram_list(
+                session_id,
+                document,
+                source_schema,
+                selected_node.clone(),
+                list_scroll,
+                &focus,
+                window,
+                cx,
+            ),
             Some(document) => {
                 let scene_padding = DIAGRAM_SCENE_PADDING;
                 let scene_width = document.width * zoom + scene_padding * 2.0;
@@ -571,7 +645,7 @@ impl DbxApp {
                         let column_total = node.columns.len() + node.omitted_columns;
                         let rows = node.columns.iter().enumerate().map(|(index, column)| {
                             let key = if column.primary_key {
-                                Some(("PK", theme().warning))
+                                Some(("PK", theme().warning_text))
                             } else if column.foreign_key {
                                 Some(("FK", theme().focus_ring))
                             } else {
@@ -634,7 +708,7 @@ impl DbxApp {
                                         .child(
                                             div()
                                                 .w(px((8.0 * zoom).max(4.0)))
-                                                .text_color(theme().warning.alpha(0.8))
+                                                .text_color(theme().warning_text)
                                                 .when(column.nullable, |view| view.child("?")),
                                         ),
                                 )
@@ -981,6 +1055,30 @@ impl DbxApp {
 
         let body = div()
             .id("diagram-shortcuts")
+            .role(gpui::Role::Region).aria_label("Database diagram")
+            .aria_description("Use the table and relationship list for keyboard reading and opening tables. In the list, Up and Down select tables; Enter opens the selected table. Control or Command plus Shift and an arrow moves the selected card.")
+            .capture_key_down(cx.listener({ let focus = focus.clone(); move |this, event: &gpui::KeyDownEvent, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                let key = event.keystroke.key.as_str();
+                if modifiers.secondary() && modifiers.shift && !modifiers.alt {
+                    let delta = match key { "left" => (-20., 0.), "right" => (20., 0.), "up" => (0., -20.), "down" => (0., 20.), _ => return };
+                    if let Some(id) = this.active_diagram_tab_mut(session_id).and_then(|diagram| diagram.selected_node.clone()) {
+                        this.move_diagram_node_by_for(session_id, &id, delta.0, delta.1, cx);
+                    }
+                    cx.stop_propagation();
+                } else if list_view && !modifiers.modified() && matches!(key, "up" | "down") {
+                    focus.focus(window, cx);
+                    this.select_diagram_relative_for(session_id, if key == "up" { -1 } else { 1 }, cx);
+                    cx.stop_propagation();
+                } else if list_view && !modifiers.modified() && key == "enter" && focus.is_focused(window) {
+                    let table = this.active_diagram_tab_mut(session_id).and_then(|diagram| {
+                        let id = diagram.selected_node.as_ref()?;
+                        diagram.document.as_ref()?.nodes.iter().find(|node| &node.id == id).map(|node| node.table.clone())
+                    });
+                    if let Some(table) = table { this.open_diagram_table_for(session_id, table, window, cx); }
+                    cx.stop_propagation();
+                }
+            }}))
             .flex_1()
             .min_w_0()
             .min_h_0()
@@ -993,31 +1091,31 @@ impl DbxApp {
             .focus_visible(|style| style.border_color(theme().focus_ring))
             .on_mouse_down(MouseButton::Left, {
                 let focus = focus.clone();
-                move |_, window, cx| focus.focus(window, cx)
+                move |_, window, cx| { if !list_view { focus.focus(window, cx); } }
             })
             .on_action(cx.listener(move |this, _: &DiagramPanLeft, _, cx| {
-                this.pan_diagram_by_for(session_id, -48.0, 0.0, cx);
+                if !list_view { this.pan_diagram_by_for(session_id, -48.0, 0.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanRight, _, cx| {
-                this.pan_diagram_by_for(session_id, 48.0, 0.0, cx);
+                if !list_view { this.pan_diagram_by_for(session_id, 48.0, 0.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanUp, _, cx| {
-                this.pan_diagram_by_for(session_id, 0.0, -48.0, cx);
+                if list_view { this.select_diagram_relative_for(session_id, -1, cx); } else { this.pan_diagram_by_for(session_id, 0.0, -48.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanDown, _, cx| {
-                this.pan_diagram_by_for(session_id, 0.0, 48.0, cx);
+                if list_view { this.select_diagram_relative_for(session_id, 1, cx); } else { this.pan_diagram_by_for(session_id, 0.0, 48.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanLeftLarge, _, cx| {
-                this.pan_diagram_by_for(session_id, -160.0, 0.0, cx);
+                if !list_view { this.pan_diagram_by_for(session_id, -160.0, 0.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanRightLarge, _, cx| {
-                this.pan_diagram_by_for(session_id, 160.0, 0.0, cx);
+                if !list_view { this.pan_diagram_by_for(session_id, 160.0, 0.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanUpLarge, _, cx| {
-                this.pan_diagram_by_for(session_id, 0.0, -160.0, cx);
+                if list_view { this.select_diagram_relative_for(session_id, -10, cx); } else { this.pan_diagram_by_for(session_id, 0.0, -160.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramPanDownLarge, _, cx| {
-                this.pan_diagram_by_for(session_id, 0.0, 160.0, cx);
+                if list_view { this.select_diagram_relative_for(session_id, 10, cx); } else { this.pan_diagram_by_for(session_id, 0.0, 160.0, cx); }
             }))
             .on_action(cx.listener(move |this, _: &DiagramZoomIn, _, cx| {
                 this.set_diagram_zoom_for(session_id, zoom + 0.15, cx);
@@ -1044,6 +1142,11 @@ impl DbxApp {
             .flex()
             .flex_col()
             .child(toolbar)
+            .child(
+                crate::accessibility::announcement("diagram-selection", selection_summary, false)
+                    .px(crate::theme::ui_px(12.))
+                    .text_size(crate::theme::ui_px(11.)),
+            )
             .child(body)
             .into_any_element()
     }

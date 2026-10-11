@@ -50,15 +50,25 @@ impl DbxApp {
         };
         div()
             .id(id)
+            .debug_selector(move || id.into())
+            .pressable(match pane {
+                PaneResize::Explorer => "Explorer width",
+                PaneResize::Inspector => "Inspector width",
+            })
+            .role(gpui::Role::Splitter)
+            .aria_label(match pane {
+                PaneResize::Explorer => "Explorer width",
+                PaneResize::Inspector => "Inspector width",
+            })
             .group(group)
             .absolute()
             .top_0()
             .bottom_0()
-            .w(px(HANDLE_WIDTH))
+            .w(crate::theme::ui_px(HANDLE_WIDTH))
             // The explorer's handle fills the gap beside the glass; the
             // inspector's straddles its border with the grid.
             .map(|handle| match pane {
-                PaneResize::Explorer => handle.right(px(-HANDLE_WIDTH)),
+                PaneResize::Explorer => handle.right(crate::theme::ui_px(-HANDLE_WIDTH)),
                 PaneResize::Inspector => handle.left(px(-HANDLE_WIDTH / 2.)),
             })
             .flex()
@@ -68,13 +78,56 @@ impl DbxApp {
             .child(
                 div()
                     .h_full()
-                    .w(px(2.))
+                    .w(crate::theme::ui_px(2.))
                     .when(resizing, |line| line.bg(theme().accent))
                     .when(!resizing, |line| {
                         line.group_hover(group, |line| line.bg(theme().border_strong))
                     }),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                if !matches!(key, "left" | "right" | "home") {
+                    return;
+                }
+                cx.stop_propagation();
+                if key == "home" {
+                    match pane {
+                        PaneResize::Explorer => this.explorer_width = None,
+                        PaneResize::Inspector => this.inspector_width = None,
+                    }
+                } else {
+                    let delta = if key == "right" { 10. } else { -10. };
+                    match pane {
+                        PaneResize::Explorer => {
+                            this.explorer_width = Some(
+                                (this.explorer_width() + delta)
+                                    .clamp(EXPLORER_MIN_WIDTH, EXPLORER_MAX_WIDTH),
+                            )
+                        }
+                        PaneResize::Inspector => {
+                            let explorer = if this.sidebar_hidden {
+                                0.
+                            } else {
+                                this.explorer_width() + GLASS_INSET
+                            };
+                            let max = (f32::from(window.bounds().size.width)
+                                - APP_RAIL_WIDTH
+                                - explorer
+                                - GRID_MIN_WIDTH)
+                                .max(INSPECTOR_MIN_WIDTH);
+                            this.inspector_width = Some(
+                                (this.inspector_width() - delta).clamp(INSPECTOR_MIN_WIDTH, max),
+                            );
+                        }
+                    }
+                }
+                this.persist_settings(cx);
+                cx.notify();
+            }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 cx.stop_propagation();
                 if event.click_count() == 2 {
@@ -133,5 +186,69 @@ impl DbxApp {
             self.persist_settings(cx);
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Harness {
+        app: Entity<DbxApp>,
+        focus: FocusHandle,
+    }
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .w(px(400.))
+                .h(px(200.))
+                .track_focus(&self.focus)
+                .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
+                .child(self.app.update(cx, |app, cx| {
+                    app.pane_resize_handle(PaneResize::Explorer, cx)
+                }))
+        }
+    }
+
+    #[gpui::test]
+    fn explorer_splitter_can_be_reached_resized_and_reset_from_the_keyboard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| cx.bind_keys(focus_key_bindings()));
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at(directory.path().join("settings.json"));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| {
+                let mut app = DbxApp::new(window, cx);
+                app.settings_store = Some(store.clone());
+                app.explorer_width = Some(236.);
+                app
+            });
+            let focus = cx.focus_handle();
+            focus.focus(window, cx);
+            Harness { app, focus }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let root = view.read_with(cx, |view, _| view.focus.clone());
+        cx.simulate_keystrokes("tab");
+        assert_ne!(
+            cx.update(|window, cx| window.focused(cx)),
+            Some(root),
+            "splitter must be a keyboard tab stop"
+        );
+        cx.simulate_keystrokes("right");
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.app.read(cx).explorer_width()),
+            246.
+        );
+        assert_eq!(store.load().unwrap().explorer_width, Some(246));
+        cx.simulate_keystrokes("home");
+        assert!(
+            view.read_with(cx, |view, cx| view.app.read(cx).explorer_width)
+                .is_none()
+        );
+        assert!(store.load().unwrap().explorer_width.is_none());
     }
 }

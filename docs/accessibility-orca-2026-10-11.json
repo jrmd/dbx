@@ -1,0 +1,86 @@
+{
+  "reader": "Orca 50.2-1",
+  "platform": "Linux / Hyprland Wayland / native DBX",
+  "scope": "Disposable SQLite fixture, live AT-SPI processing and generated speech; silent output sink",
+  "audio_verified": false,
+  "automatic_key_driven_line_speech_verified": false,
+  "protected_values_retained": false,
+  "journal": "/tmp/dbx-orca-50.2/dbx-presentation.jsonl",
+  "presentation": [
+    {
+      "time": 29919.461597557,
+      "kind": "speech",
+      "text": "Connection name entry.",
+      "focus": "Connection name",
+      "role": "entry"
+    },
+    {
+      "time": 29922.455303741,
+      "kind": "speech",
+      "text": "Dismiss notification",
+      "focus": "Connection name",
+      "role": "entry"
+    },
+    {
+      "time": 30097.546023201,
+      "kind": "speech",
+      "text": "SQL query entry -- QA reader é 👩‍💻\n",
+      "focus": "SQL query",
+      "role": "entry"
+    },
+    {
+      "time": 30187.393167516,
+      "kind": "speech",
+      "text": "Choose a database for a new connection panel",
+      "focus": "Import connection string",
+      "role": "entry"
+    },
+    {
+      "time": 30192.403062078,
+      "kind": "speech",
+      "text": "Connection succeeded · 0 tables",
+      "focus": "Connection name",
+      "role": "entry"
+    },
+    {
+      "time": 30226.537397523,
+      "kind": "speech",
+      "text": "database connection failed: sqlite://<redacted> (error returned from database: (code: 14) unable to open database file)",
+      "focus": "Database file or connection string",
+      "role": "entry"
+    },
+    {
+      "time": 30342.949301128,
+      "kind": "speech",
+      "text": "Import connection profiles button.",
+      "focus": "Import connection profiles",
+      "role": "button"
+    },
+    {
+      "time": 30503.524025187,
+      "kind": "speech",
+      "text": "New SQLite connection panel",
+      "focus": "Connection name",
+      "role": "entry"
+    },
+    {
+      "time": 30525.053686193,
+      "kind": "speech",
+      "text": "Bundle or file passphrase password text.",
+      "focus": "Bundle or file passphrase",
+      "role": "password text"
+    },
+    {
+      "time": 30575.999813427,
+      "kind": "speech_metadata",
+      "text": "Review connection import",
+      "role": "password text"
+    },
+    {
+      "time": 30575.999836821,
+      "kind": "speech_metadata",
+      "text": "Bundle or file passphrase",
+      "role": "password text"
+    }
+  ]
+}

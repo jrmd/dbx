@@ -89,16 +89,18 @@ impl DbxApp {
             } else {
                 "explorer-objects"
             })
-            .max_h(px(260.))
+            .role(gpui::Role::List)
+            .aria_label("Schema objects")
+            .max_h(crate::theme::ui_px(260.))
             .overflow_y_scroll()
             .flex()
             .flex_col()
             .when(!objects.is_empty(), |view| {
                 view.child(
                     div()
-                        .px(px(14.))
-                        .pt(px(8.))
-                        .text_size(px(11.))
+                        .px(crate::theme::ui_px(14.))
+                        .pt(crate::theme::ui_px(8.))
+                        .text_size(crate::theme::ui_px(11.))
                         .text_color(theme().text_muted)
                         .child("Schema objects"),
                 )
@@ -106,9 +108,9 @@ impl DbxApp {
             .when_some(session.schema_objects_error.clone(), |view, error| {
                 view.child(
                     div()
-                        .p(px(8.))
-                        .text_color(theme().danger)
-                        .text_size(px(10.))
+                        .p(crate::theme::ui_px(8.))
+                        .text_color(theme().danger_text)
+                        .text_size(crate::theme::ui_px(10.))
                         .child(error),
                 )
             })
@@ -119,58 +121,73 @@ impl DbxApp {
                     SchemaObjectKind::Function => "Function",
                     SchemaObjectKind::Procedure => "Procedure",
                 };
-                div().w_full().px(px(6.)).child(
-                    div()
-                        .id(SharedString::from(format!(
-                            "schema-object-{session_id}-{index}"
-                        )))
-                        .w_full()
-                        .h(px(28.))
-                        .px(px(8.))
-                        .rounded(px(RADIUS_CONTROL))
-                        .text_size(px(12.))
-                        .text_color(theme().text)
-                        .flex()
-                        .items_center()
-                        .gap(px(7.))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme().glass_hover))
-                        .tooltip(tip(object.name.clone()))
-                        .child(icon(Icon::Query, theme().text_muted))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(object.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.))
-                                .text_color(theme().text_muted)
-                                .child(kind),
-                        )
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if let Some(definition) = &object.definition {
-                                this.open_saved_query_for(
-                                    session_id,
-                                    SavedQuery {
-                                        name: object.name.clone(),
-                                        sql: definition.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            } else {
-                                this.show_toast(
-                                    ToastKind::Info,
-                                    "This account cannot read the object definition",
-                                    cx,
-                                );
-                            }
-                        })),
-                )
+                div()
+                    .id(("schema-object-row", index))
+                    .role(gpui::Role::ListItem)
+                    .aria_label(format!(
+                        "{kind} {}{}",
+                        object
+                            .schema
+                            .as_ref()
+                            .map(|schema| format!("{schema}. "))
+                            .unwrap_or_default(),
+                        object.name
+                    ))
+                    .w_full()
+                    .px(crate::theme::ui_px(6.))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "schema-object-{session_id}-{index}"
+                            )))
+                            .pressable(format!("Open {kind} {} definition", object.name))
+                            .w_full()
+                            .h(crate::theme::ui_px(28.))
+                            .px(crate::theme::ui_px(8.))
+                            .rounded(crate::theme::ui_px(RADIUS_CONTROL))
+                            .text_size(crate::theme::ui_px(12.))
+                            .text_color(theme().text)
+                            .flex()
+                            .items_center()
+                            .gap(crate::theme::ui_px(7.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme().glass_hover))
+                            .tooltip(tip(object.name.clone()))
+                            .child(icon(Icon::Query, theme().text_muted))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(object.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_color(theme().text_muted)
+                                    .child(kind),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(definition) = &object.definition {
+                                    this.open_saved_query_for(
+                                        session_id,
+                                        SavedQuery {
+                                            name: object.name.clone(),
+                                            sql: definition.clone(),
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                } else {
+                                    this.show_toast(
+                                        ToastKind::Info,
+                                        "This account cannot read the object definition",
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
             }))
             .into_any_element()
     }

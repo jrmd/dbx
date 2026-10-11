@@ -317,6 +317,11 @@ impl DbxApp {
             CellValue::Null => String::new(),
             value => value_view::json_preview(value).unwrap_or_else(|| field_editor_text(value)),
         };
+        let column_name = data
+            .table_columns
+            .get(column)
+            .map(|column| column.name.clone())
+            .unwrap_or_else(|| format!("Column {}", column + 1));
         let value = cx.new(|_| text);
         let editor = cx.new(|cx| {
             TextEditor::new_with_language(
@@ -330,6 +335,7 @@ impl DbxApp {
                 window,
                 cx,
             )
+            .accessibility_label(format!("{column_name}, row {}", row + 1))
         });
         let focus = editor.read(cx).focus_handle();
         let blur = cx.on_blur(&focus, window, move |this, window, cx| {

@@ -4,8 +4,9 @@ const TAG_PALETTE: [u32; 8] = [
     0xef6b73, 0xe5b567, 0x8fcf9c, 0x82aaff, 0xb48ead, 0x56b6c2, 0xe89bb5, 0xaab2bf,
 ];
 
-const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 5] = [
+const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 6] = [
     (SettingsSection::Appearance, "Appearance", Icon::Appearance),
+    (SettingsSection::Editor, "Editor", Icon::Query),
     (
         SettingsSection::QueryAgent,
         "Query assistant",
@@ -22,7 +23,11 @@ impl DbxApp {
     /// windows get a sidebar; compact ones a segmented control.
     pub(super) fn render_settings(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let compact = self.compact_layout;
-        let padding = if compact { px(14.) } else { px(28.) };
+        let padding = if compact {
+            crate::theme::ui_px(14.)
+        } else {
+            crate::theme::ui_px(28.)
+        };
         let selected = self.settings_section;
         let title = SETTINGS_SECTIONS
             .iter()
@@ -30,27 +35,27 @@ impl DbxApp {
             .map_or("Settings", |(_, label, _)| *label);
         let content = match selected {
             SettingsSection::Appearance => self.render_settings_appearance(cx).into_any_element(),
+            SettingsSection::Editor => self.render_settings_editor(cx).into_any_element(),
             SettingsSection::QueryAgent => self.render_agent_settings(cx).into_any_element(),
             SettingsSection::Connections => self.render_settings_connections(cx).into_any_element(),
             SettingsSection::Tags => self.render_settings_tags(cx).into_any_element(),
             SettingsSection::Updates => self.render_settings_updates(cx).into_any_element(),
         };
-        let close = Button::new("close-settings")
-            .with_size(Size::XSmall)
-            .compact()
-            .ghost()
-            .tooltip("Back to workspace")
-            .child(icon(Icon::Close, theme().text_muted))
-            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)));
+        let close = glass_icon_button("close-settings", Icon::Close, false)
+            .aria_label("Close settings")
+            .track_focus(&self.settings_focus)
+            .debug_selector(|| "close-settings".into())
+            .tooltip(tip("Back to workspace"))
+            .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)));
         let header = div()
             .flex_none()
-            .h(px(52.))
+            .h(crate::theme::ui_px(52.))
             .px(padding)
             .border_b_1()
             .border_color(theme().hairline)
             .flex()
             .items_center()
-            .gap(px(12.))
+            .gap(crate::theme::ui_px(12.))
             .map(|view| {
                 if compact {
                     view.child(
@@ -64,6 +69,9 @@ impl DbxApp {
                                 SETTINGS_SECTIONS.into_iter().map(|(section, label, _)| {
                                     segment(label, section == selected)
                                         .id(SharedString::from(format!("settings-section-{label}")))
+                                        .pressable(label)
+                                        .role(gpui::Role::Tab)
+                                        .aria_selected(section == selected)
                                         .debug_selector(move || format!("settings-section-{label}"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.show_settings_section(section, cx)
@@ -74,7 +82,7 @@ impl DbxApp {
                 } else {
                     view.child(
                         div()
-                            .text_size(px(16.))
+                            .text_size(crate::theme::ui_px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
@@ -87,15 +95,15 @@ impl DbxApp {
             .min_w_0()
             .min_h_0()
             .flex()
-            .pr(px(GLASS_INSET))
-            .pb(px(GLASS_INSET))
+            .pr(crate::theme::ui_px(GLASS_INSET))
+            .pb(crate::theme::ui_px(GLASS_INSET))
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .overflow_hidden()
-                    .rounded(px(RADIUS_PANEL))
+                    .rounded(crate::theme::ui_px(RADIUS_PANEL))
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().canvas)
@@ -113,6 +121,7 @@ impl DbxApp {
                             .child(
                                 div()
                                     .id("settings-scroll")
+                                    .track_scroll(&self.settings_scroll)
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_y_scroll()
@@ -120,32 +129,41 @@ impl DbxApp {
                                     .flex()
                                     .justify_center()
                                     .items_start()
-                                    .child(div().w_full().min_w_0().max_w(px(640.)).child(content)),
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .max_w(crate::theme::ui_px(640.))
+                                            .child(content),
+                                    ),
                             ),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_settings_sidebar(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_settings_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.settings_section;
         div()
-            .w(px(208.))
+            .id("settings-sections")
+            .role(gpui::Role::TabList)
+            .aria_label("Settings sections")
+            .w(crate::theme::ui_px(208.))
             .flex_none()
             .flex()
             .flex_col()
-            .gap(px(2.))
-            .p(px(10.))
+            .gap(crate::theme::ui_px(2.))
+            .p(crate::theme::ui_px(10.))
             .border_r_1()
             .border_color(theme().hairline)
             .child(
                 div()
-                    .h(px(32.))
-                    .px(px(8.))
-                    .mb(px(8.))
+                    .h(crate::theme::ui_px(32.))
+                    .px(crate::theme::ui_px(8.))
+                    .mb(crate::theme::ui_px(8.))
                     .flex()
                     .items_center()
-                    .text_size(px(13.))
+                    .text_size(crate::theme::ui_px(13.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme().text_muted)
                     .child("Settings"),
@@ -154,14 +172,17 @@ impl DbxApp {
                 let active = section == selected;
                 div()
                     .id(SharedString::from(format!("settings-section-{label}")))
+                    .pressable(label)
+                    .role(gpui::Role::Tab)
+                    .aria_selected(section == selected)
                     .debug_selector(move || format!("settings-section-{label}"))
-                    .h(px(32.))
-                    .px(px(10.))
-                    .rounded(px(RADIUS_CONTROL))
+                    .h(crate::theme::ui_px(32.))
+                    .px(crate::theme::ui_px(10.))
+                    .rounded(crate::theme::ui_px(RADIUS_CONTROL))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
-                    .text_size(px(13.))
+                    .gap(crate::theme::ui_px(10.))
+                    .text_size(crate::theme::ui_px(13.))
                     .cursor_pointer()
                     .when(active, |view| {
                         view.bg(theme().glass_selected)
@@ -196,9 +217,71 @@ impl DbxApp {
     }
 
     /// Jump straight to tag management, e.g. from the connection form.
-    pub(super) fn open_tag_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_tag_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_section = SettingsSection::Tags;
-        self.open_settings(cx);
+        self.open_settings(window, cx);
+    }
+
+    pub(in crate::app) fn scrolling_settings_group(
+        &self,
+        id: &'static str,
+        rows: impl IntoIterator<Item = AnyElement>,
+    ) -> Div {
+        settings_group(rows.into_iter().enumerate().map(|(index, row)| {
+            crate::accessibility::focus_reveal((id, index), &self.settings_scroll, row)
+                .into_any_element()
+        }))
+    }
+
+    fn text_scale_choices(&self, editor: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = if editor {
+            self.editor_scale
+        } else {
+            self.ui_scale
+        };
+        div()
+            .id(if editor {
+                "editor-text-sizes"
+            } else {
+                "interface-text-sizes"
+            })
+            .flex()
+            .flex_wrap()
+            .gap(crate::theme::ui_px(4.))
+            .role(gpui::Role::RadioGroup)
+            .aria_label(if editor {
+                "SQL editor text size"
+            } else {
+                "Interface size"
+            })
+            .children([100, 125, 150, 175, 200].into_iter().map(|scale| {
+                let label = format!("{scale}%");
+                segment(label.clone(), scale == selected)
+                    .id(("text-scale", scale as usize))
+                    .pressable(format!(
+                        "{} size {label}",
+                        if editor {
+                            "SQL editor text"
+                        } else {
+                            "Interface"
+                        }
+                    ))
+                    .debug_selector(move || {
+                        format!(
+                            "{}-size-{scale}",
+                            if editor { "editor" } else { "interface" }
+                        )
+                    })
+                    .role(gpui::Role::RadioButton)
+                    .aria_toggled(if scale == selected {
+                        gpui::accesskit::Toggled::True
+                    } else {
+                        gpui::accesskit::Toggled::False
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_text_scale(scale, editor, window, cx)
+                    }))
+            }))
     }
 
     fn render_settings_appearance(&mut self, cx: &mut Context<Self>) -> Div {
@@ -209,6 +292,13 @@ impl DbxApp {
                     "settings-appearance-{}",
                     option.label()
                 )))
+                .pressable(option.label())
+                .role(gpui::Role::RadioButton)
+                .aria_toggled(if option == current {
+                    gpui::accesskit::Toggled::True
+                } else {
+                    gpui::accesskit::Toggled::False
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_appearance_preference(option, window, cx)
                 }))
@@ -217,70 +307,115 @@ impl DbxApp {
             settings_row(
                 "Theme",
                 None,
-                segmented_track().children(appearance_choices),
+                segmented_track()
+                    .id("appearance-choices")
+                    .role(gpui::Role::RadioGroup)
+                    .aria_label("Theme")
+                    .children(appearance_choices),
             )
             .into_any_element(),
         ];
+        rows.push(settings_row("Interface size", Some("Grow text and controls together. Command or Control with +, −, or 0 adjusts or resets the size.".into()), self.text_scale_choices(false, cx)).into_any_element());
+        rows.push(settings_row("Motion", Some("Follow your system preference or choose static controls. System uses reduced motion when the desktop cannot report a preference.".into()),
+            div().id("motion-choices").role(gpui::Role::RadioGroup).aria_label("Motion")
+                .flex().flex_wrap().gap(crate::theme::ui_px(4.))
+                .children(crate::motion::MotionPreference::ALL.into_iter().map(|option| {
+                    segment(option.label(), option == crate::motion::preference(cx))
+                        .id(SharedString::from(format!("motion-{}", option.label())))
+                        .pressable(format!("Motion {}", option.label()))
+                        .role(gpui::Role::RadioButton)
+                        .aria_toggled(if option == crate::motion::preference(cx) { gpui::accesskit::Toggled::True } else { gpui::accesskit::Toggled::False })
+                        .debug_selector(move || format!("motion-{}", option.label()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            crate::motion::set_preference(option, cx);
+                            this.persist_settings(cx);
+                            cx.notify();
+                        }))
+                }))).into_any_element());
         if !cfg!(target_os = "macos") {
             rows.push(
                 settings_row(
                     "Reduce transparency",
                     None,
-                    gpui_component::switch::Switch::new("settings-reduce-transparency")
-                        .checked(self.reduce_transparency)
-                        .with_size(Size::Small)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.toggle_reduce_transparency(window, cx)
-                        })),
+                    settings_switch(
+                        "settings-reduce-transparency",
+                        "Reduce transparency",
+                        self.reduce_transparency,
+                    )
+                    .debug_selector(|| "settings-reduce-transparency".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_reduce_transparency(window, cx)
+                    })),
                 )
                 .into_any_element(),
             );
         }
-        div().child(settings_group(rows))
+        div().child(self.scrolling_settings_group("settings-main-row", rows))
     }
 
     fn render_settings_connections(&mut self, cx: &mut Context<Self>) -> Div {
         let unavailable = self.vault_state != Some(VaultState::Unlocked) || self.vault_busy;
-        div().child(settings_group(
-            [
-                (
-                    0,
-                    "Export profiles",
-                    "Save connection details without passwords.",
-                    "Export…",
-                ),
-                (
-                    1,
-                    "Export encrypted bundle",
-                    "Back up connections and credentials with a separate passphrase.",
-                    "Export…",
-                ),
-                (
-                    2,
-                    "Import profiles",
-                    "Review a DBX or TablePro export before importing.",
-                    "Import…",
-                ),
-            ]
-            .into_iter()
-            .map(|(mode, label, detail, action)| {
-                settings_row(
-                    label,
-                    Some(detail.into()),
-                    button(
-                        SharedString::from(format!("profile-portability-{mode}")),
-                        action,
-                        ButtonKind::Quiet,
+        div().child(
+            self.scrolling_settings_group(
+                "settings-connections-row",
+                [
+                    (
+                        0,
+                        "Export profiles",
+                        "Save connection details without passwords.",
+                        "Export…",
+                    ),
+                    (
+                        1,
+                        "Export encrypted bundle",
+                        "Back up connections and credentials with a separate passphrase.",
+                        "Export…",
+                    ),
+                    (
+                        2,
+                        "Import profiles",
+                        "Review a DBX or TablePro export before importing.",
+                        "Import…",
+                    ),
+                ]
+                .into_iter()
+                .map(|(mode, label, detail, action)| {
+                    settings_row(
+                        label,
+                        Some(detail.into()),
+                        button(
+                            SharedString::from(format!("profile-portability-{mode}")),
+                            action,
+                            ButtonKind::Quiet,
+                        )
+                        .accessible_name(match mode {
+                            0 => "Export password-free connection profiles",
+                            1 => "Export encrypted connection bundle",
+                            _ => "Import connection profiles",
+                        })
+                        .debug_selector(move || format!("profile-portability-{mode}"))
+                        .disabled(unavailable)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| this.open_profile_transfer(mode, window, cx),
+                        )),
                     )
-                    .debug_selector(move || format!("profile-portability-{mode}"))
-                    .disabled(unavailable)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_profile_transfer(mode, window, cx)
-                    })),
-                )
-                .into_any_element()
-            }),
-        ))
+                    .into_any_element()
+                }),
+            ),
+        )
+    }
+
+    fn render_settings_editor(&mut self, cx: &mut Context<Self>) -> Div {
+        div().child(self.scrolling_settings_group("settings-editor-row", [
+            settings_row("SQL editor text size", Some("Additional enlargement of query text.".into()), self.text_scale_choices(true, cx)).into_any_element(),
+            settings_row(
+                "Vim mode",
+                Some("Modal editing in SQL query tabs. Starts in Normal mode; press i to type and Esc to return. F6 moves focus out of the editor.".into()),
+                div().id("vim-setting-control").debug_selector(|| "settings-vim-mode".into()).child(settings_switch("settings-vim-mode", "SQL Vim mode", self.vim_mode)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_vim_mode(cx)))),
+            ).into_any_element(),
+        ])).child(div().mt(crate::theme::ui_px(16.)).text_size(crate::theme::ui_px(12.)).text_color(theme().text_muted)
+            .child("Vim keys: h/j/k/l, w/b/e, W/B/E, 0/^/$, gg/G, counts, i/a/I/A, o/O, v/V, d/c/y with motions, dd/cc/yy, x/X, D/C, r, p/P, u and Ctrl+R. Query and clipboard shortcuts remain available."))
     }
 
     fn render_settings_tags(&mut self, cx: &mut Context<Self>) -> Div {
@@ -303,14 +438,15 @@ impl DbxApp {
         } else {
             div()
                 .id("new-tag")
+                .pressable("New tag")
                 .debug_selector(|| "new-tag".into())
-                .h(px(48.))
-                .px(px(16.))
+                .h(crate::theme::ui_px(48.))
+                .px(crate::theme::ui_px(16.))
                 .flex()
                 .items_center()
-                .gap(px(10.))
-                .text_size(px(13.))
-                .text_color(theme().accent)
+                .gap(crate::theme::ui_px(10.))
+                .text_size(crate::theme::ui_px(13.))
+                .text_color(theme().accent_text)
                 .cursor_pointer()
                 .hover(|style| style.bg(theme().glass_hover))
                 .child(icon(Icon::Add, theme().accent))
@@ -322,7 +458,7 @@ impl DbxApp {
                 }))
                 .into_any_element()
         });
-        div().child(settings_group(rows))
+        div().child(self.scrolling_settings_group("settings-main-row", rows))
     }
 
     fn tag_usage(&self, id: Uuid) -> usize {
@@ -340,10 +476,10 @@ impl DbxApp {
             div()
                 .flex()
                 .items_center()
-                .gap(px(10.))
+                .gap(crate::theme::ui_px(10.))
                 .child(
                     div()
-                        .size(px(10.))
+                        .size(crate::theme::ui_px(10.))
                         .flex_none()
                         .rounded_full()
                         .bg(gpui::rgb(tag.color)),
@@ -352,7 +488,7 @@ impl DbxApp {
             Some(connection_count(used).into()),
             div()
                 .flex()
-                .gap(px(2.))
+                .gap(crate::theme::ui_px(2.))
                 .child(
                     glass_icon_button(
                         SharedString::from(format!("edit-tag-{id}")),
@@ -390,7 +526,7 @@ impl DbxApp {
             (used > 0).then(|| format!("{} will lose this tag.", connection_count(used)).into()),
             div()
                 .flex()
-                .gap(px(8.))
+                .gap(crate::theme::ui_px(8.))
                 .child(
                     button("cancel-delete-tag", "Cancel", ButtonKind::Quiet)
                         .cursor_pointer()
@@ -422,32 +558,38 @@ impl DbxApp {
         )
         .ok();
         div()
-            .px(px(16.))
-            .py(px(12.))
+            .px(crate::theme::ui_px(16.))
+            .py(crate::theme::ui_px(12.))
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(crate::theme::ui_px(12.))
             .bg(theme().panel_raised)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .child(div().flex_1().min_w(px(140.)).child(editor::input(
-                        self.tag_editor.name_editor.clone(),
-                        name_focus,
-                        false,
-                    )))
+                    .gap(crate::theme::ui_px(8.))
                     .child(
                         div()
-                            .w(px(104.))
+                            .flex_1()
+                            .min_w(crate::theme::ui_px(140.))
+                            .child(editor::input(
+                                self.tag_editor.name_editor.clone(),
+                                name_focus,
+                                false,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w(crate::theme::ui_px(104.))
                             .flex_none()
                             .flex()
                             .items_center()
-                            .gap(px(4.))
+                            .gap(crate::theme::ui_px(4.))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .text_color(theme().text_muted)
                                     .child("#"),
                             )
@@ -455,6 +597,7 @@ impl DbxApp {
                                 self.tag_editor.color_editor.clone(),
                                 color_focus,
                                 false,
+                                cx,
                             ))),
                     ),
             )
@@ -463,12 +606,19 @@ impl DbxApp {
                     .flex()
                     .flex_wrap()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(crate::theme::ui_px(8.))
                     .children(TAG_PALETTE.into_iter().map(|color| {
                         let chosen = current == Some(color);
                         div()
                             .id(SharedString::from(format!("tag-colour-{color:06x}")))
-                            .size(px(22.))
+                            .pressable(format!("Tag colour #{color:06x}"))
+                            .role(gpui::Role::RadioButton)
+                            .aria_toggled(if chosen {
+                                gpui::accesskit::Toggled::True
+                            } else {
+                                gpui::accesskit::Toggled::False
+                            })
+                            .size(crate::theme::ui_px(28.))
                             .flex_none()
                             .rounded_full()
                             .bg(gpui::rgb(color))
@@ -541,15 +691,15 @@ impl DbxApp {
         let version = div()
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(crate::theme::ui_px(2.))
             .child(concat!("DBX ", env!("CARGO_PKG_VERSION")))
             .when_some(status, |view, status| {
                 view.child(
                     div()
                         .id("settings-update-status")
-                        .text_size(px(11.))
+                        .text_size(crate::theme::ui_px(11.))
                         .text_color(if failed {
-                            theme().danger
+                            theme().danger_text
                         } else {
                             theme().text_muted
                         })
@@ -576,11 +726,11 @@ impl DbxApp {
             rows.push(
                 div()
                     .id("settings-release-notes")
-                    .max_h(px(360.))
-                    .px(px(16.))
-                    .py(px(12.))
+                    .max_h(crate::theme::ui_px(360.))
+                    .px(crate::theme::ui_px(16.))
+                    .py(crate::theme::ui_px(12.))
                     .overflow_y_scroll()
-                    .text_size(px(12.))
+                    .text_size(crate::theme::ui_px(12.))
                     .child(
                         gpui_component::text::TextView::markdown(
                             "settings-release-notes-text",
@@ -591,7 +741,7 @@ impl DbxApp {
                     .into_any_element(),
             );
         }
-        div().child(settings_group(rows))
+        div().child(self.scrolling_settings_group("settings-main-row", rows))
     }
 }
 
@@ -608,6 +758,159 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    fn motion_choices_apply_to_gpui_and_survive_other_preference_saves(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at(directory.path().join("settings.json"));
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.settings_open = true;
+            app.settings_store = Some(store.clone());
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for (label, reduced) in [
+            ("motion-Reduce", true),
+            ("motion-Full", false),
+            ("motion-System", true),
+        ] {
+            let bounds = cx.debug_bounds(label).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert_eq!(cx.update(|_, cx| cx.reduce_motion()), reduced);
+            let saved = store.load().unwrap().motion;
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.set_text_scale(125, false, window, cx))
+            });
+            assert_eq!(store.load().unwrap().motion, saved);
+        }
+        crate::theme::set_text_scales(100, 100);
+    }
+
+    #[gpui::test]
+    fn interface_size_shortcuts_persist_and_controls_fit_at_two_hundred_percent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at(directory.path().join("settings.json"));
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.saved_connections.clear();
+            app.settings_store = Some(store.clone());
+            app.settings_open = true;
+            app
+        });
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..4 {
+            cx.simulate_keystrokes("ctrl-=");
+        }
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.update(|_, cx| app.read(cx).ui_scale), 200);
+        assert_eq!(store.load().unwrap().ui_scale, 200);
+        let control = cx
+            .debug_bounds("interface-size-200")
+            .expect("200 percent choice drawn");
+        assert!(
+            control.right() <= px(800.) && control.left() >= px(0.),
+            "scaled size choices must fit the narrow window: {control:?}"
+        );
+        assert!(
+            control.size.height >= px(48.),
+            "controls must grow with their text"
+        );
+        cx.simulate_keystrokes("ctrl-0");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(store.load().unwrap().ui_scale, 100);
+        crate::theme::set_text_scales(100, 100);
+    }
+
+    #[gpui::test]
+    fn focusing_an_offscreen_settings_row_reveals_it_at_two_hundred_percent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.settings_open = true;
+            app.settings_store = Some(SettingsStore::at(directory.path().join("settings.json")));
+            app
+        });
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let initial = cx.debug_bounds("settings-reduce-transparency").unwrap();
+        cx.simulate_mouse_down(initial.center(), MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(
+            gpui::point(px(-10.), px(-10.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        let focus = cx.update(|window, cx| window.focused(cx).unwrap());
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.settings_focus.focus(window, cx);
+                app.set_text_scale(200, false, window, cx);
+            })
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let before = cx.debug_bounds("settings-reduce-transparency").unwrap();
+        assert!(
+            before.bottom() > px(600.),
+            "fixture must put the control below the viewport"
+        );
+        cx.update(|window, cx| focus.focus(window, cx));
+        for _ in 0..4 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        let after = cx.debug_bounds("settings-reduce-transparency").unwrap();
+        cx.update(|window, _| {
+            assert!(focus.is_focused(window), "control focus was lost");
+        });
+        assert!(
+            after.top() >= px(0.) && after.bottom() <= px(600.),
+            "focused control must be visible: {after:?}"
+        );
+        cx.update(|_, cx| {
+            app.read(cx)
+                .settings_scroll
+                .set_offset(gpui::point(px(0.), px(0.)))
+        });
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
+        assert!(
+            cx.debug_bounds("settings-reduce-transparency")
+                .unwrap()
+                .bottom()
+                > px(600.),
+            "manual scrolling must not be undone while focus stays on the same row"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.set_text_scale(100, false, window, cx))
+        });
+        crate::theme::set_text_scales(100, 100);
+    }
+
+    #[gpui::test]
     fn connection_actions_are_available_on_their_own_screens(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (app, cx) = cx.add_window_view(|window, cx| {
@@ -619,9 +922,9 @@ mod tests {
         });
         for width in [1200., 720., 480.] {
             cx.simulate_resize(gpui::size(px(width), px(800.)));
-            cx.update(|_, cx| {
+            cx.update(|window, cx| {
                 app.update(cx, |app, cx| {
-                    app.close_settings(cx);
+                    app.close_settings(window, cx);
                     app.begin_new_connection(cx);
                 })
             });
@@ -644,7 +947,7 @@ mod tests {
                 "demo is only offered when choosing a new connection"
             );
 
-            cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(cx)));
+            cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(window, cx)));
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let connections = cx.debug_bounds("settings-section-Connections").unwrap();
             assert!(connections.left() >= px(0.) && connections.right() <= px(width));

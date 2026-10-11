@@ -1,0 +1,2217 @@
+--- a/accesskit_atspi_common/src/adapter.rs
++++ b/accesskit_atspi_common/src/adapter.rs
+@@ -515,7 +515,7 @@
+ 
+     pub fn update(&mut self, update: TreeUpdate) {
+         let mut handler = AdapterChangeHandler::new(self);
+-        let mut tree = self.context.tree.write().unwrap();
++        let mut tree = self.context.write_tree();
+         tree.update_and_process_changes(update, &mut handler);
+         drop(tree);
+         handler.emit_selection_changed();
+@@ -523,7 +523,7 @@
+ 
+     pub fn update_window_focus_state(&mut self, is_focused: bool) {
+         let mut handler = AdapterChangeHandler::new(self);
+-        let mut tree = self.context.tree.write().unwrap();
++        let mut tree = self.context.write_tree();
+         tree.update_host_focus_state_and_process_changes(is_focused, &mut handler);
+     }
+ 
+--- a/accesskit_atspi_common/src/context.rs
++++ b/accesskit_atspi_common/src/context.rs
+@@ -5,6 +5,7 @@
+ 
+ use accesskit::{ActionHandler, ActionRequest};
+ use accesskit_consumer::Tree;
++use std::collections::HashMap;
+ use std::fmt::{Debug, Formatter};
+ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+ 
+@@ -34,7 +35,8 @@
+ 
+ pub(crate) struct Context {
+     pub(crate) app_context: Arc<RwLock<AppContext>>,
+-    pub(crate) tree: RwLock<Tree>,
++    tree: RwLock<Tree>,
++    pub(crate) table_cache: Mutex<HashMap<accesskit_consumer::NodeId, Arc<crate::node::Table>>>,
+     pub(crate) action_handler: Arc<dyn ActionHandlerNoMut + Send + Sync>,
+     pub(crate) root_window_bounds: RwLock<WindowBounds>,
+ }
+@@ -60,6 +62,7 @@
+         Arc::new(Self {
+             app_context: Arc::clone(app_context),
+             tree: RwLock::new(tree),
++            table_cache: Mutex::new(HashMap::new()),
+             action_handler,
+             root_window_bounds: RwLock::new(root_window_bounds),
+         })
+@@ -67,6 +70,15 @@
+ 
+     pub(crate) fn read_tree(&self) -> RwLockReadGuard<'_, Tree> {
+         self.tree.read().unwrap()
++    }
++
++    pub(crate) fn write_tree(&self) -> RwLockWriteGuard<'_, Tree> {
++        // Queries take the tree read lock before the cache lock. Hold the write
++        // lock while invalidating so readers cannot reuse metadata across a
++        // semantic update, reparent/removal, or host-focus filter change.
++        let tree = self.tree.write().unwrap();
++        self.table_cache.lock().unwrap().clear();
++        tree
+     }
+ 
+     pub(crate) fn read_root_window_bounds(&self) -> RwLockReadGuard<'_, WindowBounds> {
+--- a/accesskit_atspi_common/src/lib.rs
++++ b/accesskit_atspi_common/src/lib.rs
+@@ -28,6 +28,8 @@
+ pub use context::{ActionHandlerNoMut, ActionHandlerWrapper, AppContext};
+ pub use error::*;
+ pub use events::*;
+-pub use node::{NodeIdOrRoot, PlatformNode, PlatformRoot};
++pub use node::{
++    AppCacheInfo, NodeCacheInfo, NodeIdOrRoot, PlatformNode, PlatformRoot, TableCellInfo,
++};
+ pub use rect::*;
+ pub use util::WindowBounds;
+--- a/accesskit_atspi_common/src/node.rs
++++ b/accesskit_atspi_common/src/node.rs
+@@ -32,6 +32,11 @@
+     text_attributes::ATTRIBUTE_GETTERS,
+     util::*,
+ };
++
++#[path = "table.rs"]
++mod table;
++pub(crate) use table::Table;
++pub use table::TableCellInfo;
+ 
+ pub(crate) struct NodeWrapper<'a>(pub(crate) &'a Node<'a>);
+ 
+@@ -277,6 +282,14 @@
+     }
+ 
+     pub(crate) fn state(&self, is_window_focused: bool) -> StateSet {
++        self.state_with_filter(is_window_focused, &filter)
++    }
++
++    fn state_with_filter(
++        &self,
++        is_window_focused: bool,
++        node_filter: &impl Fn(&Node<'_>) -> FilterResult,
++    ) -> StateSet {
+         let state = self.0;
+         let atspi_role = self.role();
+         let mut atspi_state = StateSet::empty();
+@@ -291,12 +304,21 @@
+             atspi_state.insert(State::Editable);
+         }
+         // TODO: Focus and selection.
+-        if state.is_focusable(&filter) {
++        if state.is_focusable(node_filter) {
+             atspi_state.insert(State::Focusable);
+         }
+-        let filter_result = filter(self.0);
++        let filter_result = node_filter(self.0);
+         if filter_result == FilterResult::Include {
+-            atspi_state.insert(State::Visible | State::Showing);
++            atspi_state.insert(State::Visible);
++            // Logical table items remain discoverable while virtualized, but
++            // are showing only once the app supplies painted bounds.
++            let unpainted_table_item = matches!(
++                state.role(),
++                Role::Cell | Role::GridCell | Role::Row | Role::ColumnHeader | Role::RowHeader
++            ) && state.raw_bounds().is_none();
++            if !unpainted_table_item {
++                atspi_state.insert(State::Showing);
++            }
+         }
+         if state.is_required() {
+             atspi_state.insert(State::Required);
+@@ -413,7 +435,10 @@
+     }
+ 
+     fn supports_component(&self) -> bool {
+-        self.0.raw_bounds().is_some() || self.is_root()
++        self.0.raw_bounds().is_some()
++            || self.is_root()
++            || self.0.data().supports_action(Action::Focus)
++            || self.0.data().supports_action(Action::ScrollIntoView)
+     }
+ 
+     fn supports_hyperlink(&self) -> bool {
+@@ -433,8 +458,15 @@
+     }
+ 
+     pub(crate) fn interfaces(&self) -> InterfaceSet {
++        self.interfaces_with_filter(&filter)
++    }
++
++    fn interfaces_with_filter(
++        &self,
++        node_filter: &impl Fn(&Node<'_>) -> FilterResult,
++    ) -> InterfaceSet {
+         let mut interfaces = InterfaceSet::new(Interface::Accessible);
+-        if self.supports_action() {
++        if self.0.is_clickable(node_filter) {
+             interfaces.insert(Interface::Action);
+         }
+         if self.supports_component() {
+@@ -445,6 +477,12 @@
+         }
+         if self.supports_selection() {
+             interfaces.insert(Interface::Selection);
++        }
++        if table::is_table(self.0.role()) {
++            interfaces.insert(Interface::Table);
++        }
++        if table::supports_table_cell(self.0, node_filter) {
++            interfaces.insert(Interface::TableCell);
+         }
+         if self.supports_text() {
+             interfaces.insert(Interface::Text);
+@@ -628,6 +666,51 @@
+     id: NodeId,
+ }
+ 
++/// The same public metadata as Accessible, captured under one tree read lock.
++/// Values, text runs and editing payloads are deliberately not extra fields.
++pub struct NodeCacheInfo {
++    pub adapter: usize,
++    pub id: NodeId,
++    pub parent: NodeIdOrRoot,
++    pub index: i32,
++    pub children: i32,
++    pub interfaces: InterfaceSet,
++    pub name: String,
++    pub role: AtspiRole,
++    pub description: String,
++    pub states: StateSet,
++}
++
++pub struct AppCacheInfo {
++    pub name: String,
++    pub windows: i32,
++    pub nodes: Vec<NodeCacheInfo>,
++}
++
++fn cache_info(
++    node: &Node<'_>,
++    adapter: usize,
++    parent: NodeIdOrRoot,
++    index: i32,
++    children: i32,
++    is_window_focused: bool,
++    node_filter: &impl Fn(&Node<'_>) -> FilterResult,
++) -> NodeCacheInfo {
++    let wrapper = NodeWrapper(node);
++    NodeCacheInfo {
++        adapter,
++        id: node.id(),
++        parent,
++        index,
++        children,
++        interfaces: wrapper.interfaces_with_filter(node_filter),
++        name: wrapper.name().unwrap_or_default(),
++        role: wrapper.role(),
++        description: wrapper.description().unwrap_or_default(),
++        states: wrapper.state_with_filter(is_window_focused, node_filter),
++    }
++}
++
+ impl PlatformNode {
+     pub(crate) fn new(context: &Arc<Context>, adapter_id: usize, id: NodeId) -> Self {
+         Self {
+@@ -668,7 +751,7 @@
+         f(&tree, &context)
+     }
+ 
+-    fn resolve_with_context<F, T>(&self, f: F) -> Result<T>
++    pub(crate) fn resolve_with_context<F, T>(&self, f: F) -> Result<T>
+     where
+         for<'a> F: FnOnce(Node<'a>, &'a Tree, &Context) -> Result<T>,
+     {
+@@ -751,6 +834,44 @@
+         } else {
+             Err(Error::Defunct)
+         }
++    }
++
++    pub fn cache_info(&self) -> Result<NodeCacheInfo> {
++        self.resolve_with_context(|node, tree, context| {
++            if filter(&node) != FilterResult::Include {
++                return Err(Error::Defunct);
++            }
++            let mut ancestor = node.parent();
++            while let Some(parent) = ancestor {
++                if filter(&parent) == FilterResult::ExcludeSubtree {
++                    return Err(Error::Defunct);
++                }
++                ancestor = parent.parent();
++            }
++            let (parent, index) = if let Some(parent) = node.filtered_parent(&filter) {
++                let index = parent
++                    .filtered_children(&filter)
++                    .position(|child| child.id() == node.id())
++                    .ok_or(Error::Defunct)?;
++                (NodeIdOrRoot::Node(parent.id()), index)
++            } else {
++                let index = context
++                    .read_app_context()
++                    .adapter_index(self.adapter_id)
++                    .map_err(|_| Error::Defunct)?;
++                (NodeIdOrRoot::Root, index)
++            };
++            let children = node.filtered_children(&filter).count();
++            Ok(cache_info(
++                &node,
++                self.adapter_id,
++                parent,
++                i32::try_from(index).map_err(|_| Error::TooManyChildren)?,
++                i32::try_from(children).map_err(|_| Error::TooManyChildren)?,
++                tree.state().focus_id().is_some(),
++                &filter,
++            ))
++        })
+     }
+ 
+     pub fn name(&self) -> Result<String> {
+@@ -1650,6 +1771,56 @@
+         f(app_context)
+     }
+ 
++    pub fn cache_snapshot(&self) -> Result<AppCacheInfo> {
++        // Release the app lock before reading any window tree. Writers use the
++        // tree -> app ordering; holding app here would invert that ordering.
++        let (name, adapters) = self.resolve_app_context(|context| {
++            Ok((
++                context.name.clone().unwrap_or_default(),
++                context.adapters.clone(),
++            ))
++        })?;
++        let windows = i32::try_from(adapters.len()).map_err(|_| Error::TooManyChildren)?;
++        let mut nodes = Vec::new();
++        for (window_index, (adapter, context)) in adapters.into_iter().enumerate() {
++            let tree = context.read_tree();
++            let filter_results = std::cell::RefCell::new(HashMap::new());
++            let cached_filter = |node: &Node<'_>| {
++                if let Some(result) = filter_results.borrow().get(&node.id()).copied() {
++                    return result;
++                }
++                let result = filter(node);
++                filter_results.borrow_mut().insert(node.id(), result);
++                result
++            };
++            let mut pending = vec![(tree.state().root(), NodeIdOrRoot::Root, window_index)];
++            while let Some((node, parent, index)) = pending.pop() {
++                let children: Vec<_> = node.filtered_children(&cached_filter).collect();
++                nodes.push(cache_info(
++                    &node,
++                    adapter,
++                    parent,
++                    i32::try_from(index).map_err(|_| Error::TooManyChildren)?,
++                    i32::try_from(children.len()).map_err(|_| Error::TooManyChildren)?,
++                    tree.state().focus_id().is_some(),
++                    &cached_filter,
++                ));
++                pending.extend(
++                    children
++                        .into_iter()
++                        .enumerate()
++                        .rev()
++                        .map(|(index, child)| (child, NodeIdOrRoot::Node(node.id()), index)),
++                );
++            }
++        }
++        Ok(AppCacheInfo {
++            name,
++            windows,
++            nodes,
++        })
++    }
++
+     pub fn name(&self) -> Result<String> {
+         self.resolve_app_context(|context| Ok(context.name.clone().unwrap_or_default()))
+     }
+--- /dev/null
++++ b/accesskit_atspi_common/src/table.rs
+@@ -0,0 +1,1188 @@
++// DBX local extension of AccessKit's AT-SPI adapter.
++// Licensed under MIT OR Apache-2.0, like the surrounding adapter.
++
++use super::{NodeWrapper, PlatformNode};
++use crate::{Error, Result, filters::filter};
++use accesskit::Role;
++use accesskit_consumer::{FilterResult, Node, NodeId};
++
++pub(super) fn is_table(role: Role) -> bool {
++    matches!(role, Role::Table | Role::Grid | Role::TreeGrid)
++}
++
++fn is_cell(role: Role) -> bool {
++    matches!(
++        role,
++        Role::Cell | Role::GridCell | Role::RowHeader | Role::ColumnHeader
++    )
++}
++
++fn containing_table<'a>(node: &Node<'a>) -> Option<Node<'a>> {
++    containing_table_with_filter(node, &filter)
++}
++
++fn containing_table_with_filter<'a>(
++    node: &Node<'a>,
++    node_filter: &impl Fn(&Node<'_>) -> FilterResult,
++) -> Option<Node<'a>> {
++    let mut parent = node.parent();
++    while let Some(node) = parent {
++        if node_filter(&node) == FilterResult::ExcludeSubtree {
++            return None;
++        }
++        if is_table(node.role()) {
++            return Some(node);
++        }
++        parent = node.parent();
++    }
++    None
++}
++
++pub(super) fn supports_table_cell(
++    node: &Node<'_>,
++    node_filter: &impl Fn(&Node<'_>) -> FilterResult,
++) -> bool {
++    is_cell(node.role())
++        && node_filter(node) != FilterResult::ExcludeSubtree
++        && containing_table_with_filter(node, node_filter).is_some()
++        && cell_position(node).is_some()
++}
++
++fn cell_position(node: &Node<'_>) -> Option<(usize, usize)> {
++    let column = node.data().column_index()?;
++    let mut row = node.data().row_index();
++    let mut parent = node.parent();
++    while row.is_none() {
++        let node = parent?;
++        if is_table(node.role()) {
++            break;
++        }
++        if node.role() == Role::Row {
++            row = node.data().row_index();
++        }
++        parent = node.parent();
++    }
++    Some((row?, column))
++}
++
++#[derive(Clone, Debug)]
++struct Cell {
++    id: NodeId,
++    role: Role,
++    row: usize,
++    column: usize,
++    row_span: usize,
++    column_span: usize,
++    selected: bool,
++    name: String,
++}
++
++impl Cell {
++    fn from_node(node: &Node<'_>) -> Option<Self> {
++        let (row, column) = cell_position(node)?;
++        let row_span = node.data().row_span().unwrap_or(1).max(1);
++        let column_span = node.data().column_span().unwrap_or(1).max(1);
++        // Do not wrap malformed producer coordinates or advertise negative extents.
++        let row_end = row.checked_add(row_span)?;
++        let column_end = column.checked_add(column_span)?;
++        i32::try_from(row_end).ok()?;
++        i32::try_from(column_end).ok()?;
++        Some(Self {
++            id: node.id(),
++            role: node.role(),
++            row,
++            column,
++            row_span,
++            column_span,
++            selected: node.is_selected().unwrap_or(false),
++            name: NodeWrapper(node).name().unwrap_or_default(),
++        })
++    }
++
++    fn covers(&self, row: usize, column: usize) -> bool {
++        (self.row..self.row + self.row_span).contains(&row)
++            && (self.column..self.column + self.column_span).contains(&column)
++    }
++}
++
++/// A snapshot of actual exposed cells, rebuilt under the consumer tree read lock.
++/// Missing virtualized cells stay missing; this adapter never invents accessibles.
++pub(crate) struct Table {
++    id: NodeId,
++    rows: usize,
++    columns: usize,
++    cells: Vec<Cell>,
++    children: Vec<NodeId>,
++    selected_rows: Vec<(usize, usize)>,
++}
++
++#[cfg(test)]
++thread_local! {
++    static SNAPSHOTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
++}
++
++impl Table {
++    fn cached(node: &Node<'_>, context: &crate::context::Context) -> Result<std::sync::Arc<Self>> {
++        let mut cache = context.table_cache.lock().unwrap();
++        if let Some(table) = cache.get(&node.id()) {
++            return Ok(table.clone());
++        }
++        let table = std::sync::Arc::new(Self::new(node)?);
++        cache.insert(node.id(), table.clone());
++        Ok(table)
++    }
++
++    fn new(node: &Node<'_>) -> Result<Self> {
++        if !is_table(node.role()) {
++            return Err(Error::UnsupportedInterface);
++        }
++        #[cfg(test)]
++        SNAPSHOTS_BUILT.with(|count| count.set(count.get() + 1));
++        let mut cells = Vec::new();
++        let mut selected_rows = Vec::new();
++        let children = node
++            .filtered_children(&filter)
++            .map(|child| child.id())
++            .collect();
++        let mut pending: Vec<_> = node.filtered_children(&filter).rev().collect();
++        while let Some(child) = pending.pop() {
++            // Nested tables belong to their own interface, not the enclosing table.
++            if is_table(child.role()) {
++                continue;
++            }
++            if child.role() == Role::Row && child.is_selected() == Some(true) {
++                if let Some(row) = child.data().row_index() {
++                    let span = child.data().row_span().unwrap_or(1).max(1);
++                    if let Some(end) = row
++                        .checked_add(span)
++                        .filter(|end| i32::try_from(*end).is_ok())
++                    {
++                        selected_rows.push((row, end));
++                    }
++                }
++            }
++            if is_cell(child.role()) {
++                if let Some(cell) = Cell::from_node(&child) {
++                    cells.push(cell);
++                }
++                // Embedded controls/editors must not become additional cells.
++                continue;
++            }
++            pending.extend(child.filtered_children(&filter).rev());
++        }
++        let rows = node.data().row_count().unwrap_or_else(|| {
++            cells
++                .iter()
++                .map(|cell| cell.row + cell.row_span)
++                .max()
++                .unwrap_or(0)
++        });
++        let columns = node.data().column_count().unwrap_or_else(|| {
++            cells
++                .iter()
++                .map(|cell| cell.column + cell.column_span)
++                .max()
++                .unwrap_or(0)
++        });
++        i32::try_from(rows).map_err(|_| Error::TooManyChildren)?;
++        i32::try_from(columns).map_err(|_| Error::TooManyChildren)?;
++        cells.retain(|cell| {
++            cell.row + cell.row_span <= rows && cell.column + cell.column_span <= columns
++        });
++        selected_rows.retain(|(_, end)| *end <= rows);
++        for cell in &mut cells {
++            cell.selected |= selected_rows
++                .iter()
++                .any(|(start, end)| *start <= cell.row && cell.row + cell.row_span <= *end);
++        }
++        Ok(Self {
++            id: node.id(),
++            rows,
++            columns,
++            cells,
++            children,
++            selected_rows,
++        })
++    }
++
++    fn coordinate(&self, row: i32, column: i32) -> Result<(usize, usize)> {
++        let row = usize::try_from(row).map_err(|_| Error::IndexOutOfRange)?;
++        let column = usize::try_from(column).map_err(|_| Error::IndexOutOfRange)?;
++        if row >= self.rows || column >= self.columns {
++            return Err(Error::IndexOutOfRange);
++        }
++        Ok((row, column))
++    }
++
++    fn axis(&self, index: i32, rows: bool) -> Result<usize> {
++        let index = usize::try_from(index).map_err(|_| Error::IndexOutOfRange)?;
++        if index >= if rows { self.rows } else { self.columns } {
++            return Err(Error::IndexOutOfRange);
++        }
++        Ok(index)
++    }
++
++    fn at(&self, row: usize, column: usize) -> Option<&Cell> {
++        self.cells.iter().find(|cell| cell.covers(row, column))
++    }
++
++    fn at_child_index(&self, index: i32) -> Option<&Cell> {
++        let id = self.children.get(usize::try_from(index).ok()?)?;
++        self.cells.iter().find(|cell| &cell.id == id)
++    }
++
++    fn headers(&self, index: usize, rows: bool) -> impl Iterator<Item = &Cell> {
++        self.cells.iter().filter(move |cell| {
++            if rows {
++                cell.role == Role::RowHeader
++                    && (cell.row..cell.row + cell.row_span).contains(&index)
++            } else {
++                cell.role == Role::ColumnHeader
++                    && (cell.column..cell.column + cell.column_span).contains(&index)
++            }
++        })
++    }
++
++    fn selected_axis(&self, index: usize, rows: bool) -> bool {
++        // Partial cell selection is not full row/column selection. Require actual
++        // selected cells to cover the entire advertised axis, including spans.
++        if rows
++            && self
++                .selected_rows
++                .iter()
++                .any(|(start, end)| (*start..*end).contains(&index))
++        {
++            return true;
++        }
++        let count = if rows { self.columns } else { self.rows };
++        if count == 0 {
++            return false;
++        }
++        let mut spans: Vec<_> = self
++            .cells
++            .iter()
++            .filter_map(|cell| {
++                let (position, span, start, length) = if rows {
++                    (cell.row, cell.row_span, cell.column, cell.column_span)
++                } else {
++                    (cell.column, cell.column_span, cell.row, cell.row_span)
++                };
++                (cell.selected && (position..position + span).contains(&index))
++                    .then_some((start, start + length))
++            })
++            .collect();
++        if !rows {
++            spans.extend(self.selected_rows.iter().copied());
++        }
++        spans.sort_unstable();
++        let mut end = 0;
++        for (start, next_end) in spans {
++            if start > end {
++                return false;
++            }
++            end = end.max(next_end);
++        }
++        end >= count
++    }
++
++    fn selected_axes(&self, rows: bool) -> Result<Vec<i32>> {
++        // Candidate axes come from real cells, avoiding iteration over huge
++        // declared dimensions on a sparse/virtualized table.
++        // The DBus array must fit bounded memory even for malformed span metadata.
++        const MAX_SELECTED_AXES: usize = 100_000;
++        if !rows {
++            let mut intervals = self.selected_rows.clone();
++            intervals.sort_unstable();
++            let mut end = 0;
++            for (start, next_end) in intervals {
++                if start > end {
++                    break;
++                }
++                end = end.max(next_end);
++            }
++            if self.rows > 0 && end >= self.rows {
++                if self.columns > MAX_SELECTED_AXES {
++                    return Err(Error::TooManyChildren);
++                }
++                return Ok((0..self.columns as i32).collect());
++            }
++        }
++        let candidates = self
++            .cells
++            .iter()
++            .filter(|cell| cell.selected)
++            .try_fold(0usize, |count, cell| {
++                count.checked_add(if rows {
++                    cell.row_span
++                } else {
++                    cell.column_span
++                })
++            })
++            .ok_or(Error::TooManyChildren)?;
++        let candidates = if rows {
++            self.selected_rows
++                .iter()
++                .try_fold(candidates, |count, (start, end)| {
++                    count.checked_add(end - start)
++                })
++                .ok_or(Error::TooManyChildren)?
++        } else {
++            candidates
++        };
++        if candidates > MAX_SELECTED_AXES {
++            return Err(Error::TooManyChildren);
++        }
++        let mut indices: Vec<_> = self
++            .cells
++            .iter()
++            .filter(|cell| cell.selected)
++            .flat_map(|cell| {
++                if rows {
++                    cell.row..cell.row + cell.row_span
++                } else {
++                    cell.column..cell.column + cell.column_span
++                }
++            })
++            .collect();
++        if rows {
++            indices.extend(
++                self.selected_rows
++                    .iter()
++                    .flat_map(|(start, end)| *start..*end),
++            );
++        }
++        indices.sort_unstable();
++        indices.dedup();
++        Ok(indices
++            .into_iter()
++            .filter(|index| self.selected_axis(*index, rows))
++            .map(|index| index as i32)
++            .collect())
++    }
++}
++
++/// Native cell coordinates and extents in zero-based AT-SPI table space.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct TableCellInfo {
++    pub row: i32,
++    pub column: i32,
++    pub row_span: i32,
++    pub column_span: i32,
++}
++
++impl From<&Cell> for TableCellInfo {
++    fn from(cell: &Cell) -> Self {
++        Self {
++            row: cell.row as i32,
++            column: cell.column as i32,
++            row_span: cell.row_span as i32,
++            column_span: cell.column_span as i32,
++        }
++    }
++}
++
++impl PlatformNode {
++    fn resolve_table<T>(&self, f: impl FnOnce(&Table) -> Result<T>) -> Result<T> {
++        self.resolve_with_context(|node, _, context| f(Table::cached(&node, context)?.as_ref()))
++    }
++
++    fn resolve_table_cell<T>(&self, f: impl FnOnce(&Table, &Cell) -> Result<T>) -> Result<T> {
++        self.resolve_with_context(|node, _, context| {
++            if !supports_table_cell(&node, &filter) {
++                return Err(Error::UnsupportedInterface);
++            }
++            let table = Table::cached(
++                &containing_table(&node).ok_or(Error::UnsupportedInterface)?,
++                context,
++            )?;
++            let cell = table
++                .cells
++                .iter()
++                .find(|cell| cell.id == node.id())
++                .ok_or(Error::IndexOutOfRange)?;
++            f(&table, cell)
++        })
++    }
++
++    pub fn table_dimensions(&self) -> Result<(i32, i32)> {
++        self.resolve_table(|table| Ok((table.rows as i32, table.columns as i32)))
++    }
++
++    pub fn table_cell_at(&self, row: i32, column: i32) -> Result<Option<NodeId>> {
++        self.resolve_table(|table| {
++            let (row, column) = table.coordinate(row, column)?;
++            Ok(table.at(row, column).map(|cell| cell.id))
++        })
++    }
++
++    pub fn table_index_at(&self, row: i32, column: i32) -> Result<i32> {
++        self.resolve_table(|table| {
++            let (row, column) = table.coordinate(row, column)?;
++            // The legacy API promises an index usable by Accessible.GetChildAtIndex.
++            // Nested row cells have no such index; return -1 rather than a fabricated flat offset.
++            Ok(table
++                .at(row, column)
++                .and_then(|cell| table.children.iter().position(|id| *id == cell.id))
++                .map(|index| index as i32)
++                .unwrap_or(-1))
++        })
++    }
++
++    pub fn table_cell_at_index(&self, index: i32) -> Result<Option<(TableCellInfo, bool)>> {
++        self.resolve_table(|table| {
++            Ok(table
++                .at_child_index(index)
++                .map(|cell| (cell.into(), cell.selected)))
++        })
++    }
++
++    pub fn table_cell_extent_at(&self, row: i32, column: i32, rows: bool) -> Result<i32> {
++        self.resolve_table(|table| {
++            let (row, column) = table.coordinate(row, column)?;
++            Ok(table
++                .at(row, column)
++                .map(|cell| {
++                    if rows {
++                        cell.row_span
++                    } else {
++                        cell.column_span
++                    }
++                })
++                .unwrap_or(0) as i32)
++        })
++    }
++
++    pub fn table_header(&self, index: i32, rows: bool) -> Result<Option<NodeId>> {
++        self.resolve_table(|table| {
++            let index = table.axis(index, rows)?;
++            Ok(table.headers(index, rows).next().map(|cell| cell.id))
++        })
++    }
++
++    pub fn table_description(&self, index: i32, rows: bool) -> Result<String> {
++        self.resolve_table(|table| {
++            let index = table.axis(index, rows)?;
++            Ok(table
++                .headers(index, rows)
++                .map(|cell| cell.name.as_str())
++                .filter(|name| !name.is_empty())
++                .collect::<Vec<_>>()
++                .join(" "))
++        })
++    }
++
++    pub fn table_is_selected(&self, row: i32, column: i32) -> Result<bool> {
++        self.resolve_table(|table| {
++            let (row, column) = table.coordinate(row, column)?;
++            Ok(table
++                .selected_rows
++                .iter()
++                .any(|(start, end)| (*start..*end).contains(&row))
++                || table.at(row, column).is_some_and(|cell| cell.selected))
++        })
++    }
++
++    pub fn table_is_axis_selected(&self, index: i32, rows: bool) -> Result<bool> {
++        self.resolve_table(|table| Ok(table.selected_axis(table.axis(index, rows)?, rows)))
++    }
++
++    pub fn table_selected_axes(&self, rows: bool) -> Result<Vec<i32>> {
++        self.resolve_table(|table| table.selected_axes(rows))
++    }
++
++    pub fn table_change_axis_selection(&self, index: i32, rows: bool) -> Result<bool> {
++        self.resolve_table(|table| {
++            table.axis(index, rows)?;
++            // AccessKit has no atomic full-row/column selection action. Never
++            // pretend that selecting one cell performs a whole-axis operation.
++            Ok(false)
++        })
++    }
++
++    pub fn table_cell_info(&self) -> Result<TableCellInfo> {
++        self.resolve_table_cell(|_, cell| Ok(cell.into()))
++    }
++
++    pub fn table_cell_table(&self) -> Result<NodeId> {
++        self.resolve_table_cell(|table, _| Ok(table.id))
++    }
++
++    pub fn table_cell_headers(&self, rows: bool) -> Result<Vec<NodeId>> {
++        self.resolve_table_cell(|table, cell| {
++            let (start, span) = if rows {
++                (cell.row, cell.row_span)
++            } else {
++                (cell.column, cell.column_span)
++            };
++            Ok(table
++                .cells
++                .iter()
++                .filter(|header| {
++                    if header.id == cell.id {
++                        return false;
++                    }
++                    let (role, position, length) = if rows {
++                        (Role::RowHeader, header.row, header.row_span)
++                    } else {
++                        (Role::ColumnHeader, header.column, header.column_span)
++                    };
++                    header.role == role && position < start + span && start < position + length
++                })
++                .map(|header| header.id)
++                .collect())
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{
++        ActionHandlerNoMut, WindowBounds,
++        context::{AppContext, Context},
++    };
++    use accesskit::{
++        ActionRequest, Node as Data, NodeId as LocalId, Tree as TreeData, TreeId, TreeUpdate,
++    };
++    use accesskit_consumer::Tree;
++    use atspi_common::Interface;
++    use std::sync::Arc;
++
++    struct NoActions;
++    impl ActionHandlerNoMut for NoActions {
++        fn do_action(&self, _: ActionRequest) {}
++    }
++
++    fn context(nodes: Vec<(u64, Data)>) -> Arc<Context> {
++        let tree = Tree::new(
++            TreeUpdate {
++                nodes: nodes
++                    .into_iter()
++                    .map(|(id, node)| (LocalId(id), node))
++                    .collect(),
++                tree: Some(TreeData::new(LocalId(0))),
++                tree_id: TreeId::ROOT,
++                focus: LocalId(0),
++            },
++            true,
++        );
++        Context::new(
++            &AppContext::new(None),
++            tree,
++            Arc::new(NoActions),
++            WindowBounds::default(),
++        )
++    }
++
++    fn root(context: &Arc<Context>) -> PlatformNode {
++        PlatformNode::new(context, 42, context.read_tree().state().root_id())
++    }
++
++    fn cell(role: Role, row: usize, column: usize, label: &str) -> Data {
++        let mut node = Data::new(role);
++        node.set_row_index(row);
++        node.set_column_index(column);
++        node.set_label(label);
++        node
++    }
++
++    #[test]
++    fn repeated_table_queries_share_one_snapshot_until_the_tree_changes() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_row_count(1001);
++        grid.set_column_count(41);
++        grid.set_children(vec![LocalId(1)]);
++        let context = context(vec![(0, grid), (1, cell(Role::GridCell, 1000, 40, "last"))]);
++        let table = root(&context);
++        let last = child(&context, 0);
++        SNAPSHOTS_BUILT.with(|count| count.set(0));
++        for _ in 0..8 {
++            assert_eq!(table.table_dimensions().unwrap(), (1001, 41));
++            assert_eq!(table.table_cell_at(1000, 40).unwrap(), Some(last.id));
++            assert_eq!(last.table_cell_info().unwrap().row, 1000);
++            assert_eq!(last.table_cell_table().unwrap(), table.id);
++            assert!(last.table_cell_headers(false).unwrap().is_empty());
++        }
++        assert_eq!(SNAPSHOTS_BUILT.with(|count| count.get()), 1);
++    }
++
++    #[test]
++    fn cached_queries_follow_reposition_selection_headers_hidden_rows_and_removal() {
++        fn nodes(moved: bool, removed: bool) -> Vec<(u64, Data)> {
++            let mut grid = Data::new(Role::Grid);
++            grid.set_row_count(if moved { 4 } else { 3 });
++            grid.set_column_count(2);
++            grid.set_children(vec![LocalId(1), LocalId(2), LocalId(5)]);
++            let index = if moved { 3 } else { 1 };
++            let mut row = Data::new(Role::Row);
++            row.set_row_index(index);
++            row.set_selected(moved);
++            row.set_children(if removed {
++                vec![LocalId(3)]
++            } else {
++                vec![LocalId(3), LocalId(4)]
++            });
++            let mut hidden_row = Data::new(Role::Row);
++            hidden_row.set_row_index(2);
++            hidden_row.set_children(vec![LocalId(6), LocalId(7)]);
++            if moved {
++                hidden_row.set_hidden();
++            }
++            let mut result = vec![
++                (0, grid),
++                (
++                    1,
++                    cell(
++                        Role::ColumnHeader,
++                        0,
++                        1,
++                        if moved { "Updated header" } else { "Header" },
++                    ),
++                ),
++                (2, row),
++                (
++                    3,
++                    cell(
++                        Role::RowHeader,
++                        index,
++                        0,
++                        if moved { "Row 4" } else { "Row 2" },
++                    ),
++                ),
++                (5, hidden_row),
++                (6, cell(Role::RowHeader, 2, 0, "Row 3")),
++                (7, cell(Role::GridCell, 2, 1, "hidden after update")),
++            ];
++            if !removed {
++                result.push((4, cell(Role::GridCell, index, 1, "value")));
++            }
++            result
++        }
++        let context = context(nodes(false, false));
++        let table = root(&context);
++        let value = {
++            let tree = context.read_tree();
++            let id = tree
++                .state()
++                .root()
++                .children()
++                .nth(1)
++                .unwrap()
++                .children()
++                .nth(1)
++                .unwrap()
++                .id();
++            PlatformNode::new(&context, 42, id)
++        };
++        // Warm all cached relationships before changing the tree.
++        assert_eq!(table.table_dimensions().unwrap(), (3, 2));
++        assert_eq!(value.table_cell_info().unwrap().row, 1);
++        assert_eq!(table.table_description(1, false).unwrap(), "Header");
++        assert!(!table.table_is_axis_selected(1, true).unwrap());
++        for removed in [false, true] {
++            *context.write_tree() = Tree::new(
++                TreeUpdate {
++                    nodes: nodes(true, removed)
++                        .into_iter()
++                        .map(|(id, node)| (LocalId(id), node))
++                        .collect(),
++                    tree: Some(TreeData::new(LocalId(0))),
++                    tree_id: TreeId::ROOT,
++                    focus: LocalId(0),
++                },
++                true,
++            );
++            assert_eq!(table.table_dimensions().unwrap(), (4, 2));
++            assert_eq!(table.table_description(1, false).unwrap(), "Updated header");
++            assert!(table.table_is_axis_selected(3, true).unwrap());
++            assert_eq!(table.table_cell_at(1, 1).unwrap(), None);
++            assert_eq!(table.table_cell_at(2, 1).unwrap(), None);
++            if removed {
++                assert_eq!(table.table_cell_at(3, 1).unwrap(), None);
++                assert!(matches!(value.table_cell_info(), Err(Error::Defunct)));
++            } else {
++                assert_eq!(table.table_cell_at(3, 1).unwrap(), Some(value.id));
++                assert_eq!(value.table_cell_info().unwrap().row, 3);
++                assert!(table.table_is_selected(3, 1).unwrap());
++                assert_eq!(value.table_cell_headers(true).unwrap().len(), 1);
++                assert_eq!(table.table_description(3, true).unwrap(), "Row 4");
++            }
++        }
++    }
++
++    #[test]
++    fn bulk_cache_matches_accessible_metadata_and_excludes_hidden_and_password_values() {
++        struct NoCallbacks;
++        impl crate::AdapterCallback for NoCallbacks {
++            fn register_interfaces(
++                &self,
++                _: &crate::Adapter,
++                _: NodeId,
++                _: atspi_common::InterfaceSet,
++            ) {
++            }
++            fn unregister_interfaces(
++                &self,
++                _: &crate::Adapter,
++                _: NodeId,
++                _: atspi_common::InterfaceSet,
++            ) {
++            }
++            fn emit_event(&self, _: &crate::Adapter, _: crate::Event) {}
++        }
++        let app = AppContext::new(Some("QA app".into()));
++        let mut window = Data::new(Role::Window);
++        window.set_children(vec![LocalId(1), LocalId(2), LocalId(7), LocalId(8)]);
++        let mut transparent = Data::new(Role::GenericContainer);
++        transparent.set_children(vec![LocalId(3)]);
++        let mut hidden = Data::new(Role::Group);
++        hidden.set_hidden();
++        hidden.set_children(vec![LocalId(5)]);
++        let mut button = Data::new(Role::Button);
++        button.set_label("Visible button");
++        let mut secret = Data::new(Role::PasswordInput);
++        secret.set_label("Vault passphrase");
++        secret.set_value("private-value-sentinel");
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(9)]);
++        let mut row = Data::new(Role::Row);
++        row.set_row_index(1);
++        row.set_children(vec![LocalId(10), LocalId(11)]);
++        let mut value = cell(Role::GridCell, 1, 1, "alpha");
++        value.add_action(accesskit::Action::Focus);
++        value.set_bounds(accesskit::Rect::new(10., 10., 20., 20.));
++        let mut adapter = crate::Adapter::with_wrapped_action_handler(
++            42,
++            &app,
++            NoCallbacks,
++            TreeUpdate {
++                nodes: vec![
++                    (LocalId(0), window),
++                    (LocalId(1), transparent),
++                    (LocalId(2), hidden),
++                    (LocalId(3), button),
++                    (LocalId(5), cell(Role::Cell, 0, 0, "hidden-sentinel")),
++                    (LocalId(7), secret),
++                    (LocalId(8), grid),
++                    (LocalId(9), row),
++                    (LocalId(10), cell(Role::RowHeader, 1, 0, "Row 1")),
++                    (LocalId(11), value),
++                ],
++                tree: Some(TreeData::new(LocalId(0))),
++                tree_id: TreeId::ROOT,
++                focus: LocalId(11),
++            },
++            true,
++            WindowBounds::default(),
++            Arc::new(NoActions),
++        );
++        let snapshot = adapter.platform_root().cache_snapshot().unwrap();
++        assert_eq!(snapshot.name, "QA app");
++        assert_eq!(snapshot.windows, 1);
++        assert_eq!(snapshot.nodes.len(), 7);
++        for info in &snapshot.nodes {
++            let node = adapter.platform_node(info.id);
++            assert_eq!(info.parent, node.parent().unwrap());
++            assert_eq!(info.index, node.index_in_parent().unwrap());
++            assert_eq!(info.children, node.child_count().unwrap());
++            assert_eq!(info.name, node.name().unwrap());
++            assert_eq!(info.role, node.role().unwrap());
++            assert_eq!(info.states, node.state());
++            assert_eq!(info.interfaces, node.interfaces().unwrap());
++            assert_eq!(info.description, node.description().unwrap());
++            assert!(!info.name.contains("sentinel"));
++        }
++        let protected = snapshot
++            .nodes
++            .iter()
++            .find(|info| info.name == "Vault passphrase")
++            .unwrap();
++        assert_eq!(protected.role, atspi_common::Role::PasswordText);
++        assert_eq!(protected.children, 0);
++        assert!(!protected.interfaces.contains(Interface::Text));
++        let focused = snapshot
++            .nodes
++            .iter()
++            .find(|info| info.name == "alpha")
++            .unwrap();
++        assert!(focused.states.contains(atspi_common::State::Focused));
++        assert!(focused.interfaces.contains(Interface::TableCell));
++        assert!(
++            snapshot
++                .nodes
++                .iter()
++                .all(|info| info.role != atspi_common::Role::Section)
++        );
++        let node = adapter.platform_node(focused.id);
++        let single = node.cache_info().unwrap();
++        assert_eq!(single.parent, focused.parent);
++        assert_eq!(single.index, focused.index);
++        let mut updated = cell(Role::GridCell, 1, 1, "beta");
++        updated.set_selected(true);
++        adapter.update(TreeUpdate {
++            nodes: vec![(LocalId(11), updated)],
++            tree: None,
++            tree_id: TreeId::ROOT,
++            focus: LocalId(11),
++        });
++        let current = adapter.platform_root().cache_snapshot().unwrap();
++        assert!(!current.nodes.iter().any(|info| info.name == "alpha"));
++        assert!(
++            current
++                .nodes
++                .iter()
++                .find(|info| info.name == "beta")
++                .unwrap()
++                .states
++                .contains(atspi_common::State::Selected)
++        );
++        let mut hidden_grid = Data::new(Role::Grid);
++        hidden_grid.set_children(vec![LocalId(9)]);
++        hidden_grid.set_hidden();
++        adapter.update(TreeUpdate {
++            nodes: vec![(LocalId(8), hidden_grid)],
++            tree: None,
++            tree_id: TreeId::ROOT,
++            focus: LocalId(0),
++        });
++        assert!(
++            !adapter
++                .platform_root()
++                .cache_snapshot()
++                .unwrap()
++                .nodes
++                .iter()
++                .any(|info| info.id == focused.id)
++        );
++        assert!(matches!(node.cache_info(), Err(Error::Defunct)));
++    }
++
++    #[test]
++    fn exposes_native_table_and_table_cell_interfaces() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let context = context(vec![(0, grid), (1, cell(Role::GridCell, 0, 0, "value"))]);
++        let tree = context.read_tree();
++        let grid = tree.state().root();
++        let child = grid.children().next().unwrap();
++        assert!(NodeWrapper(&grid).interfaces().contains(Interface::Table));
++        assert!(
++            NodeWrapper(&child)
++                .interfaces()
++                .contains(Interface::TableCell)
++        );
++    }
++
++    fn child(context: &Arc<Context>, index: usize) -> PlatformNode {
++        let tree = context.read_tree();
++        let id = tree.state().root().children().nth(index).unwrap().id();
++        PlatformNode::new(context, 42, id)
++    }
++
++    #[test]
++    fn reports_declared_dimensions_without_fabricating_virtualized_cells() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_row_count(1001);
++        grid.set_column_count(3);
++        grid.set_children(vec![LocalId(1)]);
++        let context = context(vec![(0, grid), (1, cell(Role::GridCell, 5, 2, "visible"))]);
++        let table = root(&context);
++        assert_eq!(table.table_dimensions().unwrap(), (1001, 3));
++        assert_eq!(
++            table.table_cell_at(5, 2).unwrap(),
++            Some(child(&context, 0).id)
++        );
++        assert_eq!(table.table_cell_at(999, 2).unwrap(), None);
++        assert_eq!(table.table_cell_extent_at(999, 2, true).unwrap(), 0);
++        for (row, column) in [(-1, 0), (0, -1), (1001, 0), (0, 3)] {
++            assert!(matches!(
++                table.table_cell_at(row, column),
++                Err(Error::IndexOutOfRange)
++            ));
++        }
++    }
++
++    #[test]
++    fn honors_spans_and_returns_real_child_indices_for_flat_tables() {
++        let mut table = Data::new(Role::Table);
++        table.set_children(vec![LocalId(1)]);
++        let mut value = cell(Role::Cell, 2, 3, "spanning");
++        value.set_row_span(2);
++        value.set_column_span(3);
++        let context = context(vec![(0, table), (1, value)]);
++        let table = root(&context);
++        let value = child(&context, 0);
++        assert_eq!(table.table_dimensions().unwrap(), (4, 6));
++        assert_eq!(table.table_cell_at(3, 5).unwrap(), Some(value.id));
++        assert_eq!(table.table_index_at(3, 5).unwrap(), 0);
++        assert_eq!(
++            table.table_cell_at_index(0).unwrap().unwrap().0,
++            TableCellInfo {
++                row: 2,
++                column: 3,
++                row_span: 2,
++                column_span: 3
++            }
++        );
++        assert_eq!(value.table_cell_table().unwrap(), table.id);
++        assert_eq!(value.table_cell_info().unwrap().row_span, 2);
++        assert_eq!(table.table_cell_at_index(-1).unwrap(), None);
++        assert_eq!(table.table_cell_at_index(1).unwrap(), None);
++    }
++
++    #[test]
++    fn inherits_row_metadata_through_wrappers_without_fabricating_child_indices() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let mut row = Data::new(Role::Row);
++        row.set_row_index(7);
++        row.set_children(vec![LocalId(2)]);
++        let mut wrapper = Data::new(Role::GenericContainer);
++        wrapper.set_children(vec![LocalId(3)]);
++        let mut value = Data::new(Role::GridCell);
++        value.set_column_index(2);
++        let context = context(vec![(0, grid), (1, row), (2, wrapper), (3, value)]);
++        let table = root(&context);
++        assert_eq!(table.table_dimensions().unwrap(), (8, 3));
++        assert!(table.table_cell_at(7, 2).unwrap().is_some());
++        assert_eq!(table.table_index_at(7, 2).unwrap(), -1);
++        assert_eq!(table.table_cell_at_index(0).unwrap(), None);
++    }
++
++    #[test]
++    fn excludes_hidden_cells_and_nested_table_contents() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1), LocalId(2), LocalId(3)]);
++        let mut hidden = cell(Role::GridCell, 88, 88, "hidden");
++        hidden.set_hidden();
++        let mut inner = Data::new(Role::Table);
++        inner.set_children(vec![LocalId(4)]);
++        let context = context(vec![
++            (0, grid),
++            (1, cell(Role::GridCell, 0, 0, "outer")),
++            (2, hidden),
++            (3, inner),
++            (4, cell(Role::Cell, 10, 10, "inner")),
++        ]);
++        assert_eq!(root(&context).table_dimensions().unwrap(), (1, 1));
++        assert_eq!(child(&context, 2).table_dimensions().unwrap(), (11, 11));
++        assert!(
++            !child(&context, 1)
++                .interfaces()
++                .unwrap()
++                .contains(Interface::TableCell)
++        );
++    }
++
++    #[test]
++    fn returns_row_and_column_header_objects_including_spanning_headers() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1), LocalId(2), LocalId(3), LocalId(4)]);
++        let mut group = cell(Role::ColumnHeader, 0, 1, "group");
++        group.set_column_span(2);
++        let context = context(vec![
++            (0, grid),
++            (1, group),
++            (2, cell(Role::ColumnHeader, 1, 2, "name")),
++            (3, cell(Role::RowHeader, 2, 0, "row two")),
++            (4, cell(Role::GridCell, 2, 2, "value")),
++        ]);
++        let table = root(&context);
++        let value = child(&context, 3);
++        assert_eq!(
++            table.table_header(2, false).unwrap(),
++            Some(child(&context, 0).id)
++        );
++        assert_eq!(table.table_description(2, false).unwrap(), "group name");
++        assert_eq!(
++            table.table_header(2, true).unwrap(),
++            Some(child(&context, 2).id)
++        );
++        assert_eq!(
++            value.table_cell_headers(false).unwrap(),
++            vec![child(&context, 0).id, child(&context, 1).id]
++        );
++        assert_eq!(
++            value.table_cell_headers(true).unwrap(),
++            vec![child(&context, 2).id]
++        );
++        assert!(
++            child(&context, 2)
++                .table_cell_headers(true)
++                .unwrap()
++                .is_empty()
++        );
++    }
++
++    #[test]
++    fn does_not_advertise_cells_without_coordinates_or_containing_table() {
++        let mut window = Data::new(Role::Window);
++        window.set_children(vec![LocalId(1)]);
++        let context = context(vec![(0, window), (1, cell(Role::GridCell, 0, 0, "orphan"))]);
++        assert!(
++            !child(&context, 0)
++                .interfaces()
++                .unwrap()
++                .contains(Interface::TableCell)
++        );
++        assert!(matches!(
++            child(&context, 0).table_cell_info(),
++            Err(Error::UnsupportedInterface)
++        ));
++        assert!(matches!(
++            root(&context).table_dimensions(),
++            Err(Error::UnsupportedInterface)
++        ));
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let missing = Data::new(Role::GridCell);
++        let context = super::tests::context(vec![(0, grid), (1, missing)]);
++        assert!(
++            !child(&context, 0)
++                .interfaces()
++                .unwrap()
++                .contains(Interface::TableCell)
++        );
++    }
++
++    #[test]
++    fn distinguishes_partial_cell_selection_from_full_axis_selection() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1), LocalId(2), LocalId(3)]);
++        grid.set_row_count(2);
++        grid.set_column_count(2);
++        let mut a = cell(Role::GridCell, 0, 0, "a");
++        a.set_selected(true);
++        let mut b = cell(Role::GridCell, 0, 1, "b");
++        b.set_selected(true);
++        let mut c = cell(Role::GridCell, 1, 0, "c");
++        c.set_selected(true);
++        let context = context(vec![(0, grid), (1, a), (2, b), (3, c)]);
++        let table = root(&context);
++        assert!(table.table_is_selected(1, 0).unwrap());
++        assert!(!table.table_is_selected(1, 1).unwrap());
++        assert_eq!(table.table_selected_axes(true).unwrap(), vec![0]);
++        assert_eq!(table.table_selected_axes(false).unwrap(), vec![0]);
++        assert!(!table.table_is_axis_selected(1, true).unwrap());
++        assert!(!table.table_change_axis_selection(0, true).unwrap());
++        assert!(matches!(
++            table.table_change_axis_selection(-1, true),
++            Err(Error::IndexOutOfRange)
++        ));
++    }
++
++    #[test]
++    fn reports_explicit_row_selection_even_when_not_all_cells_are_painted() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_row_count(10);
++        grid.set_column_count(3);
++        grid.set_children(vec![LocalId(1)]);
++        let mut row = Data::new(Role::Row);
++        row.set_row_index(4);
++        row.set_selected(true);
++        row.set_children(vec![LocalId(2)]);
++        let context = context(vec![
++            (0, grid),
++            (1, row),
++            (2, cell(Role::GridCell, 4, 1, "selected row value")),
++        ]);
++        let table = root(&context);
++        assert_eq!(table.table_selected_axes(true).unwrap(), vec![4]);
++        assert!(table.table_is_axis_selected(4, true).unwrap());
++        assert!(table.table_is_selected(4, 1).unwrap());
++        assert!(table.table_is_selected(4, 2).unwrap());
++        assert!(table.table_selected_axes(false).unwrap().is_empty());
++    }
++
++    #[test]
++    fn rejects_overflow_and_out_of_bounds_metadata_and_bounds_selection_memory() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1), LocalId(2)]);
++        grid.set_row_count(2);
++        grid.set_column_count(2);
++        let context = context(vec![
++            (0, grid),
++            (1, cell(Role::GridCell, usize::MAX, 0, "overflow")),
++            (2, cell(Role::GridCell, 2, 2, "outside")),
++        ]);
++        assert_eq!(root(&context).table_cell_at(0, 0).unwrap(), None);
++        assert!(matches!(
++            child(&context, 1).table_cell_info(),
++            Err(Error::IndexOutOfRange)
++        ));
++        let mut grid = Data::new(Role::Grid);
++        grid.set_row_count(usize::MAX);
++        let context = super::tests::context(vec![(0, grid)]);
++        assert!(matches!(
++            root(&context).table_dimensions(),
++            Err(Error::TooManyChildren)
++        ));
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let mut value = cell(Role::GridCell, 0, 0, "huge selected span");
++        value.set_row_span(i32::MAX as usize);
++        value.set_selected(true);
++        let context = super::tests::context(vec![(0, grid), (1, value)]);
++        assert!(matches!(
++            root(&context).table_selected_axes(true),
++            Err(Error::TooManyChildren)
++        ));
++    }
++
++    #[test]
++    fn removed_nodes_and_changed_roles_stop_answering_table_queries() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let context = context(vec![(0, grid), (1, cell(Role::GridCell, 0, 0, "old"))]);
++        let table = root(&context);
++        let old = child(&context, 0);
++        *context.write_tree() = Tree::new(
++            TreeUpdate {
++                nodes: vec![(LocalId(0), Data::new(Role::Window))],
++                tree: Some(TreeData::new(LocalId(0))),
++                tree_id: TreeId::ROOT,
++                focus: LocalId(0),
++            },
++            true,
++        );
++        assert!(matches!(old.table_cell_info(), Err(Error::Defunct)));
++        assert!(matches!(
++            table.table_dimensions(),
++            Err(Error::UnsupportedInterface)
++        ));
++        drop(context);
++        assert!(matches!(table.table_dimensions(), Err(Error::Defunct)));
++    }
++    #[test]
++    fn logical_focusable_cells_support_component_without_invented_bounds() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let mut value = cell(Role::GridCell, 4, 1, "unpainted");
++        value.add_action(accesskit::Action::Focus);
++        value.add_action(accesskit::Action::ScrollIntoView);
++        let context = context(vec![(0, grid), (1, value)]);
++        let value = child(&context, 0);
++        assert!(value.interfaces().unwrap().contains(Interface::Component));
++        assert_eq!(
++            value.extents(atspi_common::CoordType::Window).unwrap(),
++            crate::Rect::INVALID
++        );
++        assert!(!value.state().contains(atspi_common::State::Showing));
++        assert!(value.state().contains(atspi_common::State::Visible));
++        assert!(value.grab_focus().unwrap());
++    }
++    #[test]
++    fn painted_logical_cells_report_showing_and_actual_bounds() {
++        let mut grid = Data::new(Role::Grid);
++        grid.set_children(vec![LocalId(1)]);
++        let mut value = cell(Role::GridCell, 4, 1, "item 5");
++        value.set_bounds(accesskit::Rect::new(10.0, 20.0, 110.0, 50.0));
++        value.add_action(accesskit::Action::Focus);
++        let context = context(vec![(0, grid), (1, value)]);
++        let value = child(&context, 0);
++        assert!(value.state().contains(atspi_common::State::Showing));
++        assert!(value.state().contains(atspi_common::State::Visible));
++        let bounds = value.extents(atspi_common::CoordType::Window).unwrap();
++        assert_ne!(bounds, crate::Rect::INVALID);
++    }
++}
+--- a/accesskit_unix/src/atspi/bus.rs
++++ b/accesskit_unix/src/atspi/bus.rs
+@@ -21,6 +21,7 @@
+     Address, Connection, Result,
+     connection::Builder,
+     names::{BusName, InterfaceName, MemberName, OwnedUniqueName},
++    object_server::SignalEmitter,
+     zvariant::{Str, Value},
+ };
+ 
+@@ -70,26 +71,31 @@
+     async fn register_root_node(&mut self) -> Result<()> {
+         let node = PlatformRoot::new(get_or_init_app_context());
+         let path = ObjectId::Root.path();
+-
++        // Publish all root endpoints before Embed announces this application.
++        self.conn
++            .object_server()
++            .at(
++                CACHE_PATH,
++                CacheInterface::new(self.unique_name().to_owned(), node.clone()),
++            )
++            .await?;
++        self.conn
++            .object_server()
++            .at(
++                path.clone(),
++                RootAccessibleInterface::new(self.unique_name().to_owned(), node.clone()),
++            )
++            .await?;
+         if self
+             .conn
+             .object_server()
+-            .at(path.clone(), ApplicationInterface(node.clone()))
++            .at(path.clone(), ApplicationInterface(node))
+             .await?
+         {
+             self.socket_proxy
+-                .embed(&(self.unique_name().as_str(), ObjectId::Root.path().into()))
+-                .await?;
+-
+-            self.conn
+-                .object_server()
+-                .at(
+-                    path,
+-                    RootAccessibleInterface::new(self.unique_name().to_owned(), node),
+-                )
+-                .await?;
+-        }
+-
++                .embed(&(self.unique_name().as_str(), path.into()))
++                .await?;
++        }
+         Ok(())
+     }
+ 
+@@ -136,11 +142,35 @@
+             self.register_interface(&path, TextInterface::new(node.clone()))
+                 .await?;
+         }
++        if new_interfaces.contains(Interface::Table) {
++            self.register_interface(&path, TableInterface::new(bus_name.clone(), node.clone()))
++                .await?;
++        }
++        if new_interfaces.contains(Interface::TableCell) {
++            self.register_interface(
++                &path,
++                TableCellInterface::new(bus_name.clone(), node.clone()),
++            )
++            .await?;
++        }
+         if new_interfaces.contains(Interface::Value) {
+             self.register_interface(&path, ValueInterface::new(node.clone()))
+                 .await?;
+         }
+ 
++        // Only announce after the requested interfaces are installed. A queued
++        // node can have disappeared before registration reaches this worker.
++        if let Ok(info) = node.cache_info() {
++            map_or_ignoring_broken_pipe(
++                CacheInterface::add_accessible(
++                    &SignalEmitter::new(&self.conn, CACHE_PATH)?,
++                    &CacheItem::node(&bus_name, info),
++                )
++                .await,
++                (),
++                |result| result,
++            )?;
++        }
+         Ok(())
+     }
+ 
+@@ -188,10 +218,33 @@
+         if old_interfaces.contains(Interface::Text) {
+             self.unregister_interface::<TextInterface>(&path).await?;
+         }
++        if old_interfaces.contains(Interface::Table) {
++            self.unregister_interface::<TableInterface>(&path).await?;
++        }
++        if old_interfaces.contains(Interface::TableCell) {
++            self.unregister_interface::<TableCellInterface>(&path)
++                .await?;
++        }
+         if old_interfaces.contains(Interface::Value) {
+             self.unregister_interface::<ValueInterface>(&path).await?;
+         }
+ 
++        if old_interfaces.contains(Interface::Accessible) {
++            let object = ObjectId::Node {
++                adapter: adapter_id,
++                node: node_id,
++            }
++            .to_address(self.unique_name().inner());
++            map_or_ignoring_broken_pipe(
++                CacheInterface::remove_accessible(
++                    &SignalEmitter::new(&self.conn, CACHE_PATH)?,
++                    &object,
++                )
++                .await,
++                (),
++                |result| result,
++            )?;
++        }
+         Ok(())
+     }
+ 
+--- /dev/null
++++ b/accesskit_unix/src/atspi/interfaces/cache.rs
+@@ -0,0 +1,107 @@
++// DBX local extension of AccessKit's AT-SPI adapter.
++// Licensed under MIT OR Apache-2.0, like the surrounding adapter.
++
++use crate::atspi::{ObjectId, OwnedObjectAddress};
++use accesskit_atspi_common::{NodeCacheInfo, NodeIdOrRoot, PlatformRoot};
++use atspi::{Interface, InterfaceSet, Role, StateSet};
++use serde::Serialize;
++use zbus::{fdo, interface, names::OwnedUniqueName, object_server::SignalEmitter, zvariant::Type};
++
++pub(crate) const CACHE_PATH: &str = "/org/a11y/atspi/cache";
++
++#[derive(Serialize, Type)]
++pub(crate) struct CacheItem {
++    object: OwnedObjectAddress,
++    app: OwnedObjectAddress,
++    parent: OwnedObjectAddress,
++    index: i32,
++    children: i32,
++    interfaces: InterfaceSet,
++    name: String,
++    role: Role,
++    description: String,
++    states: StateSet,
++}
++
++impl CacheItem {
++    pub(crate) fn node(bus_name: &OwnedUniqueName, info: NodeCacheInfo) -> Self {
++        let parent = match info.parent {
++            NodeIdOrRoot::Root => ObjectId::Root,
++            NodeIdOrRoot::Node(node) => ObjectId::Node {
++                adapter: info.adapter,
++                node,
++            },
++        };
++        Self {
++            object: ObjectId::Node {
++                adapter: info.adapter,
++                node: info.id,
++            }
++            .to_address(bus_name.inner()),
++            app: ObjectId::Root.to_address(bus_name.inner()),
++            parent: parent.to_address(bus_name.inner()),
++            index: info.index,
++            children: info.children,
++            interfaces: info.interfaces,
++            name: info.name,
++            role: info.role,
++            description: info.description,
++            states: info.states,
++        }
++    }
++}
++
++pub(crate) struct CacheInterface {
++    bus_name: OwnedUniqueName,
++    root: PlatformRoot,
++}
++impl CacheInterface {
++    pub(crate) fn new(bus_name: OwnedUniqueName, root: PlatformRoot) -> Self {
++        Self { bus_name, root }
++    }
++}
++
++#[interface(name = "org.a11y.atspi.Cache")]
++impl CacheInterface {
++    // Version 1 has GetItems/AddAccessible/RemoveAccessible. No asynchronous
++    // initialization or version-2 Ready signal is advertised.
++    #[zbus(property, name = "version")]
++    fn version(&self) -> u32 {
++        1
++    }
++
++    fn get_items(&self) -> fdo::Result<Vec<CacheItem>> {
++        let snapshot = self.root.cache_snapshot().map_err(super::map_root_error)?;
++        let mut result = Vec::with_capacity(snapshot.nodes.len() + 1);
++        result.push(CacheItem {
++            object: ObjectId::Root.to_address(self.bus_name.inner()),
++            app: ObjectId::Root.to_address(self.bus_name.inner()),
++            parent: OwnedObjectAddress::null(),
++            index: -1,
++            children: snapshot.windows,
++            interfaces: InterfaceSet::new(Interface::Accessible | Interface::Application),
++            name: snapshot.name,
++            role: Role::Application,
++            description: String::new(),
++            states: StateSet::empty(),
++        });
++        result.extend(
++            snapshot
++                .nodes
++                .into_iter()
++                .map(|node| CacheItem::node(&self.bus_name, node)),
++        );
++        Ok(result)
++    }
++
++    #[zbus(signal)]
++    pub(crate) async fn add_accessible(
++        emitter: &SignalEmitter<'_>,
++        item: &CacheItem,
++    ) -> zbus::Result<()>;
++    #[zbus(signal)]
++    pub(crate) async fn remove_accessible(
++        emitter: &SignalEmitter<'_>,
++        object: &OwnedObjectAddress,
++    ) -> zbus::Result<()>;
++}
+--- a/accesskit_unix/src/atspi/interfaces/mod.rs
++++ b/accesskit_unix/src/atspi/interfaces/mod.rs
+@@ -6,9 +6,12 @@
+ mod accessible;
+ mod action;
+ mod application;
++mod cache;
+ mod component;
+ mod hyperlink;
+ mod selection;
++mod table;
++mod table_cell;
+ mod text;
+ mod value;
+ 
+@@ -32,8 +35,150 @@
+ pub(crate) use accessible::*;
+ pub(crate) use action::*;
+ pub(crate) use application::*;
++pub(crate) use cache::*;
+ pub(crate) use component::*;
+ pub(crate) use hyperlink::*;
+ pub(crate) use selection::*;
++pub(crate) use table::*;
++pub(crate) use table_cell::*;
+ pub(crate) use text::*;
+ pub(crate) use value::*;
++
++#[cfg(test)]
++mod table_protocol_tests {
++    use super::*;
++    use accesskit::{ActionHandler, ActionRequest, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
++    use accesskit_atspi_common::{
++        Adapter, AdapterCallback, AppContext, Event, InterfaceSet, PlatformNode, WindowBounds,
++    };
++    use zbus::object_server::Interface;
++
++    struct NoActions;
++    impl ActionHandler for NoActions {
++        fn do_action(&mut self, _: ActionRequest) {}
++    }
++    struct NoCallbacks;
++    impl AdapterCallback for NoCallbacks {
++        fn register_interfaces(
++            &self,
++            _: &Adapter,
++            _: accesskit_atspi_common::NodeId,
++            _: InterfaceSet,
++        ) {
++        }
++        fn unregister_interfaces(
++            &self,
++            _: &Adapter,
++            _: accesskit_atspi_common::NodeId,
++            _: InterfaceSet,
++        ) {
++        }
++        fn emit_event(&self, _: &Adapter, _: Event) {}
++    }
++
++    fn fixture() -> (Adapter, PlatformNode) {
++        let adapter = Adapter::new(
++            &AppContext::new(None),
++            NoCallbacks,
++            TreeUpdate {
++                nodes: vec![(NodeId(0), Node::new(Role::Grid))],
++                tree: Some(Tree::new(NodeId(0))),
++                tree_id: TreeId::ROOT,
++                focus: NodeId(0),
++            },
++            true,
++            WindowBounds::default(),
++            NoActions,
++        );
++        let node = adapter.platform_node(adapter.root_id());
++        (adapter, node)
++    }
++
++    fn xml(interface: &impl Interface) -> String {
++        let mut xml = String::new();
++        interface.introspect_to_writer(&mut xml, 0);
++        xml
++    }
++
++    fn property(xml: &str, name: &str, signature: &str) {
++        assert!(
++            xml.lines().any(|line| line.contains("<property ")
++                && line.contains(&format!("name=\"{name}\""))
++                && line.contains(&format!("type=\"{signature}\""))),
++            "Unexpected property schema for {name}: {xml}"
++        );
++    }
++
++    fn method_outputs(xml: &str, method: &str) -> Vec<String> {
++        let start = xml.find(&format!("<method name=\"{method}\"")).unwrap();
++        let body = &xml[start..];
++        let body = &body[..body.find("</method>").unwrap()];
++        body.lines()
++            .filter(|line| line.contains("direction=\"out\""))
++            .map(|line| {
++                line.split("type=\"")
++                    .nth(1)
++                    .unwrap()
++                    .split('"')
++                    .next()
++                    .unwrap()
++                    .to_string()
++            })
++            .collect()
++    }
++
++    #[test]
++    fn cache_schema_uses_bulk_metadata_and_native_object_reference_signatures() {
++        let (adapter, _) = fixture();
++        let cache = CacheInterface::new(":1.42".try_into().unwrap(), adapter.platform_root());
++        let xml = xml(&cache);
++        property(&xml, "version", "u");
++        assert_eq!(
++            method_outputs(&xml, "GetItems"),
++            ["a((so)(so)(so)iiassusau)"]
++        );
++        let add = &xml[xml.find("<signal name=\"AddAccessible\"").unwrap()..];
++        assert!(add[..add.find("</signal>").unwrap()].contains("type=\"((so)(so)(so)iiassusau)\""));
++        let remove = &xml[xml.find("<signal name=\"RemoveAccessible\"").unwrap()..];
++        assert!(remove[..remove.find("</signal>").unwrap()].contains("type=\"(so)\""));
++    }
++
++    #[test]
++    fn table_schema_matches_native_object_reference_and_scalar_contracts() {
++        let (_adapter, node) = fixture();
++        let table = TableInterface::new(":1.42".try_into().unwrap(), node);
++        let xml = xml(&table);
++        for name in ["Caption", "Summary"] {
++            property(&xml, name, "(so)");
++        }
++        for name in ["NRows", "NColumns", "NSelectedRows", "NSelectedColumns"] {
++            property(&xml, name, "i");
++        }
++        for name in ["GetAccessibleAt", "GetRowHeader", "GetColumnHeader"] {
++            assert_eq!(method_outputs(&xml, name), ["(so)"]);
++        }
++        assert_eq!(
++            method_outputs(&xml, "GetRowColumnExtentsAtIndex"),
++            ["b", "i", "i", "i", "i", "b"]
++        );
++    }
++
++    #[test]
++    fn table_cell_schema_has_single_containing_table_struct_not_nested_wrapper() {
++        let (_adapter, node) = fixture();
++        let cell = TableCellInterface::new(":1.42".try_into().unwrap(), node);
++        let xml = xml(&cell);
++        // A ((so)) Table property causes libatspi's libdbus decoder to abort.
++        property(&xml, "Table", "(so)");
++        property(&xml, "Position", "(ii)");
++        property(&xml, "RowSpan", "i");
++        property(&xml, "ColumnSpan", "i");
++        for name in ["GetRowHeaderCells", "GetColumnHeaderCells"] {
++            assert_eq!(method_outputs(&xml, name), ["a(so)"]);
++        }
++        assert_eq!(
++            method_outputs(&xml, "GetRowColumnSpan"),
++            ["i", "i", "i", "i"]
++        );
++    }
++}
+--- /dev/null
++++ b/accesskit_unix/src/atspi/interfaces/table.rs
+@@ -0,0 +1,192 @@
++// DBX local extension of AccessKit's AT-SPI adapter.
++// Licensed under MIT OR Apache-2.0, like the surrounding adapter.
++
++use crate::atspi::{ObjectId, OwnedObjectAddress};
++use accesskit_atspi_common::PlatformNode;
++use zbus::{fdo, interface, names::OwnedUniqueName};
++
++pub(crate) struct TableInterface {
++    bus_name: OwnedUniqueName,
++    node: PlatformNode,
++}
++
++impl TableInterface {
++    pub fn new(bus_name: OwnedUniqueName, node: PlatformNode) -> Self {
++        Self { bus_name, node }
++    }
++    fn map_error(&self) -> impl '_ + FnOnce(accesskit_atspi_common::Error) -> fdo::Error {
++        |error| crate::util::map_error_from_node(&self.node, error)
++    }
++    fn address(&self, id: Option<accesskit_atspi_common::NodeId>) -> (OwnedObjectAddress,) {
++        super::optional_object_address(
++            &self.bus_name,
++            id.map(|node| ObjectId::Node {
++                adapter: self.node.adapter_id(),
++                node,
++            }),
++        )
++    }
++}
++
++#[interface(name = "org.a11y.atspi.Table")]
++impl TableInterface {
++    #[zbus(property)]
++    fn n_rows(&self) -> fdo::Result<i32> {
++        self.node
++            .table_dimensions()
++            .map(|(rows, _)| rows)
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn n_columns(&self) -> fdo::Result<i32> {
++        self.node
++            .table_dimensions()
++            .map(|(_, columns)| columns)
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn n_selected_rows(&self) -> fdo::Result<i32> {
++        self.node
++            .table_selected_axes(true)
++            .map(|rows| rows.len() as i32)
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn n_selected_columns(&self) -> fdo::Result<i32> {
++        self.node
++            .table_selected_axes(false)
++            .map(|columns| columns.len() as i32)
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn caption(&self) -> fdo::Result<OwnedObjectAddress> {
++        self.node.table_dimensions().map_err(self.map_error())?;
++        Ok(self.address(None).0)
++    }
++    #[zbus(property)]
++    fn summary(&self) -> fdo::Result<OwnedObjectAddress> {
++        self.node.table_dimensions().map_err(self.map_error())?;
++        Ok(self.address(None).0)
++    }
++    fn get_accessible_at(&self, row: i32, column: i32) -> fdo::Result<(OwnedObjectAddress,)> {
++        self.node
++            .table_cell_at(row, column)
++            .map(|cell| self.address(cell))
++            .map_err(self.map_error())
++    }
++    fn get_index_at(&self, row: i32, column: i32) -> fdo::Result<i32> {
++        self.node
++            .table_index_at(row, column)
++            .map_err(self.map_error())
++    }
++    fn get_row_at_index(&self, index: i32) -> fdo::Result<i32> {
++        self.node
++            .table_cell_at_index(index)
++            .map(|cell| cell.map(|(info, _)| info.row).unwrap_or(-1))
++            .map_err(self.map_error())
++    }
++    fn get_column_at_index(&self, index: i32) -> fdo::Result<i32> {
++        self.node
++            .table_cell_at_index(index)
++            .map(|cell| cell.map(|(info, _)| info.column).unwrap_or(-1))
++            .map_err(self.map_error())
++    }
++    fn get_row_column_extents_at_index(
++        &self,
++        index: i32,
++    ) -> fdo::Result<(bool, i32, i32, i32, i32, bool)> {
++        self.node
++            .table_cell_at_index(index)
++            .map(|cell| {
++                cell.map(|(info, selected)| {
++                    (
++                        true,
++                        info.row,
++                        info.column,
++                        info.row_span,
++                        info.column_span,
++                        selected,
++                    )
++                })
++                .unwrap_or((false, -1, -1, 0, 0, false))
++            })
++            .map_err(self.map_error())
++    }
++    fn get_row_extent_at(&self, row: i32, column: i32) -> fdo::Result<i32> {
++        self.node
++            .table_cell_extent_at(row, column, true)
++            .map_err(self.map_error())
++    }
++    fn get_column_extent_at(&self, row: i32, column: i32) -> fdo::Result<i32> {
++        self.node
++            .table_cell_extent_at(row, column, false)
++            .map_err(self.map_error())
++    }
++    fn get_row_header(&self, row: i32) -> fdo::Result<(OwnedObjectAddress,)> {
++        self.node
++            .table_header(row, true)
++            .map(|id| self.address(id))
++            .map_err(self.map_error())
++    }
++    fn get_column_header(&self, column: i32) -> fdo::Result<(OwnedObjectAddress,)> {
++        self.node
++            .table_header(column, false)
++            .map(|id| self.address(id))
++            .map_err(self.map_error())
++    }
++    fn get_row_description(&self, row: i32) -> fdo::Result<String> {
++        self.node
++            .table_description(row, true)
++            .map_err(self.map_error())
++    }
++    fn get_column_description(&self, column: i32) -> fdo::Result<String> {
++        self.node
++            .table_description(column, false)
++            .map_err(self.map_error())
++    }
++    fn is_selected(&self, row: i32, column: i32) -> fdo::Result<bool> {
++        self.node
++            .table_is_selected(row, column)
++            .map_err(self.map_error())
++    }
++    fn is_row_selected(&self, row: i32) -> fdo::Result<bool> {
++        self.node
++            .table_is_axis_selected(row, true)
++            .map_err(self.map_error())
++    }
++    fn is_column_selected(&self, column: i32) -> fdo::Result<bool> {
++        self.node
++            .table_is_axis_selected(column, false)
++            .map_err(self.map_error())
++    }
++    fn get_selected_rows(&self) -> fdo::Result<Vec<i32>> {
++        self.node
++            .table_selected_axes(true)
++            .map_err(self.map_error())
++    }
++    fn get_selected_columns(&self) -> fdo::Result<Vec<i32>> {
++        self.node
++            .table_selected_axes(false)
++            .map_err(self.map_error())
++    }
++    fn add_row_selection(&self, row: i32) -> fdo::Result<bool> {
++        self.node
++            .table_change_axis_selection(row, true)
++            .map_err(self.map_error())
++    }
++    fn remove_row_selection(&self, row: i32) -> fdo::Result<bool> {
++        self.node
++            .table_change_axis_selection(row, true)
++            .map_err(self.map_error())
++    }
++    fn add_column_selection(&self, column: i32) -> fdo::Result<bool> {
++        self.node
++            .table_change_axis_selection(column, false)
++            .map_err(self.map_error())
++    }
++    fn remove_column_selection(&self, column: i32) -> fdo::Result<bool> {
++        self.node
++            .table_change_axis_selection(column, false)
++            .map_err(self.map_error())
++    }
++}
+--- /dev/null
++++ b/accesskit_unix/src/atspi/interfaces/table_cell.rs
+@@ -0,0 +1,91 @@
++// DBX local extension of AccessKit's AT-SPI adapter.
++// Licensed under MIT OR Apache-2.0, like the surrounding adapter.
++
++use crate::atspi::{ObjectId, OwnedObjectAddress};
++use accesskit_atspi_common::PlatformNode;
++use zbus::{fdo, interface, names::OwnedUniqueName};
++
++pub(crate) struct TableCellInterface {
++    bus_name: OwnedUniqueName,
++    node: PlatformNode,
++}
++
++impl TableCellInterface {
++    pub fn new(bus_name: OwnedUniqueName, node: PlatformNode) -> Self {
++        Self { bus_name, node }
++    }
++    fn map_error(&self) -> impl '_ + FnOnce(accesskit_atspi_common::Error) -> fdo::Error {
++        |error| crate::util::map_error_from_node(&self.node, error)
++    }
++    fn address(&self, id: Option<accesskit_atspi_common::NodeId>) -> (OwnedObjectAddress,) {
++        super::optional_object_address(
++            &self.bus_name,
++            id.map(|node| ObjectId::Node {
++                adapter: self.node.adapter_id(),
++                node,
++            }),
++        )
++    }
++}
++
++#[interface(name = "org.a11y.atspi.TableCell")]
++impl TableCellInterface {
++    #[zbus(property)]
++    fn position(&self) -> fdo::Result<(i32, i32)> {
++        self.node
++            .table_cell_info()
++            .map(|info| (info.row, info.column))
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn row_span(&self) -> fdo::Result<i32> {
++        self.node
++            .table_cell_info()
++            .map(|info| info.row_span)
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn column_span(&self) -> fdo::Result<i32> {
++        self.node
++            .table_cell_info()
++            .map(|info| info.column_span)
++            .map_err(self.map_error())
++    }
++    #[zbus(property)]
++    fn table(&self) -> fdo::Result<OwnedObjectAddress> {
++        self.node
++            .table_cell_table()
++            .map(|id| self.address(Some(id)).0)
++            .map_err(self.map_error())
++    }
++    // GNOME libatspi and the ATK bridge use four integers here. The upstream
++    // XML/generated Rust proxy still includes an incompatible leading boolean.
++    fn get_row_column_span(&self) -> fdo::Result<(i32, i32, i32, i32)> {
++        self.node
++            .table_cell_info()
++            .map(|info| (info.row, info.column, info.row_span, info.column_span))
++            .map_err(self.map_error())
++    }
++    fn get_row_header_cells(&self) -> fdo::Result<Vec<OwnedObjectAddress>> {
++        self.node
++            .table_cell_headers(true)
++            .map(|headers| {
++                headers
++                    .into_iter()
++                    .map(|id| self.address(Some(id)).0)
++                    .collect()
++            })
++            .map_err(self.map_error())
++    }
++    fn get_column_header_cells(&self) -> fdo::Result<Vec<OwnedObjectAddress>> {
++        self.node
++            .table_cell_headers(false)
++            .map(|headers| {
++                headers
++                    .into_iter()
++                    .map(|id| self.address(Some(id)).0)
++                    .collect()
++            })
++            .map_err(self.map_error())
++    }
++}

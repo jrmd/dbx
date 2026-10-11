@@ -1,0 +1,702 @@
+{
+  "schema": 1,
+  "scope": "Generated local SQLite 1000-row, 40-data-column grid, Linux debug native build and silent Orca 50.2; warm query performance is separate from cold reader startup",
+  "before_cache": {
+    "dimensions": [
+      1001,
+      41
+    ],
+    "initial_table_lookup_seconds": 0.7686645729991142,
+    "far_cell_lookup_and_position_seconds": [
+      0.7395974279934308,
+      0.7384617700008675,
+      0.739472150002257,
+      0.7391649060009513,
+      0.7352907470049104,
+      0.7360848259995691,
+      0.7380689839992556,
+      0.7390712880005594
+    ],
+    "median_seconds": 0.7387665290007135
+  },
+  "after_cache_only": {
+    "dimensions": [
+      1001,
+      41
+    ],
+    "initial_table_lookup_seconds": 0.03235834401129978,
+    "far_cell_lookup_and_position_seconds": [
+      0.0013656449955306016,
+      0.0011631789966486394,
+      0.0011716560038621537,
+      0.001162237997050397,
+      0.001179430000775028,
+      0.0012453849994926713,
+      0.0012110699972254224,
+      0.001177266996819526
+    ],
+    "median_seconds": 0.001178348498797277,
+    "last_row_last_column_reveal_seconds": 0.9295117250003386,
+    "last_cell_bounds": [
+      1717,
+      1275,
+      300,
+      72
+    ],
+    "binary_sha256": "81c574d1b332a89ecc1710fb12e6a3d0d32d1ce31bb556a8bbba5fd6c6b6d23e",
+    "initial_frame_coordinate_bounds_unavailable": true,
+    "native_grid_window_bounds": [
+      437,
+      305,
+      1590,
+      1042
+    ],
+    "visual_last_cell_reveal_verified": true,
+    "capture_path": "/tmp/dbx-a11y-vbCm2A/large-grid-last-cell.png"
+  },
+  "final_cache_and_width_build": {
+    "dimensions": [
+      1001,
+      41
+    ],
+    "initial_table_lookup_seconds": 2.2406134939883486,
+    "far_cell_lookup_and_position_seconds": [
+      0.001592445005371701,
+      0.0011952300046687014,
+      0.001291784006753005,
+      0.0012726569984806702,
+      0.0012187249958515167,
+      0.0011749319965019822,
+      0.0012303670009714551,
+      0.0011717450033756904
+    ],
+    "median_seconds": 0.001224545998411486,
+    "last_row_last_column_reveal_seconds": 0.8904349350050325,
+    "last_cell_bounds": [
+      1717,
+      1275,
+      300,
+      72
+    ]
+  },
+  "native_200_percent": {
+    "dimensions": [
+      1001,
+      41
+    ],
+    "initial_table_lookup_seconds": 2.203711143003602,
+    "far_cell_lookup_and_position_seconds": [
+      0.0014856720008538105,
+      0.0012253679960849695,
+      0.0011835780023830011,
+      0.0011912029949598946,
+      0.0012518570001702756,
+      0.0012085260023013689,
+      0.0011855319971800782,
+      0.001174479999463074
+    ],
+    "median_seconds": 0.0011998644986306317,
+    "last_row_last_column_reveal_seconds": 0.8515429079998285,
+    "last_cell_bounds": [
+      1608,
+      1220,
+      400,
+      96
+    ]
+  },
+  "reader_last_cell_startup": {
+    "loaded_rows": 1000,
+    "data_columns": 40,
+    "initial_native_focus": "last row/last column",
+    "ready_seconds": 73.94447915199999,
+    "observation_seconds": 74.06403574699652,
+    "reached_ready": true,
+    "actual_speech": [
+      {
+        "time": 38829.180258786,
+        "kind": "speech",
+        "text": "DBX",
+        "focus": "DBX",
+        "role": "frame"
+      },
+      {
+        "time": 38902.883127292,
+        "kind": "speech",
+        "text": "DBX embedded",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.883689009,
+        "kind": "speech",
+        "text": "DBX workspace",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.884229256,
+        "kind": "speech",
+        "text": "Table data.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.884754493,
+        "kind": "speech",
+        "text": "table with 1001 rows 41 columns",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.88528975,
+        "kind": "speech",
+        "text": "Row 1000.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.885809086,
+        "kind": "speech",
+        "text": "not selected Row 1000, column 1 of 41. #",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.886335136,
+        "kind": "speech",
+        "text": "large-r999c35.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.886856075,
+        "kind": "speech",
+        "text": "not selected Row 1000, column 37 of 41. column 35  TEXT.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.887393306,
+        "kind": "speech",
+        "text": "large-r999c36.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.887914305,
+        "kind": "speech",
+        "text": "not selected Row 1000, column 38 of 41. column 36  TEXT.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.888445053,
+        "kind": "speech",
+        "text": "large-r999c37.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.88896438,
+        "kind": "speech",
+        "text": "not selected Row 1000, column 39 of 41. column 37  TEXT.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.889488175,
+        "kind": "speech",
+        "text": "large-r999c38.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.890012561,
+        "kind": "speech",
+        "text": "not selected Row 1000, column 40 of 41. column 38  TEXT.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.890532889,
+        "kind": "speech",
+        "text": "large-r999c39.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      },
+      {
+        "time": 38902.891056764,
+        "kind": "speech",
+        "text": "Row 1000, column 41 of 41. column 39  TEXT.",
+        "focus": "large-r999c39",
+        "role": "table cell"
+      }
+    ],
+    "scope": "Silent actual Orca 50.2, isolated memory settings and DBX-only capture; cold startup with last cell selected"
+  },
+  "reader_first_cell_startup": {
+    "loaded_rows": 1000,
+    "data_columns": 40,
+    "initial_native_focus": "first data row/first data column",
+    "ready_seconds": 1.6785021100004087,
+    "observation_seconds": 3.020415074999619,
+    "reached_ready": true,
+    "actual_speech": [
+      {
+        "time": 39029.433687476,
+        "kind": "speech",
+        "text": "DBX",
+        "focus": "DBX",
+        "role": "frame"
+      },
+      {
+        "time": 39030.608658782,
+        "kind": "speech",
+        "text": "DBX embedded",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.609199258,
+        "kind": "speech",
+        "text": "DBX workspace",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.609709938,
+        "kind": "speech",
+        "text": "Table data.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.610221811,
+        "kind": "speech",
+        "text": "table with 1001 rows 41 columns",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.610728373,
+        "kind": "speech",
+        "text": "Row 1.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.611243611,
+        "kind": "speech",
+        "text": "not selected Row 1, column 1 of 41. #",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.611743951,
+        "kind": "speech",
+        "text": "large-r0c0.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.612254391,
+        "kind": "speech",
+        "text": "Row 1, column 2 of 41. column 0  TEXT.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.612757677,
+        "kind": "speech",
+        "text": "large-r0c1.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.613282363,
+        "kind": "speech",
+        "text": "not selected Row 1, column 3 of 41. column 1  TEXT.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.613785629,
+        "kind": "speech",
+        "text": "large-r0c2.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.614301339,
+        "kind": "speech",
+        "text": "not selected Row 1, column 4 of 41. column 2  TEXT.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.614829512,
+        "kind": "speech",
+        "text": "large-r0c3.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.615362193,
+        "kind": "speech",
+        "text": "not selected Row 1, column 5 of 41. column 3  TEXT.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.615868205,
+        "kind": "speech",
+        "text": "large-r0c4.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.616380107,
+        "kind": "speech",
+        "text": "not selected Row 1, column 6 of 41. column 4  TEXT.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.616879555,
+        "kind": "speech",
+        "text": "large-r0c5.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      },
+      {
+        "time": 39030.617391528,
+        "kind": "speech",
+        "text": "not selected Row 1, column 7 of 41. column 5  TEXT.",
+        "focus": "large-r0c0",
+        "role": "table cell"
+      }
+    ]
+  },
+  "row_number_visual_check": {
+    "native_scale_action": "Interface size 200%",
+    "saved_preference_verified": true,
+    "complete_row_1000_visible": true,
+    "settled_capture": "/tmp/dbx-a11y-vbCm2A/large-grid-last-cell-200-settled.png"
+  },
+  "scaling_transition_issue": {
+    "initial_200_percent_capture": "/tmp/dbx-a11y-vbCm2A/large-grid-last-cell-200.png",
+    "initial_headers": [
+      27,
+      28,
+      29
+    ],
+    "initial_data_columns": [
+      37,
+      38,
+      39
+    ],
+    "settled_headers": [
+      37,
+      38,
+      39
+    ],
+    "settled_data_columns": [
+      37,
+      38,
+      39
+    ],
+    "ocr_confirmed_both_states": true,
+    "resolved": false,
+    "settling_duration_not_measured": true,
+    "native_geometry_alignment_alone_did_not_detect_the_visual_failure": true
+  },
+  "source_sha256": {
+    "vendor/accesskit_atspi_common/src/adapter.rs": "90c4ddf53b69194e51e52dbce04f33bca7a79991ada7b2dc86d5a22df20e6d61",
+    "vendor/accesskit_atspi_common/src/context.rs": "c6be71db128dd19f63a4ce978709f232833ec9a2c90cd0fa94d0ea2b931dde76",
+    "vendor/accesskit_atspi_common/src/lib.rs": "f258ee404fa540d1f4c14e2c8d0f6d322780e1b1c84916140c7097110758f7ff",
+    "vendor/accesskit_atspi_common/src/node.rs": "9f09b74722003f6911f36940d9c882f6e0633e2764c5ba2ed204a1484a45fb61",
+    "vendor/accesskit_atspi_common/src/table.rs": "c7f21a29ca5176a1c65c8a50473af969e60ce3b70a5cc7df90483132bb89f378",
+    "vendor/accesskit_unix/src/atspi/bus.rs": "6f2ce7d76b806a193fab2a36456fb19b1fb46e5cd07b000c54d124121b96f959",
+    "vendor/accesskit_unix/src/atspi/interfaces/mod.rs": "49edc10150cac24cee1d08d91ed2ccac8eb0a2843cef658b613745722add2c1a",
+    "vendor/accesskit_unix/src/atspi/interfaces/table.rs": "46d56caabf1756cc3d81c2ef24201c122e840726f7c0bf0c59a6220d5437a37d",
+    "vendor/accesskit_unix/src/atspi/interfaces/table_cell.rs": "6641811af6f79f18dc47dd95273cbb15a0119f633e36d60231c67211f67a1123",
+    "patches/accesskit-atspi-tables.patch": "5b7a40fe732feda65194f410c57f2ccc0c112a77edcab13c002b7cbee306393f",
+    "crates/dbx-ui/src/app/result_table.rs": "0b77b608b49244b804c3d861bcebc00202c62210cde7418ca572839910d8347d",
+    "crates/dbx-ui/src/app/result_table/accessibility.rs": "496e71cd4cfd638c253c556a98b5f375619d0f432aae2b9a4ca887701112377c",
+    "crates/dbx-ui/src/app/result_table/accessibility/virtualized.rs": "139d68cd968fadba17e50e22622b9b70762449d3667e8734ccff6f8be054a49c",
+    "crates/dbx-ui/src/app.rs": "ac6a2a43059280e49dda8ff993553dfda409be3f5e30a19912806ec5dda7db1e"
+  },
+  "verification": {
+    "ui_tests_passed": 401,
+    "ui_existing_ignored": 2,
+    "ui_seconds": 88.11,
+    "adapter_common_tests_passed": 15,
+    "adapter_unix_schema_tests_passed": 2,
+    "strict_all_target_clippy_ui_and_adapters": true,
+    "format_checks": true,
+    "nine_file_adapter_patch_reproduced_byte_for_byte": true
+  },
+  "remaining": [
+    "Cold reader focus discovery on the far selected cell",
+    "Header/value alignment during interface scaling transitions",
+    "Native application-frame extents and global Wayland coordinate behavior",
+    "Full edit/save reader workflows and other audit areas",
+    "Actual macOS and Windows reader verification"
+  ],
+  "cleanup": {
+    "qa_app_confirmed_absent": 991846,
+    "app_exit_cause": "unknown; empty log and no matching system coredump metadata",
+    "isolated_readers_stopped_and_verified": [
+      980913,
+      983426
+    ],
+    "desktop_accessibility_flags_restored_and_read_back": {
+      "IsEnabled": false,
+      "ScreenReaderEnabled": false
+    }
+  },
+  "final_small_table_orca_rerun": "Did not execute: QA process already absent; earlier retained speech is not relabeled as current-build proof",
+  "native_bulk_cache": {
+    "scope": "Native Linux debug build: version-1 AT-SPI Cache metadata, real client cache use, and cold Orca startup. Other platforms and the full accessibility workflow remain unverified.",
+    "bulk_metadata": {
+      "qa_pid": 1181016,
+      "bus": ":1.595",
+      "item_count": 42103,
+      "get_items_and_python_unpack_seconds": 2.498302500003774,
+      "get_items_wire_seconds": 0.7817778640019242,
+      "all_references_unique": true,
+      "all_node_parents_present": true,
+      "last_cell": {
+        "object": [
+          ":1.595",
+          "/org/a11y/atspi/accessible/0/247034825842038769517823187347618922496"
+        ],
+        "name": "large-r999c39",
+        "interfaces": [
+          "org.a11y.atspi.Accessible",
+          "org.a11y.atspi.Action",
+          "org.a11y.atspi.Component",
+          "org.a11y.atspi.TableCell"
+        ]
+      },
+      "focused_names": [],
+      "selected_names": [
+        "QA SQLite",
+        "Data",
+        "a11y_large",
+        "a11y_large"
+      ],
+      "cache_version": 1
+    },
+    "focused_last_cell_bulk_wire_seconds": 1.0236922479962232,
+    "client_inside_event_loop": {
+      "native_object_path": "/org/a11y/atspi/accessible/0/247034825842038769517823187347618922496",
+      "inside_atspi_event_loop": true,
+      "cache_mask": 127,
+      "cached_flags": {
+        "1": true,
+        "2": true,
+        "4": true,
+        "8": true,
+        "16": true,
+        "32": true,
+        "64": true,
+        "128": false
+      },
+      "last_cell_name": "large-r999c39"
+    },
+    "cache_reference_matches_real_table_cell": true,
+    "warm_traversal_diagnostic": {
+      "diagnostic_only": true,
+      "inside_atspi_event_loop": true,
+      "cache_delivery_wait_seconds": 4,
+      "focused_descendant_lookup_seconds": 0.6072133019988541,
+      "focused_name": ""
+    },
+    "cold_reader": {
+      "reader_version": "50.2",
+      "target_pid": 1159557,
+      "startup_seconds": 75.29635989700182,
+      "selected_cell_speech_seconds": 75.29205922799883,
+      "speech": [
+        {
+          "time": 43877.339463824,
+          "kind": "speech",
+          "text": "DBX",
+          "focus": "DBX",
+          "role": "frame"
+        },
+        {
+          "time": 43951.391901012,
+          "kind": "speech",
+          "text": "DBX embedded",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.392558581,
+          "kind": "speech",
+          "text": "DBX workspace",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.393238232,
+          "kind": "speech",
+          "text": "Table data.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.39382144,
+          "kind": "speech",
+          "text": "table with 1001 rows 41 columns",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.39441109,
+          "kind": "speech",
+          "text": "Row 1000.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.394995269,
+          "kind": "speech",
+          "text": "not selected Row 1000, column 1 of 41. #",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.395597453,
+          "kind": "speech",
+          "text": "large-r999c36.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.396188416,
+          "kind": "speech",
+          "text": "not selected Row 1000, column 38 of 41. column 36  TEXT.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.396866494,
+          "kind": "speech",
+          "text": "large-r999c37.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.397567135,
+          "kind": "speech",
+          "text": "not selected Row 1000, column 39 of 41. column 37  TEXT.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.398318402,
+          "kind": "speech",
+          "text": "large-r999c38.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.399052446,
+          "kind": "speech",
+          "text": "not selected Row 1000, column 40 of 41. column 38  TEXT.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.39962792,
+          "kind": "speech",
+          "text": "large-r999c39.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        },
+        {
+          "time": 43951.400178646,
+          "kind": "speech",
+          "text": "Row 1000, column 41 of 41. column 39  TEXT.",
+          "focus": "large-r999c39",
+          "role": "table cell"
+        }
+      ],
+      "case": "cold startup with final loaded grid cell selected; default full-row reader preference"
+    },
+    "native_query_and_reveal": {
+      "dimensions": [
+        1001,
+        41
+      ],
+      "initial_table_lookup_seconds": 0.7596273750023101,
+      "far_cell_lookup_and_position_seconds": [
+        0.0020514869975158945,
+        0.0015820249973330647,
+        0.0015695920010330155,
+        0.0016745009997976013,
+        0.001794468000298366,
+        0.0016730479983380064,
+        0.0015991780019248836,
+        0.0016938179978751577
+      ],
+      "median_seconds": 0.0016737744990678038,
+      "last_row_last_column_reveal_seconds": 0.6537500390040805,
+      "last_cell_bounds": [
+        878,
+        455,
+        400,
+        72
+      ]
+    },
+    "probe_correction": "The earlier private libatspi cache predicates were evaluated outside atspi_event_main. The library deliberately bypasses most cached fields there; false predicates were not proof that GetItems was rejected. Inside the event loop the seven default metadata cache flags are true.",
+    "cold_start_not_fixed": true,
+    "primary_client_source": "https://github.com/GNOME/at-spi2-core/blob/2.60.6/atspi/atspi-accessible.c",
+    "source_sha256": {
+      "vendor/accesskit_atspi_common/src/adapter.rs": "90c4ddf53b69194e51e52dbce04f33bca7a79991ada7b2dc86d5a22df20e6d61",
+      "vendor/accesskit_atspi_common/src/context.rs": "c6be71db128dd19f63a4ce978709f232833ec9a2c90cd0fa94d0ea2b931dde76",
+      "vendor/accesskit_atspi_common/src/lib.rs": "4996c0a6f96682ed4f33c3cfce63fe79c8892c226ba4afd13ed81c139d74a375",
+      "vendor/accesskit_atspi_common/src/node.rs": "faa9294e95fa0421d4ec16d82568a59670b69bae3eabb1686157b2d549752043",
+      "vendor/accesskit_atspi_common/src/table.rs": "cfe67008db64910cc60bb42de69ab72da6c149df1b0e5afcf588816fe28edea6",
+      "vendor/accesskit_unix/src/atspi/bus.rs": "774384fcea6a4d8982b76a117291bb8ea743c18cf42e52f48bd3e1d2909f75e6",
+      "vendor/accesskit_unix/src/atspi/interfaces/cache.rs": "d9ef1bc9085fa81636f1342e3b1dea071594f9940a92c5062876d77bb7bbc275",
+      "vendor/accesskit_unix/src/atspi/interfaces/mod.rs": "ad60f261b4cf3eecadbd26918f07a157bf227151cf1b3807b68ee9195184a8fe",
+      "vendor/accesskit_unix/src/atspi/interfaces/table.rs": "46d56caabf1756cc3d81c2ef24201c122e840726f7c0bf0c59a6220d5437a37d",
+      "vendor/accesskit_unix/src/atspi/interfaces/table_cell.rs": "6641811af6f79f18dc47dd95273cbb15a0119f633e36d60231c67211f67a1123"
+    },
+    "binary_sha256": "6a658c970562c33a2bf7b0e594206bc1a217314e844706e09bd0b21e27003378",
+    "verification": {
+      "ui_tests_passed": 401,
+      "ui_existing_ignored": 2,
+      "ui_seconds": 97.98,
+      "common_tests_passed": 16,
+      "unix_schema_tests_passed": 3,
+      "strict_all_target_clippy_ui_and_adapters": true,
+      "format_checks": true,
+      "ten_file_adapter_patch_reproduced_byte_for_byte": true
+    },
+    "remaining": [
+      "Cold Orca startup scans the large tree before the AT-SPI event loop enables normal metadata caching. A provider-side focused-descendant query remains to be implemented and checked against the actual cold case.",
+      "Native live cache add/remove/update coherence across modal hiding, sorting and interface changes needs direct coverage.",
+      "The previously observed 150-to-200% header/body transition mismatch remains open."
+    ],
+    "cleanup": {
+      "supervised_qa": {
+        "qa_pid": 1181016,
+        "returncode": -15,
+        "exited_at": 1791753035.5160408
+      },
+      "qa_pid_absent": 1181016,
+      "accessibility_flags_restored_and_verified": {
+        "IsEnabled": false,
+        "ScreenReaderEnabled": false
+      },
+      "reader_stopped": 1171784,
+      "earlier_unsupervised_qa_pid_absent": 1159557,
+      "earlier_unsupervised_exit_cause": "unknown; own log empty and no coredump found"
+    }
+  }
+}

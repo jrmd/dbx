@@ -12,12 +12,15 @@
 //! ranges internally, while GPUI's input protocol is UTF-16; all conversion
 //! happens at the boundary below.
 
+mod accessibility;
 mod commands;
 mod folding;
 mod signatures;
 mod syntax;
+mod vim;
 pub use signatures::function_signature;
 pub use syntax::*;
+pub use vim::VimMode;
 
 use std::ops::Range;
 
@@ -234,6 +237,9 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
             Some(SQL_EDITOR_CONTEXT),
         ),
     ]
+    .into_iter()
+    .chain(vim::bindings())
+    .collect()
 }
 
 /// A native single-line or multiline text editor.
@@ -306,6 +312,8 @@ pub struct TextEditor {
     /// Paint text as bullets while retaining the backing value for input and
     /// connection-string construction.
     password: bool,
+    accessibility_label: SharedString,
+    accessible_text: std::rc::Rc<std::cell::RefCell<accessibility::AccessibleText>>,
     /// UTF-8 byte ranges at grapheme boundaries.
     selected_range: Range<usize>,
     /// Further selections edited together with `selected_range`, sorted and
@@ -349,6 +357,7 @@ pub struct TextEditor {
     /// so a find bar can reveal the match it selected.
     reveal_requested: std::cell::Cell<bool>,
     _subscriptions: Vec<Subscription>,
+    vim: Option<vim::VimState>,
 }
 
 /// The old short name is useful when migrating an existing GPUI screen to
@@ -375,7 +384,9 @@ impl TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let focus_handle = cx.focus_handle();
+        // Every field is reachable with Tab; `tab_stop` writes through to the
+        // window's handle registry, which the tracked shell element honours.
+        let focus_handle = cx.focus_handle().tab_stop(true);
         let observed = cx.observe(&value, |this, value, cx| {
             let text = value.read(cx);
             this.selected_range = clamp_range(text, this.selected_range.clone());
@@ -399,6 +410,14 @@ impl TextEditor {
             multiline,
             language,
             password: false,
+            accessibility_label: match language {
+                EditorLanguage::Sql(_) => "SQL query",
+                EditorLanguage::Redis => "Redis command",
+                EditorLanguage::Json => "JSON value",
+                EditorLanguage::PlainText => "Text",
+            }
+            .into(),
+            accessible_text: Default::default(),
             selected_range: 0..0,
             extra_selections: Vec::new(),
             folds: Vec::new(),
@@ -421,6 +440,7 @@ impl TextEditor {
             typing_run: None,
             reveal_requested: std::cell::Cell::new(false),
             _subscriptions: vec![observed, focus, blur],
+            vim: None,
         }
     }
 
@@ -452,6 +472,66 @@ impl TextEditor {
         self.password = true;
         self.language = EditorLanguage::PlainText;
         self
+    }
+
+    /// A persistent field name, independent of its value or placeholder.
+    pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.accessibility_label = label.into();
+        self
+    }
+
+    /// Designer fields can change purpose when their operation changes.
+    pub fn set_accessibility_label(
+        &mut self,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let label = label.into();
+        if self.accessibility_label != label {
+            self.accessibility_label = label;
+            cx.notify();
+        }
+    }
+
+    fn accessible_action(
+        &mut self,
+        action: gpui::AccessibleAction,
+        data: Option<&gpui::accesskit::ActionData>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui::accesskit::{Action, ActionData};
+        match (action, data) {
+            (Action::SetValue, Some(ActionData::Value(value))) => self.set_text(value.as_ref(), cx),
+            (Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
+                self.replace(self.selected_range.clone(), value, cx);
+            }
+            (Action::SetTextSelection, Some(ActionData::SetTextSelection(selection)))
+                if !self.password =>
+            {
+                let positions = {
+                    let snapshot = self.accessible_text.borrow();
+                    if snapshot.text != *self.value.read(cx) {
+                        return; // An action from a tree older than the current edit.
+                    }
+                    snapshot
+                        .offset(selection.anchor)
+                        .zip(snapshot.offset(selection.focus))
+                };
+                let Some((anchor, focus)) = positions else {
+                    return;
+                };
+                self.extra_selections.clear();
+                self.marked_range = None;
+                self.selected_range = anchor.min(focus)..anchor.max(focus);
+                self.selection_reversed = focus < anchor;
+            }
+            (Action::ScrollIntoView, _) => {}
+            _ => return,
+        }
+        self.reveal_requested.set(true);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     /// Create an editor with a new empty value entity.
@@ -951,7 +1031,7 @@ impl TextEditor {
         let x = self
             .last_layout
             .get(line)
-            .map_or(px(0.), |shaped| shaped.x_for_index(column));
+            .map_or(crate::theme::ui_px(0.), |shaped| shaped.x_for_index(column));
         let position = point(
             bounds.left() + x,
             bounds.top() + self.last_layout.top(line, line_height),
@@ -972,14 +1052,14 @@ impl TextEditor {
         let card = div()
             .id("dbx-editor-signature")
             .debug_selector(|| "dbx-editor-signature".into())
-            .max_w(px(480.))
-            .px(px(9.))
-            .py(px(6.))
-            .rounded(px(7.))
+            .max_w(crate::theme::ui_px(480.))
+            .px(crate::theme::ui_px(9.))
+            .py(crate::theme::ui_px(6.))
+            .rounded(crate::theme::ui_px(7.))
             .border_1()
             .border_color(theme().border_strong)
             .bg(theme().panel_raised)
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .child(
                 div()
                     .flex()
@@ -996,8 +1076,8 @@ impl TextEditor {
             )
             .child(
                 div()
-                    .pt(px(3.))
-                    .text_size(px(11.))
+                    .pt(crate::theme::ui_px(3.))
+                    .text_size(crate::theme::ui_px(11.))
                     .text_color(theme().text_muted)
                     .child(signature.summary),
             );
@@ -1005,8 +1085,8 @@ impl TextEditor {
             deferred(
                 anchored()
                     .anchor(gpui::Anchor::BottomLeft)
-                    .position(position - point(px(9.), px(4.)))
-                    .snap_to_window_with_margin(px(8.))
+                    .position(position - point(crate::theme::ui_px(9.), crate::theme::ui_px(4.)))
+                    .snap_to_window_with_margin(crate::theme::ui_px(8.))
                     .child(card),
             )
             .with_priority(30)
@@ -1084,28 +1164,30 @@ impl TextEditor {
         let card = div()
             .id("dbx-editor-hover")
             .debug_selector(|| "dbx-editor-hover".into())
-            .max_w(px(420.))
-            .px(px(9.))
-            .py(px(6.))
-            .rounded(px(7.))
+            .max_w(crate::theme::ui_px(420.))
+            .px(crate::theme::ui_px(9.))
+            .py(crate::theme::ui_px(6.))
+            .rounded(crate::theme::ui_px(7.))
             .border_1()
             .border_color(theme().border_strong)
             .bg(theme().panel_raised)
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .text_color(theme().text)
             .child(hover.info.title.clone())
             .children(hover.info.detail.clone().map(|detail| {
                 div()
-                    .pt(px(3.))
-                    .text_size(px(11.))
+                    .pt(crate::theme::ui_px(3.))
+                    .text_size(crate::theme::ui_px(11.))
                     .text_color(theme().text_muted)
                     .child(detail)
             }));
         Some(
             deferred(
                 anchored()
-                    .position(hover.position + point(px(0.), px(18.)))
-                    .snap_to_window_with_margin(px(8.))
+                    .position(
+                        hover.position + point(crate::theme::ui_px(0.), crate::theme::ui_px(18.)),
+                    )
+                    .snap_to_window_with_margin(crate::theme::ui_px(8.))
                     .child(card),
             )
             .with_priority(40)
@@ -1198,6 +1280,12 @@ impl TextEditor {
     }
 
     fn record_history(&mut self, cx: &mut Context<Self>) {
+        if self.vim.as_ref().is_some_and(|vim| {
+            vim.mode == VimMode::Insert && self.undo_history.len() > vim.insert_undo_start
+        }) {
+            self.redo_history.clear();
+            return;
+        }
         let snapshot = EditorSnapshot::from_editor(self, cx);
         if self.undo_history.last() != Some(&snapshot) {
             self.undo_history.push(snapshot);
@@ -1790,7 +1878,7 @@ fn completion_anchor(
     layout: &LineLayouts,
 ) -> Point<Pixels> {
     let Some(bounds) = bounds else {
-        return point(px(0.), px(0.));
+        return point(crate::theme::ui_px(0.), crate::theme::ui_px(0.));
     };
     let cursor = clamp_boundary(text, cursor);
     let (line, column) = line_and_column(text, cursor);
@@ -1798,7 +1886,7 @@ fn completion_anchor(
     let x = layout
         .get(line)
         .map(|line| line.x_for_index(column))
-        .unwrap_or(px(0.));
+        .unwrap_or(crate::theme::ui_px(0.));
     point(
         bounds.left() + x,
         bounds.top() + layout.top(line, line_height) + line_height,
@@ -1999,6 +2087,9 @@ impl Focusable for TextEditor {
 }
 
 impl EntityInputHandler for TextEditor {
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.accepts_insert_input()
+    }
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -2048,6 +2139,9 @@ impl EntityInputHandler for TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.accepts_insert_input() {
+            return;
+        }
         let content = self.text(cx);
         let range = range
             .map(|range| {
@@ -2097,6 +2191,9 @@ impl EntityInputHandler for TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.accepts_insert_input() {
+            return;
+        }
         self.extra_selections.clear();
         let content = self.text(cx);
         let range = range
@@ -2188,6 +2285,13 @@ impl Render for TextEditor {
         if self.is_code() {
             self.reconcile_folds(cx);
         }
+        // Refresh only while a screen reader is connected. Never copy a
+        // password into a snapshot, even while the bridge is inactive.
+        *self.accessible_text.borrow_mut() = if window.is_a11y_active() && !self.password {
+            accessibility::AccessibleText::new(self.text(cx))
+        } else {
+            Default::default()
+        };
         let editor = div()
             .id(gpui::SharedString::from(format!(
                 "dbx-text-editor-scroll-{:?}",
@@ -2208,6 +2312,16 @@ impl Render for TextEditor {
                 .flex()
                 .size_full()
                 .min_w_0()
+                .when_some(self.vim_mode(), |view, mode| {
+                    view.track_focus(&self.focus_handle)
+                        .key_context(if mode == VimMode::Insert {
+                            vim::INSERT_CONTEXT
+                        } else {
+                            vim::NORMAL_CONTEXT
+                        })
+                        .on_action(cx.listener(Self::vim_key))
+                        .on_key_down(cx.listener(Self::vim_unbound_key))
+                })
                 .child(LineNumberGutter {
                     editor: cx.entity(),
                 })
@@ -2324,6 +2438,7 @@ impl Element for LineNumberGutter {
         let focused = editor.focus_handle.is_focused(window);
         let offset = editor.scroll_handle.offset().y;
         let line_height = window.line_height();
+
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let rows = folding::RowMap::new(&editor.folded);
@@ -2511,7 +2626,7 @@ impl Element for TextEditorText {
                 .split('\n')
                 .map(|line| shape(window, line))
                 .max()
-                .unwrap_or(px(1.));
+                .unwrap_or(crate::theme::ui_px(1.));
             (width, painted.split('\n').count())
         } else {
             let mut cache = editor.paint_cache.borrow_mut();
@@ -2525,7 +2640,7 @@ impl Element for TextEditorText {
                         .into_iter()
                         .map(|line| shape(window, cache.line(text, line)))
                         .max()
-                        .unwrap_or(px(1.));
+                        .unwrap_or(crate::theme::ui_px(1.));
                     cache.width = Some((font_size, width));
                     width
                 }
@@ -2535,7 +2650,7 @@ impl Element for TextEditorText {
         };
 
         let mut style = Style::default();
-        style.size.width = measured_width.max(px(1.)).into();
+        style.size.width = measured_width.max(crate::theme::ui_px(1.)).into();
         style.size.height = (window.line_height() * line_count.max(1) as f32).into();
         (window.request_layout(style, [], cx), ())
     }
@@ -2603,9 +2718,31 @@ impl Element for TextEditorText {
             }
         };
 
-        let cursor = clamp_boundary(text, editor.cursor_offset());
+        let cursor = clamp_boundary(
+            text,
+            editor
+                .vim
+                .as_ref()
+                .filter(|vim| matches!(vim.mode, VimMode::Visual | VimMode::VisualLine))
+                .map_or_else(|| editor.cursor_offset(), |vim| vim.cursor),
+        );
         let (cursor_line, cursor_col) = cache.line_and_column(cursor);
         let cursor_shaped = shape(window, cursor_line);
+        let block_caret = editor
+            .vim_mode()
+            .is_some_and(|mode| mode != VimMode::Insert);
+        let caret_width = if block_caret {
+            let line = cache.line(text, cursor_line);
+            let measured = cursor_shaped.x_for_index(next_boundary(line, cursor_col))
+                - cursor_shaped.x_for_index(cursor_col);
+            if measured > crate::theme::ui_px(0.) {
+                measured
+            } else {
+                crate::theme::ui_px(8.)
+            }
+        } else {
+            crate::theme::ui_px(2.)
+        };
         let cursor_position = point(
             cursor_shaped.x_for_index(display_column(cursor_line, cursor_col)),
             line_height * rows.row(cursor_line) as f32,
@@ -2620,7 +2757,7 @@ impl Element for TextEditorText {
                     editor.scroll_handle.max_offset().into(),
                     editor.scroll_handle.bounds().size,
                     cursor_position,
-                    size(px(2.), line_height),
+                    size(caret_width, line_height),
                     editor.multiline,
                 );
                 (bounds + (next_offset - current_offset), Some(next_offset))
@@ -2670,7 +2807,7 @@ impl Element for TextEditorText {
                                     + shaped.x_for_index(display_column(line, column)),
                                 paint_bounds.top() + line_height * rows.row(line) as f32,
                             ),
-                            size(px(2.), line_height),
+                            size(crate::theme::ui_px(2.), line_height),
                         ),
                         crate::theme::theme().focus_ring,
                     ))
@@ -2686,11 +2823,17 @@ impl Element for TextEditorText {
                         paint_bounds.left() + cursor_position.x,
                         paint_bounds.top() + cursor_position.y,
                     ),
-                    size(px(2.), line_height),
+                    size(crate::theme::ui_px(2.), line_height),
                 ),
                 // Pure blue vanishes on the dark canvas; the focus ring
                 // colour is tuned for contrast in both appearances.
-                crate::theme::theme().focus_ring,
+                {
+                    let mut color = crate::theme::theme().focus_ring;
+                    if block_caret {
+                        color.a = 0.4;
+                    }
+                    color
+                },
             )
         });
 
@@ -2710,7 +2853,7 @@ impl Element for TextEditorText {
                 let start = if line == start_line {
                     shaped_line.x_for_index(display_column(line, start_col))
                 } else {
-                    px(0.)
+                    crate::theme::ui_px(0.)
                 };
                 let end = if line == end_line {
                     shaped_line.x_for_index(display_column(line, end_col))
@@ -2843,25 +2986,38 @@ impl Element for TextEditorText {
                 None,
             );
             let top = paint_bounds.top() + line_height * rows.row(region.start_line) as f32;
-            let left = paint_bounds.left() + shaped.width + px(6.);
+            let left = paint_bounds.left() + shaped.width + crate::theme::ui_px(6.);
             decorations.push(
                 fill(
                     Bounds::new(
-                        point(left, top + px(2.)),
-                        size(marker.width + px(8.), line_height - px(4.)),
+                        point(left, top + crate::theme::ui_px(2.)),
+                        size(
+                            marker.width + crate::theme::ui_px(8.),
+                            line_height - crate::theme::ui_px(4.),
+                        ),
                     ),
                     crate::theme::theme().grid_alternate,
                 )
-                .corner_radii(px(3.)),
+                .corner_radii(crate::theme::ui_px(3.)),
             );
-            fold_markers.push((point(left + px(4.), top), marker));
+            fold_markers.push((point(left + crate::theme::ui_px(4.), top), marker));
+        }
+        let lines = LineLayouts {
+            count: row_count,
+            lines,
+            rows,
+        };
+        if window.is_a11y_active() && !editor.password {
+            editor.accessible_text.borrow_mut().update_geometry(
+                &cache.line_starts,
+                &lines,
+                paint_bounds,
+                line_height,
+                window.scale_factor(),
+            );
         }
         PrepaintState {
-            lines: LineLayouts {
-                count: row_count,
-                lines,
-                rows,
-            },
+            lines,
             decorations,
             cursor: cursor_quad,
             extra_cursors,
@@ -2883,6 +3039,7 @@ impl Element for TextEditorText {
         cx: &mut App,
     ) {
         let focus = self.editor.read(cx).focus_handle.clone();
+
         window.handle_input(
             &focus,
             // The input handler's fallback bounds must share the text
@@ -2938,7 +3095,10 @@ impl Element for TextEditorText {
                 // The line-number gutter painted earlier this frame with the
                 // old offset.
                 if editor.is_code() {
-                    window.refresh();
+                    // A refresh during painting is cleared at the end of the
+                    // current draw. Schedule the follow-up after this frame so
+                    // the gutter repaints with the committed offset.
+                    window.on_next_frame(|window, _| window.refresh());
                 }
             }
             // The prepaint state is no longer needed after painting. Move the
@@ -2956,8 +3116,26 @@ impl Element for TextEditorText {
 /// before deciding where it is placed, and to make the intended row/editor
 /// mode obvious at call sites.  It should match the mode passed to
 /// [`TextEditor::new`].
-pub fn input(editor: Entity<TextEditor>, focus: FocusHandle, multiline: bool) -> impl IntoElement {
-    input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false)
+pub fn input(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    multiline: bool,
+    cx: &App,
+) -> impl IntoElement {
+    input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false, cx)
+}
+
+/// A standard field whose viewport is limited by a containing form. Keep the
+/// editor and accessible node unchanged while allowing multiline controls to
+/// fit a short scrolling pane.
+pub fn input_with_height(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    multiline: bool,
+    height: Pixels,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false, cx).h(height)
 }
 
 /// Render a standard DBX field with an additional shell-owned key context.
@@ -2970,8 +3148,9 @@ pub fn input_with_key_context(
     focus: FocusHandle,
     multiline: bool,
     key_context: &'static str,
+    cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
-    input_with_context(editor, focus, multiline, key_context, false)
+    input_with_context(editor, focus, multiline, key_context, false, cx)
 }
 
 /// Render a single-line editor without its own chrome, sized to `height`.
@@ -2982,12 +3161,13 @@ pub fn bare_input(
     editor: Entity<TextEditor>,
     focus: FocusHandle,
     height: Pixels,
+    cx: &App,
 ) -> impl IntoElement {
-    input_with_context(editor, focus, false, TEXT_EDITOR_CONTEXT, false)
+    input_with_context(editor, focus, false, TEXT_EDITOR_CONTEXT, false, cx)
         .h(height)
-        .px(px(0.))
-        .py(px(0.))
-        .pt(px(3.))
+        .px(crate::theme::ui_px(0.))
+        .py(crate::theme::ui_px(0.))
+        .pt(crate::theme::ui_px(3.))
         .bg(gpui::transparent_black())
         .border_0()
 }
@@ -2998,16 +3178,113 @@ pub fn sql_input(
     editor: Entity<TextEditor>,
     focus: FocusHandle,
     multiline: bool,
+    cx: &App,
 ) -> impl IntoElement {
-    input_with_context(editor, focus, multiline, SQL_TEXT_EDITOR_CONTEXT, false)
+    input_with_context(editor, focus, multiline, SQL_TEXT_EDITOR_CONTEXT, false, cx)
 }
 
 /// Render the query SQL editor so it fills a resizable parent pane.
 ///
 /// This intentionally does not alter [`sql_input`]: row and JSON editors
 /// retain their compact, fixed multiline height.
-pub fn sql_input_fill(editor: Entity<TextEditor>, focus: FocusHandle) -> impl IntoElement {
-    input_with_context(editor, focus, true, SQL_TEXT_EDITOR_CONTEXT, true)
+pub fn sql_input_fill(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    cx: &App,
+) -> impl IntoElement {
+    input_with_context(editor, focus, true, SQL_TEXT_EDITOR_CONTEXT, true, cx)
+}
+
+fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let state = editor.read(cx);
+    let password = state.password;
+    let multiline = state.multiline;
+    let invalid = state
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error);
+    let description = if password {
+        // Diagnostic text can contain input excerpts. Never publish them for
+        // a protected field, even if a future validator supplies diagnostics.
+        if invalid {
+            "Invalid value".to_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        state
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let severity = match diagnostic.severity {
+                    DiagnosticSeverity::Error => "Error",
+                    DiagnosticSeverity::Warning => "Warning",
+                };
+                format!("{severity}: {}", diagnostic.message)
+            })
+            .collect::<Vec<_>>()
+            .join(". ")
+    };
+    let selection = state.selected_range.clone();
+    let reversed = state.selection_reversed;
+    let label = state.accessibility_label.clone();
+    let accessible_text = state.accessible_text.clone();
+    let entity = editor.clone();
+    div()
+        .id(gpui::SharedString::from(format!(
+            "dbx-text-editor-{:?}",
+            editor.entity_id()
+        )))
+        .role(if password {
+            gpui::Role::PasswordInput
+        } else if multiline {
+            gpui::Role::MultilineTextInput
+        } else {
+            gpui::Role::TextInput
+        })
+        .aria_label(label)
+        .aria_description(description)
+        .a11y_synthetic_children(move |builder| {
+            let node = builder.parent_node();
+            if invalid {
+                node.set_invalid(gpui::accesskit::Invalid::True);
+            }
+            if password {
+                return;
+            }
+            let mut snapshot = accessible_text.borrow_mut();
+            if snapshot.runs.is_empty() {
+                return;
+            }
+            for (index, run) in snapshot.runs.iter_mut().enumerate() {
+                run.id = builder.synthetic_node_id(index);
+            }
+            for run in &snapshot.runs {
+                builder.push_child(run.id, snapshot.node(run));
+            }
+            builder
+                .parent_node()
+                .set_text_selection(snapshot.selection(selection, reversed));
+        })
+        .map(|mut view| {
+            for action in [
+                gpui::AccessibleAction::SetValue,
+                gpui::AccessibleAction::ReplaceSelectedText,
+                gpui::AccessibleAction::SetTextSelection,
+                gpui::AccessibleAction::ScrollIntoView,
+            ] {
+                if password && action == gpui::AccessibleAction::SetTextSelection {
+                    continue;
+                }
+                let entity = entity.clone();
+                view = view.on_a11y_action(action, move |data, window, cx| {
+                    entity.update(cx, |editor, cx| {
+                        editor.accessible_action(action, data, window, cx)
+                    });
+                });
+            }
+            view
+        })
 }
 
 fn input_with_context(
@@ -3016,12 +3293,9 @@ fn input_with_context(
     multiline: bool,
     key_context: &'static str,
     fill_height: bool,
+    cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(gpui::SharedString::from(format!(
-            "dbx-text-editor-{:?}",
-            editor.entity_id()
-        )))
+    accessible_input_shell(editor.clone(), cx)
         .key_context(key_context)
         .track_focus(&focus)
         // GPUI 0.2.2 invalidates the owning view whenever a cursor-bearing
@@ -3032,15 +3306,32 @@ fn input_with_context(
         .min_w_0()
         .when(fill_height, |this| this.flex_1().min_h_0().h_full())
         .when(!fill_height, |this| {
-            this.h(if multiline { px(204.) } else { px(32.) })
+            this.h(if multiline {
+                crate::theme::ui_px(204.)
+            } else {
+                crate::theme::ui_px(32.)
+            })
         })
-        .p(if multiline { px(10.) } else { px(7.) })
+        .p(if multiline {
+            crate::theme::ui_px(10.)
+        } else {
+            crate::theme::ui_px(7.)
+        })
         .overflow_hidden()
         .bg(theme().canvas)
         .border_1()
-        .border_color(theme().border_strong)
-        .rounded(px(5.))
-        .text_size(px(12.))
+        .border_color(theme().input_border)
+        // Colour only: a width change would shift neighbouring controls.
+        .focus(|style| style.border_color(theme().focus_ring))
+        .rounded(crate::theme::ui_px(5.))
+        .text_size(
+            crate::theme::ui_px(12.)
+                * if editor.read(cx).is_code() {
+                    crate::theme::editor_scale()
+                } else {
+                    1.
+                },
+        )
         .text_color(theme().text)
         .on_action({
             let editor = editor.clone();
@@ -3472,7 +3763,7 @@ fn apply_marked_runs(
                 len: end - start,
                 underline: Some(UnderlineStyle {
                     color: Some(run.color),
-                    thickness: px(1.),
+                    thickness: crate::theme::ui_px(1.),
                     wavy: false,
                 }),
                 ..run.clone()
@@ -3525,7 +3816,7 @@ fn apply_diagnostic_runs(
                     len: end - start,
                     underline: Some(UnderlineStyle {
                         color: Some(color.into()),
-                        thickness: px(1.),
+                        thickness: crate::theme::ui_px(1.),
                         wavy: true,
                     }),
                     ..run.clone()
@@ -3759,7 +4050,10 @@ fn reveal_offset(
     target_start: Pixels,
     target_end: Pixels,
 ) -> Pixels {
-    let mut next = current.clamp(px(0.), maximum.max(px(0.)));
+    let mut next = current.clamp(
+        crate::theme::ui_px(0.),
+        maximum.max(crate::theme::ui_px(0.)),
+    );
     // If the target itself is taller/wider than the viewport, neither edge
     // can be revealed at once. Keeping the existing offset avoids a frame to
     // frame top/bottom oscillation.
@@ -3771,7 +4065,10 @@ fn reveal_offset(
     } else if target_end > next + viewport {
         next = target_end - viewport;
     }
-    next.clamp(px(0.), maximum.max(px(0.)))
+    next.clamp(
+        crate::theme::ui_px(0.),
+        maximum.max(crate::theme::ui_px(0.)),
+    )
 }
 
 fn scroll_offset_for_cursor(
@@ -4908,8 +5205,150 @@ mod code_editing_tests {
             div()
                 .w(px(480.))
                 .h(px(240.))
-                .child(sql_input_fill(self.editor.clone(), focus))
+                .child(sql_input_fill(self.editor.clone(), focus, cx))
         }
+    }
+
+    #[gpui::test]
+    fn accessible_editing_selects_unicode_replaces_and_rejects_stale_positions(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| "a👩‍💻\n第二行".to_owned());
+            let editor = cx.new(|cx| {
+                TextEditor::new(value, true, window, cx).accessibility_label("Query notes")
+            });
+            Harness { editor }
+        });
+        let editor = harness.read_with(cx, |harness, _| harness.editor.clone());
+        let selection = cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                let mut snapshot = accessibility::AccessibleText::new(editor.text(cx));
+                for (index, run) in snapshot.runs.iter_mut().enumerate() {
+                    run.id = gpui::accesskit::NodeId(index as u64 + 1);
+                }
+                let selection = snapshot.selection(1..12, true);
+                *editor.accessible_text.borrow_mut() = snapshot;
+                selection
+            })
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.accessible_action(
+                    gpui::AccessibleAction::SetTextSelection,
+                    Some(&gpui::accesskit::ActionData::SetTextSelection(selection)),
+                    window,
+                    cx,
+                );
+                assert_eq!(editor.selected_range, 1..12);
+                assert!(editor.selection_reversed);
+                assert!(editor.focus_handle.is_focused(window));
+                editor.accessible_action(
+                    gpui::AccessibleAction::ReplaceSelectedText,
+                    Some(&gpui::accesskit::ActionData::Value("λ".into())),
+                    window,
+                    cx,
+                );
+                assert_eq!(editor.text(cx), "aλ\n第二行");
+                assert_eq!(editor.cursor_offset(), 3);
+                // The old screen reader positions must not select different text
+                // after an edit has invalidated their snapshot.
+                editor.accessible_action(
+                    gpui::AccessibleAction::SetTextSelection,
+                    Some(&gpui::accesskit::ActionData::SetTextSelection(selection)),
+                    window,
+                    cx,
+                );
+                assert_eq!(editor.selected_range, 3..3);
+                editor.undo(cx);
+                assert_eq!(editor.text(cx), "a👩‍💻\n第二行");
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn password_fields_publish_a_name_and_protected_role_without_plaintext(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| "test-only-secret".to_owned());
+            let editor = cx.new(|cx| {
+                TextEditor::new(value, false, window, cx)
+                    .password()
+                    .accessibility_label("Vault passphrase")
+            });
+            Harness { editor }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|_, cx| {
+            let editor = &harness.read(cx).editor;
+            let shell = accessible_input_shell(editor.clone(), cx);
+            assert_eq!(shell.a11y_role(), Some(gpui::Role::PasswordInput));
+            let mut node = gpui::accesskit::Node::new(shell.a11y_role().unwrap());
+            shell.write_a11y_info(&mut node);
+            assert_eq!(node.label(), Some("Vault passphrase"));
+            assert_eq!(node.value(), None);
+            assert!(editor.read(cx).accessible_text.borrow().text.is_empty());
+            assert!(editor.read(cx).accessible_text.borrow().runs.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn diagnostic_descriptions_are_named_by_severity_and_protect_secrets(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| "known fixture".to_owned());
+            let editor =
+                cx.new(|cx| TextEditor::new(value, false, window, cx).accessibility_label("Query"));
+            Harness { editor }
+        });
+        cx.update(|_, cx| {
+            let editor = harness.read(cx).editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_diagnostics(
+                    vec![
+                        EditorDiagnostic {
+                            range: 0..5,
+                            severity: DiagnosticSeverity::Warning,
+                            message: "Unknown column".into(),
+                        },
+                        EditorDiagnostic {
+                            range: 6..13,
+                            severity: DiagnosticSeverity::Error,
+                            message: "Missing expression".into(),
+                        },
+                    ],
+                    cx,
+                )
+            });
+            let shell = accessible_input_shell(editor.clone(), cx);
+            let mut node = gpui::accesskit::Node::new(gpui::Role::TextInput);
+            shell.write_a11y_info(&mut node);
+            assert_eq!(
+                node.description(),
+                Some("Warning: Unknown column. Error: Missing expression")
+            );
+            editor.update(cx, |editor, _| editor.password = true);
+            let shell = accessible_input_shell(editor.clone(), cx);
+            shell.write_a11y_info(&mut node);
+            assert_eq!(node.description(), Some("Invalid value"));
+            editor.update(cx, |editor, cx| {
+                editor.set_diagnostics(
+                    vec![EditorDiagnostic {
+                        range: 0..5,
+                        severity: DiagnosticSeverity::Warning,
+                        message: "known fixture".into(),
+                    }],
+                    cx,
+                )
+            });
+            let shell = accessible_input_shell(editor, cx);
+            let mut node = gpui::accesskit::Node::new(gpui::Role::PasswordInput);
+            shell.write_a11y_info(&mut node);
+            assert!(node.description().is_none_or(str::is_empty));
+        });
     }
 
     #[gpui::test]
@@ -5021,6 +5460,85 @@ mod code_editing_tests {
                 assert!(!editor.collapse_selections(cx));
             })
         });
+    }
+
+    #[gpui::test]
+    fn accessible_selection_unfolds_hidden_sql_and_reveals_an_offscreen_line(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let text = format!(
+                "WITH a AS (\n  SELECT 1\n  FROM t\n)\n{}",
+                "SELECT 1;\n".repeat(60)
+            );
+            let value = cx.new(|_| text);
+            let editor =
+                cx.new(|cx| TextEditor::new_sql(value, Some(DatabaseKind::PostgreSQL), window, cx));
+            Harness { editor }
+        });
+        let editor = harness.read_with(cx, |harness, _| harness.editor.clone());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.move_to(15, cx);
+                editor.fold(&Fold, window, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(!editor.read_with(cx, |editor, _| editor.folded.is_empty()));
+        for end in [
+            "WITH a AS (\n  SELECT 1\n  ".len(),
+            editor.read_with(cx, |editor, cx| editor.text(cx).len() - 1),
+        ] {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let mut snapshot = accessibility::AccessibleText::new(editor.text(cx));
+                    for (index, run) in snapshot.runs.iter_mut().enumerate() {
+                        run.id = gpui::accesskit::NodeId(index as u64 + 1);
+                    }
+                    let selection = snapshot.selection(end..end, false);
+                    *editor.accessible_text.borrow_mut() = snapshot;
+                    editor.accessible_action(
+                        gpui::AccessibleAction::SetTextSelection,
+                        Some(&gpui::accesskit::ActionData::SetTextSelection(selection)),
+                        window,
+                        cx,
+                    );
+                })
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(editor.read_with(cx, |editor, _| editor.folded.is_empty()));
+            if end > 100 {
+                assert!(
+                    editor.read_with(cx, |editor, _| editor.scroll_handle.offset().y < px(0.)),
+                    "caret reveal must commit the scroll offset used by the gutter"
+                );
+                for _ in 0..2 {
+                    cx.update(|window, cx| {
+                        window.simulate_next_frame(cx);
+                        window.draw(cx).clear(cx);
+                    });
+                }
+                assert!(
+                    editor.read_with(cx, |editor, _| editor.scroll_handle.offset().y < px(0.)),
+                    "subsequent frames must preserve gutter scroll state"
+                );
+            }
+
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    let caret = editor
+                        .bounds_for_range(end..end, editor.scroll_handle.bounds(), window, cx)
+                        .expect("caret shaped after accessible selection");
+                    let viewport = editor.scroll_handle.bounds();
+                    assert!(
+                        caret.top() >= viewport.top() && caret.bottom() <= viewport.bottom(),
+                        "accessible caret revealed: {caret:?}, {viewport:?}"
+                    );
+                })
+            });
+        }
     }
 
     #[gpui::test]

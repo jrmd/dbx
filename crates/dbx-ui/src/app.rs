@@ -7,6 +7,9 @@
 //! IMPLEMENTATION: `DbxApp` coordinates shared session state; focused workflows and rendering live in
 //! the private `app/` module tree documented in `docs/architecture.md`.
 
+use crate::accessibility::DialogElement as _;
+use crate::accessibility::SelectAccessibility as _;
+
 mod agents;
 mod cell_edits;
 mod designer;
@@ -22,6 +25,8 @@ mod data_import;
 mod diagnostics;
 mod explorer;
 mod find;
+mod focus;
+pub use focus::focus_key_bindings;
 mod mcp;
 mod profile_transfer;
 mod query_language;
@@ -67,7 +72,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     resizable::ResizableState,
     select::{SearchableVec, Select, SelectEvent, SelectState},
-    table::{DataTable, TableEvent, TableState},
+    table::{TableEvent, TableState},
 };
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -91,12 +96,12 @@ use crate::{
     },
     settings::{Settings, SettingsStore},
     theme::{
-        Appearance, ButtonKind, FollowCorners, GLASS_INSET, Icon, RADIUS_CONTROL, RADIUS_GLASS,
-        RADIUS_PANEL, appearance, badge, button, connection_tab, database_logo, glass,
-        glass_icon_button, glass_raised, glass_shadow, icon, panel_header, reduce_transparency,
-        segment, segmented_track, set_appearance, set_reduce_transparency, set_system_appearance,
-        settings_group, settings_row, shortcut, sync_component_theme, theme, tip,
-        window_background,
+        Appearance, ButtonAccessibility as _, ButtonKind, FollowCorners, GLASS_INSET, Icon,
+        Pressable as _, RADIUS_CONTROL, RADIUS_GLASS, RADIUS_PANEL, appearance, badge, button,
+        connection_tab, database_logo, glass, glass_icon_button, glass_raised, glass_shadow, icon,
+        panel_header, reduce_transparency, segment, segmented_track, set_appearance,
+        set_reduce_transparency, set_system_appearance, settings_group, settings_row,
+        settings_switch, shortcut, sync_component_theme, theme, tip, window_background,
     },
     vault::{VaultError, VaultState},
 };
@@ -134,8 +139,8 @@ gpui::actions!(
         DiagramResetView,
         DiagramFit,
         DiagramRefresh,
-        VaultFocusNext,
-        VaultFocusPrevious,
+        FocusNext,
+        FocusPrevious,
         NewConnection,
         NewQuery,
         CloseTab,
@@ -389,20 +394,26 @@ struct ConnectionTransportDraft {
 
 impl ConnectionTransportDraft {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
-        let mut field = |initial: &str| {
+        let mut field = |label: &str, initial: &str| {
             let value = cx.new(|_| initial.to_owned());
-            let editor = cx.new(|cx| TextEditor::new(value.clone(), false, window, cx));
+            let editor = cx.new(|cx| {
+                TextEditor::new(value.clone(), false, window, cx)
+                    .accessibility_label(label.to_owned())
+            });
             (value, editor)
         };
-        let (socket, socket_editor) = field("");
-        let (ssh_host, ssh_host_editor) = field("");
-        let (ssh_port, ssh_port_editor) = field("22");
-        let (ssh_user, ssh_user_editor) = field("");
-        let (ssh_key, ssh_key_editor) = field("");
-        let (ssh_jump, ssh_jump_editor) = field("");
+        let (socket, socket_editor) = field("Unix socket path", "");
+        let (ssh_host, ssh_host_editor) = field("SSH host", "");
+        let (ssh_port, ssh_port_editor) = field("SSH port", "22");
+        let (ssh_user, ssh_user_editor) = field("SSH username", "");
+        let (ssh_key, ssh_key_editor) = field("SSH private key path", "");
+        let (ssh_jump, ssh_jump_editor) = field("SSH jump host", "");
         let ssh_password = cx.new(|_| String::new());
-        let ssh_password_editor =
-            cx.new(|cx| TextEditor::new(ssh_password.clone(), false, window, cx).password());
+        let ssh_password_editor = cx.new(|cx| {
+            TextEditor::new(ssh_password.clone(), false, window, cx)
+                .accessibility_label("SSH password")
+                .password()
+        });
         Self {
             socket_enabled: false,
             ssh_enabled: false,
@@ -441,8 +452,12 @@ impl TagEditor {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let name = cx.new(|_| String::new());
         let color = cx.new(|_| "82AAFF".to_owned());
-        let name_editor = cx.new(|cx| TextEditor::new(name.clone(), false, window, cx));
-        let color_editor = cx.new(|cx| TextEditor::new(color.clone(), false, window, cx));
+        let name_editor = cx.new(|cx| {
+            TextEditor::new(name.clone(), false, window, cx).accessibility_label("Tag name")
+        });
+        let color_editor = cx.new(|cx| {
+            TextEditor::new(color.clone(), false, window, cx).accessibility_label("Tag colour")
+        });
         Self {
             editing: None,
             creating: false,
@@ -466,12 +481,16 @@ impl VaultEditors {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let passphrase = cx.new(|_| String::new());
         let confirmation = cx.new(|_| String::new());
-        let passphrase_editor =
-            cx.new(|cx| TextEditor::new(passphrase.clone(), false, window, cx).password());
-        let confirmation_editor =
-            cx.new(|cx| TextEditor::new(confirmation.clone(), false, window, cx).password());
-        let _ = passphrase_editor.read(cx).focus_handle().tab_stop(true);
-        let _ = confirmation_editor.read(cx).focus_handle().tab_stop(true);
+        let passphrase_editor = cx.new(|cx| {
+            TextEditor::new(passphrase.clone(), false, window, cx)
+                .accessibility_label("Vault passphrase")
+                .password()
+        });
+        let confirmation_editor = cx.new(|cx| {
+            TextEditor::new(confirmation.clone(), false, window, cx)
+                .accessibility_label("Confirm vault passphrase")
+                .password()
+        });
 
         Self {
             passphrase,
@@ -486,7 +505,10 @@ impl ConnectionDraft {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let connection_name = cx.new(|_| String::new());
         let import_url = cx.new(|_| String::new());
-        let import_url_editor = cx.new(|cx| TextEditor::new(import_url.clone(), false, window, cx));
+        let import_url_editor = cx.new(|cx| {
+            TextEditor::new(import_url.clone(), false, window, cx)
+                .accessibility_label("Import connection string")
+        });
         let fields = ConnectionFields::from_url("sqlite://dbx.db?mode=rwc")
             .expect("default SQLite connection URL is valid");
         let connection_url = cx.new(|_| fields.connection_string.clone());
@@ -495,16 +517,29 @@ impl ConnectionDraft {
         let username = cx.new(|_| fields.username.clone());
         let password = cx.new(|_| fields.password.clone());
         let database = cx.new(|_| fields.database.clone());
-        let connection_name_editor =
-            cx.new(|cx| TextEditor::new(connection_name.clone(), false, window, cx));
-        let connection_editor =
-            cx.new(|cx| TextEditor::new(connection_url.clone(), false, window, cx));
-        let host_editor = cx.new(|cx| TextEditor::new(host.clone(), false, window, cx));
-        let port_editor = cx.new(|cx| TextEditor::new(port.clone(), false, window, cx));
-        let username_editor = cx.new(|cx| TextEditor::new(username.clone(), false, window, cx));
-        let password_editor =
-            cx.new(|cx| TextEditor::new(password.clone(), false, window, cx).password());
-        let database_editor = cx.new(|cx| TextEditor::new(database.clone(), false, window, cx));
+        let connection_name_editor = cx.new(|cx| {
+            TextEditor::new(connection_name.clone(), false, window, cx)
+                .accessibility_label("Connection name")
+        });
+        let connection_editor = cx.new(|cx| {
+            TextEditor::new(connection_url.clone(), false, window, cx)
+                .accessibility_label("Database file or connection string")
+        });
+        let host_editor = cx
+            .new(|cx| TextEditor::new(host.clone(), false, window, cx).accessibility_label("Host"));
+        let port_editor = cx
+            .new(|cx| TextEditor::new(port.clone(), false, window, cx).accessibility_label("Port"));
+        let username_editor = cx.new(|cx| {
+            TextEditor::new(username.clone(), false, window, cx).accessibility_label("Username")
+        });
+        let password_editor = cx.new(|cx| {
+            TextEditor::new(password.clone(), false, window, cx)
+                .accessibility_label("Password or API token")
+                .password()
+        });
+        let database_editor = cx.new(|cx| {
+            TextEditor::new(database.clone(), false, window, cx).accessibility_label("Database")
+        });
 
         Self {
             kind: DatabaseKind::SQLite,
@@ -556,6 +591,8 @@ struct DatabaseExportDialog {
     output_directory: PathBuf,
     output_name: Entity<String>,
     output_name_editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    return_focus: Option<FocusHandle>,
     _output_name_subscription: Subscription,
 }
 
@@ -704,6 +741,7 @@ fn compact_connection_picker_visible(
 enum SettingsSection {
     #[default]
     Appearance,
+    Editor,
     QueryAgent,
     Connections,
     Tags,
@@ -754,10 +792,16 @@ pub struct DbxApp {
     profile_transfer_dialog: Option<profile_transfer::ProfileTransferDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     settings_open: bool,
+    settings_focus: FocusHandle,
+    settings_scroll: gpui::ScrollHandle,
+    settings_return_focus: Option<FocusHandle>,
     settings_section: SettingsSection,
     tag_editor: TagEditor,
     appearance: Appearance,
     reduce_transparency: bool,
+    ui_scale: u16,
+    editor_scale: u16,
+    vim_mode: bool,
     settings_store: Option<SettingsStore>,
     agent_setup: agents::AgentSetup,
     compact_layout: bool,
@@ -771,6 +815,13 @@ pub struct DbxApp {
     /// Owns keyboard focus whenever no control does, so app shortcuts keep
     /// working after the focused element (e.g. a closed tab's editor) is gone.
     focus_handle: FocusHandle,
+    /// The topmost modal as of the last render, to notice when one opens.
+    last_modal_trap: Option<FocusHandle>,
+    /// A modal opened and hasn't been checked for focus since it painted.
+    modal_focus_pending: bool,
+    connection_form_focus_pending: bool,
+    /// Focus was outside the app's tree on the previous render.
+    stray_focus_seen: bool,
     toasts: Vec<Toast>,
     next_toast_id: u64,
     window_drag_armed: bool,
@@ -890,10 +941,22 @@ impl DbxApp {
             copied_table_data: None,
             mutation_error_dialog: None,
             settings_open: false,
+            settings_focus: cx.focus_handle(),
+            settings_scroll: gpui::ScrollHandle::new(),
+            settings_return_focus: None,
             settings_section: SettingsSection::Appearance,
             tag_editor,
             appearance: appearance(),
             reduce_transparency: reduce_transparency(),
+            ui_scale: saved_settings
+                .as_ref()
+                .map_or(100, |settings| settings.ui_scale.clamp(100, 200)),
+            editor_scale: saved_settings
+                .as_ref()
+                .map_or(100, |settings| settings.editor_scale.clamp(100, 200)),
+            vim_mode: saved_settings
+                .as_ref()
+                .is_some_and(|settings| settings.vim_mode),
             settings_store: SettingsStore::new().ok(),
             agent_setup: agents::AgentSetup::new(window, cx),
             compact_layout: false,
@@ -909,6 +972,10 @@ impl DbxApp {
                 .map(|width| width as f32),
             pane_resizing: None,
             focus_handle: cx.focus_handle(),
+            last_modal_trap: None,
+            modal_focus_pending: false,
+            connection_form_focus_pending: false,
+            stray_focus_seen: false,
             toasts: Vec::new(),
             next_toast_id: 0,
             window_drag_armed: false,
@@ -981,18 +1048,26 @@ impl DbxApp {
         .detach();
     }
 
-    pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.vault_state != Some(VaultState::Unlocked) {
             return;
         }
-        self.settings_open = true;
+        if !self.settings_open {
+            self.settings_return_focus = window.focused(cx);
+            self.settings_focus.focus(window, cx);
+            self.settings_open = true;
+        }
         self.check_agent_cli(cx);
         cx.notify();
     }
 
-    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.settings_open) {
             self.edit_tag(None, cx);
+            self.settings_return_focus
+                .take()
+                .unwrap_or_else(|| self.focus_handle.clone())
+                .focus(window, cx);
             cx.notify();
         }
     }
@@ -1233,6 +1308,10 @@ impl DbxApp {
             .with_reduce_transparency(self.reduce_transparency)
             .with_remember_device(self.remember_device);
         settings.agents = self.agent_setup.preferences.clone();
+        settings.vim_mode = self.vim_mode;
+        settings.motion = crate::motion::preference(cx);
+        settings.ui_scale = self.ui_scale;
+        settings.editor_scale = self.editor_scale;
         settings.explorer_width = self.explorer_width.map(|width| width.round() as u32);
         settings.inspector_width = self.inspector_width.map(|width| width.round() as u32);
         let failure = match &self.settings_store {
@@ -1250,6 +1329,84 @@ impl DbxApp {
         }
     }
 
+    pub(super) fn set_text_scale(
+        &mut self,
+        scale: u16,
+        editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let scale = scale.clamp(100, 200);
+        let preference = if editor {
+            &mut self.editor_scale
+        } else {
+            &mut self.ui_scale
+        };
+        if *preference == scale {
+            return;
+        }
+        let ratio = scale as f32 / *preference as f32;
+        *preference = scale;
+        crate::theme::set_text_scales(self.ui_scale, self.editor_scale);
+        window.set_rem_size(gpui::px(16. * crate::theme::ui_scale()));
+        if !editor {
+            // Existing column widths must follow the text immediately; their
+            // persisted values remain in screen pixels, as before.
+            for session in &mut self.sessions {
+                for tab in &mut session.secondary_tabs {
+                    let grid = match &mut tab.kind {
+                        SecondaryTabKind::Data(data) => &data.data_grid,
+                        SecondaryTabKind::Query(query) => &query.result_grid,
+                        _ => continue,
+                    };
+                    grid.update(cx, |table, cx| {
+                        table.delegate_mut().scale_column_widths(ratio);
+                        table.refresh(cx);
+                        result_table::emit_widths(table, cx);
+                    });
+                }
+            }
+        }
+        self.persist_settings(cx);
+        window.refresh();
+        cx.notify();
+    }
+
+    fn change_text_scale_on_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.keystroke.modifiers;
+        if !modifiers.secondary() || modifiers.alt {
+            return;
+        }
+        let scale = match event.keystroke.key.as_str() {
+            "+" | "=" => self.ui_scale.saturating_add(25),
+            "-" => self.ui_scale.saturating_sub(25),
+            "0" if !modifiers.shift => 100,
+            _ => return,
+        };
+        cx.stop_propagation();
+        self.set_text_scale(scale, false, window, cx);
+    }
+
+    fn toggle_vim_mode(&mut self, cx: &mut Context<Self>) {
+        self.vim_mode = !self.vim_mode;
+        for session in &self.sessions {
+            for tab in &session.secondary_tabs {
+                if let SecondaryTabKind::Query(query) = &tab.kind {
+                    query
+                        .query_editor
+                        .update(cx, |editor, cx| editor.set_vim_mode(self.vim_mode, cx));
+                }
+            }
+        }
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
     fn dismiss_overlay_on_escape(
         &mut self,
         event: &KeyDownEvent,
@@ -1259,35 +1416,35 @@ impl DbxApp {
         if event.keystroke.modifiers.modified() || event.keystroke.key.as_str() != "escape" {
             return;
         }
-        let dismissed = if self
+        let dismissed = if self.confirmation_dialog.is_some() {
+            self.cancel_confirmation(window, cx);
+            true
+        } else if self.workspace_screen_drawn() && self.dismiss_mutation_error_dialog(window, cx) {
+            true
+        } else if self
             .data_import_dialog
             .as_ref()
             .is_some_and(|dialog| !dialog.busy)
         {
-            self.data_import_dialog = None;
-            self.focus_handle.focus(window, cx);
+            self.close_data_import(window, cx);
             true
         } else if self
             .profile_transfer_dialog
             .as_ref()
             .is_some_and(|dialog| !dialog.busy)
         {
-            self.profile_transfer_dialog = None;
-            self.focus_handle.focus(window, cx);
+            self.close_profile_transfer(window, cx);
             true
         } else if self.quick_open.is_some() {
             self.close_quick_open(window, cx);
             true
-        } else if self.dismiss_mutation_error_dialog(window, cx) {
+        } else if self.workspace_screen_drawn() && self.cancel_database_export(window, cx) {
             true
-        } else if self.confirmation_dialog.is_some() {
-            self.cancel_confirmation(window, cx);
+        } else if self.settings_open {
+            self.close_settings(window, cx);
             true
         } else {
-            self.database_export_dialog.take().is_some()
-                || std::mem::take(&mut self.settings_open)
-                || self.dismiss_table_context_menu(window, cx)
-                || self.dismiss_connection_picker()
+            self.dismiss_table_context_menu(window, cx) || self.dismiss_connection_picker()
         };
         if dismissed {
             cx.stop_propagation();
@@ -2042,6 +2199,9 @@ impl DbxApp {
                 .iter_mut()
                 .find(|row| row.id == row_id)
             {
+                row.editor.update(cx, |editor, cx| {
+                    editor.set_accessibility_label(format!("Filter value for {column}"), cx)
+                });
                 row.set_selected_column(column);
             }
             cx.notify();
@@ -2389,6 +2549,9 @@ impl DbxApp {
                 return None;
             };
             let text_revision = query_tab.query_revision;
+            if !query_tab.query_editor.read(cx).accepts_insert_input() {
+                return None;
+            }
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
             let recent_data = session.recent_data();
             let signature = CompletionSignature {
@@ -2997,8 +3160,22 @@ impl DbxApp {
         self.cycle_connection(false, cx);
     }
 
-    fn toggle_sidebar_action(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_sidebar(cx);
+    fn toggle_sidebar_action(
+        &mut self,
+        _: &ToggleSidebar,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inspector_page() {
+            if let Some((session, tab)) = self
+                .active_session()
+                .and_then(|session| session.active_data_tab_id().map(|tab| (session.id, tab)))
+            {
+                self.close_inspector_for(session, tab, window, cx);
+            }
+        } else {
+            self.toggle_sidebar(cx);
+        }
     }
 
     pub(crate) fn show_toast(
@@ -3206,6 +3383,13 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.row_draft.is_some())
+        {
+            self.open_inspector_for(session_id, tab_id, window, cx);
+            return;
+        }
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
@@ -3232,8 +3416,10 @@ impl DbxApp {
         data.draft_insert = None;
         data.selected_row = None;
         data.inspector_open = true;
+        data.inspector_expanded = true;
         data.clear_grid_selection(cx);
         data.row_draft = Some(row_draft);
+        self.focus_inspector_for(session_id, tab_id, window, cx);
         cx.notify();
     }
 
@@ -3653,7 +3839,66 @@ impl DbxApp {
         };
         data.draft_insert = insert;
         data.inspector_open = true;
+        data.inspector_expanded = true;
         data.row_draft = Some(draft);
+        self.focus_inspector_for(session_id, tab_id, window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn inspector_page(&self) -> bool {
+        self.narrow_workspace
+            && self.active_session().is_some_and(|session| {
+                session.pane == Pane::Data
+                    && session.active_data_tab().is_some_and(|data| {
+                        data.inspector_open && (data.inspector_expanded || data.row_draft.is_some())
+                    })
+            })
+    }
+
+    fn focus_inspector_for(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.data_tab(session_id, tab_id) else {
+            return;
+        };
+        let focus = data
+            .row_draft
+            .as_ref()
+            .and_then(|draft| draft.fields().first())
+            .map(|field| {
+                if let Some(selector) = &field.state_selector {
+                    selector.focus_handle(cx)
+                } else if let Some(selector) = field
+                    .boolean_selector
+                    .as_ref()
+                    .or(field.enum_selector.as_ref())
+                {
+                    selector.focus_handle(cx)
+                } else {
+                    field.editor.read(cx).focus_handle()
+                }
+            })
+            .unwrap_or_else(|| data.inspector_focus.clone());
+        focus.focus(window, cx);
+    }
+
+    fn open_inspector_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
+            return;
+        };
+        data.inspector_open = true;
+        data.inspector_expanded = true;
+        self.focus_inspector_for(session_id, tab_id, window, cx);
         cx.notify();
     }
 
@@ -3661,10 +3906,13 @@ impl DbxApp {
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(data) = self.data_tab_mut(session_id, tab_id) {
             data.inspector_open = false;
+            data.inspector_expanded = false;
+            data.data_grid.focus_handle(cx).focus(window, cx);
             cx.notify();
         }
     }
@@ -3725,6 +3973,7 @@ impl DbxApp {
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.session_mut(session_id) else {
@@ -3744,6 +3993,8 @@ impl DbxApp {
             data.clear_grid_selection(cx);
         }
         data.draft_mode = DraftMode::Update;
+        data.inspector_expanded = false;
+        data.data_grid.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
@@ -3821,9 +4072,11 @@ impl DbxApp {
             }
             (DraftMode::Update, None) => {}
         }
-        if let Some(data) = self.data_tab(session_id, tab_id) {
-            let grid = data.data_grid.read(cx).focus_handle(cx);
-            grid.focus(window, cx);
+        if let Some(data) = self.data_tab_mut(session_id, tab_id)
+            && data.row_draft.is_none()
+        {
+            data.inspector_expanded = false;
+            data.data_grid.focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -4637,6 +4890,7 @@ mod tests {
                     focus,
                     false,
                     "DbxTextEditor VaultGate",
+                    cx,
                 ))
         }
     }

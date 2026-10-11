@@ -458,8 +458,10 @@ impl FieldRow {
         let editor = cx.new(|editor_cx| {
             if value_kind == FieldValueKind::Json {
                 TextEditor::new_json(value.clone(), window, editor_cx)
+                    .accessibility_label(column.name.clone())
             } else {
                 TextEditor::new(value.clone(), false, window, editor_cx)
+                    .accessibility_label(column.name.clone())
             }
         });
         let sql_editor = cx.new(|editor_cx| {
@@ -470,6 +472,7 @@ impl FieldRow {
                 window,
                 editor_cx,
             )
+            .accessibility_label(format!("SQL expression for {}", column.name))
         });
         let enum_selector = if column.enum_values.is_empty() {
             None

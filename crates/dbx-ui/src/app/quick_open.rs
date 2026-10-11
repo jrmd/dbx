@@ -11,6 +11,8 @@ const MAX_RESULTS: usize = 50;
 pub(super) struct QuickOpen {
     pub(super) query: Entity<TextEditor>,
     pub(super) selected: usize,
+    pub(super) focus: FocusHandle,
+    return_focus: Option<FocusHandle>,
     _subscription: Subscription,
 }
 
@@ -98,25 +100,31 @@ impl DbxApp {
             open.query.read(cx).focus_handle().focus(window, cx);
             return;
         }
-        let query = cx.new(|cx| TextEditor::empty(false, window, cx));
+        let query = cx.new(|cx| {
+            TextEditor::empty(false, window, cx)
+                .accessibility_label("Search connections, tables and queries")
+        });
         let subscription = cx.observe(&query, |this, _, cx| {
             if let Some(open) = this.quick_open.as_mut() {
                 open.selected = 0;
             }
             cx.notify();
         });
+        let return_focus = window.focused(cx);
         query.read(cx).focus_handle().focus(window, cx);
         self.quick_open = Some(QuickOpen {
             query,
             selected: 0,
+            focus: cx.focus_handle(),
+            return_focus,
             _subscription: subscription,
         });
         cx.notify();
     }
 
     pub(super) fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.quick_open.take().is_some() {
-            window.focus(&self.focus_handle, cx);
+        if let Some(open) = self.quick_open.take() {
+            window.focus(open.return_focus.as_ref().unwrap_or(&self.focus_handle), cx);
             cx.notify();
         }
     }
@@ -383,10 +391,26 @@ impl DbxApp {
         };
         let editor = open.query.clone();
         let focus = editor.read(cx).focus_handle();
+        let modal_focus = open.focus.clone();
         let items = self.quick_open_items(cx);
         let selected = open.selected.min(items.len().saturating_sub(1));
+        let selected_label = items
+            .get(selected)
+            .map(|item| {
+                format!(
+                    "{} of {}: {}. {}",
+                    selected + 1,
+                    items.len(),
+                    item.label,
+                    item.detail
+                )
+            })
+            .unwrap_or_else(|| "No matches".into());
         div()
             .id("quick-open-overlay")
+            .role(gpui::Role::Dialog).aria_label("Quick open").aria_description("Search connections, tables, and queries. Use Up and Down to select a result and Enter to open it.")
+            .a11y_synthetic_children({ let background = self.modal_is_background(&modal_focus); move |builder| { let node = builder.parent_node(); node.set_modal(); if background { node.set_hidden(); } } })
+            .track_focus(&modal_focus)
             .occlude()
             .absolute()
             .top_0()
@@ -396,7 +420,7 @@ impl DbxApp {
             .flex()
             .flex_col()
             .items_center()
-            .pt(px(96.))
+            .pt(crate::theme::ui_px(96.))
             .bg(theme().overlay)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_mouse_down(
@@ -416,15 +440,15 @@ impl DbxApp {
                 glass_raised(div(), RADIUS_GLASS)
                     .id("quick-open")
                     .debug_selector(|| "quick-open".into())
-                    .w(px(560.))
-                    .max_h(px(440.))
+                    .w(crate::theme::ui_px(560.))
+                    .max_h(crate::theme::ui_px(440.))
                     .flex()
                     .flex_col()
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
-                            .p(px(8.))
+                            .p(crate::theme::ui_px(8.))
                             .border_b_1()
                             .border_color(theme().border)
                             .child(editor::input_with_key_context(
@@ -432,33 +456,37 @@ impl DbxApp {
                                 focus,
                                 false,
                                 QUICK_OPEN_CONTEXT,
+                                cx,
                             )),
                     )
                     .child(
                         div()
                             .id("quick-open-results")
+                            .role(gpui::Role::ListBox).aria_label("Search results")
                             .flex_1()
                             .min_h_0()
                             .overflow_y_scroll()
-                            .p(px(6.))
+                            .p(crate::theme::ui_px(6.))
                             .when(items.is_empty(), |list| {
                                 list.child(
-                                    div()
-                                        .p(px(10.))
-                                        .text_size(px(12.))
+                                    crate::accessibility::announcement("quick-open-selection", selected_label.clone(), false)
+                                        .p(crate::theme::ui_px(10.))
+                                        .text_size(crate::theme::ui_px(12.))
                                         .text_color(theme().text_muted)
                                         .child("No matches"),
                                 )
                             })
+                            .child(crate::accessibility::announcement("quick-open-selected-result", selected_label, false))
                             .children(items.into_iter().enumerate().map(|(index, item)| {
                                 let active = index == selected;
                                 div()
                                     .id(("quick-open-item", index))
-                                    .h(px(34.))
-                                    .px(px(10.))
+                                    .role(gpui::Role::ListBoxOption).aria_label(item.label.clone()).aria_description(item.detail.clone()).aria_selected(active)
+                                    .h(crate::theme::ui_px(34.))
+                                    .px(crate::theme::ui_px(10.))
                                     .flex()
                                     .items_center()
-                                    .gap(px(10.))
+                                    .gap(crate::theme::ui_px(10.))
                                     .rounded(px(RADIUS_PANEL - 2.))
                                     .cursor_pointer()
                                     .when(active, |row| row.bg(theme().accent_soft))
@@ -478,15 +506,15 @@ impl DbxApp {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(px(13.))
+                                            .text_size(crate::theme::ui_px(13.))
                                             .child(item.label),
                                     )
                                     .child(
                                         div()
                                             .flex_none()
-                                            .max_w(px(200.))
+                                            .max_w(crate::theme::ui_px(200.))
                                             .truncate()
-                                            .text_size(px(11.))
+                                            .text_size(crate::theme::ui_px(11.))
                                             .text_color(theme().text_muted)
                                             .child(item.detail),
                                     )

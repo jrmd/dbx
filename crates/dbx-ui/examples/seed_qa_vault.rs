@@ -4,8 +4,12 @@
 mod vault;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let directory =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-test/config/dbx");
+    let directory = std::env::args_os()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/ui-test/config/dbx")
+        });
     let vault = vault::CredentialVault::at(directory.join("credentials.vault"));
     match vault.state() {
         vault::VaultState::Uninitialized => vault.create("dbx-ui-test-vault")?,

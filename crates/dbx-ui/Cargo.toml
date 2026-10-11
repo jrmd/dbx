@@ -35,6 +35,7 @@ uuid.workspace = true
 zeroize.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
+gpui-base.workspace = true
 gpui-component-assets.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 semver = "1.0"
@@ -48,3 +49,12 @@ libc = "0.2"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.19.0", features = ["blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace", "NSAccessibility"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_UI_WindowsAndMessaging"] }

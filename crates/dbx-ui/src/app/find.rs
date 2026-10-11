@@ -98,8 +98,12 @@ impl DbxApp {
             }
             None => {
                 let value = cx.new(|_| selected.unwrap_or_default());
-                let needle = cx.new(|cx| TextEditor::new(value, false, window, cx));
-                let replacement = cx.new(|cx| TextEditor::empty(false, window, cx));
+                let needle = cx.new(|cx| {
+                    TextEditor::new(value, false, window, cx).accessibility_label("Find text")
+                });
+                let replacement = cx.new(|cx| {
+                    TextEditor::empty(false, window, cx).accessibility_label("Replace with")
+                });
                 let subscription = cx.observe(&needle, move |this, _, cx| {
                     this.find_step_for(session_id, None, cx);
                 });
@@ -311,15 +315,15 @@ impl DbxApp {
         };
         let needle_focus = needle.read(cx).focus_handle();
         let replacement_focus = replacement.read(cx).focus_handle();
-        let row = || div().flex().items_center().gap(px(6.));
+        let row = || div().flex().items_center().gap(crate::theme::ui_px(6.));
         Some(
             div()
                 .flex_none()
-                .px(px(9.))
-                .py(px(5.))
+                .px(crate::theme::ui_px(9.))
+                .py(crate::theme::ui_px(5.))
                 .flex()
                 .flex_col()
-                .gap(px(5.))
+                .gap(crate::theme::ui_px(5.))
                 .border_b_1()
                 .border_color(theme().border)
                 .bg(theme().panel)
@@ -364,13 +368,14 @@ impl DbxApp {
                                     needle_focus,
                                     false,
                                     FIND_CONTEXT,
+                                    cx,
                                 )),
                         )
                         .child(
                             div()
-                                .w(px(76.))
+                                .w(crate::theme::ui_px(76.))
                                 .flex_none()
-                                .text_size(px(11.))
+                                .text_size(crate::theme::ui_px(11.))
                                 .text_color(theme().text_muted)
                                 .child(status),
                         )
@@ -384,6 +389,7 @@ impl DbxApp {
                                     ButtonKind::Quiet
                                 },
                             )
+                            .accessible_name("Match case")
                             .tooltip("Match case")
                             .cursor_pointer()
                             .on_click(cx.listener(
@@ -395,6 +401,7 @@ impl DbxApp {
                                 .with_size(Size::XSmall)
                                 .compact()
                                 .ghost()
+                                .accessible_name("Previous match (Shift+Enter)")
                                 .tooltip("Previous match (Shift+Enter)")
                                 .child(icon(Icon::ChevronUp, theme().text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -406,6 +413,7 @@ impl DbxApp {
                                 .with_size(Size::XSmall)
                                 .compact()
                                 .ghost()
+                                .accessible_name("Next match (Enter)")
                                 .tooltip("Next match (Enter)")
                                 .child(icon(Icon::ChevronDown, theme().text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -417,6 +425,7 @@ impl DbxApp {
                                 .with_size(Size::XSmall)
                                 .compact()
                                 .ghost()
+                                .accessible_name("Close (Esc)")
                                 .tooltip("Close (Esc)")
                                 .child(icon(Icon::Close, theme().text_muted))
                                 .on_click(cx.listener(move |this, _, window, cx| {
@@ -436,6 +445,7 @@ impl DbxApp {
                                         replacement_focus,
                                         false,
                                         FIND_CONTEXT,
+                                        cx,
                                     )),
                             )
                             .child(

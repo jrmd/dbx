@@ -186,6 +186,34 @@ impl DbxApp {
         }
     }
 
+    pub(super) fn scroll_explorer_accessibly(
+        &mut self,
+        session_id: SessionId,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_session_id != Some(session_id) {
+            return;
+        }
+        let anchor = self.explorer_anchor(session_id).unwrap_or(0);
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let rows = &session.sidebar.list.visible;
+        if rows.is_empty() {
+            return;
+        }
+        let target = anchor.saturating_add_signed(delta).min(rows.len() - 1);
+        session.sidebar.cursor = Some(table_sidebar_id(&rows[target]));
+        session
+            .sidebar
+            .scroll
+            .scroll_to_item(target, ScrollStrategy::Nearest);
+        session.sidebar.focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn move_explorer_cursor(&mut self, motion: Motion, cx: &mut Context<Self>) {
         let Some(session_id) = self.active_session_id else {
             return;
@@ -325,16 +353,18 @@ impl DbxApp {
         let row = session.sidebar.cursor_bounds.take();
         let position = match row {
             Some((row_id, bounds)) if row_id == id => point(
-                bounds.origin.x + px(28.),
+                bounds.origin.x + crate::theme::ui_px(28.),
                 bounds.origin.y + bounds.size.height,
             ),
-            _ => session
-                .sidebar
-                .list_bounds
-                .get()
-                .map_or(point(px(80.), px(120.)), |bounds| {
-                    point(bounds.origin.x + px(28.), bounds.origin.y + px(28.))
-                }),
+            _ => session.sidebar.list_bounds.get().map_or(
+                point(crate::theme::ui_px(80.), crate::theme::ui_px(120.)),
+                |bounds| {
+                    point(
+                        bounds.origin.x + crate::theme::ui_px(28.),
+                        bounds.origin.y + crate::theme::ui_px(28.),
+                    )
+                },
+            ),
         };
         self.open_table_context_menu(session_id, table, position, window, cx);
         if let Some(menu) = &mut self.table_context_menu {
@@ -676,6 +706,80 @@ mod tests {
             })
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[gpui::test]
+    fn accessible_paging_reaches_virtualized_objects_and_respects_filtering(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (app, cx, session_id) = explorer_window(cx);
+        app.update(cx, |app, _| {
+            let session = app.session_mut(session_id).unwrap();
+            session.tables = (0..100)
+                .map(|index| TableInfo::table(format!("table_{index:03}"), None))
+                .collect();
+            session.tables_revision += 1;
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..6 {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.scroll_explorer_accessibly(session_id, 20, window, cx)
+                })
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        assert_eq!(
+            cursor_name(&app, cx).as_deref(),
+            Some("table-<default>-table_099")
+        );
+        cx.update(|window, cx| {
+            assert!(
+                app.read(cx)
+                    .session(session_id)
+                    .unwrap()
+                    .sidebar
+                    .focus
+                    .is_focused(window)
+            )
+        });
+        app.update(cx, |app, cx| {
+            let session = app.session_mut(session_id).unwrap();
+            session.editors.sidebar_search.update(cx, |text, cx| {
+                *text = "table_00".into();
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.scroll_explorer_accessibly(session_id, 20, window, cx)
+            })
+        });
+        assert_eq!(
+            cursor_name(&app, cx).as_deref(),
+            Some("table-<default>-table_009")
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.scroll_explorer_accessibly(session_id, -20, window, cx)
+            })
+        });
+        assert_eq!(
+            cursor_name(&app, cx).as_deref(),
+            Some("table-<default>-table_000")
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.active_session_id = None;
+                app.scroll_explorer_accessibly(session_id, 20, window, cx);
+                assert_eq!(
+                    app.session(session_id).unwrap().sidebar.cursor.as_deref(),
+                    Some("table-<default>-table_000"),
+                    "stale accessible requests must not navigate a hidden connection"
+                );
+            })
+        });
     }
 
     #[gpui::test]

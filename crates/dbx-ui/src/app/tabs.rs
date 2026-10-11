@@ -14,6 +14,9 @@ impl DbxApp {
 
         let id = Uuid::new_v4();
         let query_tab = QueryTab::new(kind, session_id, id, window, cx);
+        query_tab
+            .query_editor
+            .update(cx, |editor, cx| editor.set_vim_mode(self.vim_mode, cx));
         let Some(session) = self.session_mut(session_id) else {
             return;
         };
@@ -428,7 +431,9 @@ impl DbxApp {
             return;
         };
         diagram.zoom = 1.0;
-        diagram.scroll_handle.set_offset(point(px(0.), px(0.)));
+        diagram
+            .scroll_handle
+            .set_offset(point(crate::theme::ui_px(0.), crate::theme::ui_px(0.)));
         diagram.drag_anchor = None;
         cx.notify();
     }
@@ -443,7 +448,9 @@ impl DbxApp {
             return;
         };
         diagram.zoom = zoom.clamp(0.35, 2.0);
-        diagram.scroll_handle.set_offset(point(px(0.), px(0.)));
+        diagram
+            .scroll_handle
+            .set_offset(point(crate::theme::ui_px(0.), crate::theme::ui_px(0.)));
         diagram.drag_anchor = None;
         cx.notify();
     }
@@ -480,7 +487,7 @@ impl DbxApp {
         let travel = (pointer.x - anchor.pointer.x)
             .abs()
             .max((pointer.y - anchor.pointer.y).abs());
-        anchor.moved |= travel > px(3.);
+        anchor.moved |= travel > crate::theme::ui_px(3.);
         let anchor = *anchor;
         let offset = point(
             anchor.scroll_offset.x + (pointer.x - anchor.pointer.x),
@@ -580,6 +587,69 @@ impl DbxApp {
             cx.notify();
         }
         true
+    }
+
+    pub(super) fn move_diagram_node_by_for(
+        &mut self,
+        session_id: SessionId,
+        node_id: &str,
+        dx: f32,
+        dy: f32,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return;
+        };
+        let Some(document) = diagram.document.as_mut() else {
+            return;
+        };
+        let Some((x, y)) = document.node_position(node_id) else {
+            return;
+        };
+        if Arc::make_mut(document).move_node(node_id, x + dx, y + dy)
+            && let Some(position) = document.node_position(node_id)
+        {
+            diagram
+                .arranged_positions
+                .insert(node_id.to_owned(), position);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn select_diagram_relative_for(
+        &mut self,
+        session_id: SessionId,
+        direction: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(diagram) = self.active_diagram_tab_mut(session_id) else {
+            return;
+        };
+        let Some(document) = diagram.document.as_ref() else {
+            return;
+        };
+        if document.nodes.is_empty() {
+            return;
+        }
+        let current = diagram
+            .selected_node
+            .as_ref()
+            .and_then(|id| document.nodes.iter().position(|node| &node.id == id));
+        let next = current.map_or(
+            if direction < 0 {
+                document.nodes.len() - 1
+            } else {
+                0
+            },
+            |index| {
+                index
+                    .saturating_add_signed(direction)
+                    .min(document.nodes.len() - 1)
+            },
+        );
+        diagram.selected_node = Some(document.nodes[next].id.clone());
+        diagram.list_scroll.scroll_to_top_of_item(next);
+        cx.notify();
     }
 
     /// Discard hand-arranged card positions and return to the automatic
