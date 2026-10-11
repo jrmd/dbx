@@ -3,9 +3,10 @@ use crate::diagram::{
     DiagramPalette, EDGE_CORNER_RADIUS, HEADER_HEIGHT, ROW_HEIGHT, RouteStep, edge_markers,
     rounded_route,
 };
+use crate::popups::DropdownMenu as _;
 use gpui::{BoxShadow, CursorStyle, MouseButton, PathBuilder, canvas};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::PopupMenuItem;
 use gpui_component::popover::Popover;
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::tooltip::Tooltip;
@@ -181,15 +182,6 @@ impl DbxApp {
             let popover = Popover::new("diagram-schema-filter")
                 .p_0()
                 .w(px(220.))
-                .trigger(
-                    button(
-                        "diagram-schema-filter-trigger",
-                        format!("Schemas · {summary}"),
-                        ButtonKind::Quiet,
-                    )
-                    .selected(schema_filter_active)
-                    .tooltip("Schemas"),
-                )
                 .child(
                     div()
                         .px(px(10.))
@@ -245,6 +237,16 @@ impl DbxApp {
                         .children(schema_rows),
                 );
             crate::popups::ScrollBlockingPopover::new("diagram-schema-filter", popover)
+                .trap_focus()
+                .trigger(
+                    button(
+                        "diagram-schema-filter-trigger",
+                        format!("Schemas · {summary}"),
+                        ButtonKind::Quiet,
+                    )
+                    .selected(schema_filter_active)
+                    .tooltip("Schemas"),
+                )
         });
         let toolbar = div()
             .h(px(48.))

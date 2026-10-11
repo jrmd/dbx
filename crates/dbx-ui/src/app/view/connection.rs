@@ -319,7 +319,9 @@ impl DbxApp {
                             .h(px(26.))
                             .text_size(px(11.))
                             .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.open_tag_settings(cx))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_tag_settings(window, cx)
+                            })),
                     ),
             )
     }

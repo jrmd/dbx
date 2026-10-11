@@ -16,8 +16,10 @@ mod commands;
 mod folding;
 mod signatures;
 mod syntax;
+mod vim;
 pub use signatures::function_signature;
 pub use syntax::*;
+pub use vim::VimMode;
 
 use std::ops::Range;
 
@@ -234,6 +236,9 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
             Some(SQL_EDITOR_CONTEXT),
         ),
     ]
+    .into_iter()
+    .chain(vim::bindings())
+    .collect()
 }
 
 /// A native single-line or multiline text editor.
@@ -349,6 +354,7 @@ pub struct TextEditor {
     /// so a find bar can reveal the match it selected.
     reveal_requested: std::cell::Cell<bool>,
     _subscriptions: Vec<Subscription>,
+    vim: Option<vim::VimState>,
 }
 
 /// The old short name is useful when migrating an existing GPUI screen to
@@ -423,6 +429,7 @@ impl TextEditor {
             typing_run: None,
             reveal_requested: std::cell::Cell::new(false),
             _subscriptions: vec![observed, focus, blur],
+            vim: None,
         }
     }
 
@@ -1200,6 +1207,12 @@ impl TextEditor {
     }
 
     fn record_history(&mut self, cx: &mut Context<Self>) {
+        if self.vim.as_ref().is_some_and(|vim| {
+            vim.mode == VimMode::Insert && self.undo_history.len() > vim.insert_undo_start
+        }) {
+            self.redo_history.clear();
+            return;
+        }
         let snapshot = EditorSnapshot::from_editor(self, cx);
         if self.undo_history.last() != Some(&snapshot) {
             self.undo_history.push(snapshot);
@@ -2001,6 +2014,9 @@ impl Focusable for TextEditor {
 }
 
 impl EntityInputHandler for TextEditor {
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.accepts_insert_input()
+    }
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -2050,6 +2066,9 @@ impl EntityInputHandler for TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.accepts_insert_input() {
+            return;
+        }
         let content = self.text(cx);
         let range = range
             .map(|range| {
@@ -2099,6 +2118,9 @@ impl EntityInputHandler for TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.accepts_insert_input() {
+            return;
+        }
         self.extra_selections.clear();
         let content = self.text(cx);
         let range = range
@@ -2210,6 +2232,16 @@ impl Render for TextEditor {
                 .flex()
                 .size_full()
                 .min_w_0()
+                .when_some(self.vim_mode(), |view, mode| {
+                    view.track_focus(&self.focus_handle)
+                        .key_context(if mode == VimMode::Insert {
+                            vim::INSERT_CONTEXT
+                        } else {
+                            vim::NORMAL_CONTEXT
+                        })
+                        .on_action(cx.listener(Self::vim_key))
+                        .on_key_down(cx.listener(Self::vim_unbound_key))
+                })
                 .child(LineNumberGutter {
                     editor: cx.entity(),
                 })
@@ -2605,9 +2637,27 @@ impl Element for TextEditorText {
             }
         };
 
-        let cursor = clamp_boundary(text, editor.cursor_offset());
+        let cursor = clamp_boundary(
+            text,
+            editor
+                .vim
+                .as_ref()
+                .filter(|vim| matches!(vim.mode, VimMode::Visual | VimMode::VisualLine))
+                .map_or_else(|| editor.cursor_offset(), |vim| vim.cursor),
+        );
         let (cursor_line, cursor_col) = cache.line_and_column(cursor);
         let cursor_shaped = shape(window, cursor_line);
+        let block_caret = editor
+            .vim_mode()
+            .is_some_and(|mode| mode != VimMode::Insert);
+        let caret_width = if block_caret {
+            let line = cache.line(text, cursor_line);
+            let measured = cursor_shaped.x_for_index(next_boundary(line, cursor_col))
+                - cursor_shaped.x_for_index(cursor_col);
+            if measured > px(0.) { measured } else { px(8.) }
+        } else {
+            px(2.)
+        };
         let cursor_position = point(
             cursor_shaped.x_for_index(display_column(cursor_line, cursor_col)),
             line_height * rows.row(cursor_line) as f32,
@@ -2622,7 +2672,7 @@ impl Element for TextEditorText {
                     editor.scroll_handle.max_offset().into(),
                     editor.scroll_handle.bounds().size,
                     cursor_position,
-                    size(px(2.), line_height),
+                    size(caret_width, line_height),
                     editor.multiline,
                 );
                 (bounds + (next_offset - current_offset), Some(next_offset))
@@ -2692,7 +2742,13 @@ impl Element for TextEditorText {
                 ),
                 // Pure blue vanishes on the dark canvas; the focus ring
                 // colour is tuned for contrast in both appearances.
-                crate::theme::theme().focus_ring,
+                {
+                    let mut color = crate::theme::theme().focus_ring;
+                    if block_caret {
+                        color.a = 0.4;
+                    }
+                    color
+                },
             )
         });
 

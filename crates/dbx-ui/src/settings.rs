@@ -31,6 +31,9 @@ pub struct Settings {
     pub remember_device: bool,
     #[serde(default)]
     pub agents: crate::agents::AgentPreferences,
+    /// Use modal Vim bindings in SQL query editors only.
+    #[serde(default)]
+    pub vim_mode: bool,
     /// Dragged widths of the explorer sidebar and row inspector, in pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explorer_width: Option<u32>,
@@ -56,6 +59,7 @@ impl Settings {
             reduce_transparency: false,
             remember_device: true,
             agents: crate::agents::AgentPreferences::default(),
+            vim_mode: false,
             explorer_width: None,
             inspector_width: None,
         }
@@ -205,6 +209,22 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary settings directory");
         let store = SettingsStore::at(directory.path().join(SETTINGS_FILE_NAME));
         (directory, store)
+    }
+
+    #[test]
+    fn vim_mode_defaults_off_for_old_settings_and_survives_relaunch() {
+        let (_directory, store) = test_store();
+        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
+        let mut settings = store.load().unwrap();
+        assert!(!settings.vim_mode);
+        settings.vim_mode = true;
+        store.save(settings).unwrap();
+        assert!(
+            SettingsStore::at(store.path.clone())
+                .load()
+                .unwrap()
+                .vim_mode
+        );
     }
 
     #[test]

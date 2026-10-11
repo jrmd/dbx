@@ -705,6 +705,7 @@ fn compact_connection_picker_visible(
 enum SettingsSection {
     #[default]
     Appearance,
+    Editor,
     QueryAgent,
     Connections,
     Tags,
@@ -755,10 +756,13 @@ pub struct DbxApp {
     profile_transfer_dialog: Option<profile_transfer::ProfileTransferDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     settings_open: bool,
+    settings_focus: FocusHandle,
+    settings_return_focus: Option<FocusHandle>,
     settings_section: SettingsSection,
     tag_editor: TagEditor,
     appearance: Appearance,
     reduce_transparency: bool,
+    vim_mode: bool,
     settings_store: Option<SettingsStore>,
     agent_setup: agents::AgentSetup,
     compact_layout: bool,
@@ -897,10 +901,15 @@ impl DbxApp {
             copied_table_data: None,
             mutation_error_dialog: None,
             settings_open: false,
+            settings_focus: cx.focus_handle(),
+            settings_return_focus: None,
             settings_section: SettingsSection::Appearance,
             tag_editor,
             appearance: appearance(),
             reduce_transparency: reduce_transparency(),
+            vim_mode: saved_settings
+                .as_ref()
+                .is_some_and(|settings| settings.vim_mode),
             settings_store: SettingsStore::new().ok(),
             agent_setup: agents::AgentSetup::new(window, cx),
             compact_layout: false,
@@ -991,18 +1000,26 @@ impl DbxApp {
         .detach();
     }
 
-    pub(super) fn open_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.vault_state != Some(VaultState::Unlocked) {
             return;
         }
-        self.settings_open = true;
+        if !self.settings_open {
+            self.settings_return_focus = window.focused(cx);
+            self.settings_focus.focus(window, cx);
+            self.settings_open = true;
+        }
         self.check_agent_cli(cx);
         cx.notify();
     }
 
-    pub(super) fn close_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.settings_open) {
             self.edit_tag(None, cx);
+            self.settings_return_focus
+                .take()
+                .unwrap_or_else(|| self.focus_handle.clone())
+                .focus(window, cx);
             cx.notify();
         }
     }
@@ -1243,6 +1260,7 @@ impl DbxApp {
             .with_reduce_transparency(self.reduce_transparency)
             .with_remember_device(self.remember_device);
         settings.agents = self.agent_setup.preferences.clone();
+        settings.vim_mode = self.vim_mode;
         settings.explorer_width = self.explorer_width.map(|width| width.round() as u32);
         settings.inspector_width = self.inspector_width.map(|width| width.round() as u32);
         let failure = match &self.settings_store {
@@ -1258,6 +1276,21 @@ impl DbxApp {
         } else {
             self.agent_setup.save_error = None;
         }
+    }
+
+    fn toggle_vim_mode(&mut self, cx: &mut Context<Self>) {
+        self.vim_mode = !self.vim_mode;
+        for session in &self.sessions {
+            for tab in &session.secondary_tabs {
+                if let SecondaryTabKind::Query(query) = &tab.kind {
+                    query
+                        .query_editor
+                        .update(cx, |editor, cx| editor.set_vim_mode(self.vim_mode, cx));
+                }
+            }
+        }
+        self.persist_settings(cx);
+        cx.notify();
     }
 
     fn dismiss_overlay_on_escape(
@@ -1293,9 +1326,11 @@ impl DbxApp {
         } else if self.confirmation_dialog.is_some() {
             self.cancel_confirmation(window, cx);
             true
+        } else if self.settings_open {
+            self.close_settings(window, cx);
+            true
         } else {
             self.database_export_dialog.take().is_some()
-                || std::mem::take(&mut self.settings_open)
                 || self.dismiss_table_context_menu(window, cx)
                 || self.dismiss_connection_picker()
         };
@@ -2399,6 +2434,9 @@ impl DbxApp {
                 return None;
             };
             let text_revision = query_tab.query_revision;
+            if !query_tab.query_editor.read(cx).accepts_insert_input() {
+                return None;
+            }
             let cursor = query_tab.query_editor.read(cx).cursor_offset();
             let recent_data = session.recent_data();
             let signature = CompletionSignature {

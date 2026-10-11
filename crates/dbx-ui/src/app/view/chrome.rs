@@ -297,11 +297,11 @@ impl DbxApp {
                     .child(
                         glass_icon_button("open-settings", Icon::Settings, self.settings_open)
                             .tooltip(tip("Settings"))
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 if this.settings_open {
-                                    this.close_settings(cx);
+                                    this.close_settings(window, cx);
                                 } else {
-                                    this.open_settings(cx);
+                                    this.open_settings(window, cx);
                                 }
                             })),
                     )
@@ -415,6 +415,9 @@ impl DbxApp {
                                     .id(SharedString::from(format!(
                                         "close-connection-tab-{session_id}"
                                     )))
+                                    .debug_selector(move || {
+                                        format!("close-connection-tab-{session_id}")
+                                    })
                                     .pressable()
                                     .size(px(18.))
                                     .rounded_full()
@@ -425,10 +428,19 @@ impl DbxApp {
                                     .hover(|style| style.bg(theme().glass_hover))
                                     .tooltip(tip("Close connection"))
                                     .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.close_session(session_id, cx)
-                                    })),
+                                    .on_click(cx.listener(
+                                        move |this, event: &gpui::ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.close_session(session_id, cx);
+                                            if event.is_keyboard()
+                                                && this.session(session_id).is_none()
+                                            {
+                                                // Walk the still-painted tab order before the removed
+                                                // close control disappears and focus falls to the root.
+                                                window.focus_next(cx);
+                                            }
+                                        },
+                                    )),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.activate_session(session_id, cx)
@@ -907,6 +919,7 @@ impl DbxApp {
                 .child(
                     div()
                         .id(SharedString::from(format!("close-document-{tab_id}")))
+                        .debug_selector(move || format!("close-document-{tab_id}"))
                         .pressable()
                         .size(px(18.))
                         .rounded_full()
@@ -916,14 +929,26 @@ impl DbxApp {
                         .hover(|style| style.bg(theme().glass_hover))
                         .tooltip(tip("Close tab"))
                         .child(icon(Icon::Close, theme().text_muted).size(px(12.)))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if let Some(session_id) = session_id {
-                                this.request_close_secondary_tab_for(
-                                    session_id, tab_id, window, cx,
-                                );
-                            }
-                        })),
+                        .on_click(cx.listener(
+                            move |this, event: &gpui::ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(session_id) = session_id {
+                                    this.request_close_secondary_tab_for(
+                                        session_id, tab_id, window, cx,
+                                    );
+                                    if event.is_keyboard()
+                                        && this.session(session_id).is_some_and(|session| {
+                                            !session
+                                                .secondary_tabs
+                                                .iter()
+                                                .any(|tab| tab.id == tab_id)
+                                        })
+                                    {
+                                        window.focus_next(cx);
+                                    }
+                                }
+                            },
+                        )),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(session_id) = session_id {

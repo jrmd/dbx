@@ -1604,7 +1604,7 @@ mod tests {
                 assert!(!app.testing_connection);
                 app.connect(window, cx);
                 app.test_connection(cx);
-                app.open_settings(cx);
+                app.open_settings(window, cx);
                 assert!(
                     app.sessions.is_empty(),
                     "Connecting while locked must be rejected"

@@ -1,6 +1,7 @@
 use super::*;
 use crate::agents::{AgentCli, AgentConfig, AgentPreferences, GeneratedQuery};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use crate::popups::DropdownMenu as _;
+use gpui_component::menu::PopupMenuItem;
 use std::time::Duration;
 
 /// The prompt field shares the editor's dispatch depth so Enter and Escape
@@ -273,9 +274,9 @@ impl DbxApp {
         cx.notify();
     }
 
-    fn open_agent_settings(&mut self, cx: &mut Context<Self>) {
+    fn open_agent_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_section = SettingsSection::QueryAgent;
-        self.open_settings(cx);
+        self.open_settings(window, cx);
     }
 
     fn agent_query_mut(
@@ -608,8 +609,8 @@ impl DbxApp {
                 let app = app.clone();
                 menu.separator()
                     .item(PopupMenuItem::new("Query assistant settings…").on_click(
-                        move |_, _, cx| {
-                            let _ = app.update(cx, |this, cx| this.open_agent_settings(cx));
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| this.open_agent_settings(window, cx));
                         },
                     ))
             });
@@ -790,9 +791,9 @@ impl DbxApp {
                             )
                             .child(
                                 button("query-agent-setup", "Open settings", ButtonKind::Quiet)
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.open_agent_settings(cx)),
-                                    ),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_agent_settings(window, cx)
+                                    })),
                             ),
                     )
                 })
@@ -825,9 +826,9 @@ impl DbxApp {
                                     "Check assistant settings",
                                     ButtonKind::Quiet,
                                 )
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_agent_settings(cx)),
-                                ),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| this.open_agent_settings(window, cx),
+                                )),
                             ),
                     )
                 })
@@ -1084,7 +1085,7 @@ mod tests {
             app.agent_setup.model.set("test-model".into(), cx);
             app.agent_setup.provider.set("test-provider".into(), cx);
             app.commit_agent_fields(cx);
-            app.open_agent_settings(cx);
+            app.open_agent_settings(window, cx);
             app
         });
         cx.update(|window, cx| {
@@ -1124,8 +1125,8 @@ mod tests {
             assert_eq!(app.agent_setup.model.text(cx), "");
             app.select_agent(AgentCli::OpenCode, cx);
             assert_eq!(app.agent_setup.model.text(cx), "edited-before-switch");
-            app.close_settings(cx);
         });
+        cx.update(|window, cx| app.update(cx, |app, cx| app.close_settings(window, cx)));
         assert_eq!(saved.load().unwrap().agents.default_cli, AgentCli::OpenCode);
     }
 

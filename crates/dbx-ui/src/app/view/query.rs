@@ -235,6 +235,8 @@ impl DbxApp {
             query_editor.update(cx, |editor, cx| editor.set_diagnostics(diagnostics, cx));
         }
         let query_focus = query_editor.read(cx).focus_handle();
+        query_editor.update(cx, |editor, cx| editor.set_vim_mode(self.vim_mode, cx));
+        let vim_mode = query_editor.read(cx).vim_mode();
         let completion = query_focus
             .is_focused(window)
             .then(|| self.query_completion_for(session_id, cx))
@@ -553,6 +555,9 @@ impl DbxApp {
             )
             .when(in_transaction, |view| view.child(div().px(px(10.)).py(px(4.)).text_xs().text_color(theme().warning)
                 .child("Transaction open in this tab · Commit to save or Rollback to discard. Closing the tab rolls it back.")))
+            .when_some(vim_mode, |view, mode| view.child(div().px(px(10.)).py(px(4.)).text_xs().text_color(theme().accent)
+                .debug_selector(|| "vim-mode-indicator".into())
+                .child(format!("{} · i to insert · Esc for Normal · F6 to leave editor", mode.label()))))
             .when(statement_labels.len() > 1, |view| view.child(div().flex().gap(px(4.)).px(px(8.)).py(px(4.))
                 .children(statement_labels.into_iter().enumerate().map(|(index, label)| {
                     button(SharedString::from(format!("statement-result-{index}")), label,

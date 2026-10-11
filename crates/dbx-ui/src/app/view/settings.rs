@@ -4,8 +4,9 @@ const TAG_PALETTE: [u32; 8] = [
     0xef6b73, 0xe5b567, 0x8fcf9c, 0x82aaff, 0xb48ead, 0x56b6c2, 0xe89bb5, 0xaab2bf,
 ];
 
-const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 5] = [
+const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 6] = [
     (SettingsSection::Appearance, "Appearance", Icon::Appearance),
+    (SettingsSection::Editor, "Editor", Icon::Query),
     (
         SettingsSection::QueryAgent,
         "Query assistant",
@@ -30,18 +31,17 @@ impl DbxApp {
             .map_or("Settings", |(_, label, _)| *label);
         let content = match selected {
             SettingsSection::Appearance => self.render_settings_appearance(cx).into_any_element(),
+            SettingsSection::Editor => self.render_settings_editor(cx).into_any_element(),
             SettingsSection::QueryAgent => self.render_agent_settings(cx).into_any_element(),
             SettingsSection::Connections => self.render_settings_connections(cx).into_any_element(),
             SettingsSection::Tags => self.render_settings_tags(cx).into_any_element(),
             SettingsSection::Updates => self.render_settings_updates(cx).into_any_element(),
         };
-        let close = Button::new("close-settings")
-            .with_size(Size::XSmall)
-            .compact()
-            .ghost()
-            .tooltip("Back to workspace")
-            .child(icon(Icon::Close, theme().text_muted))
-            .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)));
+        let close = glass_icon_button("close-settings", Icon::Close, false)
+            .track_focus(&self.settings_focus)
+            .debug_selector(|| "close-settings".into())
+            .tooltip(tip("Back to workspace"))
+            .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)));
         let header = div()
             .flex_none()
             .h(px(52.))
@@ -198,9 +198,9 @@ impl DbxApp {
     }
 
     /// Jump straight to tag management, e.g. from the connection form.
-    pub(super) fn open_tag_settings(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_tag_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_section = SettingsSection::Tags;
-        self.open_settings(cx);
+        self.open_settings(window, cx);
     }
 
     fn render_settings_appearance(&mut self, cx: &mut Context<Self>) -> Div {
@@ -284,6 +284,20 @@ impl DbxApp {
                 .into_any_element()
             }),
         ))
+    }
+
+    fn render_settings_editor(&mut self, cx: &mut Context<Self>) -> Div {
+        div().child(settings_group([
+            settings_row(
+                "Vim mode",
+                Some("Modal editing in SQL query tabs. Starts in Normal mode; press i to type and Esc to return. F6 moves focus out of the editor.".into()),
+                div().id("vim-setting-control").debug_selector(|| "settings-vim-mode".into()).child(gpui_component::switch::Switch::new("settings-vim-mode")
+                    .checked(self.vim_mode)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_vim_mode(cx)))),
+            ).into_any_element(),
+        ])).child(div().mt(px(16.)).text_size(px(12.)).text_color(theme().text_muted)
+            .child("Vim keys: h/j/k/l, w/b/e, W/B/E, 0/^/$, gg/G, counts, i/a/I/A, o/O, v/V, d/c/y with motions, dd/cc/yy, x/X, D/C, r, p/P, u and Ctrl+R. Query and clipboard shortcuts remain available."))
     }
 
     fn render_settings_tags(&mut self, cx: &mut Context<Self>) -> Div {
@@ -624,9 +638,9 @@ mod tests {
         });
         for width in [1200., 720., 480.] {
             cx.simulate_resize(gpui::size(px(width), px(800.)));
-            cx.update(|_, cx| {
+            cx.update(|window, cx| {
                 app.update(cx, |app, cx| {
-                    app.close_settings(cx);
+                    app.close_settings(window, cx);
                     app.begin_new_connection(cx);
                 })
             });
@@ -649,7 +663,7 @@ mod tests {
                 "demo is only offered when choosing a new connection"
             );
 
-            cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(cx)));
+            cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(window, cx)));
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let connections = cx.debug_bounds("settings-section-Connections").unwrap();
             assert!(connections.left() >= px(0.) && connections.right() <= px(width));

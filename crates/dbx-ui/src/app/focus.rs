@@ -202,6 +202,166 @@ mod tests {
             .collect()
     }
 
+    fn control_focus(cx: &mut VisualTestContext, selector: &str) -> FocusHandle {
+        let bounds = cx
+            .debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
+            .expect("control must be visible");
+        // Focus without clicking: releasing outside cancels the mouse click.
+        cx.simulate_mouse_down(bounds.center(), gpui::MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(
+            gpui::point(gpui::px(-10.), gpui::px(-10.)),
+            gpui::MouseButton::Left,
+            Default::default(),
+        );
+        settle(cx);
+        focused(cx).expect("control must take focus")
+    }
+
+    #[gpui::test]
+    fn keyboard_tab_close_keeps_focus_on_a_neighbor(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let session_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.sessions = vec![ConnectionSession::new(
+                session_id,
+                None,
+                "Focus test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            )];
+            app.active_session_id = Some(session_id);
+            app.connection_picker_open = false;
+            for _ in 0..3 {
+                app.add_query_tab_for(session_id, window, cx);
+            }
+            app
+        });
+        settle(cx);
+        let ids = cx.update(|_, cx| {
+            app.read(cx)
+                .session(session_id)
+                .unwrap()
+                .secondary_tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>()
+        });
+        control_focus(cx, &format!("close-document-{}", ids[2]));
+        walk(cx, "tab", 1);
+        let add_query = focused(cx).unwrap();
+        walk(cx, "shift-tab", 1);
+        walk(cx, "shift-tab", 1);
+        let next = focused(cx).unwrap();
+        let closing = control_focus(cx, &format!("close-document-{}", ids[1]));
+        // Arrive through keyboard traversal, exactly as in the reported bug.
+        cx.update(|window, cx| app.read(cx).focus_handle.clone().focus(window, cx));
+        let mut reached = false;
+        for _ in 0..100 {
+            walk(cx, "f6", 1);
+            if focused(cx) == Some(closing.clone()) {
+                reached = true;
+                break;
+            }
+        }
+        assert!(
+            reached,
+            "keyboard traversal must reach the tab close button"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        for _ in 0..3 {
+            settle(cx);
+        }
+        assert_eq!(
+            cx.update(|_, cx| app
+                .read(cx)
+                .session(session_id)
+                .unwrap()
+                .secondary_tabs
+                .len()),
+            2
+        );
+        assert_eq!(
+            focused(cx),
+            Some(next),
+            "closing a tab must keep focus beside it"
+        );
+
+        // Closing the last tab in the strip, including the only remaining tab,
+        // leaves focus on New query so the keyboard workflow can continue.
+        for id in [ids[2], ids[0]] {
+            control_focus(cx, &format!("close-document-{id}"));
+            cx.simulate_keystrokes("enter");
+            cx.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse("enter").unwrap(),
+            });
+            for _ in 0..3 {
+                settle(cx);
+            }
+            assert_eq!(focused(cx), Some(add_query.clone()));
+        }
+    }
+
+    #[gpui::test]
+    fn keyboard_connection_close_keeps_focus_in_the_connection_strip(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.sessions = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    ConnectionSession::new(
+                        *id,
+                        None,
+                        format!("Connection {index}"),
+                        DatabaseKind::SQLite,
+                        None,
+                        window,
+                        cx,
+                    )
+                })
+                .collect();
+            app.active_session_id = Some(ids[2]);
+            app.connection_picker_open = false;
+            app
+        });
+        settle(cx);
+        control_focus(cx, &format!("close-connection-tab-{}", ids[2]));
+        walk(cx, "tab", 1);
+        let add_connection = focused(cx).unwrap();
+        walk(cx, "shift-tab", 2);
+        let neighbor = focused(cx).unwrap();
+        control_focus(cx, &format!("close-connection-tab-{}", ids[1]));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        for _ in 0..3 {
+            settle(cx);
+        }
+        assert_eq!(cx.update(|_, cx| app.read(cx).sessions.len()), 2);
+        assert_eq!(focused(cx), Some(neighbor));
+        walk(cx, "tab", 1);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        for _ in 0..3 {
+            settle(cx);
+        }
+        assert_eq!(cx.update(|_, cx| app.read(cx).sessions.len()), 1);
+        assert_eq!(focused(cx), Some(add_connection));
+    }
+
     #[gpui::test]
     fn tab_walks_the_connection_form_fields(cx: &mut TestAppContext) {
         bind_keys(cx);
@@ -226,6 +386,143 @@ mod tests {
         // Shift-Tab retraces the same path.
         let back = walk(cx, "shift-tab", 1);
         assert_eq!(back[0], forward[forward.len() - 2]);
+    }
+
+    #[gpui::test]
+    fn dismissing_quick_open_restores_the_opener(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        let opener = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Unlocked);
+                app.saved_connections.clear();
+                app.select_kind(DatabaseKind::PostgreSQL, cx);
+                let opener = app.draft.connection_name_editor.read(cx).focus_handle();
+                opener.focus(window, cx);
+                opener
+            })
+        });
+        settle(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_quick_open_action(&OpenQuickOpen, window, cx)
+            })
+        });
+        settle(cx);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert_eq!(focused(cx), Some(opener));
+    }
+
+    #[gpui::test]
+    fn dismissing_settings_restores_the_opener(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        let opener = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Unlocked);
+                app.saved_connections.clear();
+                app.select_kind(DatabaseKind::PostgreSQL, cx);
+                let opener = app.draft.connection_name_editor.read(cx).focus_handle();
+                opener.focus(window, cx);
+                opener
+            })
+        });
+        settle(cx);
+        cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(window, cx)));
+        settle(cx);
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        assert_eq!(focused(cx), Some(opener));
+    }
+
+    #[gpui::test]
+    fn vim_setting_is_keyboard_operable_and_applies_to_sql_tabs(cx: &mut TestAppContext) {
+        bind_keys(cx);
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at(directory.path().join("settings.json"));
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.settings_store = Some(store.clone());
+            app.vim_mode = false;
+            app.sessions.clear();
+            for kind in [DatabaseKind::SQLite, DatabaseKind::Redis] {
+                let id = Uuid::new_v4();
+                app.sessions.push(ConnectionSession::new(
+                    id,
+                    None,
+                    "Keyboard test".into(),
+                    kind,
+                    None,
+                    window,
+                    cx,
+                ));
+                app.add_query_tab_for(id, window, cx);
+            }
+            app.active_session_id = Some(app.sessions[0].id);
+            app.connection_picker_open = false;
+            app.settings_section = SettingsSection::Editor;
+            app.open_settings(window, cx);
+            app
+        });
+        settle(cx);
+        // Settings opens on its close control; the next Tab reaches Vim mode.
+        walk(cx, "tab", 1);
+        cx.simulate_keystrokes("enter");
+        cx.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("enter").unwrap(),
+        });
+        settle(cx);
+        assert!(cx.update(|_, cx| app.read(cx).vim_mode));
+        assert!(store.load().unwrap().vim_mode);
+        cx.update(|_, cx| {
+            let app = app.read(cx);
+            for (index, session) in app.sessions.iter().enumerate() {
+                let SecondaryTabKind::Query(query) = &session.secondary_tabs[0].kind else {
+                    unreachable!()
+                };
+                assert_eq!(query.query_editor.read(cx).vim_mode().is_some(), index == 0);
+            }
+        });
+        cx.simulate_keystrokes("escape");
+        settle(cx);
+        let editor = cx.update(|_, cx| {
+            let app = app.read(cx);
+            let SecondaryTabKind::Query(query) = &app.sessions[0].secondary_tabs[0].kind else {
+                unreachable!()
+            };
+            query.query_editor.clone()
+        });
+        cx.update(|window, cx| editor.read(cx).focus_handle().focus(window, cx));
+        cx.update(|_, cx| editor.update(cx, |editor, cx| editor.set_text("SEL", cx)));
+        settle(cx);
+        assert!(
+            cx.debug_bounds("sql-completion-menu").is_none(),
+            "Normal mode must not show a typing completion menu"
+        );
+        cx.simulate_keystrokes("shift-a");
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.vim_mode()),
+            Some(editor::VimMode::Insert)
+        );
+        settle(cx);
+        assert!(
+            cx.debug_bounds("sql-completion-menu").is_some(),
+            "Insert mode retains SQL completion"
+        );
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            editor.read_with(cx, |editor, _| editor.vim_mode()),
+            Some(editor::VimMode::Normal)
+        );
+        settle(cx);
+        assert!(cx.debug_bounds("sql-completion-menu").is_none());
+        cx.simulate_keystrokes("f6");
+        assert_ne!(
+            focused(cx),
+            Some(editor.read_with(cx, |editor, _| editor.focus_handle()))
+        );
     }
 
     #[gpui::test]

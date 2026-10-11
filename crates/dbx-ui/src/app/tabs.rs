@@ -14,6 +14,9 @@ impl DbxApp {
 
         let id = Uuid::new_v4();
         let query_tab = QueryTab::new(kind, session_id, id, window, cx);
+        query_tab
+            .query_editor
+            .update(cx, |editor, cx| editor.set_vim_mode(self.vim_mode, cx));
         let Some(session) = self.session_mut(session_id) else {
             return;
         };

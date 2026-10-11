@@ -12,6 +12,7 @@ pub(super) struct QuickOpen {
     pub(super) query: Entity<TextEditor>,
     pub(super) selected: usize,
     pub(super) focus: FocusHandle,
+    return_focus: Option<FocusHandle>,
     _subscription: Subscription,
 }
 
@@ -106,19 +107,21 @@ impl DbxApp {
             }
             cx.notify();
         });
+        let return_focus = window.focused(cx);
         query.read(cx).focus_handle().focus(window, cx);
         self.quick_open = Some(QuickOpen {
             query,
             selected: 0,
             focus: cx.focus_handle(),
+            return_focus,
             _subscription: subscription,
         });
         cx.notify();
     }
 
     pub(super) fn close_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.quick_open.take().is_some() {
-            window.focus(&self.focus_handle, cx);
+        if let Some(open) = self.quick_open.take() {
+            window.focus(open.return_focus.as_ref().unwrap_or(&self.focus_handle), cx);
             cx.notify();
         }
     }
