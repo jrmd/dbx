@@ -1142,7 +1142,7 @@ impl DbxApp {
                                                     }),
                                             ),
                                     )
-                                    .child(crate::app::value_view::value_view(value.as_ref()))
+                                    .child(crate::app::value_view::value_view(value.as_ref(), cx))
                             },
                         ))
                     }),

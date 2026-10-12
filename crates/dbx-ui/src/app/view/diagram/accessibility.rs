@@ -211,7 +211,7 @@ mod tests {
                 )
             })
         });
-        cx.simulate_keystrokes("ctrl-shift-right");
+        cx.simulate_keystrokes("secondary-shift-right");
         cx.update(|_, cx| {
             app.update(cx, |app, _| {
                 let diagram = app.active_diagram_tab_mut(session_id).unwrap();

@@ -2385,7 +2385,7 @@ mod tests {
             })
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("ctrl-shift-right");
+        cx.simulate_keystrokes("secondary-shift-right");
         cx.update(|window, cx| {
             grid.update(cx, |table, cx| {
                 assert_eq!(table.delegate().columns[1].width, before + px(20.));
@@ -2394,7 +2394,7 @@ mod tests {
                 assert_eq!(window.focused(cx), Some(table.focus_handle(cx)));
             })
         });
-        cx.simulate_keystrokes("ctrl-shift-left");
+        cx.simulate_keystrokes("secondary-shift-left");
         cx.update(|_, cx| assert_eq!(grid.read(cx).delegate().columns[1].width, before));
     }
 

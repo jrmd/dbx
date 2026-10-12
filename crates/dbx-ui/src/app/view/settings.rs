@@ -808,7 +808,7 @@ mod tests {
         cx.simulate_resize(gpui::size(px(800.), px(600.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         for _ in 0..4 {
-            cx.simulate_keystrokes("ctrl-=");
+            cx.simulate_keystrokes("secondary-=");
         }
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(cx.update(|_, cx| app.read(cx).ui_scale), 200);
@@ -824,7 +824,7 @@ mod tests {
             control.size.height >= px(48.),
             "controls must grow with their text"
         );
-        cx.simulate_keystrokes("ctrl-0");
+        cx.simulate_keystrokes("secondary-0");
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(store.load().unwrap().ui_scale, 100);
         crate::theme::set_text_scales(100, 100);
@@ -845,7 +845,7 @@ mod tests {
         });
         cx.simulate_resize(gpui::size(px(800.), px(600.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let initial = cx.debug_bounds("settings-reduce-transparency").unwrap();
+        let initial = cx.debug_bounds("motion-Full").unwrap();
         cx.simulate_mouse_down(initial.center(), MouseButton::Left, Default::default());
         cx.simulate_mouse_up(
             gpui::point(px(-10.), px(-10.)),
@@ -866,7 +866,7 @@ mod tests {
         for _ in 0..3 {
             cx.update(|window, cx| window.draw(cx).clear(cx));
         }
-        let before = cx.debug_bounds("settings-reduce-transparency").unwrap();
+        let before = cx.debug_bounds("motion-Full").unwrap();
         assert!(
             before.bottom() > px(600.),
             "fixture must put the control below the viewport"
@@ -878,7 +878,7 @@ mod tests {
                 window.draw(cx).clear(cx);
             });
         }
-        let after = cx.debug_bounds("settings-reduce-transparency").unwrap();
+        let after = cx.debug_bounds("motion-Full").unwrap();
         cx.update(|window, _| {
             assert!(focus.is_focused(window), "control focus was lost");
         });
@@ -898,10 +898,7 @@ mod tests {
             });
         }
         assert!(
-            cx.debug_bounds("settings-reduce-transparency")
-                .unwrap()
-                .bottom()
-                > px(600.),
+            cx.debug_bounds("motion-Full").unwrap().bottom() > px(600.),
             "manual scrolling must not be undone while focus stays on the same row"
         );
         cx.update(|window, cx| {

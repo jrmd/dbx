@@ -1,3 +1,10 @@
+## 0.8.1 - 2026-10-12
+
+- Preview UTF-8 JSON objects and arrays returned as bytes as formatted JSON in row and query inspectors, and copy the full JSON text.
+- Use the configured monospace font and horizontal scrolling for JSON and hex previews so long lines keep their layout.
+- Fix keyboard accessibility tests on macOS by using platform shortcuts and a settings control available on every platform.
+- Wait for the agent cancellation fixture to finish starting before checking its process, avoiding a race on busy CI runners.
+
 ## 0.7.3 - 2026-10-09
 
 - Drag the edge of the explorer sidebar or the row details panel to resize it. DBX remembers the widths; double-click an edge to restore the default.

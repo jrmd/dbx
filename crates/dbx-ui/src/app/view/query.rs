@@ -581,7 +581,7 @@ impl DbxApp {
                             if let Some(query) = this.active_query_tab_mut(session_id) { query.inspected_value = None; }
                             cx.notify();
                         }))))
-                    .child(crate::app::value_view::value_view(Some(&value)))))
+                    .child(crate::app::value_view::value_view(Some(&value), cx))))
             .child(
                 gpui_component::resizable::v_resizable(SharedString::from(format!(
                     "query-workbench-split-{session_id}-{tab_id}"

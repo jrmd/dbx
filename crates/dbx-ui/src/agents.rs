@@ -510,11 +510,11 @@ else:
         let directory = tempfile::tempdir().unwrap();
         let pid_file = directory.path().join("pid");
         let script = format!(
-            "import os, time, pathlib\npathlib.Path({}).write_text(str(os.getpid()))\ntime.sleep(60)",
+            "import os, time, pathlib, sys\nsys.stdin.read()\npid_file = pathlib.Path({})\nready = pid_file.with_suffix('.ready')\nready.write_text(str(os.getpid()))\nready.replace(pid_file)\ntime.sleep(60)",
             serde_json::to_string(&pid_file.to_string_lossy()).unwrap()
         );
         let (_fixture, executable) = fixture(&script);
-        let task = tokio::spawn(generate(
+        let mut task = tokio::spawn(generate(
             AgentCli::Claude,
             AgentConfig {
                 executable,
@@ -522,15 +522,23 @@ else:
             },
             "prompt".into(),
         ));
-        for _ in 0..100 {
-            if pid_file.exists() {
-                break;
+        let ready = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match std::fs::read_to_string(&pid_file) {
+                    Ok(pid) => return pid.parse::<i32>().expect("fixture must publish a PID"),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("Could not read agent readiness: {error}"),
+                }
+                tokio::select! {
+                    result = &mut task => panic!("Agent exited before becoming ready: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                }
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        })
+        .await;
         task.abort();
         let _ = task.await;
+        let pid = ready.expect("Agent fixture did not become ready within ten seconds");
         for _ in 0..100 {
             if unsafe { libc::kill(pid, 0) } != 0 {
                 return;

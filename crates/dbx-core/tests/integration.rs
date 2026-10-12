@@ -168,6 +168,98 @@ async fn postgresql_crud_integration() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires the disposable integration databases"]
+async fn postgresql_jsonb_preview_preserves_types_nulls_and_numeric_precision() -> Result<()> {
+    let Some(url) = integration_url("DBX_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let engine =
+        DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::PostgreSQL, url)).await?;
+    let table = TableRef::in_schema("public", "dbx_integration_json_preview");
+    engine
+        .execute_sql("DROP TABLE IF EXISTS public.dbx_integration_json_preview")
+        .await?;
+    engine
+        .execute_sql("CREATE TABLE public.dbx_integration_json_preview (id integer PRIMARY KEY, payload jsonb, document json, raw bytea)")
+        .await?;
+    let document: serde_json::Value = serde_json::from_str(
+        r#"{"actor":{"kind":"user","id":900719925474099312345},"roles":["admin"],"amount":0.123456789012345678901,"missing":null,"label":"é"}"#,
+    )
+    .unwrap();
+    let payloads = [
+        CellValue::Json(document),
+        CellValue::Json(serde_json::Value::Null),
+        CellValue::Null,
+        CellValue::Json(serde_json::json!([1, true, "text"])),
+        CellValue::Json(serde_json::json!(42)),
+    ];
+    let raw = CellValue::Bytes(br#"{"actor":{"kind":"user"}}"#.to_vec());
+    for (index, payload) in payloads.iter().enumerate() {
+        engine
+            .insert(&InsertRequest {
+                table: table.clone(),
+                columns: vec![
+                    "id".into(),
+                    "payload".into(),
+                    "document".into(),
+                    "raw".into(),
+                ],
+                values: vec![
+                    CellValue::Integer(index as i64).into(),
+                    payload.clone().into(),
+                    payload.clone().into(),
+                    raw.clone().into(),
+                ],
+            })
+            .await?;
+    }
+    let columns = engine.describe_table(&table).await?;
+    let order = [Order {
+        column: "id".into(),
+        direction: OrderDirection::Ascending,
+    }];
+    // The table preview reuses cached column metadata; also exercise a fresh
+    // description and the SQL console's text-protocol results.
+    let mut results = Vec::new();
+    for metadata in [Some(columns.as_slice()), None] {
+        results.push(
+            engine
+                .query_table_with_columns(
+                    &table,
+                    &[],
+                    &[],
+                    &order,
+                    Some(Page::default()),
+                    QueryOptions::default(),
+                    metadata,
+                )
+                .await?,
+        );
+    }
+    results.push(
+        engine
+            .query(
+                "SELECT * FROM public.dbx_integration_json_preview ORDER BY id",
+                QueryOptions::default(),
+            )
+            .await?,
+    );
+    for result in results {
+        assert_eq!(result.columns[1].data_type.to_ascii_lowercase(), "jsonb");
+        assert_eq!(result.columns[2].data_type.to_ascii_lowercase(), "json");
+        assert_eq!(result.columns[3].data_type.to_ascii_lowercase(), "bytea");
+        assert_eq!(result.rows.len(), payloads.len());
+        for (row, payload) in result.rows.iter().zip(&payloads) {
+            assert_eq!(&row.values[1], payload);
+            assert_eq!(&row.values[2], payload);
+            assert_eq!(row.values[3], raw);
+        }
+    }
+    engine.drop_table(&table).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
 async fn mysql_crud_integration() -> Result<()> {
     run_sql_scenario(DatabaseKind::MySQL, "DBX_TEST_MYSQL_URL").await
 }

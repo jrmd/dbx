@@ -7,17 +7,19 @@ const HEX_PREVIEW_BYTES: usize = 512;
 const IMAGE_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 const TEXT_PREVIEW_CHARS: usize = 20_000;
 
-/// Pretty JSON for JSON values and for text holding a JSON object or array.
+/// Pretty JSON for JSON values and for text or UTF-8 bytes holding an object or array.
 pub(super) fn json_preview(value: &CellValue) -> Option<String> {
+    let document = |text: &str| {
+        let trimmed = text.trim_start();
+        if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+            return None;
+        }
+        serde_json::from_str(text).ok()
+    };
     let parsed = match value {
         CellValue::Json(value) => value.clone(),
-        CellValue::Text(text) => {
-            let trimmed = text.trim_start();
-            if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-                return None;
-            }
-            serde_json::from_str(text).ok()?
-        }
+        CellValue::Text(text) => document(text)?,
+        CellValue::Bytes(bytes) => document(std::str::from_utf8(bytes).ok()?)?,
         _ => return None,
     };
     serde_json::to_string_pretty(&parsed).ok()
@@ -72,23 +74,35 @@ fn byte_size(length: usize) -> String {
     }
 }
 
-fn monospace_block(text: String) -> Div {
+fn monospace_block(text: String, cx: &App) -> impl IntoElement {
+    use gpui_component::ActiveTheme;
+
     div()
+        .id("cell-value-preview")
+        .debug_selector(|| "cell-value-preview".into())
+        .overflow_x_scroll()
+        .flex()
+        .min_w_0()
         .p(crate::theme::ui_px(7.))
         .rounded(crate::theme::ui_px(5.))
         .bg(theme().panel_raised)
         .border_1()
         .border_color(theme().border)
-        .font_family("monospace")
+        .font_family(cx.theme().mono_font_family.clone())
         .text_size(crate::theme::ui_px(11.))
         .text_color(theme().text)
-        .whitespace_normal()
-        .child(text)
+        .whitespace_nowrap()
+        .child(
+            div()
+                .debug_selector(|| "cell-value-preview-content".into())
+                .flex_none()
+                .child(text),
+        )
 }
 
 /// The inspector body for one value: images, hex dumps, pretty JSON, or
 /// the plain display text.
-pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
+pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
     let Some(value) = value else {
         return div()
             .text_size(crate::theme::ui_px(12.))
@@ -96,6 +110,9 @@ pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
             .child("—")
             .into_any_element();
     };
+    if let Some(json) = json_preview(value) {
+        return monospace_block(truncate_preview(json), cx).into_any_element();
+    }
     match value {
         CellValue::Null => div()
             .text_size(crate::theme::ui_px(12.))
@@ -129,19 +146,16 @@ pub(super) fn value_view(value: Option<&CellValue>) -> AnyElement {
                     )
                 })
                 .when(format.is_none() && !bytes.is_empty(), |view| {
-                    view.child(monospace_block(hex_dump(bytes)))
+                    view.child(monospace_block(hex_dump(bytes), cx))
                 })
                 .into_any_element()
         }
-        value => match json_preview(value) {
-            Some(json) => monospace_block(truncate_preview(json)).into_any_element(),
-            None => div()
-                .text_size(crate::theme::ui_px(12.))
-                .text_color(theme().text)
-                .whitespace_normal()
-                .child(truncate_preview(value.to_string()))
-                .into_any_element(),
-        },
+        value => div()
+            .text_size(crate::theme::ui_px(12.))
+            .text_color(theme().text)
+            .whitespace_normal()
+            .child(truncate_preview(value.to_string()))
+            .into_any_element(),
     }
 }
 
@@ -152,7 +166,7 @@ fn truncate_preview(text: String) -> String {
     }
 }
 
-/// The clipboard form of a value: full JSON or text, and hex for bytes.
+/// The clipboard form of a value: full JSON or text, and hex for binary bytes.
 pub(super) fn value_clipboard_text(value: &CellValue) -> String {
     match value {
         CellValue::Null => "NULL".into(),
@@ -160,6 +174,7 @@ pub(super) fn value_clipboard_text(value: &CellValue) -> String {
         CellValue::Json(value) => {
             serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
         }
+        CellValue::Bytes(_) => json_preview(value).unwrap_or_else(|| value.to_string()),
         value => value.to_string(),
     }
 }
@@ -176,6 +191,94 @@ mod tests {
         );
         assert_eq!(json_preview(&CellValue::Text("42".into())), None);
         assert_eq!(json_preview(&CellValue::Text("{not json".into())), None);
+    }
+
+    #[test]
+    fn json_bytes_preview_and_copy_preserve_nested_values_and_numeric_precision() {
+        let raw = br#" {"actor":{"kind":"user","id":900719925474099312345},"roles":["admin"],"amount":0.123456789012345678901,"missing":null,"label":"\u00e9"} "#;
+        let value = CellValue::Bytes(raw.to_vec());
+        let preview = json_preview(&value).unwrap();
+        assert!(preview.contains("\n  \"actor\": {\n"));
+        assert!(preview.contains("900719925474099312345"));
+        assert!(preview.contains("0.123456789012345678901"));
+        assert!(preview.contains('é'));
+        assert_eq!(value_clipboard_text(&value), preview);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&preview).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(raw).unwrap()
+        );
+        assert!(json_preview(&CellValue::Bytes(b"[1,true,null]".to_vec())).is_some());
+    }
+
+    #[test]
+    fn binary_and_invalid_json_bytes_keep_their_hex_clipboard_form() {
+        for bytes in [
+            b"{not json".as_slice(),
+            b"{\"a\":1} trailing",
+            b"[\xff]",
+            b"DBX\x00\x01",
+            b"42",
+            b"",
+        ] {
+            let value = CellValue::Bytes(bytes.to_vec());
+            assert_eq!(json_preview(&value), None);
+            assert_eq!(value_clipboard_text(&value), value.to_string());
+        }
+    }
+
+    #[test]
+    fn large_json_preview_is_bounded_but_copy_contains_the_complete_value() {
+        let value = CellValue::Bytes(
+            serde_json::json!({"text": "é".repeat(TEXT_PREVIEW_CHARS + 1)})
+                .to_string()
+                .into_bytes(),
+        );
+        let preview = truncate_preview(json_preview(&value).unwrap());
+        assert!(preview.ends_with("… (copy for the full value)"));
+        let copied: serde_json::Value =
+            serde_json::from_str(&value_clipboard_text(&value)).unwrap();
+        assert_eq!(
+            copied["text"].as_str().unwrap().chars().count(),
+            TEXT_PREVIEW_CHARS + 1
+        );
+    }
+
+    struct PreviewHarness(CellValue);
+
+    impl Render for PreviewHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(200.)).child(value_view(Some(&self.0), cx))
+        }
+    }
+
+    #[gpui::test]
+    fn structured_previews_scroll_long_lines_without_wrapping_or_widening_the_inspector(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|_, _| {
+            PreviewHarness(CellValue::Bytes(
+                serde_json::json!({"long_key": "x".repeat(100)})
+                    .to_string()
+                    .into_bytes(),
+            ))
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let json_bounds = cx.debug_bounds("cell-value-preview").unwrap();
+        let content = cx.debug_bounds("cell-value-preview-content").unwrap();
+        assert!(json_bounds.size.width <= px(200.));
+        assert!(content.size.width > json_bounds.size.width);
+        harness.update(cx, |harness, cx| {
+            harness.0 = CellValue::Bytes(vec![0; 32]);
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let hex_bounds = cx.debug_bounds("cell-value-preview").unwrap();
+        let content = cx.debug_bounds("cell-value-preview-content").unwrap();
+        assert!(hex_bounds.size.width <= px(200.));
+        assert!(content.size.width > hex_bounds.size.width);
+        // Both previews contain three lines (the dump has a trailing newline).
+        assert_eq!(hex_bounds.size.height, json_bounds.size.height);
     }
 
     #[test]
