@@ -2,6 +2,7 @@ use super::super::*;
 use super::{GRID_MIN_WIDTH, INSPECTOR_MIN_WIDTH, PaneResize};
 use crate::diagram::display_type;
 use crate::popups::DropdownMenu as _;
+use gpui_component::InteractiveElementExt as _;
 use gpui_component::menu::PopupMenuItem;
 
 fn row_field_heading(
@@ -1312,20 +1313,37 @@ impl DbxApp {
             .p(crate::theme::ui_px(12.))
             .flex()
             .flex_col()
-            .child(panel_header(
-                table_name,
-                if busy {
-                    "Loading metadata…".into()
-                } else {
-                    String::new()
-                },
-            ))
             .child(
-                button("open-table-designer", "Design table…", ButtonKind::Quiet).on_click(
-                    cx.listener(move |this, _, window, cx| {
-                        this.open_designer_for(session_id, window, cx)
-                    }),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(crate::theme::ui_px(12.))
+                    .child(div().flex_1().min_w_0().child(panel_header(
+                        table_name,
+                        if busy {
+                            "Loading metadata…".into()
+                        } else {
+                            String::new()
+                        },
+                    )))
+                    .child(
+                        button(
+                            "open-table-designer",
+                            if designer.is_some() {
+                                "Close designer"
+                            } else {
+                                "Design table…"
+                            },
+                            ButtonKind::Quiet,
+                        )
+                        .map(|button| gpui::Styled::rounded(button, crate::theme::ui_px(5.)))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.toggle_designer_for(session_id, window, cx);
+                            },
+                        )),
+                    ),
             )
             .when_some(designer, |view, designer| view.child(designer))
             .child(objects)

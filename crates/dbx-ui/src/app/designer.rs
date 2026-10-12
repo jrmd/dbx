@@ -1,5 +1,49 @@
 use super::*;
+use crate::theme::ui_px;
 use crate::workspace::SavedQuery;
+use gpui_component::checkbox::Checkbox;
+
+fn designer_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+) -> Button {
+    let id = id.into();
+    // The shared button sets rounded_full on its style refinement. Set that
+    // refinement explicitly; Button::rounded alone cannot override it.
+    gpui::Styled::rounded(
+        button(id.clone(), label, kind).debug_selector(move || id.to_string()),
+        ui_px(5.),
+    )
+    .px(ui_px(10.))
+}
+
+fn designer_action_button(id: SharedString, label: &'static str, selected: bool) -> Button {
+    Button::new(id.clone())
+        .debug_selector(move || id.to_string())
+        .ghost()
+        .with_size(Size::XSmall)
+        .h(ui_px(28.))
+        .px(ui_px(8.))
+        .rounded(ui_px(5.))
+        .w_full()
+        .border_0()
+        .bg(if selected {
+            theme().accent_soft
+        } else {
+            gpui::transparent_black().into()
+        })
+        .text_color(if selected {
+            theme().accent_text
+        } else {
+            theme().text_muted
+        })
+        .font_weight(FontWeight::MEDIUM)
+        // Button centres its label internally; a full-width child keeps this
+        // navigation list aligned while retaining native button behaviour.
+        .child(div().w_full().line_height(relative(1.)).child(label))
+        .accessible_name(label)
+}
 
 fn split_columns(value: &str) -> Vec<String> {
     value
@@ -17,6 +61,7 @@ pub(super) struct Designer {
     unique: bool,
     drafts: Vec<String>,
     pending: bool,
+    visible: bool,
 }
 
 impl DbxApp {
@@ -26,6 +71,11 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(designer) = self.designer_mut(session_id) {
+            designer.visible = true;
+            cx.notify();
+            return;
+        }
         let fields = (0..6)
             .map(|_| {
                 let value = cx.new(|_| String::new());
@@ -46,9 +96,24 @@ impl DbxApp {
                 unique: false,
                 drafts: Vec::new(),
                 pending: false,
+                visible: true,
             });
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_designer_for(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(designer) = self.designer_mut(session_id) {
+            designer.visible = !designer.visible;
+            cx.notify();
+        } else {
+            self.open_designer_for(session_id, window, cx);
+        }
     }
 
     fn draft_designer_for(
@@ -315,225 +380,480 @@ impl DbxApp {
             return None;
         };
         let designer = structure.designer.as_ref()?;
+        if !designer.visible {
+            return None;
+        }
         let action = designer.action;
         let fields = designer.fields.clone();
-        let labels = match action {
-            0 => vec!["Column name", "Type", "Default expression (optional)"],
-            1 => vec!["Existing column", "New name"],
-            2 => vec!["Column to drop"],
-            3 => vec!["Index name", "Columns, separated by commas"],
-            4 => vec!["Index to drop"],
-            5 => vec![
-                "Existing column",
-                "New complete type",
-                "Default (empty removes default)",
-            ],
-            6 => vec![
-                "Constraint name",
-                "Primary key columns, separated by commas",
-            ],
-            7 => vec![
-                "Constraint name",
-                "Local columns, separated by commas",
-                "Referenced table",
-                "Referenced columns, separated by commas",
-                "Referenced schema (optional)",
-            ],
-            8 => vec!["Constraint name", "Check expression"],
-            _ => vec!["Constraint to drop"],
+        let actions = [
+            "Add column",
+            "Rename column",
+            "Drop column",
+            "Add index",
+            "Drop index",
+            "Alter column",
+            "Primary key",
+            "Foreign key",
+            "Check",
+            "Drop constraint",
+        ];
+        let description = match action {
+            0 => "Define a new column and its default value.",
+            1 => "Choose an existing column and give it a new name.",
+            2 => "Choose the column to remove from this table.",
+            3 => "Index one or more columns to speed up lookups.",
+            4 => "Choose the index to remove from this table.",
+            5 => "Update a column’s type, default value and nullability.",
+            6 => "Choose the columns that uniquely identify each row.",
+            7 => "Link columns in this table to another table.",
+            8 => "Define a condition that every row must satisfy.",
+            _ => "Choose the constraint to remove from this table.",
         };
-        Some(
-            div()
-                .p(crate::theme::ui_px(12.))
-                .border_1()
-                .border_color(theme().border)
-                .rounded(crate::theme::ui_px(6.))
+        // Keep labels short; guidance belongs below the relevant field.
+        let labels: &[(&str, &str)] = match action {
+            0 => &[
+                ("Column name", ""),
+                ("Data type", ""),
+                ("Default expression", "Optional · SQL expression or literal"),
+            ],
+            1 => &[("Existing column", ""), ("New name", "")],
+            2 => &[("Column to drop", "")],
+            3 => &[
+                ("Index name", ""),
+                ("Columns", "Separate column names with commas"),
+            ],
+            4 => &[("Index to drop", "")],
+            5 => &[
+                ("Existing column", ""),
+                ("Data type", "Enter the complete type definition"),
+                ("Default expression", "Leave empty to remove the default"),
+            ],
+            6 => &[
+                ("Constraint name", ""),
+                ("Primary key columns", "Separate column names with commas"),
+            ],
+            7 => &[
+                ("Constraint name", ""),
+                ("Local columns", "Separate column names with commas"),
+                ("Referenced table", ""),
+                ("Referenced columns", "Separate column names with commas"),
+                ("Referenced schema", "Optional"),
+            ],
+            8 => &[
+                ("Constraint name", ""),
+                ("Check expression", "SQL condition, e.g. budget >= 0"),
+            ],
+            _ => &[("Constraint to drop", "")],
+        };
+        let type_value = fields[1].read(cx).text(cx);
+        let selected_column = fields[0].read(cx).text(cx);
+        let local_columns = split_columns(&fields[1].read(cx).text(cx));
+        let reference_table = TableRef {
+            name: fields[2].read(cx).text(cx).trim().into(),
+            schema: {
+                let schema = fields[4].read(cx).text(cx);
+                (!schema.trim().is_empty()).then(|| schema.trim().into())
+            },
+        };
+        let referenced_columns = split_columns(&fields[3].read(cx).text(cx));
+        let chip = |id: SharedString, label: String, selected: bool| {
+            designer_button(id, label, ButtonKind::Quiet)
+                .h(ui_px(24.))
+                .px(ui_px(7.))
+                .bg(if selected {
+                    theme().accent_soft
+                } else {
+                    theme().panel_raised
+                })
+                .text_color(if selected {
+                    theme().accent_text
+                } else {
+                    theme().text_muted
+                })
+                .border_color(if selected {
+                    theme().accent
+                } else {
+                    theme().border
+                })
+        };
+        let mut form = div().flex().flex_col().gap(ui_px(12.));
+        for (index, &(label, hint)) in labels.iter().enumerate() {
+            let editor = fields[index].clone();
+            editor.update(cx, |editor, cx| editor.set_accessibility_label(label, cx));
+            let focus = editor.read(cx).focus_handle();
+            let mut field = div()
+                .id(format!("designer-field-{index}"))
+                .debug_selector(move || format!("designer-field-{index}"))
+                .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(crate::theme::ui_px(8.))
+                .gap(ui_px(5.))
                 .child(
-                    div().flex().flex_wrap().gap(crate::theme::ui_px(6.)).children(
+                    div()
+                        .text_size(ui_px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(label),
+                )
+                .child(
+                    editor::input_with_height(editor, focus, false, ui_px(32.), cx)
+                        .debug_selector(move || format!("designer-input-{index}"))
+                        .flex_none(),
+                )
+                .when(!hint.is_empty(), |view| {
+                    view.child(
+                        div()
+                            .text_size(ui_px(10.))
+                            .text_color(theme().text_muted)
+                            .child(hint),
+                    )
+                });
+            if index == 0 && !structure.columns.is_empty() && matches!(action, 1 | 2 | 5) {
+                field = field.child(div().flex().flex_wrap().gap(ui_px(4.)).children(
+                    structure.columns.iter().map(|column| {
+                        let name = column.name.clone();
+                        let data_type = column.data_type.clone();
+                        let default = column.default_value.clone().unwrap_or_default();
+                        let nullable = column.nullable;
+                        chip(
+                            format!("designer-column-{name}").into(),
+                            name.clone(),
+                            selected_column.trim() == name,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(designer) = this.designer_mut(session_id) {
+                                designer.fields[0]
+                                    .update(cx, |editor, cx| editor.set_text(name.clone(), cx));
+                                if action == 5 {
+                                    designer.fields[1].update(cx, |editor, cx| {
+                                        editor.set_text(data_type.clone(), cx)
+                                    });
+                                    designer.fields[2].update(cx, |editor, cx| {
+                                        editor.set_text(default.clone(), cx)
+                                    });
+                                    designer.nullable = nullable;
+                                }
+                            }
+                            cx.notify();
+                        }))
+                    }),
+                ));
+            }
+            if index == 1 && matches!(action, 0 | 5) {
+                field = field.child(
+                    div().flex().flex_wrap().gap(ui_px(4.)).children(
                         [
-                            "Add column",
-                            "Rename column",
-                            "Drop column",
-                            "Add index",
-                            "Drop index",
-                            "Alter column",
-                            "Primary key",
-                            "Foreign key",
-                            "Check",
-                            "Drop constraint",
+                            "integer",
+                            "bigint",
+                            "text",
+                            "varchar(255)",
+                            "boolean",
+                            "numeric(12,2)",
+                            "timestamp",
                         ]
                         .into_iter()
-                        .enumerate()
-                        .map(|(index, label)| {
-                            button(
-                                SharedString::from(format!("designer-action-{index}")),
-                                label,
-                                if index == action {
-                                    ButtonKind::Primary
-                                } else {
-                                    ButtonKind::Quiet
-                                },
+                        .map(|value| {
+                            chip(
+                                format!("designer-type-{value}").into(),
+                                value.into(),
+                                type_value.trim().eq_ignore_ascii_case(value),
                             )
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
-                                    if let Some(session) = this.session_mut(session_id)
-                                        && let Some(tab) =
-                                            session.secondary_tabs.iter_mut().find(|tab| {
-                                                Some(tab.id) == session.active_secondary_tab
-                                            })
-                                        && let SecondaryTabKind::Structure(structure) =
-                                            &mut tab.kind
-                                        && let Some(designer) = &mut structure.designer
-                                    {
-                                        designer.action = index;
-                                    }
-                                    cx.notify();
+                                    this.set_designer_field(session_id, 1, value.into(), cx)
                                 },
                             ))
                         }),
                     ),
-                )
-                .children(labels.into_iter().zip(fields).map(|(label, editor)| {
-                    editor.update(cx, |editor, cx| editor.set_accessibility_label(label, cx));
-                    let focus = editor.read(cx).focus_handle();
-                    div()
-                        .flex()
-                        .gap(crate::theme::ui_px(8.))
-                        .child(div().w(crate::theme::ui_px(200.)).child(label))
-                        .child(editor::input(editor, focus, false, cx))
-                }))
-                .when(action == 0 || action == 3 || action == 5, |view| {
-                    view.child(
-                        button(
-                            "designer-option",
-                            if action == 0 || action == 5 {
-                                if designer.nullable {
-                                    "Nullable: yes"
-                                } else {
-                                    "Nullable: no"
-                                }
-                            } else if designer.unique {
-                                "Unique: yes"
-                            } else {
-                                "Unique: no"
-                            },
-                            ButtonKind::Quiet,
+                );
+            }
+            if index == 1 && matches!(action, 3 | 6 | 7) && !structure.columns.is_empty() {
+                field = field.child(div().flex().flex_wrap().gap(ui_px(4.)).children(
+                    structure.columns.iter().map(|column| {
+                        let name = column.name.clone();
+                        chip(
+                            format!("designer-local-{name}").into(),
+                            name.clone(),
+                            local_columns.contains(&name),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(session) = this.session_mut(session_id)
-                                && let Some(tab) = session
-                                    .secondary_tabs
-                                    .iter_mut()
-                                    .find(|tab| Some(tab.id) == session.active_secondary_tab)
-                                && let SecondaryTabKind::Structure(structure) = &mut tab.kind
-                                && let Some(designer) = &mut structure.designer
-                            {
-                                if action == 0 || action == 5 {
-                                    designer.nullable = !designer.nullable;
-                                } else {
-                                    designer.unique = !designer.unique;
-                                }
-                            }
-                            cx.notify();
-                        })),
-                    )
-                })
-                .when(
-                    !structure.columns.is_empty() && matches!(action, 1 | 2 | 5),
-                    |view| {
-                        view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
-                            structure.columns.iter().map(|column| {
+                            this.append_designer_column(session_id, 1, name.clone(), cx)
+                        }))
+                    }),
+                ));
+            }
+            if action == 7 && index == 2 {
+                field = field.child(
+                    div()
+                        .max_h(ui_px(96.))
+                        .id("designer-reference-tables")
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_wrap()
+                        .gap(ui_px(4.))
+                        .children(
+                            session
+                                .tables
+                                .iter()
+                                .filter(|table| table.kind == EntityKind::Table)
+                                .map(|table| {
+                                    let table = table.clone();
+                                    let label = match &table.schema {
+                                        Some(schema) => format!("{schema}.{}", table.name),
+                                        None => table.name.clone(),
+                                    };
+                                    chip(
+                                        format!("designer-ref-{:?}-{}", table.schema, table.name)
+                                            .into(),
+                                        label,
+                                        reference_table.name == table.name
+                                            && reference_table.schema == table.schema,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.set_designer_field(
+                                                session_id,
+                                                2,
+                                                table.name.clone(),
+                                                cx,
+                                            );
+                                            this.set_designer_field(
+                                                session_id,
+                                                4,
+                                                table.schema.clone().unwrap_or_default(),
+                                                cx,
+                                            );
+                                            this.set_designer_field(
+                                                session_id,
+                                                3,
+                                                String::new(),
+                                                cx,
+                                            );
+                                        },
+                                    ))
+                                }),
+                        ),
+                );
+            }
+            if action == 7 && index == 3 {
+                field = field.child(
+                    div().flex().flex_wrap().gap(ui_px(4.)).children(
+                        session
+                            .completion_columns
+                            .get(&completion_table_key(&reference_table))
+                            .into_iter()
+                            .flatten()
+                            .map(|column| {
                                 let name = column.name.clone();
-                                let data_type = column.data_type.clone();
-                                let default = column.default_value.clone().unwrap_or_default();
-                                let nullable = column.nullable;
-                                button(
-                                    SharedString::from(format!("designer-column-{name}")),
+                                chip(
+                                    format!("designer-ref-column-{name}").into(),
                                     name.clone(),
-                                    ButtonKind::Quiet,
+                                    referenced_columns.contains(&name),
                                 )
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        if let Some(session) = this.session_mut(session_id)
-                                            && let Some(tab) =
-                                                session.secondary_tabs.iter_mut().find(|tab| {
-                                                    Some(tab.id) == session.active_secondary_tab
-                                                })
-                                            && let SecondaryTabKind::Structure(structure) =
-                                                &mut tab.kind
-                                            && let Some(designer) = &mut structure.designer
-                                        {
-                                            designer.fields[0].update(cx, |editor, cx| {
-                                                editor.set_text(name.clone(), cx)
-                                            });
-                                            if action == 5 {
-                                                designer.fields[1].update(cx, |editor, cx| {
-                                                    editor.set_text(data_type.clone(), cx)
-                                                });
-                                                designer.fields[2].update(cx, |editor, cx| {
-                                                    editor.set_text(default.clone(), cx)
-                                                });
-                                                designer.nullable = nullable;
-                                            }
-                                        }
-                                        cx.notify();
+                                        this.append_designer_column(session_id, 3, name.clone(), cx)
                                     },
                                 ))
                             }),
-                        ))
-                    },
-                )
-                .when(matches!(action, 0 | 5), |view| view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
-                    ["integer", "bigint", "text", "varchar(255)", "boolean", "numeric(12,2)", "timestamp"].into_iter().map(|value| {
-                        button(SharedString::from(format!("designer-type-{value}")), value, ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.set_designer_field(session_id, 1, value.into(), cx)))
-                    })
-                )))
-                .when(matches!(action, 3 | 6 | 7), |view| view.child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
-                    structure.columns.iter().map(|column| {
-                        let name = column.name.clone();
-                        button(SharedString::from(format!("designer-local-{name}")), name.clone(), ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.append_designer_column(session_id, 1, name.clone(), cx)))
-                    })
-                )))
-                .when(action == 7, |view| view.child(div().max_h(crate::theme::ui_px(120.)).id("designer-reference-tables").overflow_y_scroll().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
-                    session.tables.iter().filter(|table| table.kind == EntityKind::Table).map(|table| {
-                        let table = table.clone();
-                        button(SharedString::from(format!("designer-ref-{:?}-{}", table.schema, table.name)), match &table.schema { Some(schema) => format!("{schema}.{}", table.name), None => table.name.clone() }, ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_designer_field(session_id, 2, table.name.clone(), cx);
-                            this.set_designer_field(session_id, 4, table.schema.clone().unwrap_or_default(), cx);
-                            this.set_designer_field(session_id, 3, String::new(), cx);
-                        }))
-                    })
-                )).child(div().flex().flex_wrap().gap(crate::theme::ui_px(4.)).children(
-                    session.completion_columns.get(&completion_table_key(&TableRef { name: designer.fields[2].read(cx).text(cx).trim().into(), schema: { let schema = designer.fields[4].read(cx).text(cx); (!schema.trim().is_empty()).then(|| schema.trim().into()) } })).into_iter().flatten().map(|column| {
-                        let name = column.name.clone();
-                        button(SharedString::from(format!("designer-ref-column-{name}")), name.clone(), ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.append_designer_column(session_id, 3, name.clone(), cx)))
-                    })
-                )))
-                .when(!designer.drafts.is_empty(), |view| view.child(button("designer-clear-plan", "Clear queued plan", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(designer) = this.designer_mut(session_id) { designer.drafts.clear(); }
-                    cx.notify();
-                }))))
-                .when(session.kind == DatabaseKind::MySQL && action == 5, |view| view.child(div().text_sm().text_color(theme().warning_text).child("MODIFY replaces the complete column definition. Existing AUTO_INCREMENT, COLLATE, COMMENT and ON UPDATE attributes are preserved from metadata. Generated columns require manual SQL.")))
-                .child(
-                    button(
-                        "designer-queue",
-                        format!("Add to plan ({} queued)", designer.drafts.len()),
-                        ButtonKind::Quiet,
-                    )
-                    .disabled(designer.pending)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.build_designer_draft(session_id, true, window, cx)
-                    })),
-                )
-                .child(
-                    button("designer-draft", "Review SQL plan", ButtonKind::Primary).on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.draft_designer_for(session_id, window, cx)
-                        }),
                     ),
+                );
+            }
+            form = form.child(field);
+        }
+        form = form
+            .when(matches!(action, 0 | 3 | 5), |view| view.child(
+                Checkbox::new("designer-option")
+                    .label(if action == 3 { "Unique index" } else { "Allow NULL values" })
+                    .checked(if action == 3 { designer.unique } else { designer.nullable })
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(designer) = this.designer_mut(session_id) {
+                            if action == 3 { designer.unique = !designer.unique; }
+                            else { designer.nullable = !designer.nullable; }
+                        }
+                        cx.notify();
+                    }))
+            ))
+            .when(session.kind == DatabaseKind::MySQL && action == 5, |view| view.child(
+                div().text_size(ui_px(11.)).text_color(theme().warning_text)
+                    .child("MODIFY replaces the complete column definition. Existing AUTO_INCREMENT, COLLATE, COMMENT and ON UPDATE attributes are preserved from metadata. Generated columns require manual SQL.")
+            ));
+        Some(
+            div()
+                .id("table-designer")
+                .debug_selector(|| "table-designer".into())
+                .w_full()
+                .max_w(ui_px(860.))
+                .flex_none()
+                .mt(ui_px(12.))
+                .border_1()
+                .border_color(theme().border_strong)
+                .rounded(ui_px(6.))
+                .bg(theme().panel)
+                .overflow_hidden()
+                .flex()
+                .child(
+                    div()
+                        .w(ui_px(148.))
+                        .flex_none()
+                        .p(ui_px(8.))
+                        .border_r_1()
+                        .border_color(theme().border)
+                        .bg(theme().panel_raised)
+                        .flex()
+                        .flex_col()
+                        .gap(ui_px(12.))
+                        .children(
+                            [
+                                ("Columns", vec![0, 1, 5, 2]),
+                                ("Indexes", vec![3, 4]),
+                                ("Constraints", vec![6, 7, 8, 9]),
+                            ]
+                            .into_iter()
+                            .map(|(label, indices)| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(ui_px(2.))
+                                    .child(
+                                        div()
+                                            .px(ui_px(8.))
+                                            .py(ui_px(4.))
+                                            .text_size(ui_px(10.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme().text_muted)
+                                            .child(label),
+                                    )
+                                    .children(indices.into_iter().map(|index| {
+                                        designer_action_button(
+                                            format!("designer-action-{index}").into(),
+                                            actions[index],
+                                            index == action,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if let Some(designer) =
+                                                    this.designer_mut(session_id)
+                                                {
+                                                    designer.action = index;
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                    }))
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .p(ui_px(16.))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(ui_px(16.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(ui_px(4.))
+                                        .child(
+                                            div()
+                                                .text_size(ui_px(13.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(actions[action]),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(ui_px(11.))
+                                                .text_color(theme().text_muted)
+                                                .child(description),
+                                        ),
+                                )
+                                .child(form),
+                        )
+                        .child(
+                            div()
+                                .id("designer-footer")
+                                .border_t_1()
+                                .border_color(theme().border)
+                                .px(ui_px(16.))
+                                .py(ui_px(12.))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .justify_between()
+                                .gap(ui_px(8.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(ui_px(8.))
+                                        .child(
+                                            div()
+                                                .text_size(ui_px(11.))
+                                                .text_color(theme().text_muted)
+                                                .child(format!("{} queued", designer.drafts.len())),
+                                        )
+                                        .when(!designer.drafts.is_empty(), |view| {
+                                            view.child(
+                                                designer_button(
+                                                    "designer-clear-plan",
+                                                    "Clear",
+                                                    ButtonKind::Quiet,
+                                                )
+                                                .h(ui_px(24.))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    if let Some(designer) =
+                                                        this.designer_mut(session_id)
+                                                    {
+                                                        designer.drafts.clear();
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(ui_px(6.))
+                                        .child(
+                                            designer_button(
+                                                "designer-queue",
+                                                "Add to plan",
+                                                ButtonKind::Quiet,
+                                            )
+                                            .disabled(designer.pending)
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.build_designer_draft(
+                                                        session_id, true, window, cx,
+                                                    )
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            designer_button(
+                                                "designer-draft",
+                                                "Review SQL plan",
+                                                ButtonKind::Primary,
+                                            )
+                                            .disabled(designer.pending)
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.draft_designer_for(session_id, window, cx)
+                                                }),
+                                            ),
+                                        ),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -544,7 +864,7 @@ impl DbxApp {
 mod tests {
     use super::*;
     #[gpui::test]
-    fn designer_opens_a_reviewable_draft_without_altering_the_table(cx: &mut gpui::TestAppContext) {
+    fn designer_layout_preserves_reviewable_drafts(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let session_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
@@ -577,7 +897,16 @@ mod tests {
                 kind: SecondaryTabKind::Structure(Box::new(StructureTab {
                     designer: None,
                     table: TableRef::new("items"),
-                    columns: Vec::new(),
+                    columns: app
+                        .runtime
+                        .block_on(
+                            session
+                                .engine
+                                .as_ref()
+                                .unwrap()
+                                .describe_table(&TableRef::new("items")),
+                        )
+                        .unwrap(),
                     foreign_keys: Vec::new(),
                     indexes: Vec::new(),
                     checks: Vec::new(),
@@ -590,11 +919,60 @@ mod tests {
             session.pane = Pane::Structure;
             app.sessions.push(session);
             app.active_session_id = Some(session_id);
+            app.connection_picker_open = false;
+            app.startup_recovery_started = true;
             app
         });
         cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_designer_for(session_id, window, cx))
+        });
+        // Exercise the actual native layout at compact and wide window sizes.
+        for width in [720., 1440.] {
+            cx.simulate_resize(gpui::size(px(width), px(1000.)));
+            for action in 0..10 {
+                cx.update(|_, cx| {
+                    app.update(cx, |app, _| {
+                        app.designer_mut(session_id).unwrap().action = action
+                    })
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                let panel = cx
+                    .debug_bounds("table-designer")
+                    .expect("designer is visible");
+                for id in [
+                    "designer-field-0",
+                    "designer-input-0",
+                    "designer-queue",
+                    "designer-draft",
+                    "designer-action-9",
+                ] {
+                    let bounds = cx.debug_bounds(id).expect("designer control is visible");
+                    assert!(
+                        bounds.origin.x >= panel.origin.x && bounds.right() <= panel.right(),
+                        "{id} spills outside the designer at width {width}: {bounds:?}"
+                    );
+                    assert!(bounds.size.height > px(0.), "{id} is collapsed");
+                }
+                assert!(
+                    panel.right() <= px(width),
+                    "designer exceeds the window width"
+                );
+                let input = cx.debug_bounds("designer-input-0").unwrap();
+                assert_eq!(
+                    input.size.height,
+                    ui_px(32.),
+                    "input retains its usable height"
+                );
+                let queue = cx.debug_bounds("designer-queue").unwrap();
+                assert!(
+                    queue.size.width < px(180.),
+                    "plan action should remain compact"
+                );
+            }
+        }
+        cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_designer_for(session_id, window, cx);
+                app.designer_mut(session_id).unwrap().action = 0;
                 let tab = &app.session(session_id).unwrap().secondary_tabs[0];
                 let SecondaryTabKind::Structure(structure) = &tab.kind else {
                     panic!()
@@ -602,6 +980,14 @@ mod tests {
                 let designer = structure.designer.as_ref().unwrap();
                 designer.fields[0].update(cx, |editor, cx| editor.set_text("display name", cx));
                 designer.fields[1].update(cx, |editor, cx| editor.set_text("TEXT", cx));
+                app.build_designer_draft(session_id, true, window, cx);
+                app.toggle_designer_for(session_id, window, cx);
+                assert!(app.render_designer_for(session_id, cx).is_none());
+                app.toggle_designer_for(session_id, window, cx);
+                let designer = app.designer_mut(session_id).unwrap();
+                assert_eq!(designer.drafts.len(), 1);
+                assert_eq!(designer.fields[0].read(cx).text(cx), "display name");
+                assert!(designer.visible);
                 app.draft_designer_for(session_id, window, cx);
                 let query = app.active_query_tab(session_id).unwrap();
                 assert!(

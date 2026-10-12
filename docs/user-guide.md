@@ -132,8 +132,12 @@ large work separately before exiting.
 
 ## Change structure
 
-Open Structure and the designer. Select existing columns to populate properties,
-queue alterations and **Review SQL plan** in a new query tab. PostgreSQL/MySQL
+In Structure, click **Design table…** beside the table name. Choose an action
+under Columns, Indexes or Constraints. Column and type shortcuts sit beneath
+their fields; **Allow NULL values** and **Unique index** use checkboxes.
+Select existing columns to populate properties, queue alterations with
+**Add to plan**, then **Review SQL plan** in a new query tab. **Close designer**
+hides the form while retaining its fields and queued changes. PostgreSQL/MySQL
 support complete type/default/nullability definitions and PK/FK/CHECK drafts.
 MySQL drafts preserve metadata-backed auto-increment, collation, comments and
 ON UPDATE attributes; generated or unknown attributes require manual SQL. DDL may commit independently

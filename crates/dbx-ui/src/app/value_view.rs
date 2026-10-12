@@ -1,6 +1,7 @@
 //! Readable previews for structured and binary cell values in the inspector.
 
 use super::*;
+use gpui_component::InteractiveElementExt as _;
 
 /// Large values are summarized; the inspector is not a hex editor.
 const HEX_PREVIEW_BYTES: usize = 512;

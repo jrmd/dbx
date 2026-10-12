@@ -253,6 +253,18 @@ The button family is compact, capsule-shaped, and action-ranked.
 - **Keyboard model:** Cmd/Ctrl+Enter runs the current scope, Cmd/Ctrl+Shift+Enter runs the document, Escape cancels an active request, and ordinary editor undo/redo remains available. Shortcut labels use platform-neutral copy unless the platform is known.
 - **Dialect truthfulness:** SQL connections use SQL syntax, completion, formatting, and statement scope. Redis presents a command editor, disables SQL-only affordances, and executes the selected text or current command line.
 
+### Table Designer
+
+The Structure title and compact **Design table…** / **Close designer** control
+share one toolbar row. The designer aligns with the left edge of the metadata
+pane and is capped at 860px. A 148px navigation column groups Columns, Indexes
+and Constraints; selected actions use the blue selection well. The form uses
+11px labels above 32px inputs, with help and 24px type/column shortcuts directly
+under the relevant field. Nullability and uniqueness use labelled checkboxes.
+The footer keeps the queued count and Clear action together, with Add to plan
+and Review SQL plan side by side; actions wrap in compact panes. Hiding the
+form retains its state. All changes continue through the SQL review workflow.
+
 ### Database Diagram
 
 - **Scope:** the database diagram is a connection-scoped, independently closable document tab for relational engines. It loads the current database schema without adding an app-rail destination.
