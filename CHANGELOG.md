@@ -1,3 +1,10 @@
+## 0.9.0 - 2026-10-12
+
+- Highlight JSON values in table cells and inspectors with the editor's syntax colors.
+- Keep vertical scrolling in the row inspector working over wide JSON and hex previews.
+- Make the table designer easier to use with grouped Columns, Indexes and Constraints actions, type and column shortcuts, and labelled checkboxes.
+- Keep designer fields and queued changes when closing the form, and bring Add to plan and Review SQL plan together in its footer.
+
 ## 0.8.1 - 2026-10-12
 
 - Preview UTF-8 JSON objects and arrays returned as bytes as formatted JSON in row and query inspectors, and copy the full JSON text.
