@@ -3857,7 +3857,7 @@ fn redis_token_color(kind: RedisTokenKind) -> gpui::Hsla {
     }
 }
 
-fn json_token_color(kind: JsonTokenKind) -> gpui::Hsla {
+pub(crate) fn json_token_color(kind: JsonTokenKind) -> gpui::Hsla {
     match kind {
         JsonTokenKind::Property => theme().sql_identifier.into(),
         JsonTokenKind::String => theme().sql_string.into(),

@@ -898,6 +898,7 @@ impl DbxApp {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .lock_scroll_axis()
                     .px(crate::theme::ui_px(10.))
                     .pb(crate::theme::ui_px(10.))
                     .flex()

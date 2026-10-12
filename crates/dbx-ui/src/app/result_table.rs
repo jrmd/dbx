@@ -17,7 +17,7 @@ use gpui::{
     prelude::*, px,
 };
 use gpui_component::{
-    Sizable as _,
+    ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     table::{Column as DataColumn, ColumnSort, TableDelegate, TableState},
 };
@@ -154,6 +154,14 @@ fn cell_display_text(value: &CellValue) -> String {
     match text.char_indices().nth(CELL_TEXT_LIMIT) {
         Some((end, _)) => format!("{}…", &text[..end]),
         None => text.to_owned(),
+    }
+}
+
+fn rendered_cell_text(text: SharedString, json: bool) -> gpui::StyledText {
+    if json {
+        super::value_view::json_text(text)
+    } else {
+        gpui::StyledText::new(text)
     }
 }
 
@@ -614,6 +622,30 @@ impl ResultTableDelegate {
             .get(row_ix)?
             .values
             .get(data_column_ix)
+    }
+
+    fn is_json_cell(&self, row_ix: usize, col_ix: usize) -> bool {
+        let Some(column) = self.result_column(col_ix) else {
+            return false;
+        };
+        if self
+            .result
+            .as_ref()
+            .and_then(|result| result.columns.get(column))
+            .is_some_and(|column| field_value_kind(column) == FieldValueKind::Json)
+        {
+            return true;
+        }
+        let staged = self
+            .insert_row(row_ix)
+            .and_then(|row| row.get(column))
+            .and_then(Option::as_ref)
+            .or_else(|| self.changes.edits.get(&(row_ix, column)));
+        match staged {
+            Some(MutationValue::Parameter(value)) => matches!(value, CellValue::Json(_)),
+            Some(MutationValue::Expression(_)) => false,
+            None => matches!(self.cell_value(row_ix, column), Some(CellValue::Json(_))),
+        }
     }
 
     /// Return a complete underlying row, preserving `NULL` values and duplicate column names.
@@ -1681,7 +1713,10 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let semantic_cell = self.accessible_cell(row_ix, col_ix, cx);
+        let json = self.is_json_cell(row_ix, col_ix);
+        let semantic_cell = self.accessible_cell(row_ix, col_ix, cx).when(json, |cell| {
+            cell.font_family(cx.theme().mono_font_family.clone())
+        });
         if let Some((_, _, editor)) = self.editing.as_ref().filter(|(row, column, _)| {
             *row == row_ix && Some(*column) == self.result_column(col_ix)
         }) {
@@ -1741,12 +1776,10 @@ impl TableDelegate for ResultTableDelegate {
                     theme().text
                 })
                 .when(muted && col_ix > 0, |cell| cell.italic())
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .child(text.unwrap_or_else(|| "DEFAULT".into())),
-                )
+                .child(div().min_w_0().truncate().child(rendered_cell_text(
+                    text.unwrap_or_else(|| "DEFAULT".into()).into(),
+                    json && !muted,
+                )))
                 .on_mouse_down(MouseButton::Right, remember_column)
                 .into_any_element();
         }
@@ -1769,7 +1802,10 @@ impl TableDelegate for ResultTableDelegate {
                     theme().text
                 })
                 .when(muted, |cell| cell.italic())
-                .child(div().min_w_0().truncate().child(staged_text(&value)))
+                .child(div().min_w_0().truncate().child(rendered_cell_text(
+                    staged_text(&value).into(),
+                    json && !muted,
+                )))
                 .on_mouse_down(MouseButton::Right, remember_column)
                 .into_any_element();
         }
@@ -1846,7 +1882,12 @@ impl TableDelegate for ResultTableDelegate {
                         .min_w_0()
                         .flex()
                         .when(numeric, |value| value.justify_end())
-                        .child(div().min_w_0().truncate().child(text)),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(rendered_cell_text(text, json && !null && !deleted)),
+                        ),
                 )
                 .child(
                     Button::new(SharedString::from(format!(
@@ -1884,7 +1925,7 @@ impl TableDelegate for ResultTableDelegate {
                     .min_w_0()
                     .truncate()
                     .when(numeric, |value| value.text_right())
-                    .child(text),
+                    .child(rendered_cell_text(text, json && !null && !deleted)),
             );
         }
         cell.into_any_element()
@@ -1938,6 +1979,55 @@ pub(super) fn foreign_key_target_table(
 mod tests {
     use super::*;
     use dbx_core::RowData;
+
+    #[test]
+    fn json_cells_follow_column_types_and_loaded_or_staged_json_values() {
+        let mut delegate = ResultTableDelegate::default();
+        delegate.set_result(
+            Some(Arc::new(QueryResult {
+                columns: vec![
+                    ColumnInfo::result("document", 0, "JSON"),
+                    ColumnInfo::result("binary_document", 1, "jsonb"),
+                    ColumnInfo::result("inferred", 2, "TEXT"),
+                    ColumnInfo::result("plain", 3, "TEXT"),
+                ],
+                rows: vec![RowData::new(vec![
+                    CellValue::Text("{\"a\":1}".into()),
+                    CellValue::Null,
+                    CellValue::Json(serde_json::json!(true)),
+                    CellValue::Text("ordinary text".into()),
+                ])],
+                ..QueryResult::empty(None, 0)
+            })),
+            &HashMap::new(),
+            None,
+            &[],
+            &[],
+        );
+        assert!(!delegate.is_json_cell(0, 0)); // Row number.
+        assert!(delegate.is_json_cell(0, 1));
+        assert!(delegate.is_json_cell(0, 2));
+        assert!(delegate.is_json_cell(0, 3));
+        assert!(!delegate.is_json_cell(0, 4));
+
+        delegate.changes.edits.insert(
+            (0, 3),
+            MutationValue::Parameter(CellValue::Json(serde_json::json!({"new": 1}))),
+        );
+        assert!(delegate.is_json_cell(0, 4));
+        delegate.changes.inserts.push(vec![
+            None,
+            None,
+            Some(MutationValue::Parameter(CellValue::Json(
+                serde_json::json!([]),
+            ))),
+            None,
+        ]);
+        assert!(delegate.is_json_cell(1, 1));
+        assert!(delegate.is_json_cell(1, 2));
+        assert!(delegate.is_json_cell(1, 3));
+        assert!(!delegate.is_json_cell(1, 4));
+    }
 
     #[test]
     fn local_sort_keys_order_nulls_numbers_and_text() {
