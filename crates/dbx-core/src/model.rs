@@ -486,6 +486,10 @@ impl ReferentialAction {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IndexInfo {
     pub name: String,
+    /// Constraint owning this index. Such indexes must be dropped through the
+    /// constraint, not DROP INDEX (notably PostgreSQL primary/unique keys).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraint_name: Option<String>,
     /// Indexed columns or expressions, in key order. Descending parts end in
     /// ` DESC`.
     pub columns: Vec<String>,
@@ -528,6 +532,7 @@ pub struct TableStructure {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchemaObjectKind {
+    Enum,
     Trigger,
     Sequence,
     Function,

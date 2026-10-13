@@ -646,6 +646,7 @@ pub(super) fn query_history_connection(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum StructureSection {
+    EnumValues,
     ForeignKeys,
     Indexes,
     Checks,
@@ -655,6 +656,7 @@ pub(super) enum StructureSection {
 impl StructureSection {
     pub(super) fn label(self) -> &'static str {
         match self {
+            Self::EnumValues => "Enum values",
             Self::ForeignKeys => "Foreign keys",
             Self::Indexes => "Indexes",
             Self::Checks => "Check constraints",
@@ -664,6 +666,7 @@ impl StructureSection {
 
     pub(super) fn selector(self) -> &'static str {
         match self {
+            Self::EnumValues => "structure-enum-values",
             Self::ForeignKeys => "structure-foreign-keys",
             Self::Indexes => "structure-indexes",
             Self::Checks => "structure-checks",

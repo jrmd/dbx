@@ -97,6 +97,12 @@ acceptance. Installation keeps the current session open. **Restart DBX** closes
 open sessions; finish your work before clicking it. You can also use **Check for
 Updates…** in the native Mac app menu. Set `DBX_DISABLE_UPDATES=1` to disable
 background checks (useful for development, QA, and package-managed installs).
+Update checks first use an installed GitHub CLI (`gh`) and its existing authentication
+so they can use GitHub's authenticated API allowance. If `gh` is missing, fails,
+or times out, DBX falls back to the public GitHub API. On macOS it also checks
+standard Homebrew locations when the desktop launcher's PATH omits them. Archive
+downloads and checksum/signature validation follow the same verification process.
+
 Failures appear in Settings with a notification even if the dialog is closed.
 The app distinguishes checksum download, archive download, verification, and
 installation so a failed attempt can be diagnosed without guessing its stage.

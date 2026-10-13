@@ -466,10 +466,17 @@ impl<'a> ExportReader<'a> {
             if !has_primary_key && kind.dialect() == DatabaseKind::PostgreSQL {
                 for column in columns {
                     let identifier = quote_identifier(kind, &column.name)?;
-                    statement.sql = statement.sql.replace(
-                        &format!("{identifier} ASC"),
-                        &format!("CAST({identifier} AS text) ASC"),
-                    );
+                    let qualified = format!("{}.{identifier}", quote_table(kind, table)?);
+                    statement.sql = statement
+                        .sql
+                        .replace(
+                            &format!("{qualified} ASC"),
+                            &format!("CAST({qualified} AS text) ASC"),
+                        )
+                        .replace(
+                            &format!("{identifier} ASC"),
+                            &format!("CAST({identifier} AS text) ASC"),
+                        );
                 }
             }
             snapshot.query(&statement).await
@@ -744,7 +751,8 @@ pub async fn export_database(
         for object in schema_objects.iter().filter(|object| {
             matches!(
                 object.kind,
-                crate::SchemaObjectKind::Sequence
+                crate::SchemaObjectKind::Enum
+                    | crate::SchemaObjectKind::Sequence
                     | crate::SchemaObjectKind::Function
                     | crate::SchemaObjectKind::Procedure
             )
@@ -2825,6 +2833,7 @@ mod tests {
             }],
             indexes: vec![
                 crate::IndexInfo {
+                    constraint_name: None,
                     name: "items_pkey".into(),
                     columns: vec!["id".into()],
                     unique: true,
@@ -2836,6 +2845,7 @@ mod tests {
                     ),
                 },
                 crate::IndexInfo {
+                    constraint_name: None,
                     name: "items_code".into(),
                     columns: vec!["code".into()],
                     unique: true,
@@ -2873,6 +2883,7 @@ mod tests {
         let mysql = TableStructure {
             indexes: vec![
                 crate::IndexInfo {
+                    constraint_name: None,
                     name: "by_name".into(),
                     columns: vec!["name(10)".into(), "created DESC".into()],
                     unique: false,
@@ -2882,6 +2893,7 @@ mod tests {
                     definition: None,
                 },
                 crate::IndexInfo {
+                    constraint_name: None,
                     name: "by_expression".into(),
                     columns: vec!["(expression)".into()],
                     unique: false,

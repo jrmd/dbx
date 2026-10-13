@@ -5,7 +5,7 @@ use sqlx::{
     Column, Connection, MySql, MySqlPool, Postgres, Row, Sqlite, SqlitePool, TypeInfo, ValueRef,
     mysql::{MySqlArguments, MySqlConnectOptions, MySqlRow},
     postgres::{
-        PgArguments, PgConnectOptions, PgPool, PgRow,
+        PgArguments, PgConnectOptions, PgPool, PgRow, PgTypeInfo, PgTypeKind, PgValueRef,
         types::{PgInterval, PgMoney},
     },
     sqlite::{SqliteArguments, SqliteRow},
@@ -738,7 +738,7 @@ impl SqlxEngine {
                     // accepts it (length, precision, arrays, and qualified
                     // user-defined types), so mutations can cast text
                     // parameters to it.
-                    "SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    "SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((WITH RECURSIVE enum_type(oid, typbasetype) AS (SELECT oid, typbasetype FROM pg_type WHERE oid = a.atttypid UNION ALL SELECT t.oid, t.typbasetype FROM pg_type t JOIN enum_type b ON t.oid = b.typbasetype) SELECT json_agg(e.enumlabel ORDER BY e.enumsortorder)::text FROM pg_enum e WHERE e.enumtypid IN (SELECT oid FROM enum_type)), '[]') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
                     &[CellValue::Text(schema), CellValue::Text(table.name.clone())],
                 )
                 .await?
@@ -914,7 +914,7 @@ impl SqlxEngine {
                 let (filter, params) = self.table_filter(table, "n.nspname", "c.relname");
                 (
                     format!(
-                        "SELECT n.nspname, c.relname, i.relname, ix.indisunique, ix.indisprimary, am.amname, pg_get_expr(ix.indpred, ix.indrelid), pg_get_indexdef(ix.indexrelid), array_to_string(ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k, true) FROM generate_series(1, ix.indnkeyatts::INT) AS k ORDER BY k), chr(31)) FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class c ON c.oid = ix.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'{filter} ORDER BY n.nspname, c.relname, ix.indisprimary DESC, i.relname"
+                        "SELECT n.nspname, c.relname, i.relname, ix.indisunique, ix.indisprimary, am.amname, pg_get_expr(ix.indpred, ix.indrelid), pg_get_indexdef(ix.indexrelid), array_to_string(ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k, true) FROM generate_series(1, ix.indnkeyatts::INT) AS k ORDER BY k), chr(31)), con.conname FROM pg_index ix JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_class c ON c.oid = ix.indrelid JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_am am ON am.oid = i.relam LEFT JOIN pg_constraint con ON con.conindid = ix.indexrelid AND con.contype IN ('p', 'u', 'x') WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)'{filter} ORDER BY n.nspname, c.relname, ix.indisprimary DESC, i.relname"
                     ),
                     params,
                 )
@@ -953,6 +953,7 @@ impl SqlxEngine {
             let indexes = tables.entry(key.clone()).or_default();
             match self.kind.dialect() {
                 DatabaseKind::PostgreSQL => indexes.push(IndexInfo {
+                    constraint_name: optional_text_value(row, 9)?,
                     name,
                     unique: boolish_value(row, 3)?,
                     primary: boolish_value(row, 4)?,
@@ -1004,6 +1005,7 @@ impl SqlxEngine {
                     }
                     let index = if self.kind.dialect() == DatabaseKind::MySQL {
                         IndexInfo {
+                            constraint_name: None,
                             primary: name == "PRIMARY",
                             unique: !boolish_value(row, 3)?,
                             method: optional_text_value(row, 4)?,
@@ -1015,6 +1017,7 @@ impl SqlxEngine {
                     } else {
                         let origin = text_value(row, 4)?;
                         IndexInfo {
+                            constraint_name: None,
                             primary: origin == "pk",
                             unique: boolish_value(row, 3)?,
                             method: None,
@@ -1184,7 +1187,7 @@ impl SqlxEngine {
                 "SELECT NULL, m.name, p.cid, p.name, p.type, p.\"notnull\", p.dflt_value, p.pk FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, p.cid"
             }
             DatabaseKind::PostgreSQL => {
-                "SELECT n.nspname, c.relname, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((SELECT string_agg(e.enumlabel, chr(31) ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid = a.atttypid), '') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY n.nspname, c.relname, a.attnum"
+                "SELECT n.nspname, c.relname, a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, a.attnum AS ordinal_position, EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)) AS is_primary_key, COALESCE((WITH RECURSIVE enum_type(oid, typbasetype) AS (SELECT oid, typbasetype FROM pg_type WHERE oid = a.atttypid UNION ALL SELECT t.oid, t.typbasetype FROM pg_type t JOIN enum_type b ON t.oid = b.typbasetype) SELECT json_agg(e.enumlabel ORDER BY e.enumsortorder)::text FROM pg_enum e WHERE e.enumtypid IN (SELECT oid FROM enum_type)), '[]') AS enum_values, CASE WHEN a.attgenerated = '' THEN pg_get_expr(d.adbin, d.adrelid) END AS column_default FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname !~ '^pg_(toast|temp)' AND a.attnum > 0 AND NOT a.attisdropped ORDER BY n.nspname, c.relname, a.attnum"
             }
             DatabaseKind::MySQL => &format!(
                 "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) AS column_name, CAST(COLUMN_TYPE AS CHAR) AS data_type, CAST(IS_NULLABLE AS CHAR) AS is_nullable, ORDINAL_POSITION, CASE WHEN COLUMN_KEY = 'PRI' THEN TRUE ELSE FALSE END AS is_primary_key, CAST(COLUMN_TYPE AS CHAR) AS enum_values, {} FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION",
@@ -1938,8 +1941,64 @@ pub(crate) fn decode_sqlite_row(row: &SqliteRow) -> Result<Vec<CellValue>> {
         .collect()
 }
 
+/// PostgreSQL enum labels are text on the wire, including in binary results,
+/// but SQLx's String type accepts only its built-in string types. Restrict this
+/// adapter to resolved enum types so arbitrary binary data isn't read as text.
+struct PgEnumLabel(String);
+
+fn is_postgres_enum(info: &PgTypeInfo) -> bool {
+    if info.oid().is_none() || info.name() == "?" {
+        return false;
+    }
+    match info.kind() {
+        PgTypeKind::Enum(_) => true,
+        PgTypeKind::Domain(base) => is_postgres_enum(base),
+        _ => false,
+    }
+}
+
+impl sqlx::Type<Postgres> for PgEnumLabel {
+    fn type_info() -> PgTypeInfo {
+        <String as sqlx::Type<Postgres>>::type_info()
+    }
+
+    fn compatible(info: &PgTypeInfo) -> bool {
+        is_postgres_enum(info)
+    }
+}
+
+impl sqlx::postgres::PgHasArrayType for PgEnumLabel {
+    fn array_type_info() -> PgTypeInfo {
+        <String as sqlx::postgres::PgHasArrayType>::array_type_info()
+    }
+
+    fn array_compatible(info: &PgTypeInfo) -> bool {
+        if info.oid().is_none() || info.name() == "?" {
+            return false;
+        }
+        matches!(info.kind(), PgTypeKind::Array(element) if is_postgres_enum(element))
+    }
+}
+
+impl<'r> sqlx::Decode<'r, Postgres> for PgEnumLabel {
+    fn decode(value: PgValueRef<'r>) -> std::result::Result<Self, sqlx::error::BoxDynError> {
+        <String as sqlx::Decode<Postgres>>::decode(value).map(Self)
+    }
+}
+
+impl std::fmt::Display for PgEnumLabel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 fn decode_postgres_cell(row: &PgRow, index: usize, type_name: &str) -> Result<CellValue> {
     let type_name = normalized_type_name(type_name);
+    if let Ok(value) = row.try_get::<Option<PgEnumLabel>, _>(index) {
+        return Ok(value
+            .map(|value| CellValue::Text(value.0))
+            .unwrap_or(CellValue::Null));
+    }
     if (type_name == "bool" || type_name == "boolean")
         && let Ok(value) = row.try_get::<Option<bool>, _>(index)
     {
@@ -2170,6 +2229,7 @@ fn decode_postgres_array(row: &PgRow, index: usize) -> Option<CellValue> {
         };
     }
     try_array!(
+        PgEnumLabel => true,
         bool => false,
         i16 => false,
         i32 => false,
@@ -2510,11 +2570,8 @@ fn optional_text_value(row: &RowData, index: usize) -> Result<Option<String>> {
 
 fn enum_values_from_postgres_metadata(row: &RowData, index: usize) -> Result<Vec<String>> {
     let raw = text_value(row, index)?;
-    Ok(raw
-        .split('\u{1f}')
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect())
+    serde_json::from_str(&raw)
+        .map_err(|error| DbxError::Decode(format!("Invalid PostgreSQL enum metadata: {error}")))
 }
 
 /// Parse MySQL's `enum('first','second')` information_schema representation.
@@ -2652,11 +2709,13 @@ mod tests {
     }
 
     #[test]
-    fn postgres_enum_metadata_splits_ordered_labels() {
-        let row = RowData::new(vec![CellValue::Text("happy\u{1f}sad\u{1f}neutral".into())]);
+    fn postgres_enum_metadata_preserves_order_empty_labels_and_separators() {
+        let row = RowData::new(vec![CellValue::Text(
+            r#"["happy","","needs\u001fseparator","it\"s","neutral"]"#.into(),
+        )]);
         assert_eq!(
             enum_values_from_postgres_metadata(&row, 0).unwrap(),
-            vec!["happy", "sad", "neutral"]
+            vec!["happy", "", "needs\u{1f}separator", "it\"s", "neutral"]
         );
     }
 

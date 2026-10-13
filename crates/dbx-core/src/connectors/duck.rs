@@ -183,6 +183,7 @@ impl Engine for DuckEngine {
             .rows
             .iter()
             .map(|row| crate::IndexInfo {
+                constraint_name: None,
                 name: super::text(row, 0),
                 unique: super::text(row, 1) == "true",
                 primary: super::text(row, 2) == "true",

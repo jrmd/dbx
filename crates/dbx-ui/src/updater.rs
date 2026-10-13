@@ -6,13 +6,15 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 const RELEASE_API: &str = "https://api.github.com/repos/jrmd/dbx/releases/latest";
 const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
+const MAX_METADATA: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub enum UpdateState {
@@ -178,7 +180,76 @@ fn release_notes(body: &str) -> Option<String> {
     (!notes.is_empty()).then_some(notes)
 }
 
-pub fn check() -> Result<Option<Update>> {
+/// Desktop launchers on macOS often omit Homebrew from PATH. Try PATH first,
+/// then the standard installations. gh uses its own saved authentication;
+/// DBX never reads or stores the user's GitHub token.
+fn release_from_gh() -> Result<Release> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &["gh", "/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
+    } else {
+        &["gh"]
+    };
+    for candidate in candidates {
+        if let Ok(release) = release_from_gh_command(Path::new(candidate), Duration::from_secs(20))
+        {
+            return Ok(release);
+        }
+    }
+    bail!("GitHub CLI is unavailable or could not read the latest release.")
+}
+
+fn release_from_gh_command(program: &Path, timeout: Duration) -> Result<Release> {
+    // File-backed stdout avoids blocking on a full pipe or allocating arbitrary
+    // output. Bound both the process runtime and the metadata size.
+    let mut output = tempfile::tempfile()?;
+    let mut child = Command::new(program)
+        .args([
+            "api",
+            "--hostname",
+            "github.com",
+            "repos/jrmd/dbx/releases/latest",
+        ])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_PAGER", "cat")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output.try_clone()?))
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    let status = loop {
+        if started.elapsed() >= timeout || output.metadata()?.len() > MAX_METADATA {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("GitHub CLI timed out or returned too much release metadata.");
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    ensure!(
+        status.success(),
+        "GitHub CLI could not read the latest release."
+    );
+    ensure!(
+        output.metadata()?.len() <= MAX_METADATA,
+        "Release metadata is too large."
+    );
+    output.rewind()?;
+    Ok(serde_json::from_reader(output)?)
+}
+
+fn latest_release(
+    gh: impl FnOnce() -> Result<Release>,
+    http: impl FnOnce() -> Result<Option<Release>>,
+) -> Result<Option<Release>> {
+    match gh() {
+        Ok(release) => Ok(Some(release)),
+        Err(_) => http(),
+    }
+}
+
+fn release_from_http() -> Result<Option<Release>> {
     let response = client()?
         .get(RELEASE_API)
         .header("Accept", "application/vnd.github+json")
@@ -192,14 +263,21 @@ pub fn check() -> Result<Option<Update>> {
     let mut json = Vec::new();
     response
         .error_for_status()?
-        .take(2 * 1024 * 1024 + 1)
+        .take(MAX_METADATA + 1)
         .read_to_end(&mut json)?;
     ensure!(
-        json.len() <= 2 * 1024 * 1024,
+        json.len() as u64 <= MAX_METADATA,
         "Release metadata is too large."
     );
+    Ok(Some(serde_json::from_slice(&json)?))
+}
+
+pub fn check() -> Result<Option<Update>> {
+    let Some(release) = latest_release(release_from_gh, release_from_http)? else {
+        return Ok(None);
+    };
     select(
-        serde_json::from_slice(&json)?,
+        release,
         &Version::parse(env!("CARGO_PKG_VERSION"))?,
         platform()?,
     )
@@ -610,6 +688,70 @@ pub fn restart(destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_check_prefers_cli_and_falls_back_for_missing_or_failed_cli() {
+        let selected = latest_release(
+            || Ok(release("99.0.0")),
+            || panic!("HTTP must not run after gh succeeds"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.tag_name, "v99.0.0");
+        for error in [
+            "not installed",
+            "not authenticated",
+            "rate limited",
+            "invalid JSON",
+            "timed out",
+        ] {
+            let selected = latest_release(|| bail!("{error}"), || Ok(Some(release("98.0.0"))))
+                .unwrap()
+                .unwrap();
+            assert_eq!(selected.tag_name, "v98.0.0");
+        }
+        assert!(
+            latest_release(|| bail!("no gh"), || Ok(None))
+                .unwrap()
+                .is_none()
+        );
+        assert!(latest_release(|| bail!("no gh"), || bail!("HTTP unavailable")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_release_metadata_is_bounded_noninteractive_and_parsed() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("gh");
+        let script = r#"#!/bin/sh
+[ "$GH_PROMPT_DISABLED" = 1 ] || exit 1
+[ "$*" = "api --hostname github.com repos/jrmd/dbx/releases/latest" ] || exit 2
+printf '%s' '{"tag_name":"v99.0.0","draft":false,"prerelease":false,"assets":[]}'
+"#;
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            release_from_gh_command(&program, Duration::from_secs(2))
+                .unwrap()
+                .tag_name,
+            "v99.0.0"
+        );
+        fs::write(&program, "#!/bin/sh\nprintf 'invalid json'\n").unwrap();
+        assert!(release_from_gh_command(&program, Duration::from_secs(2)).is_err());
+        fs::write(&program, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(release_from_gh_command(&program, Duration::from_secs(2)).is_err());
+        fs::write(&program, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        let started = Instant::now();
+        assert!(release_from_gh_command(&program, Duration::from_millis(75)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        fs::write(&program, "#!/bin/sh\nhead -c 2097153 /dev/zero\n").unwrap();
+        assert!(release_from_gh_command(&program, Duration::from_secs(2)).is_err());
+        assert!(
+            release_from_gh_command(&directory.path().join("missing"), Duration::from_secs(2))
+                .is_err()
+        );
+    }
 
     #[test]
     fn macos_signing_requirement_is_inline_not_a_filename() {

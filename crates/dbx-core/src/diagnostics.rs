@@ -684,6 +684,7 @@ mod tests {
         let mut code = ColumnInfo::result("code", 1, "text");
         code.nullable = false;
         let index = |name: &str, unique: bool| crate::IndexInfo {
+            constraint_name: None,
             name: name.into(),
             columns: vec!["code".into()],
             unique,

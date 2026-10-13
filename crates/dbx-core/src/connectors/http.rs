@@ -859,6 +859,7 @@ impl Engine for HttpEngine {
                     .filter(|value| !matches!(value, CellValue::Null))
                     .map(ToString::to_string);
                 indexes.push(crate::IndexInfo {
+                    constraint_name: None,
                     name,
                     columns,
                     unique: super::text(row, unique_index) == "1",

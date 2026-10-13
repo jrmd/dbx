@@ -116,6 +116,7 @@ impl DbxApp {
             })
             .children(objects.into_iter().enumerate().map(|(index, object)| {
                 let kind = match object.kind {
+                    SchemaObjectKind::Enum => "Enum",
                     SchemaObjectKind::Trigger => "Trigger",
                     SchemaObjectKind::Sequence => "Sequence",
                     SchemaObjectKind::Function => "Function",
@@ -152,7 +153,15 @@ impl DbxApp {
                             .gap(crate::theme::ui_px(7.))
                             .cursor_pointer()
                             .hover(|style| style.bg(theme().glass_hover))
-                            .tooltip(tip(object.name.clone()))
+                            .tooltip(tip(format!(
+                                "{}{}",
+                                object
+                                    .schema
+                                    .as_ref()
+                                    .map(|schema| format!("{schema}."))
+                                    .unwrap_or_default(),
+                                object.name
+                            )))
                             .child(icon(Icon::Query, theme().text_muted))
                             .child(
                                 div()

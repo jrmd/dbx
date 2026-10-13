@@ -1,3 +1,12 @@
+## 0.10.0 - 2026-10-13
+
+- Make the schema designer compact with wrapping action groups, existing index and constraint choices, and custom enum type shortcuts.
+- Protect constraint-backed indexes from DROP INDEX, show full index definitions and owning constraints, and let column shortcuts toggle selections.
+- Clear fields when changing designer actions while preserving queued SQL, and allow reviewing a queued plan from an empty form.
+- Prefer GitHub CLI authentication for update checks, including standard Homebrew installations on macOS. Fall back to the public GitHub API if the CLI is missing or fails, with bounded runtime and metadata size.
+- List PostgreSQL enum types and their definitions in the schema explorer, show ordered enum values in table details, and include enum definitions before tables in SQL exports.
+- Preserve empty enum labels and separator characters, resolve enum values through domains, decode enum arrays as editable PostgreSQL array literals, and retain case in quoted type names.
+
 ## 0.9.1 - 2026-10-13
 
 - Fix scrolling in Structure so the column grid stays complete and index predicates no longer overlap the next entry.

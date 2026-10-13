@@ -1424,6 +1424,21 @@ impl DbxApp {
                                     .min_w_0()
                                     .truncate()
                                     .text_color(theme().sql_type)
+                                    .id(SharedString::from(format!("structure-type-{index}")))
+                                    .tooltip(tip(if column.enum_values.is_empty() {
+                                        column.data_type.clone()
+                                    } else {
+                                        format!(
+                                            "{} · {}",
+                                            column.data_type,
+                                            column
+                                                .enum_values
+                                                .iter()
+                                                .map(|value| format!("{value:?}"))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        )
+                                    }))
                                     .child(display_type(&column.data_type)),
                             )
                             .child(
@@ -1458,6 +1473,46 @@ impl DbxApp {
                                     }),
                             )
                     })),
+            )
+            .when(
+                table_columns
+                    .iter()
+                    .any(|column| !column.enum_values.is_empty()),
+                |view| {
+                    view.child(
+                        self.render_structure_section(
+                            (session_id, tab_id),
+                            StructureSection::EnumValues,
+                            Some(
+                                table_columns
+                                    .iter()
+                                    .filter(|column| !column.enum_values.is_empty())
+                                    .count(),
+                            ),
+                            div()
+                                .children(
+                                    table_columns
+                                        .iter()
+                                        .filter(|column| !column.enum_values.is_empty())
+                                        .map(|column| {
+                                            structure_detail_row(
+                                                column.name.clone(),
+                                                column
+                                                    .enum_values
+                                                    .iter()
+                                                    .map(|value| format!("{value:?}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join(", "),
+                                                column.data_type.clone(),
+                                                None,
+                                            )
+                                        }),
+                                )
+                                .into_any_element(),
+                            cx,
+                        ),
+                    )
+                },
             )
             .child(
                 self.render_structure_section(
@@ -1616,13 +1671,18 @@ impl DbxApp {
                                 if let Some(method) = index.method {
                                     traits.push(method.to_ascii_uppercase());
                                 }
+                                if let Some(constraint) = index.constraint_name {
+                                    traits.push(format!("CONSTRAINT {constraint}"));
+                                }
                                 structure_detail_row(
                                     index.name,
                                     index.columns.join(", "),
                                     traits.join(" · "),
-                                    index
-                                        .predicate
-                                        .map(|predicate| format!("WHERE {predicate}")),
+                                    index.definition.or_else(|| {
+                                        index
+                                            .predicate
+                                            .map(|predicate| format!("WHERE {predicate}"))
+                                    }),
                                 )
                             }))
                             .into_any_element(),
@@ -1993,6 +2053,7 @@ mod tests {
                         }],
                         indexes: (0..8)
                             .map(|index| dbx_core::IndexInfo {
+                                constraint_name: None,
                                 name: format!("index_{index}"),
                                 columns: vec!["column_1".into(), "column_2".into()],
                                 unique: false,

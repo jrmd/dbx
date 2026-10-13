@@ -26,7 +26,6 @@ fn designer_action_button(id: SharedString, label: &'static str, selected: bool)
         .h(ui_px(28.))
         .px(ui_px(8.))
         .rounded(ui_px(5.))
-        .w_full()
         .border_0()
         .bg(if selected {
             theme().accent_soft
@@ -39,9 +38,8 @@ fn designer_action_button(id: SharedString, label: &'static str, selected: bool)
             theme().text_muted
         })
         .font_weight(FontWeight::MEDIUM)
-        // Button centres its label internally; a full-width child keeps this
-        // navigation list aligned while retaining native button behaviour.
-        .child(div().w_full().line_height(relative(1.)).child(label))
+        // Keep action labels compact so the navigation wraps in small windows.
+        .child(div().line_height(relative(1.)).child(label))
         .accessible_name(label)
 }
 
@@ -52,6 +50,50 @@ fn split_columns(value: &str) -> Vec<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn designer_index_droppable(kind: DatabaseKind, index: &dbx_core::IndexInfo) -> bool {
+    !index.primary
+        && index.constraint_name.is_none()
+        && !(kind.dialect() == DatabaseKind::SQLite && index.definition.is_none())
+}
+
+fn designer_constraints(
+    kind: DatabaseKind,
+    structure: &StructureTab,
+) -> Vec<(String, &'static str)> {
+    let mut constraints = Vec::new();
+    for index in &structure.indexes {
+        let name = index.constraint_name.clone().or_else(|| {
+            (kind == DatabaseKind::MySQL && (index.primary || index.unique))
+                .then(|| index.name.clone())
+        });
+        if let Some(name) = name {
+            constraints.push((
+                name,
+                if index.primary {
+                    "Primary key"
+                } else if index.unique {
+                    "Unique"
+                } else {
+                    "Exclusion"
+                },
+            ));
+        }
+    }
+    for key in &structure.foreign_keys {
+        if let Some(name) = &key.constraint_name {
+            constraints.push((name.clone(), "Foreign key"));
+        }
+    }
+    for check in &structure.checks {
+        if let Some(name) = &check.name {
+            constraints.push((name.clone(), "Check"));
+        }
+    }
+    constraints.sort_by(|left, right| left.0.cmp(&right.0));
+    constraints.dedup_by(|left, right| left.0 == right.0);
+    constraints
 }
 
 pub(super) struct Designer {
@@ -122,7 +164,31 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.build_designer_draft(session_id, false, window, cx);
+        let queued = self.session(session_id).and_then(|session| {
+            let tab = session
+                .secondary_tabs
+                .iter()
+                .find(|tab| Some(tab.id) == session.active_secondary_tab)?;
+            let SecondaryTabKind::Structure(structure) = &tab.kind else {
+                return None;
+            };
+            let designer = structure.designer.as_ref()?;
+            (!designer.pending
+                && !designer.drafts.is_empty()
+                && designer
+                    .fields
+                    .iter()
+                    .all(|field| field.read(cx).text(cx).trim().is_empty()))
+            .then(|| SavedQuery {
+                name: format!("Alter {}", structure.table.name),
+                sql: designer.drafts.join("\n"),
+            })
+        });
+        if let Some(query) = queued {
+            self.open_saved_query_for(session_id, query, window, cx);
+        } else {
+            self.build_designer_draft(session_id, false, window, cx);
+        }
     }
 
     fn build_designer_draft(
@@ -149,6 +215,18 @@ impl DbxApp {
                 .iter()
                 .map(|editor| editor.read(cx).text(cx))
                 .collect::<Vec<_>>();
+            if designer.action == 4
+                && structure.indexes.iter().any(|index| {
+                    index.name == values[0].trim() && !designer_index_droppable(session.kind, index)
+                })
+            {
+                return Some((
+                    session.kind,
+                    structure.table.clone(),
+                    None,
+                    designer.drafts.clone(),
+                ));
+            }
             let change = match designer.action {
                 0 => dbx_core::TableAlteration::AddColumn {
                     name: values[0].trim().into(),
@@ -206,10 +284,14 @@ impl DbxApp {
             Some((
                 session.kind,
                 structure.table.clone(),
-                change,
+                Some(change),
                 designer.drafts.clone(),
             ))
         }) else {
+            return;
+        };
+        let Some(change) = change else {
+            self.show_toast(ToastKind::Error, "This index belongs to a constraint. Use Drop constraint, or review the engine’s table-rebuild SQL.", cx);
             return;
         };
         if kind == DatabaseKind::MySQL
@@ -358,7 +440,9 @@ impl DbxApp {
     ) {
         if let Some(designer) = self.designer_mut(session_id) {
             let mut names = split_columns(&designer.fields[index].read(cx).text(cx));
-            if !names.contains(&name) {
+            if let Some(position) = names.iter().position(|value| value == &name) {
+                names.remove(position);
+            } else {
                 names.push(name);
             }
             designer.fields[index].update(cx, |editor, cx| editor.set_text(names.join(", "), cx));
@@ -476,7 +560,12 @@ impl DbxApp {
                     theme().border
                 })
         };
-        let mut form = div().flex().flex_col().gap(ui_px(12.));
+        let mut form = div()
+            .w_full()
+            .max_w(ui_px(760.))
+            .flex()
+            .flex_col()
+            .gap(ui_px(12.));
         for (index, &(label, hint)) in labels.iter().enumerate() {
             let editor = fields[index].clone();
             editor.update(cx, |editor, cx| editor.set_accessibility_label(label, cx));
@@ -507,6 +596,61 @@ impl DbxApp {
                             .child(hint),
                     )
                 });
+            if index == 0 && action == 4 {
+                field = field
+                    .child(div().flex().flex_col().gap(ui_px(5.)).children(
+                        structure.indexes.iter().map(|index| {
+                            let name = index.name.clone();
+                            let droppable = designer_index_droppable(session.kind, index);
+                            let label = format!(
+                                "{} ({}){}",
+                                name,
+                                index.columns.join(", "),
+                                if droppable {
+                                    ""
+                                } else {
+                                    " · constraint index"
+                                }
+                            );
+                            chip(
+                                format!("designer-index-{name}").into(),
+                                label,
+                                selected_column.trim() == name,
+                            )
+                            .disabled(!droppable)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.set_designer_field(session_id, 0, name.clone(), cx);
+                                },
+                            ))
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_size(ui_px(10.))
+                            .text_color(theme().text_muted)
+                            .child(if structure.indexes.is_empty() {
+                                "No indexes on this table."
+                            } else {
+                                "Constraint indexes are removed through Drop constraint."
+                            }),
+                    );
+            }
+            if index == 0 && action == 9 {
+                let constraints = designer_constraints(session.kind, structure);
+                field = field.child(div().flex().flex_wrap().gap(ui_px(4.)).children(
+                    constraints.iter().map(|(name, kind)| {
+                        let name = name.clone();
+                        chip(format!("designer-constraint-{name}").into(), format!("{name} · {kind}"), selected_column.trim() == name)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_designer_field(session_id, 0, name.clone(), cx);
+                            }))
+                    })
+                )).when(constraints.is_empty(), |view| view.child(
+                    div().text_size(ui_px(10.)).text_color(theme().text_muted)
+                        .child("No named constraints available. Enter a name if you created one in the SQL plan.")
+                ));
+            }
             if index == 0 && !structure.columns.is_empty() && matches!(action, 1 | 2 | 5) {
                 field = field.child(div().flex().flex_wrap().gap(ui_px(4.)).children(
                     structure.columns.iter().map(|column| {
@@ -563,6 +707,40 @@ impl DbxApp {
                                 },
                             ))
                         }),
+                    ),
+                );
+            }
+            if index == 1 && matches!(action, 0 | 5) {
+                field = field.child(
+                    div().flex().flex_wrap().gap(ui_px(4.)).children(
+                        session
+                            .schema_objects
+                            .iter()
+                            .filter(|object| object.kind == dbx_core::SchemaObjectKind::Enum)
+                            .filter_map(|object| {
+                                dbx_core::quote_identifier(session.kind, &object.name)
+                                    .ok()
+                                    .and_then(|name| match &object.schema {
+                                        Some(schema) => {
+                                            dbx_core::quote_identifier(session.kind, schema)
+                                                .ok()
+                                                .map(|schema| format!("{schema}.{name}"))
+                                        }
+                                        None => Some(name),
+                                    })
+                            })
+                            .map(|name| {
+                                chip(
+                                    format!("designer-enum-{name}").into(),
+                                    name.clone(),
+                                    type_value.trim() == name,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.set_designer_field(session_id, 1, name.clone(), cx);
+                                    },
+                                ))
+                            }),
                     ),
                 );
             }
@@ -683,26 +861,26 @@ impl DbxApp {
                 .id("table-designer")
                 .debug_selector(|| "table-designer".into())
                 .w_full()
-                .max_w(ui_px(860.))
                 .flex_none()
-                .mt(ui_px(12.))
+                .mb(ui_px(12.))
                 .border_1()
                 .border_color(theme().border_strong)
                 .rounded(ui_px(6.))
                 .bg(theme().panel)
                 .overflow_hidden()
                 .flex()
+                .flex_col()
                 .child(
                     div()
-                        .w(ui_px(148.))
+                        .w_full()
                         .flex_none()
                         .p(ui_px(8.))
-                        .border_r_1()
+                        .border_b_1()
                         .border_color(theme().border)
                         .bg(theme().panel_raised)
                         .flex()
-                        .flex_col()
-                        .gap(ui_px(12.))
+                        .flex_wrap()
+                        .gap(ui_px(16.))
                         .children(
                             [
                                 ("Columns", vec![0, 1, 5, 2]),
@@ -712,6 +890,8 @@ impl DbxApp {
                             .into_iter()
                             .map(|(label, indices)| {
                                 div()
+                                    .min_w_0()
+                                    .max_w_full()
                                     .flex()
                                     .flex_col()
                                     .gap(ui_px(2.))
@@ -724,23 +904,33 @@ impl DbxApp {
                                             .text_color(theme().text_muted)
                                             .child(label),
                                     )
-                                    .children(indices.into_iter().map(|index| {
-                                        designer_action_button(
-                                            format!("designer-action-{index}").into(),
-                                            actions[index],
-                                            index == action,
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                if let Some(designer) =
-                                                    this.designer_mut(session_id)
-                                                {
-                                                    designer.action = index;
-                                                }
-                                                cx.notify();
-                                            }),
-                                        )
-                                    }))
+                                    .child(div().flex().flex_wrap().gap(ui_px(2.)).children(
+                                        indices.into_iter().map(|index| {
+                                            designer_action_button(
+                                                format!("designer-action-{index}").into(),
+                                                actions[index],
+                                                index == action,
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    if let Some(designer) =
+                                                        this.designer_mut(session_id)
+                                                        && designer.action != index
+                                                    {
+                                                        designer.action = index;
+                                                        for field in &designer.fields {
+                                                            field.update(cx, |editor, cx| {
+                                                                editor.set_text(String::new(), cx)
+                                                            });
+                                                        }
+                                                        designer.nullable = true;
+                                                        designer.unique = false;
+                                                    }
+                                                    cx.notify();
+                                                }),
+                                            )
+                                        }),
+                                    ))
                             }),
                         ),
                 )
@@ -863,6 +1053,35 @@ impl DbxApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn index_fixture(name: &str, constraint: Option<&str>, primary: bool) -> dbx_core::IndexInfo {
+        dbx_core::IndexInfo {
+            name: name.into(),
+            constraint_name: constraint.map(str::to_owned),
+            columns: vec!["id".into()],
+            unique: true,
+            primary,
+            method: Some("btree".into()),
+            predicate: None,
+            definition: Some(format!("CREATE UNIQUE INDEX {name} ON items (id)")),
+        }
+    }
+
+    #[test]
+    fn constraint_indexes_cannot_be_dropped_as_standalone_indexes() {
+        let regular = index_fixture("lookup", None, false);
+        let key = index_fixture("key", Some("key"), false);
+        let primary = index_fixture("primary", Some("primary"), true);
+        assert!(designer_index_droppable(DatabaseKind::PostgreSQL, &regular));
+        assert!(!designer_index_droppable(DatabaseKind::PostgreSQL, &key));
+        assert!(!designer_index_droppable(
+            DatabaseKind::PostgreSQL,
+            &primary
+        ));
+        let mut implicit = regular.clone();
+        implicit.definition = None;
+        assert!(!designer_index_droppable(DatabaseKind::SQLite, &implicit));
+    }
+
     #[gpui::test]
     fn designer_layout_preserves_reviewable_drafts(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
@@ -886,12 +1105,19 @@ mod tests {
                 session_id,
                 None,
                 "Designer".into(),
-                DatabaseKind::SQLite,
+                DatabaseKind::PostgreSQL,
                 None,
                 window,
                 cx,
             );
             session.engine = Some(engine);
+            session.schema_objects.push(dbx_core::SchemaObject {
+                kind: dbx_core::SchemaObjectKind::Enum,
+                name: "mood".into(),
+                schema: Some("public".into()),
+                table: None,
+                definition: Some("CREATE TYPE public.mood AS ENUM ('happy', 'sad')".into()),
+            });
             session.secondary_tabs.push(SecondaryTab {
                 id: tab_id,
                 kind: SecondaryTabKind::Structure(Box::new(StructureTab {
@@ -910,8 +1136,14 @@ mod tests {
                         )
                         .unwrap(),
                     foreign_keys: Vec::new(),
-                    indexes: Vec::new(),
-                    checks: Vec::new(),
+                    indexes: vec![
+                        index_fixture("id_lookup", None, false),
+                        index_fixture("id_pkey", Some("id_pkey"), true),
+                    ],
+                    checks: vec![dbx_core::CheckConstraintInfo {
+                        name: Some("positive_id".into()),
+                        expression: "id > 0".into(),
+                    }],
                     definition: None,
                     busy: false,
                     error: None,
@@ -929,7 +1161,14 @@ mod tests {
             app.update(cx, |app, cx| app.open_designer_for(session_id, window, cx))
         });
         // Exercise the actual native layout at compact and wide window sizes.
-        for width in [720., 1440.] {
+        for (scale, width) in [
+            (100, 720.),
+            (100, 1440.),
+            (200, 720.),
+            (200, 1440.),
+            (100, 1440.),
+        ] {
+            cx.update(|_, cx| app.update(cx, |app, _| app.ui_scale = scale));
             cx.simulate_resize(gpui::size(px(width), px(1000.)));
             for action in 0..10 {
                 cx.update(|_, cx| {
@@ -959,6 +1198,12 @@ mod tests {
                     panel.right() <= px(width),
                     "designer exceeds the window width"
                 );
+                if scale == 100 && width == 1440. && action == 9 {
+                    assert!(
+                        panel.size.height < ui_px(340.),
+                        "simple forms should not inherit a tall navigation sidebar: {panel:?}"
+                    );
+                }
                 let input = cx.debug_bounds("designer-input-0").unwrap();
                 assert_eq!(
                     input.size.height,
@@ -967,11 +1212,74 @@ mod tests {
                 );
                 let queue = cx.debug_bounds("designer-queue").unwrap();
                 assert!(
-                    queue.size.width < px(180.),
+                    queue.size.width < ui_px(180.),
                     "plan action should remain compact"
                 );
             }
         }
+        // Use native buttons to choose existing metadata and check task changes
+        // clear the previous fields without losing the queued SQL.
+        for (action, choice, expected) in [
+            (4, "designer-index-id_lookup", "id_lookup"),
+            (9, "designer-constraint-id_pkey", "id_pkey"),
+        ] {
+            let nav = cx
+                .debug_bounds(if action == 4 {
+                    "designer-action-4"
+                } else {
+                    "designer-action-9"
+                })
+                .unwrap();
+            cx.simulate_click(nav.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            app.read_with(cx, |app, cx| {
+                let designer = match &app.session(session_id).unwrap().secondary_tabs[0].kind {
+                    SecondaryTabKind::Structure(structure) => structure.designer.as_ref().unwrap(),
+                    _ => panic!(),
+                };
+                assert!(designer.fields[0].read(cx).text(cx).is_empty());
+            });
+            let bounds = cx.debug_bounds(choice).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    assert_eq!(
+                        app.designer_mut(session_id).unwrap().fields[0]
+                            .read(cx)
+                            .text(cx),
+                        expected
+                    );
+                    app.build_designer_draft(session_id, true, window, cx);
+                })
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let designer = app.designer_mut(session_id).unwrap();
+                assert_eq!(designer.drafts.len(), 2);
+                assert!(designer.drafts[0].contains("DROP INDEX"));
+                assert!(designer.drafts[1].contains("DROP CONSTRAINT"));
+                designer.action = 4;
+                designer.fields[0].update(cx, |editor, cx| editor.set_text("id_pkey", cx));
+                app.build_designer_draft(session_id, true, window, cx);
+                assert_eq!(app.designer_mut(session_id).unwrap().drafts.len(), 2);
+                // Review a queued plan after choosing a new, still-empty action.
+                for field in &app.designer_mut(session_id).unwrap().fields {
+                    field.update(cx, |editor, cx| editor.set_text(String::new(), cx));
+                }
+                app.draft_designer_for(session_id, window, cx);
+                assert!(
+                    app.active_query_tab(session_id)
+                        .unwrap()
+                        .query_text
+                        .read(cx)
+                        .contains("DROP CONSTRAINT")
+                );
+                app.activate_secondary_tab_for(session_id, tab_id, window, cx);
+                app.designer_mut(session_id).unwrap().drafts.clear();
+            })
+        });
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.designer_mut(session_id).unwrap().action = 0;

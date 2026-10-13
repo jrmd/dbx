@@ -3,6 +3,7 @@ use dbx_core::{
     DatabaseKind, Filter, FilterOperator, InsertRequest, Order, OrderDirection, Page, QueryOptions,
     ReferentialAction, Result, RowData, TableRef, UpdateRequest,
 };
+use futures_util::FutureExt;
 
 const TABLE_NAME: &str = "dbx_integration_rows";
 const FOREIGN_KEY_PARENT_TABLE: &str = "dbx_integration_fk_parent";
@@ -164,6 +165,173 @@ async fn native_postgres_backup_over_password_socket() -> Result<()> {
 #[ignore = "requires the disposable integration databases"]
 async fn postgresql_crud_integration() -> Result<()> {
     run_sql_scenario(DatabaseKind::PostgreSQL, "DBX_TEST_POSTGRES_URL").await
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable integration databases"]
+async fn postgresql_enum_schema_and_constraint_metadata() -> Result<()> {
+    let Some(url) = integration_url("DBX_TEST_POSTGRES_URL") else {
+        return Ok(());
+    };
+    let engine =
+        DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::PostgreSQL, url)).await?;
+    let schema = format!(
+        "dbx_enum_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    engine
+        .execute_sql(&format!("CREATE SCHEMA {schema}"))
+        .await?;
+    let operation = async {
+        engine.execute_sql(&format!("CREATE TYPE {schema}.\"mood kind\" AS ENUM ('happy', '', 'it''s', 'with,\u{1f}separator')")).await?;
+        engine
+            .execute_sql(&format!(
+                "CREATE DOMAIN {schema}.mood_domain AS {schema}.\"mood kind\""
+            ))
+            .await?;
+        engine.execute_sql(&format!("CREATE TABLE {schema}.items (id int CONSTRAINT items_pkey PRIMARY KEY, mood {schema}.\"mood kind\", moods {schema}.\"mood kind\"[], domain_mood {schema}.mood_domain, code text CONSTRAINT items_code_key UNIQUE, CONSTRAINT positive_id CHECK (id > 0))")).await?;
+        engine
+            .execute_sql(&format!(
+                "CREATE UNIQUE INDEX items_lookup ON {schema}.items (mood) WHERE mood IS NOT NULL"
+            ))
+            .await?;
+        engine.execute_sql(&format!("INSERT INTO {schema}.items VALUES (1, 'with,\u{1f}separator', ARRAY['happy', '', NULL, 'it''s']::{schema}.\"mood kind\"[], 'it''s', 'one')")).await?;
+        let table = TableRef::in_schema(&schema, "items");
+        let structure = engine.table_structure(&table).await?;
+        let labels = ["happy", "", "it's", "with,\u{1f}separator"];
+        for column in [&structure.columns[1], &structure.columns[3]] {
+            assert_eq!(column.enum_values, labels);
+        }
+        assert!(
+            structure.columns[2].enum_values.is_empty(),
+            "array columns must keep the array editor"
+        );
+        for (name, owner) in [
+            ("items_pkey", Some("items_pkey")),
+            ("items_code_key", Some("items_code_key")),
+            ("items_lookup", None),
+        ] {
+            let index = structure
+                .indexes
+                .iter()
+                .find(|index| index.name == name)
+                .unwrap();
+            assert_eq!(index.constraint_name.as_deref(), owner);
+        }
+        let lookup = structure
+            .indexes
+            .iter()
+            .find(|index| index.name == "items_lookup")
+            .unwrap();
+        assert!(lookup.definition.as_deref().unwrap().contains("WHERE"));
+        let objects = engine.schema_objects().await?;
+        let enum_type = objects
+            .iter()
+            .find(|object| object.schema.as_deref() == Some(&schema) && object.name == "mood kind")
+            .unwrap();
+        assert_eq!(enum_type.kind, dbx_core::SchemaObjectKind::Enum);
+        let definition = enum_type.definition.as_deref().unwrap();
+        assert!(definition.contains("AS ENUM ('happy', '', 'it''s', 'with,"));
+        let snapshot = engine.relational_schema().await?;
+        let bulk = snapshot
+            .tables
+            .iter()
+            .find(|candidate| {
+                candidate.table.schema.as_deref() == Some(&schema)
+                    && candidate.table.name == "items"
+            })
+            .unwrap();
+        assert_eq!(bulk.structure.columns, structure.columns);
+        assert_eq!(bulk.structure.indexes, structure.indexes);
+        let rows = engine
+            .query(
+                &format!("SELECT mood, moods, domain_mood FROM {schema}.items"),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(
+            rows.rows[0].values,
+            [
+                CellValue::Text("with,\u{1f}separator".into()),
+                CellValue::Text("{happy,\"\",NULL,it's}".into()),
+                CellValue::Text("it's".into())
+            ]
+        );
+        // The UI generates reviewable statements; check those statements on
+        // disposable data and verify unrelated constraints are retained.
+        for change in [
+            dbx_core::TableAlteration::DropIndex {
+                name: "items_lookup".into(),
+            },
+            dbx_core::TableAlteration::DropConstraint {
+                name: "items_code_key".into(),
+            },
+        ] {
+            let sql = dbx_core::draft_table_alteration(DatabaseKind::PostgreSQL, &table, &change)?;
+            engine.execute_sql(&sql).await?;
+        }
+        let remaining = engine.table_structure(&table).await?;
+        assert_eq!(remaining.indexes.len(), 1);
+        assert_eq!(
+            remaining.indexes[0].constraint_name.as_deref(),
+            Some("items_pkey")
+        );
+        engine
+            .execute_sql(&format!(
+                "CREATE TABLE {schema}.export_items (mood {schema}.\"mood kind\")"
+            ))
+            .await?;
+        engine
+            .execute_sql(&format!(
+                "INSERT INTO {schema}.export_items VALUES ('it''s'), ('')"
+            ))
+            .await?;
+        let directory = tempfile::tempdir().unwrap();
+        dbx_core::export_database(
+            &engine,
+            &dbx_core::DatabaseExportRequest {
+                tables: vec![TableRef::in_schema(&schema, "export_items")],
+                output_directory: directory.path().to_owned(),
+                output_name: "enums".into(),
+                format: dbx_core::DumpFormat::Sql,
+                schema_only: false,
+                gzipped: false,
+            },
+        )
+        .await?;
+        let dump = directory.path().join("enums.sql");
+        let sql = std::fs::read_to_string(&dump).unwrap();
+        assert!(sql.find("CREATE TYPE").unwrap() < sql.find("CREATE TABLE").unwrap());
+        engine
+            .execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await?;
+        dbx_core::import_database(&engine, &dump).await?;
+        let restored = engine
+            .query(
+                &format!("SELECT mood FROM {schema}.export_items ORDER BY mood"),
+                QueryOptions::default(),
+            )
+            .await?;
+        assert_eq!(
+            restored.rows,
+            [
+                RowData::new(vec![CellValue::Text("".into())]),
+                RowData::new(vec![CellValue::Text("it's".into())])
+            ]
+        );
+        Ok::<(), dbx_core::DbxError>(())
+    };
+    let outcome = std::panic::AssertUnwindSafe(operation).catch_unwind().await;
+    engine
+        .execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await?;
+    match outcome {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 #[tokio::test]

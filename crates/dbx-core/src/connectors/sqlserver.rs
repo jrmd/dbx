@@ -364,7 +364,7 @@ impl SqlServerEngine {
     async fn indexes(&self, object: &str) -> Result<Vec<IndexInfo>> {
         let rows = self
             .metadata(
-                "SELECT i.name, i.is_unique, i.is_primary_key, i.type_desc, i.filter_definition, c.name, ic.is_descending_key FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.object_id = OBJECT_ID(@P1) AND i.name IS NOT NULL ORDER BY i.is_primary_key DESC, i.name, ic.key_ordinal",
+                "SELECT i.name, i.is_unique, i.is_primary_key, i.type_desc, i.filter_definition, c.name, ic.is_descending_key, CASE WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN i.name END FROM sys.indexes i JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE i.object_id = OBJECT_ID(@P1) AND i.name IS NOT NULL ORDER BY i.is_primary_key DESC, i.name, ic.key_ordinal",
                 &[CellValue::Text(object.into())],
             )
             .await?;
@@ -378,6 +378,7 @@ impl SqlServerEngine {
             match indexes.last_mut().filter(|index| index.name == name) {
                 Some(index) => index.columns.push(part),
                 None => indexes.push(IndexInfo {
+                    constraint_name: text_at(row, 7),
                     name,
                     columns: vec![part],
                     unique: flag(row, 1),

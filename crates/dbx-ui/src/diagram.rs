@@ -996,14 +996,25 @@ pub fn short_type(data_type: &str) -> String {
 
 /// Lowercases the type name up to its first argument list.
 pub fn display_type(data_type: &str) -> String {
-    match data_type.find('(') {
-        Some(open) => format!(
-            "{}{}",
-            data_type[..open].to_ascii_lowercase(),
-            &data_type[open..]
-        ),
-        None => data_type.to_ascii_lowercase(),
+    let mut output = String::with_capacity(data_type.len());
+    let mut quote = None;
+    for (index, character) in data_type.char_indices() {
+        if let Some(delimiter) = quote {
+            output.push(character);
+            if character == delimiter {
+                quote = None;
+            }
+        } else if matches!(character, '"' | '`') {
+            quote = Some(character);
+            output.push(character);
+        } else if character == '(' {
+            output.push_str(&data_type[index..]);
+            break;
+        } else {
+            output.push(character.to_ascii_lowercase());
+        }
     }
+    output
 }
 
 fn edge_path_points(path: &str) -> Vec<(f32, f32)> {
@@ -1154,6 +1165,17 @@ fn adler32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_labels_preserve_quoted_enum_names_and_enum_values() {
+        assert_eq!(display_type("VARCHAR(255)"), "varchar(255)");
+        assert_eq!(
+            display_type(r#""Sales"."Mood (State)"[]"#),
+            r#""Sales"."Mood (State)"[]"#
+        );
+        assert_eq!(display_type("ENUM('Happy','SAD')"), "enum('Happy','SAD')");
+    }
+
     use dbx_core::{EntityKind, ForeignKeyInfo, RelationalTable, TableStructure};
     use std::sync::Arc;
 
