@@ -1,3 +1,8 @@
+## 0.9.1 - 2026-10-13
+
+- Fix scrolling in Structure so the column grid stays complete and index predicates no longer overlap the next entry.
+- Keep the table header visible, allow horizontal column scrolling in narrow windows, and group metadata into expandable sections with counts and per-tab state.
+
 ## 0.9.0 - 2026-10-12
 
 - Highlight JSON values in table cells and inspectors with the editor's syntax colors.
