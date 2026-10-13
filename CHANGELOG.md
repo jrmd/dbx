@@ -1,3 +1,8 @@
+## 0.10.2 - 2026-10-13
+
+- Fix JSON and JSONB cell editors so typing, selection, keyboard editing, and staging changes work.
+- Prompt for the destination table before copying or exporting query results as INSERT statements.
+
 ## 0.10.1 - 2026-10-13
 
 - Use the theme's monospaced font in SQL, JSON, and Redis editors, including single-line SQL expressions and SQL line numbers.

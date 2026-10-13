@@ -3134,11 +3134,7 @@ pub fn input(
 }
 
 /// Render a multiline field so its editable viewport fills a containing pane.
-pub fn input_fill(
-    editor: Entity<TextEditor>,
-    focus: FocusHandle,
-    cx: &App,
-) -> impl IntoElement {
+pub fn input_fill(editor: Entity<TextEditor>, focus: FocusHandle, cx: &App) -> impl IntoElement {
     input_with_context(editor, focus, true, TEXT_EDITOR_CONTEXT, true, cx)
 }
 

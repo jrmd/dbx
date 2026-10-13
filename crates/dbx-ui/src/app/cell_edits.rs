@@ -1252,7 +1252,8 @@ mod tests {
             })
         });
         let document =
-            serde_json::to_string_pretty(&serde_json::json!({"complete":"x".repeat(1200)})).unwrap();
+            serde_json::to_string_pretty(&serde_json::json!({"complete":"x".repeat(1200)}))
+                .unwrap();
         let editor = cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.begin_cell_edit_for(session_id, tab_id, 0, 1, window, cx);
@@ -1268,9 +1269,15 @@ mod tests {
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.simulate_input("{invalid");
-        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "{invalid");
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "{invalid"
+        );
         cx.simulate_keystrokes("backspace");
-        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "{invali");
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            "{invali"
+        );
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
