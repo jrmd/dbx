@@ -107,6 +107,8 @@ impl DbxApp {
             session.secondary_tabs.push(SecondaryTab {
                 id,
                 kind: SecondaryTabKind::Structure(Box::new(StructureTab {
+                    scroll: ScrollHandle::new(),
+                    expanded_sections: HashSet::new(),
                     designer: None,
                     table: table_ref.clone(),
                     columns: Vec::new(),

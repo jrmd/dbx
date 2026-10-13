@@ -644,7 +644,37 @@ pub(super) fn query_history_connection(
         })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum StructureSection {
+    ForeignKeys,
+    Indexes,
+    Checks,
+    Definition,
+}
+
+impl StructureSection {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::ForeignKeys => "Foreign keys",
+            Self::Indexes => "Indexes",
+            Self::Checks => "Check constraints",
+            Self::Definition => "Definition",
+        }
+    }
+
+    pub(super) fn selector(self) -> &'static str {
+        match self {
+            Self::ForeignKeys => "structure-foreign-keys",
+            Self::Indexes => "structure-indexes",
+            Self::Checks => "structure-checks",
+            Self::Definition => "structure-definition",
+        }
+    }
+}
+
 pub(super) struct StructureTab {
+    pub(super) scroll: ScrollHandle,
+    pub(super) expanded_sections: HashSet<StructureSection>,
     pub(super) designer: Option<designer::Designer>,
     pub(super) table: TableRef,
     pub(super) columns: Vec<ColumnInfo>,

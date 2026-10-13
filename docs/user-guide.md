@@ -132,6 +132,13 @@ large work separately before exiting.
 
 ## Change structure
 
+The Structure page keeps the table name and **Design table…** action visible
+while the columns and metadata scroll. In narrow windows, scroll the column
+grid horizontally to see every field. Expand **Foreign keys**, **Indexes**,
+**Check constraints**, or **Definition** to inspect those details; counts show
+how many entries are available. Each structure tab retains its scroll position
+and expanded sections when switching tabs.
+
 In Structure, click **Design table…** beside the table name. Choose an action
 under Columns, Indexes or Constraints. Column and type shortcuts sit beneath
 their fields; **Allow NULL values** and **Unique index** use checkboxes.

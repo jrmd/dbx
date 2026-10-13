@@ -4,6 +4,7 @@ use crate::diagram::display_type;
 use crate::popups::DropdownMenu as _;
 use gpui_component::InteractiveElementExt as _;
 use gpui_component::menu::PopupMenuItem;
+use gpui_component::scroll::ScrollableElement as _;
 
 fn row_field_heading(
     field_id: FieldId,
@@ -1248,7 +1249,7 @@ impl DbxApp {
     }
 
     pub(super) fn render_structure(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (indexes, checks, definition) = self
+        let (tab_id, indexes, checks, definition, scroll) = self
             .active_session()
             .and_then(|session| {
                 let tab_id = session.active_secondary_tab?;
@@ -1257,9 +1258,11 @@ impl DbxApp {
                     return None;
                 };
                 Some((
+                    tab_id,
                     structure.indexes.clone(),
                     structure.checks.clone(),
                     structure.definition.clone(),
+                    structure.scroll.clone(),
                 ))
             })
             .unwrap_or_default();
@@ -1306,47 +1309,15 @@ impl DbxApp {
             });
         let objects = self.render_schema_objects_for(session_id, object_table.as_ref(), cx);
         let designer = self.render_designer_for(session_id, cx);
-        div()
-            .id("structure-scroll")
-            .flex_1()
-            .overflow_y_scroll()
-            .p(crate::theme::ui_px(12.))
+        let designer_open = designer.is_some();
+        // The viewport owns scrolling; the content keeps its natural height.
+        let content = div()
+            .w_full()
+            .flex_none()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(crate::theme::ui_px(12.))
-                    .child(div().flex_1().min_w_0().child(panel_header(
-                        table_name,
-                        if busy {
-                            "Loading metadata…".into()
-                        } else {
-                            String::new()
-                        },
-                    )))
-                    .child(
-                        button(
-                            "open-table-designer",
-                            if designer.is_some() {
-                                "Close designer"
-                            } else {
-                                "Design table…"
-                            },
-                            ButtonKind::Quiet,
-                        )
-                        .map(|button| gpui::Styled::rounded(button, crate::theme::ui_px(5.)))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.toggle_designer_for(session_id, window, cx);
-                            },
-                        )),
-                    ),
-            )
+            .p(crate::theme::ui_px(12.))
             .when_some(designer, |view, designer| view.child(designer))
-            .child(objects)
             .when(error.is_some(), |view| {
                 view.child(
                     div()
@@ -1357,11 +1328,17 @@ impl DbxApp {
             })
             .child(
                 div()
-                    .mt(crate::theme::ui_px(12.))
+                    .id(SharedString::from(format!(
+                        "structure-columns-scroll-{tab_id}"
+                    )))
+                    .debug_selector(|| "structure-columns".into())
+                    .flex_none()
+                    .min_w_0()
                     .rounded(crate::theme::ui_px(RADIUS_PANEL))
                     .border_1()
                     .border_color(theme().border)
-                    .overflow_hidden()
+                    .overflow_x_scroll()
+                    .lock_scroll_axis()
                     .child(
                         structure_row()
                             .h(crate::theme::ui_px(30.))
@@ -1402,6 +1379,7 @@ impl DbxApp {
                         let foreign = reference.is_some();
                         structure_row()
                             .id(SharedString::from(format!("structure-column-{index}")))
+                            .debug_selector(move || format!("structure-column-{index}"))
                             .h(crate::theme::ui_px(32.))
                             .text_size(crate::theme::ui_px(12.))
                             .when(index > 0, |row| {
@@ -1482,191 +1460,362 @@ impl DbxApp {
                     })),
             )
             .child(
-                div()
-                    .mt(crate::theme::ui_px(18.))
-                    .child(panel_header("Foreign keys", "")),
+                self.render_structure_section(
+                    (session_id, tab_id),
+                    StructureSection::ForeignKeys,
+                    Some(foreign_keys.len()),
+                    div()
+                        .when(
+                            foreign_keys.is_empty() && !busy && error.is_none(),
+                            |view| {
+                                view.child(
+                                    div()
+                                        .mt(crate::theme::ui_px(8.))
+                                        .px(crate::theme::ui_px(10.))
+                                        .py(crate::theme::ui_px(12.))
+                                        .border_1()
+                                        .border_color(theme().border)
+                                        .rounded(crate::theme::ui_px(6.))
+                                        .text_size(crate::theme::ui_px(11.))
+                                        .text_color(theme().text_muted)
+                                        .child("No foreign keys"),
+                                )
+                            },
+                        )
+                        .children(foreign_keys.iter().enumerate().map(|(index, foreign_key)| {
+                            let source = foreign_key.columns.join(", ");
+                            let target_table = match &foreign_key.referenced_schema {
+                                Some(schema) => {
+                                    format!("{schema}.{}", foreign_key.referenced_table)
+                                }
+                                None => foreign_key.referenced_table.clone(),
+                            };
+                            let target = format!(
+                                "{} ({})",
+                                target_table,
+                                foreign_key.referenced_columns.join(", ")
+                            );
+                            let actions = foreign_key_actions(foreign_key);
+                            let can_navigate =
+                                foreign_key_target_table(&tables, foreign_key).is_some();
+                            let foreign_key = foreign_key.clone();
+                            div()
+                                .flex_none()
+                                .min_h(crate::theme::ui_px(44.))
+                                .px(crate::theme::ui_px(10.))
+                                .py(crate::theme::ui_px(7.))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(crate::theme::ui_px(12.))
+                                .border_b_1()
+                                .border_color(theme().border)
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(crate::theme::ui_px(3.))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(crate::theme::ui_px(11.))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(
+                                                    foreign_key
+                                                        .constraint_name
+                                                        .clone()
+                                                        .unwrap_or_else(|| {
+                                                            "Unnamed constraint".into()
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(crate::theme::ui_px(10.))
+                                                .text_color(theme().text_muted)
+                                                .child(source),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "foreign-key-target-{session_id}-{index}"
+                                        )))
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .items_end()
+                                        .gap(crate::theme::ui_px(3.))
+                                        .when(can_navigate, |view| {
+                                            view.pressable("Open referenced row")
+                                                .cursor_pointer()
+                                                .hover(|style| style.text_color(theme().text))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.navigate_to_foreign_key_for(
+                                                            session_id,
+                                                            foreign_key.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    },
+                                                ))
+                                        })
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(crate::theme::ui_px(5.))
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(crate::theme::ui_px(11.))
+                                                        .text_color(if can_navigate {
+                                                            theme().accent_text
+                                                        } else {
+                                                            theme().text_muted
+                                                        })
+                                                        .child(format!("REFERENCES {target}")),
+                                                )
+                                                .when(can_navigate, |view| {
+                                                    view.child(icon(
+                                                        Icon::ArrowRight,
+                                                        theme().accent,
+                                                    ))
+                                                }),
+                                        )
+                                        .when(!actions.is_empty(), |view| {
+                                            view.child(
+                                                div()
+                                                    .text_size(crate::theme::ui_px(9.))
+                                                    .text_color(theme().text_muted)
+                                                    .child(actions),
+                                            )
+                                        }),
+                                )
+                        }))
+                        .into_any_element(),
+                    cx,
+                ),
             )
-            .when(
-                foreign_keys.is_empty() && !busy && error.is_none(),
-                |view| {
-                    view.child(
+            .when(!indexes.is_empty(), |view| {
+                view.child(
+                    self.render_structure_section(
+                        (session_id, tab_id),
+                        StructureSection::Indexes,
+                        Some(indexes.len()),
                         div()
-                            .mt(crate::theme::ui_px(8.))
-                            .px(crate::theme::ui_px(10.))
-                            .py(crate::theme::ui_px(12.))
+                            .children(indexes.into_iter().map(|index| {
+                                let mut traits = Vec::new();
+                                if index.primary {
+                                    traits.push("PRIMARY".to_owned());
+                                } else if index.unique {
+                                    traits.push("UNIQUE".to_owned());
+                                }
+                                if let Some(method) = index.method {
+                                    traits.push(method.to_ascii_uppercase());
+                                }
+                                structure_detail_row(
+                                    index.name,
+                                    index.columns.join(", "),
+                                    traits.join(" · "),
+                                    index
+                                        .predicate
+                                        .map(|predicate| format!("WHERE {predicate}")),
+                                )
+                            }))
+                            .into_any_element(),
+                        cx,
+                    ),
+                )
+            })
+            .when(!checks.is_empty(), |view| {
+                view.child(
+                    self.render_structure_section(
+                        (session_id, tab_id),
+                        StructureSection::Checks,
+                        Some(checks.len()),
+                        div()
+                            .children(checks.into_iter().map(|check| {
+                                structure_detail_row(
+                                    check.name.unwrap_or_else(|| "Unnamed constraint".into()),
+                                    format!("CHECK ({})", check.expression),
+                                    String::new(),
+                                    None,
+                                )
+                            }))
+                            .into_any_element(),
+                        cx,
+                    ),
+                )
+            })
+            .when_some(definition, |view, definition| {
+                view.child(
+                    self.render_structure_section(
+                        (session_id, tab_id),
+                        StructureSection::Definition,
+                        None,
+                        div()
+                            .flex_none()
+                            .p(crate::theme::ui_px(10.))
+                            .rounded(crate::theme::ui_px(6.))
                             .border_1()
                             .border_color(theme().border)
-                            .rounded(crate::theme::ui_px(6.))
+                            .bg(theme().panel_raised)
+                            .font_family("monospace")
                             .text_size(crate::theme::ui_px(11.))
-                            .text_color(theme().text_muted)
-                            .child("No foreign keys"),
-                    )
-                },
-            )
-            .children(foreign_keys.iter().enumerate().map(|(index, foreign_key)| {
-                let source = foreign_key.columns.join(", ");
-                let target_table = match &foreign_key.referenced_schema {
-                    Some(schema) => format!("{schema}.{}", foreign_key.referenced_table),
-                    None => foreign_key.referenced_table.clone(),
-                };
-                let target = format!(
-                    "{} ({})",
-                    target_table,
-                    foreign_key.referenced_columns.join(", ")
-                );
-                let actions = foreign_key_actions(foreign_key);
-                let can_navigate = foreign_key_target_table(&tables, foreign_key).is_some();
-                let foreign_key = foreign_key.clone();
+                            .text_color(theme().text)
+                            .whitespace_normal()
+                            .child(definition)
+                            .into_any_element(),
+                        cx,
+                    ),
+                )
+            })
+            .child(div().flex_none().child(objects));
+        div()
+            .id("structure-pane")
+            .debug_selector(|| "structure-pane".into())
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
                 div()
-                    .min_h(crate::theme::ui_px(44.))
-                    .px(crate::theme::ui_px(10.))
-                    .py(crate::theme::ui_px(7.))
+                    .debug_selector(|| "structure-header".into())
+                    .flex_none()
+                    .p(crate::theme::ui_px(12.))
+                    .border_b_1()
+                    .border_color(theme().border)
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(crate::theme::ui_px(12.))
-                    .border_b_1()
-                    .border_color(theme().border)
+                    .child(div().flex_1().min_w_0().child(panel_header(
+                        table_name,
+                        if busy {
+                            "Loading metadata…".into()
+                        } else {
+                            String::new()
+                        },
+                    )))
+                    .child(
+                        button(
+                            "open-table-designer",
+                            if designer_open {
+                                "Close designer"
+                            } else {
+                                "Design table…"
+                            },
+                            ButtonKind::Quiet,
+                        )
+                        .map(|button| gpui::Styled::rounded(button, crate::theme::ui_px(5.)))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.toggle_designer_for(session_id, window, cx);
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("structure-scroll-{tab_id}")))
+                    .debug_selector(|| "structure-scroll".into())
+                    .track_scroll(&scroll)
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .lock_scroll_axis()
+                    .vertical_scrollbar(&scroll)
+                    .child(content),
+            )
+    }
+
+    fn render_structure_section(
+        &self,
+        tab: (SessionId, SecondaryTabId),
+        section: StructureSection,
+        count: Option<usize>,
+        content: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let (session_id, tab_id) = tab;
+        let expanded = self
+            .session(session_id)
+            .and_then(|session| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
+            .is_some_and(|tab| {
+                matches!(&tab.kind, SecondaryTabKind::Structure(structure)
+                if structure.expanded_sections.contains(&section))
+            });
+        let selector = section.selector();
+        div()
+            .flex_none()
+            .mt(crate::theme::ui_px(12.))
+            .border_1()
+            .border_color(theme().border)
+            .rounded(crate::theme::ui_px(6.))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{selector}-{tab_id}")))
+                    .debug_selector(move || selector.into())
+                    .pressable(section.label())
+                    .aria_expanded(expanded)
+                    .cursor_pointer()
+                    .px(crate::theme::ui_px(10.))
+                    .h(crate::theme::ui_px(34.))
+                    .flex()
+                    .items_center()
+                    .gap(crate::theme::ui_px(8.))
+                    .rounded(crate::theme::ui_px(6.))
+                    .hover(|style| style.bg(theme().glass_hover))
+                    .child(icon(
+                        if expanded {
+                            Icon::ChevronUp
+                        } else {
+                            Icon::ChevronDown
+                        },
+                        theme().text_muted,
+                    ))
                     .child(
                         div()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(crate::theme::ui_px(3.))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(crate::theme::ui_px(11.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(
-                                        foreign_key
-                                            .constraint_name
-                                            .clone()
-                                            .unwrap_or_else(|| "Unnamed constraint".into()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(crate::theme::ui_px(10.))
-                                    .text_color(theme().text_muted)
-                                    .child(source),
-                            ),
+                            .flex_1()
+                            .text_size(crate::theme::ui_px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(section.label()),
                     )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "foreign-key-target-{session_id}-{index}"
-                            )))
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .items_end()
-                            .gap(crate::theme::ui_px(3.))
-                            .when(can_navigate, |view| {
-                                view.pressable("Open referenced row")
-                                    .cursor_pointer()
-                                    .hover(|style| style.text_color(theme().text))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.navigate_to_foreign_key_for(
-                                            session_id,
-                                            foreign_key.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                    }))
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(crate::theme::ui_px(5.))
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_size(crate::theme::ui_px(11.))
-                                            .text_color(if can_navigate {
-                                                theme().accent_text
-                                            } else {
-                                                theme().text_muted
-                                            })
-                                            .child(format!("REFERENCES {target}")),
-                                    )
-                                    .when(can_navigate, |view| {
-                                        view.child(icon(Icon::ArrowRight, theme().accent))
-                                    }),
-                            )
-                            .when(!actions.is_empty(), |view| {
-                                view.child(
-                                    div()
-                                        .text_size(crate::theme::ui_px(9.))
-                                        .text_color(theme().text_muted)
-                                        .child(actions),
-                                )
-                            }),
-                    )
-            }))
-            .when(!indexes.is_empty(), |view| {
-                view.child(
-                    div()
-                        .mt(crate::theme::ui_px(18.))
-                        .child(panel_header("Indexes", "")),
-                )
-                .children(indexes.into_iter().map(|index| {
-                    let mut traits = Vec::new();
-                    if index.primary {
-                        traits.push("PRIMARY".to_owned());
-                    } else if index.unique {
-                        traits.push("UNIQUE".to_owned());
-                    }
-                    if let Some(method) = index.method {
-                        traits.push(method.to_ascii_uppercase());
-                    }
-                    structure_detail_row(
-                        index.name,
-                        index.columns.join(", "),
-                        traits.join(" · "),
-                        index
-                            .predicate
-                            .map(|predicate| format!("WHERE {predicate}")),
-                    )
-                }))
-            })
-            .when(!checks.is_empty(), |view| {
-                view.child(
-                    div()
-                        .mt(crate::theme::ui_px(18.))
-                        .child(panel_header("Check constraints", "")),
-                )
-                .children(checks.into_iter().map(|check| {
-                    structure_detail_row(
-                        check.name.unwrap_or_else(|| "Unnamed constraint".into()),
-                        format!("CHECK ({})", check.expression),
-                        String::new(),
-                        None,
-                    )
-                }))
-            })
-            .when_some(definition, |view, definition| {
-                view.child(
-                    div()
-                        .mt(crate::theme::ui_px(18.))
-                        .child(panel_header("Definition", "")),
-                )
-                .child(
-                    div()
-                        .mt(crate::theme::ui_px(8.))
-                        .p(crate::theme::ui_px(10.))
-                        .rounded(crate::theme::ui_px(6.))
-                        .border_1()
-                        .border_color(theme().border)
-                        .bg(theme().panel_raised)
-                        .font_family("monospace")
-                        .text_size(crate::theme::ui_px(11.))
-                        .text_color(theme().text)
-                        .whitespace_normal()
-                        .child(definition),
-                )
-            })
+                    .when_some(count, |header, count| {
+                        header.child(
+                            div()
+                                .text_size(crate::theme::ui_px(10.))
+                                .text_color(theme().text_muted)
+                                .child(count.to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let Some(session) = this.session_mut(session_id) else {
+                            return;
+                        };
+                        let Some(tab) = session
+                            .secondary_tabs
+                            .iter_mut()
+                            .find(|tab| tab.id == tab_id)
+                        else {
+                            return;
+                        };
+                        let SecondaryTabKind::Structure(structure) = &mut tab.kind else {
+                            return;
+                        };
+                        if !structure.expanded_sections.insert(section) {
+                            structure.expanded_sections.remove(&section);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(expanded, |view| view.child(content))
     }
 }
 
@@ -1678,7 +1827,10 @@ fn structure_detail_row(
     traits: String,
     predicate: Option<String>,
 ) -> Div {
+    let selector = format!("structure-detail-{name}");
     div()
+        .debug_selector(move || selector.clone())
+        .flex_none()
         .min_h(crate::theme::ui_px(44.))
         .px(crate::theme::ui_px(10.))
         .py(crate::theme::ui_px(7.))
@@ -1736,6 +1888,8 @@ const STRUCTURE_NULL_WIDTH: f32 = 84.0;
 
 fn structure_row() -> Div {
     div()
+        .flex_none()
+        .min_w(crate::theme::ui_px(900.))
         .px(crate::theme::ui_px(12.))
         .flex()
         .items_center()
@@ -1743,7 +1897,11 @@ fn structure_row() -> Div {
 }
 
 fn structure_cell(width: f32) -> Div {
-    div().w(px(width)).flex_none().flex().items_center()
+    div()
+        .w(crate::theme::ui_px(width))
+        .flex_none()
+        .flex()
+        .items_center()
 }
 
 /// A compact PK/FK marker shared by the structure grid and diagram cards.
@@ -1785,6 +1943,255 @@ mod tests {
                         .into_any_element(),
                 ),
             ))
+        }
+    }
+
+    #[gpui::test]
+    fn structure_scrolls_without_clipping_and_remembers_expanded_details_per_tab(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let other_tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.settings_store = None;
+            app.startup_recovery_started = true;
+            app.connection_picker_open = false;
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Schema test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            for id in [tab_id, other_tab_id] {
+                session.secondary_tabs.push(SecondaryTab {
+                    id,
+                    kind: SecondaryTabKind::Structure(Box::new(StructureTab {
+                        scroll: ScrollHandle::new(),
+                        expanded_sections: HashSet::new(),
+                        designer: None,
+                        table: TableRef::new("comments"),
+                        columns: (0..15)
+                            .map(|index| {
+                                ColumnInfo::result(format!("column_{index}"), index, "TEXT")
+                            })
+                            .collect(),
+                        foreign_keys: vec![ForeignKeyInfo {
+                            constraint_name: Some("comments_parent_fkey".into()),
+                            columns: vec!["column_1".into()],
+                            referenced_schema: None,
+                            referenced_table: "comments".into(),
+                            referenced_columns: vec!["column_0".into()],
+                            on_update: Some(ReferentialAction::NoAction),
+                            on_delete: Some(ReferentialAction::Cascade),
+                        }],
+                        indexes: (0..8)
+                            .map(|index| dbx_core::IndexInfo {
+                                name: format!("index_{index}"),
+                                columns: vec!["column_1".into(), "column_2".into()],
+                                unique: false,
+                                primary: false,
+                                method: Some("btree".into()),
+                                predicate: Some("deleted_at IS NULL AND parent_id IS NULL".into()),
+                                definition: None,
+                            })
+                            .collect(),
+                        checks: vec![dbx_core::CheckConstraintInfo {
+                            name: Some("valid_comment".into()),
+                            expression: "column_2 <> ''".into(),
+                        }],
+                        definition: Some("CREATE TABLE comments (...)".into()),
+                        busy: false,
+                        error: None,
+                    })),
+                });
+            }
+            session.active_secondary_tab = Some(tab_id);
+            session.pane = Pane::Structure;
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app
+        });
+        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        for scale in [100, 200] {
+            cx.update(|window, cx| {
+                app.update(cx, |app, _| app.ui_scale = scale);
+                window.draw(cx).clear(cx);
+            });
+            let scroll = app.read_with(cx, |app, _| {
+                let SecondaryTabKind::Structure(structure) =
+                    &app.session(session_id).unwrap().secondary_tabs[0].kind
+                else {
+                    panic!("structure tab")
+                };
+                structure.scroll.clone()
+            });
+            scroll.set_offset(gpui::point(px(0.), px(0.)));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let viewport = cx.debug_bounds("structure-scroll").unwrap();
+            let header = cx.debug_bounds("structure-header").unwrap();
+            let grid = cx.debug_bounds("structure-columns").unwrap();
+            let first = cx.debug_bounds("structure-column-0").unwrap();
+            let last = cx.debug_bounds("structure-column-14").unwrap();
+            assert!(viewport.bottom() <= px(600.));
+            assert!(header.bottom() <= viewport.top());
+            assert!(grid.size.height >= crate::theme::ui_px(30. + 15. * 32.));
+            assert!(
+                last.bottom() <= grid.bottom(),
+                "the last column must not be clipped"
+            );
+            assert!(
+                last.top() > viewport.bottom(),
+                "fixture needs scrolling at {scale}%"
+            );
+            assert!(
+                cx.debug_bounds("structure-detail-index_0").is_none(),
+                "details start collapsed"
+            );
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: viewport.origin + gpui::point(px(40.), px(40.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(-40.), px(0.))),
+                touch_phase: gpui::TouchPhase::Started,
+                ..Default::default()
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let shifted = cx.debug_bounds("structure-column-0").unwrap();
+            assert!(
+                shifted.left() < first.left(),
+                "wide columns must scroll horizontally"
+            );
+            assert_eq!(scroll.offset().y, px(0.));
+            let first = shifted;
+            // Vertical input over the horizontally scrollable grid reaches the page.
+            for delta in [
+                gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-60.))),
+                gpui::ScrollDelta::Lines(gpui::point(0., -3.)),
+            ] {
+                let before = scroll.offset().y;
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position: viewport.origin + gpui::point(px(40.), px(40.)),
+                    delta,
+                    touch_phase: gpui::TouchPhase::Started,
+                    ..Default::default()
+                });
+                cx.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+                assert!(
+                    scroll.offset().y < before,
+                    "wheel must move the schema page"
+                );
+                assert_eq!(cx.debug_bounds("structure-header").unwrap(), header);
+                assert_eq!(
+                    cx.debug_bounds("structure-column-0").unwrap().left(),
+                    first.left()
+                );
+            }
+            scroll.set_offset(gpui::point(px(0.), px(-10000.)));
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+            }
+            let indexes = cx.debug_bounds("structure-indexes").unwrap();
+            scroll.set_offset(gpui::point(
+                px(0.),
+                scroll.offset().y + viewport.top() + crate::theme::ui_px(4.) - indexes.top(),
+            ));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let indexes = cx.debug_bounds("structure-indexes").unwrap();
+            assert!(
+                indexes.top() >= viewport.top() && indexes.bottom() <= viewport.bottom(),
+                "indexes: {indexes:?}; viewport: {viewport:?}; offset: {:?}; scale: {scale}",
+                scroll.offset()
+            );
+            cx.simulate_click(indexes.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let row = cx.debug_bounds("structure-detail-index_0").unwrap();
+            let next = cx.debug_bounds("structure-detail-index_1").unwrap();
+            assert!(
+                row.size.height > crate::theme::ui_px(44.),
+                "predicates need their own line"
+            );
+            assert!(
+                row.bottom() <= next.top(),
+                "index predicates must not overlap the next row"
+            );
+            scroll.set_offset(gpui::point(px(0.), px(-10000.)));
+            for _ in 0..2 {
+                cx.update(|window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+            }
+            let last_index = cx.debug_bounds("structure-detail-index_7").unwrap();
+            scroll.set_offset(gpui::point(
+                px(0.),
+                scroll.offset().y + viewport.top() + crate::theme::ui_px(4.) - last_index.top(),
+            ));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let last_index = cx.debug_bounds("structure-detail-index_7").unwrap();
+            assert!(last_index.top() >= viewport.top() && last_index.bottom() <= viewport.bottom());
+            let retained_offset = scroll.offset();
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.activate_secondary_tab_for(session_id, other_tab_id, window, cx)
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("structure-detail-index_0").is_none());
+            assert!(
+                cx.debug_bounds("structure-column-0").unwrap().top()
+                    >= cx.debug_bounds("structure-scroll").unwrap().top()
+            );
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    app.activate_secondary_tab_for(session_id, tab_id, window, cx)
+                });
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("structure-detail-index_0").is_some());
+            assert_eq!(scroll.offset(), retained_offset);
+            // Collapse again before repeating at the other scale.
+            let indexes = cx.debug_bounds("structure-indexes").unwrap();
+            scroll.set_offset(gpui::point(
+                px(0.),
+                scroll.offset().y + viewport.top() + crate::theme::ui_px(4.) - indexes.top(),
+            ));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            let indexes = cx.debug_bounds("structure-indexes").unwrap();
+            cx.simulate_click(indexes.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+            assert!(cx.debug_bounds("structure-detail-index_0").is_none());
         }
     }
 
