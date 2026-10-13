@@ -35,6 +35,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::theme::theme;
+use gpui_component::ActiveTheme as _;
 use gpui_component::input::{
     MoveEnd, MoveHome, MoveToNextWord, MoveToPreviousWord, SelectToEndOfLine, SelectToNextWordEnd,
     SelectToPreviousWordStart, SelectToStartOfLine,
@@ -2282,6 +2283,11 @@ impl EntityInputHandler for TextEditor {
 
 impl Render for TextEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Code fields must not inherit the surrounding form's proportional
+        // font. Apply the same family to the text and SQL line-number gutter,
+        // including JSON and single-line SQL expressions without a gutter.
+        let code_font = (!self.password && self.language != EditorLanguage::PlainText)
+            .then(|| cx.theme().mono_font_family.clone());
         if self.is_code() {
             self.reconcile_folds(cx);
         }
@@ -2298,6 +2304,7 @@ impl Render for TextEditor {
                 cx.entity().entity_id()
             )))
             .size_full()
+            .when_some(code_font.clone(), |view, family| view.font_family(family))
             // Keep the scrollable editor from contributing its intrinsic text
             // width to a flex ancestor. The input shell owns the available
             // width; this child may be wider only inside its scroll viewport.
@@ -2311,6 +2318,7 @@ impl Render for TextEditor {
             div()
                 .flex()
                 .size_full()
+                .when_some(code_font, |view, family| view.font_family(family))
                 .min_w_0()
                 .when_some(self.vim_mode(), |view, mode| {
                     view.track_focus(&self.focus_handle)

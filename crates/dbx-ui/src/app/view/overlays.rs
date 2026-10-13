@@ -1,5 +1,6 @@
 use super::super::*;
 use crate::app::explorer::{MenuTone, TableMenuRow};
+use gpui_component::ActiveTheme as _;
 
 impl DbxApp {
     pub(super) fn render_database_export_dialog(
@@ -488,7 +489,7 @@ impl DbxApp {
                                 .px(crate::theme::ui_px(16.))
                                 .py(crate::theme::ui_px(12.))
                                 .bg(theme().canvas)
-                                .font_family("monospace")
+                                .font_family(cx.theme().mono_font_family.clone())
                                 .text_size(crate::theme::ui_px(11.))
                                 .text_color(theme().text)
                                 .line_height(gpui::relative(1.5))

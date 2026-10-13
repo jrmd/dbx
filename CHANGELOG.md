@@ -1,3 +1,8 @@
+## 0.10.1 - 2026-10-13
+
+- Use the theme's monospaced font in SQL, JSON, and Redis editors, including single-line SQL expressions and SQL line numbers.
+- Use the same monospaced font in SQL previews, table defaults, and schema definitions.
+
 ## 0.10.0 - 2026-10-13
 
 - Make the schema designer compact with wrapping action groups, existing index and constraint choices, and custom enum type shortcuts.

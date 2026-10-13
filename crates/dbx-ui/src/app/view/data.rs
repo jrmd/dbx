@@ -2,6 +2,7 @@ use super::super::*;
 use super::{GRID_MIN_WIDTH, INSPECTOR_MIN_WIDTH, PaneResize};
 use crate::diagram::display_type;
 use crate::popups::DropdownMenu as _;
+use gpui_component::ActiveTheme as _;
 use gpui_component::InteractiveElementExt as _;
 use gpui_component::menu::PopupMenuItem;
 use gpui_component::scroll::ScrollableElement as _;
@@ -1455,7 +1456,7 @@ impl DbxApp {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .font_family("monospace")
+                                    .font_family(cx.theme().mono_font_family.clone())
                                     .text_size(crate::theme::ui_px(11.))
                                     .text_color(theme().text_muted)
                                     .when_some(column.default_value.clone(), |cell, default| {
@@ -1505,6 +1506,7 @@ impl DbxApp {
                                                     .join(", "),
                                                 column.data_type.clone(),
                                                 None,
+                                                cx,
                                             )
                                         }),
                                 )
@@ -1683,6 +1685,7 @@ impl DbxApp {
                                             .predicate
                                             .map(|predicate| format!("WHERE {predicate}"))
                                     }),
+                                    cx,
                                 )
                             }))
                             .into_any_element(),
@@ -1703,6 +1706,7 @@ impl DbxApp {
                                     format!("CHECK ({})", check.expression),
                                     String::new(),
                                     None,
+                                    cx,
                                 )
                             }))
                             .into_any_element(),
@@ -1723,7 +1727,7 @@ impl DbxApp {
                             .border_1()
                             .border_color(theme().border)
                             .bg(theme().panel_raised)
-                            .font_family("monospace")
+                            .font_family(cx.theme().mono_font_family.clone())
                             .text_size(crate::theme::ui_px(11.))
                             .text_color(theme().text)
                             .whitespace_normal()
@@ -1886,6 +1890,7 @@ fn structure_detail_row(
     body: String,
     traits: String,
     predicate: Option<String>,
+    cx: &App,
 ) -> Div {
     let selector = format!("structure-detail-{name}");
     div()
@@ -1923,7 +1928,7 @@ fn structure_detail_row(
         )
         .child(
             div()
-                .font_family("monospace")
+                .font_family(cx.theme().mono_font_family.clone())
                 .text_size(crate::theme::ui_px(10.))
                 .text_color(theme().text_muted)
                 .child(body),
@@ -1931,7 +1936,7 @@ fn structure_detail_row(
         .when_some(predicate, |row, predicate| {
             row.child(
                 div()
-                    .font_family("monospace")
+                    .font_family(cx.theme().mono_font_family.clone())
                     .text_size(crate::theme::ui_px(10.))
                     .text_color(theme().text_muted)
                     .child(predicate),
