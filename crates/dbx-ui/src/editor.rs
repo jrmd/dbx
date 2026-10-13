@@ -3133,6 +3133,15 @@ pub fn input(
     input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false, cx)
 }
 
+/// Render a multiline field so its editable viewport fills a containing pane.
+pub fn input_fill(
+    editor: Entity<TextEditor>,
+    focus: FocusHandle,
+    cx: &App,
+) -> impl IntoElement {
+    input_with_context(editor, focus, true, TEXT_EDITOR_CONTEXT, true, cx)
+}
+
 /// A standard field whose viewport is limited by a containing form. Keep the
 /// editor and accessible node unchanged while allowing multiline controls to
 /// fit a short scrolling pane.

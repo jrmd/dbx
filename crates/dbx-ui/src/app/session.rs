@@ -377,6 +377,7 @@ pub(super) struct QueryTab {
     pub(super) execution_override: Option<super::query_actions::ExecutionSource>,
     pub(super) prepared_parameters: Option<Vec<dbx_core::SqlStatement>>,
     pub(super) export_target: Entity<TextEditor>,
+    pub(super) export_prompt: Option<QueryResultExportAction>,
     pub(super) inspected_value: Option<CellValue>,
     /// Values last entered for `:name` placeholders, the open prompt, and
     /// whether the current run has confirmed them.
@@ -505,6 +506,7 @@ impl QueryTab {
             export_target: cx.new(|cx| {
                 TextEditor::empty(false, window, cx).accessibility_label("SQL export target table")
             }),
+            export_prompt: None,
             inspected_value: None,
             parameter_values: HashMap::new(),
             parameter_prompt: None,

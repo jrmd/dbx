@@ -1212,12 +1212,14 @@ mod tests {
     #[gpui::test]
     fn json_editor_validates_and_persists_the_complete_document(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
+        cx.update(|cx| cx.bind_keys(editor::default_key_bindings()));
         let session_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let (app,cx) = cx.add_window_view(|window,cx| {
             let mut app=DbxApp::new(window,cx);
             app.runtime=Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
             app.vault_state=Some(VaultState::Unlocked);
+            app.connection_picker_open = false;
             let engine=Arc::new(app.runtime.block_on(DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::SQLite,"sqlite::memory:"))).unwrap());
             app.runtime.block_on(engine.execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, document JSON); INSERT INTO items VALUES(1, '{\"valid\":true}'),(2,NULL)")).unwrap();
             let result=app.runtime.block_on(engine.query("SELECT * FROM items",QueryOptions::default())).unwrap();
@@ -1249,8 +1251,9 @@ mod tests {
                 );
             })
         });
-        let document = serde_json::json!({"complete":"x".repeat(1200)}).to_string();
-        cx.update(|window, cx| {
+        let document =
+            serde_json::to_string_pretty(&serde_json::json!({"complete":"x".repeat(1200)})).unwrap();
+        let editor = cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.begin_cell_edit_for(session_id, tab_id, 0, 1, window, cx);
                 let cell = app
@@ -1260,8 +1263,16 @@ mod tests {
                     .as_ref()
                     .unwrap();
                 assert!(cell.structured);
-                let editor = cell.editor.clone();
-                editor.update(cx, |editor, cx| editor.set_text("{invalid", cx));
+                cell.editor.clone()
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_input("{invalid");
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "{invalid");
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "{invali");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
                 app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
                 assert!(
                     app.data_tab(session_id, tab_id)
@@ -1274,8 +1285,30 @@ mod tests {
                         .unwrap()
                         .has_pending_edits()
                 );
-                editor.update(cx, |editor, cx| editor.set_text(&document, cx));
-                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+            })
+        });
+        // Clicking back into the panel must restore focus and selection editing.
+        cx.update(|window, cx| {
+            app.read(cx).focus_handle.clone().focus(window, cx);
+            window.draw(cx).clear(cx);
+        });
+        let bounds = cx.debug_bounds("json-cell-editor").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input(&document);
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), document);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor.text(cx)),
+            format!("{document}\n")
+        );
+        cx.simulate_keystrokes("backspace");
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), document);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let stage = cx.debug_bounds("stage-json-edit").unwrap();
+        cx.simulate_click(stage.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
                 assert!(
                     app.data_tab(session_id, tab_id)
                         .unwrap()

@@ -219,6 +219,12 @@ pub(super) enum QueryResultExportFormat {
     Insert,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum QueryResultExportAction {
+    Copy,
+    Export,
+}
+
 /// The diagram renderer owns the actual SVG/PNG encoding; app state owns the
 /// native save flow so the view never has to reach into platform APIs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -597,6 +597,7 @@ impl DbxApp {
                     .filter(|cell| cell.structured)
                     .map(|cell| cell.editor.clone()),
                 |view, editor| {
+                    let focus = editor.read(cx).focus_handle();
                     view.child(
                         div()
                             .flex_none()
@@ -626,6 +627,7 @@ impl DbxApp {
                                                 "Stage change",
                                                 ButtonKind::Primary,
                                             )
+                                            .debug_selector(|| "stage-json-edit".into())
                                             .on_click(
                                                 cx.listener(move |this, _, window, cx| {
                                                     this.commit_cell_edit_for(
@@ -636,7 +638,13 @@ impl DbxApp {
                                         ),
                                 ),
                             )
-                            .child(div().flex_1().min_h_0().child(editor)),
+                            .child(
+                                div()
+                                    .debug_selector(|| "json-cell-editor".into())
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(editor::input_fill(editor, focus, cx)),
+                            ),
                     )
                 },
             )

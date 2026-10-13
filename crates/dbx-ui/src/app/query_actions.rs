@@ -255,6 +255,7 @@ impl DbxApp {
             return;
         };
         query_tab.busy = true;
+        query_tab.export_prompt = None;
         query_tab.results_stale = query_tab.result.is_some();
         query_tab.error = None;
         query_tab.status = "Running query…".into();
@@ -500,6 +501,77 @@ impl DbxApp {
         }
         query_tab.status = "Stopping query; verifying server cancellation…".into();
         cx.notify();
+    }
+
+    pub(super) fn request_query_result_export_for(
+        &mut self,
+        session_id: SessionId,
+        format: QueryResultExportFormat,
+        action: QueryResultExportAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(format, QueryResultExportFormat::Insert) {
+            let Some(query) = self.active_query_tab_mut(session_id) else {
+                return;
+            };
+            query.export_prompt = Some(action);
+            query
+                .export_target
+                .read(cx)
+                .focus_handle()
+                .focus(window, cx);
+            cx.notify();
+            return;
+        }
+        match action {
+            QueryResultExportAction::Copy => self.copy_query_result_for(session_id, format, cx),
+            QueryResultExportAction::Export => self.export_query_result_for(session_id, format, cx),
+        }
+    }
+
+    pub(super) fn dismiss_query_export_prompt_for(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(query) = self.active_query_tab_mut(session_id) {
+            query.export_prompt = None;
+            query.query_editor.read(cx).focus_handle().focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn submit_query_export_prompt_for(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query) = self.active_query_tab(session_id) else {
+            return;
+        };
+        let Some(action) = query.export_prompt else {
+            return;
+        };
+        if query.export_target.read(cx).text(cx).trim().is_empty() {
+            self.show_toast(
+                ToastKind::Info,
+                "Enter a target table for INSERT statements",
+                cx,
+            );
+            return;
+        }
+        self.dismiss_query_export_prompt_for(session_id, window, cx);
+        match action {
+            QueryResultExportAction::Copy => {
+                self.copy_query_result_for(session_id, QueryResultExportFormat::Insert, cx)
+            }
+            QueryResultExportAction::Export => {
+                self.export_query_result_for(session_id, QueryResultExportFormat::Insert, cx)
+            }
+        }
     }
 
     pub(super) fn query_result_text_for(

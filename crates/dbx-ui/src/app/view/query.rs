@@ -364,11 +364,53 @@ impl DbxApp {
         let agent_panel = self.render_agent_panel(session_id, tab_id, cx);
         let parameter_prompt = self.render_parameter_prompt(session_id, cx);
         let find_bar = self.render_find_bar(session_id, cx);
-        let export_target = self
-            .active_query_tab(session_id)
-            .unwrap()
-            .export_target
-            .clone();
+        let export_prompt = self.active_query_tab(session_id).and_then(|query| {
+            query.export_prompt.map(|action| {
+                let export_target = query.export_target.clone();
+                let focus = export_target.read(cx).focus_handle();
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(crate::theme::ui_px(8.))
+                    .px(crate::theme::ui_px(10.))
+                    .py(crate::theme::ui_px(4.))
+                    .child(
+                        div()
+                            .text_size(crate::theme::ui_px(11.))
+                            .child("INSERT target table:"),
+                    )
+                    .child(div().w(crate::theme::ui_px(220.)).child(editor::input(
+                        export_target,
+                        focus,
+                        false,
+                        cx,
+                    )))
+                    .child(
+                        button(
+                            "submit-query-insert-export",
+                            match action {
+                                QueryResultExportAction::Copy => "Copy",
+                                QueryResultExportAction::Export => "Export…",
+                            },
+                            ButtonKind::Primary,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.submit_query_export_prompt_for(session_id, window, cx);
+                            },
+                        )),
+                    )
+                    .child(
+                        button("cancel-query-insert-export", "Cancel", ButtonKind::Quiet).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.dismiss_query_export_prompt_for(session_id, window, cx);
+                            }),
+                        ),
+                    )
+                    .into_any_element()
+            })
+        });
         let inspected_value = self
             .active_query_tab(session_id)
             .and_then(|query| query.inspected_value.clone());
@@ -379,8 +421,12 @@ impl DbxApp {
             .flex()
             .flex_col()
             .key_context("QueryWorkbench")
-            .on_action(cx.listener(move |this, _: &CancelQuery, _, cx| {
-                this.cancel_query_for(session_id, cx);
+            .on_action(cx.listener(move |this, _: &CancelQuery, window, cx| {
+                if this.active_query_tab(session_id).is_some_and(|query| query.export_prompt.is_some()) {
+                    this.dismiss_query_export_prompt_for(session_id, window, cx);
+                } else {
+                    this.cancel_query_for(session_id, cx);
+                }
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(move |this, _: &ToggleQueryAgent, window, cx| {
@@ -566,9 +612,7 @@ impl DbxApp {
             .when_some(agent_panel, |view, panel| view.child(panel))
             .when_some(parameter_prompt, |view, prompt| view.child(prompt))
             .when_some(find_bar, |view, bar| view.child(bar))
-            .when(has_rowset, |view| view.child(div().flex().items_center().gap(crate::theme::ui_px(8.)).px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.))
-                .child(div().text_size(crate::theme::ui_px(11.)).child("INSERT export target table:"))
-                .child(div().w(crate::theme::ui_px(220.)).child(export_target))))
+            .when_some(export_prompt, |view, prompt| view.child(prompt))
             .when_some(inspected_value, |view, value| view.child(
                 div().id("query-value-viewer").max_h(crate::theme::ui_px(300.)).overflow_y_scroll().p(crate::theme::ui_px(10.))
                     .child(div().flex().justify_between().child("Value")
@@ -841,8 +885,14 @@ impl QueryOptions {
             ] {
                 menu = menu.item(
                     options
-                        .item(label, move |this, _, cx| {
-                            this.copy_query_result_for(session_id, format, cx)
+                        .item(label, move |this, window, cx| {
+                            this.request_query_result_export_for(
+                                session_id,
+                                format,
+                                QueryResultExportAction::Copy,
+                                window,
+                                cx,
+                            )
                         })
                         .disabled(!rows),
                 );
@@ -860,8 +910,14 @@ impl QueryOptions {
             ] {
                 menu = menu.item(
                     options
-                        .item(label, move |this, _, cx| {
-                            this.export_query_result_for(session_id, format, cx)
+                        .item(label, move |this, window, cx| {
+                            this.request_query_result_export_for(
+                                session_id,
+                                format,
+                                QueryResultExportAction::Export,
+                                window,
+                                cx,
+                            )
                         })
                         .disabled(!options.has_rowset),
                 );
