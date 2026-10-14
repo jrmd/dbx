@@ -1,3 +1,7 @@
+## 0.11.1 - 2026-10-14
+
+- Keep the active row highlighted across its full width when selecting individual cells, and preserve selected-row highlights when hovering.
+
 ## 0.11.0 - 2026-10-14
 
 - Choose interface and monospace fonts with searchable font pickers, and adjust each font size independently using numeric inputs and minus/plus buttons.
