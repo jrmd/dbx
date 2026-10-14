@@ -644,6 +644,17 @@ impl DbxApp {
         row: Option<usize>,
         cx: &mut Context<Self>,
     ) {
+        let rows = self.action_rows(session_id, tab_id, row);
+        self.delete_explicit_rows_for(session_id, tab_id, rows, cx);
+    }
+
+    pub(super) fn delete_explicit_rows_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        rows: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .data_tab(session_id, tab_id)
             .is_some_and(|data| data.recovered_changeset.is_some())
@@ -659,7 +670,6 @@ impl DbxApp {
         if self.editable_table_for(session_id, tab_id).is_none() {
             return;
         }
-        let rows = self.action_rows(session_id, tab_id, row);
         if rows.is_empty() {
             return;
         }
@@ -710,6 +720,47 @@ impl DbxApp {
             data.clear_grid_selection(cx);
         }
         data.sync_cell_edits(cx);
+        cx.notify();
+    }
+
+    pub(super) fn duplicate_rows_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        rows: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        for &row in rows {
+            self.duplicate_row_for(session_id, tab_id, row, cx);
+        }
+    }
+
+    pub(super) fn revert_rows_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        rows: &[usize],
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = rows.to_vec();
+        rows.sort_unstable();
+        rows.dedup();
+        // Remove staged inserts from the end so earlier indices stay valid.
+        for row in rows.into_iter().rev() {
+            self.revert_row_for(session_id, tab_id, row, cx);
+        }
+        if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            data.marked_rows.clear();
+            data.mark_anchor = None;
+            if data
+                .selected_row
+                .is_some_and(|row| row >= data.loaded_rows() + data.pending_inserts.len())
+            {
+                data.selected_row = None;
+                data.clear_grid_selection(cx);
+            }
+            data.sync_cell_edits(cx);
+        }
         cx.notify();
     }
 
@@ -1350,6 +1401,136 @@ mod tests {
                     .unwrap(),
                 serde_json::from_str::<serde_json::Value>(&document).unwrap()
             );
+        });
+    }
+
+    #[gpui::test]
+    fn row_menu_bulk_copy_duplicate_delete_restore_and_revert(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+            app.vault_state = Some(VaultState::Unlocked);
+            let engine = Arc::new(app.runtime.block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                DatabaseKind::SQLite,
+                format!("sqlite://{}?mode=rwc", directory.path().join("rows.sqlite").display()),
+            ))).unwrap());
+            app.runtime.block_on(engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO items VALUES (1, 'one'), (2, 'two'), (3, 'three')")).unwrap();
+            let result = app.runtime.block_on(engine.query("SELECT * FROM items ORDER BY id", QueryOptions::default())).unwrap();
+            let columns = app.runtime.block_on(engine.describe_table(&TableRef::new("items"))).unwrap();
+            let mut session = ConnectionSession::new(session_id, None, "Changeset test".into(), DatabaseKind::SQLite, None, window, cx);
+            session.engine = Some(engine);
+            session.tables = vec![TableInfo::table("items", None)];
+            let mut data = DataTab::new(session_id, tab_id, TableRef::new("items"), true, window, cx);
+            data.table_columns = columns;
+            data.result_table = Some(data.table.clone());
+            data.set_result(Some(result), &session.tables, cx);
+            session.secondary_tabs.push(SecondaryTab { id: tab_id, kind: SecondaryTabKind::Data(Box::new(data)) });
+            session.active_secondary_tab = Some(tab_id);
+            session.pane = Pane::Data;
+            app.sessions.push(session);
+            app.active_session_id = Some(session_id);
+            app
+        });
+        cx.simulate_resize(gpui::size(px(1400.), px(1000.)));
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.mark_row_for(session_id, tab_id, 0, false, false, cx);
+                app.mark_row_for(session_id, tab_id, 1, true, false, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        // Choose JSON, TSV and SQL through the actual right-click menu.
+        for (keys, format) in [
+            ("down enter", "json"),
+            ("down down enter", "tsv"),
+            ("down down down enter", "sql"),
+        ] {
+            let row = cx.debug_bounds("dbx-result-row-1").unwrap();
+            let point = gpui::point(row.left() + px(8.), row.center().y);
+            cx.simulate_mouse_down(point, MouseButton::Right, Default::default());
+            cx.simulate_mouse_up(point, MouseButton::Right, Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_keystrokes(keys);
+            let text = cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap());
+            match format {
+                "json" => {
+                    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(json.as_array().unwrap().len(), 2);
+                    assert_eq!(json[0]["name"], "one");
+                    assert_eq!(json[1]["name"], "two");
+                }
+                "tsv" => assert_eq!(text, "1\tone\n2\ttwo"),
+                _ => {
+                    assert_eq!(text.matches("INSERT INTO").count(), 2);
+                    assert!(text.contains("'one'") && text.contains("'two'"));
+                }
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let cell = cx.debug_bounds("result-cell-text-1-2").unwrap();
+        cx.simulate_mouse_down(cell.center(), MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(cell.center(), MouseButton::Right, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("down down down down enter");
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+            "one\ntwo"
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // Inspect/edit are disabled for a range, so the next enabled item is Duplicate.
+        let row = cx.debug_bounds("dbx-result-row-1").unwrap();
+        let point = gpui::point(row.left() + px(8.), row.center().y);
+        cx.simulate_mouse_down(point, MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(point, MouseButton::Right, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("down down down down enter");
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let data = app.data_tab(session_id, tab_id).unwrap();
+                assert_eq!(data.pending_inserts.len(), 2);
+                assert_eq!(
+                    data.pending_inserts[0].values.get(&1),
+                    Some(&MutationValue::Parameter(CellValue::Text("one".into())))
+                );
+                assert_eq!(
+                    data.pending_inserts[1].values.get(&1),
+                    Some(&MutationValue::Parameter(CellValue::Text("two".into())))
+                );
+                assert!(
+                    data.pending_inserts
+                        .iter()
+                        .all(|row| !row.values.contains_key(&0))
+                );
+                app.delete_explicit_rows_for(session_id, tab_id, vec![0, 1], cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id).unwrap().pending_deletes,
+                    BTreeSet::from([0, 1])
+                );
+                app.delete_explicit_rows_for(session_id, tab_id, vec![0, 1], cx);
+                assert!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_deletes
+                        .is_empty()
+                );
+                app.data_tab_mut(session_id, tab_id)
+                    .unwrap()
+                    .pending_edits
+                    .insert(
+                        (0, 1),
+                        MutationValue::Parameter(CellValue::Text("edited".into())),
+                    );
+                // A mixed range includes both existing rows and newly duplicated rows.
+                app.revert_rows_for(session_id, tab_id, &[0, 3, 4], cx);
+                let data = app.data_tab(session_id, tab_id).unwrap();
+                assert!(data.pending_edits.is_empty());
+                assert!(data.pending_inserts.is_empty());
+                assert!(data.marked_rows.is_empty());
+            })
         });
     }
 

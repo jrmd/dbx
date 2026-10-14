@@ -442,7 +442,7 @@ impl DbxApp {
                     .child(
                         div()
                             .px(crate::theme::ui_px(16.))
-                            .text_size(crate::theme::ui_px(11.))
+                            .text_size(crate::theme::text_px(11.))
                             .text_color(theme().text_muted)
                             .child(
                                 "Your description and schema are sent through the CLI to its \
@@ -712,7 +712,7 @@ impl DbxApp {
                         .child(icon(Icon::Sparkles, theme().accent))
                         .child(
                             div()
-                                .text_size(crate::theme::ui_px(12.))
+                                .text_size(crate::theme::text_px(12.))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child("Query assistant"),
                         )
@@ -721,7 +721,7 @@ impl DbxApp {
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(crate::theme::ui_px(11.))
+                                .text_size(crate::theme::text_px(11.))
                                 .text_color(theme().text_muted)
                                 .child(context_label),
                         )
@@ -758,7 +758,7 @@ impl DbxApp {
                         )
                         .when(prompt_empty, |view| {
                             view.child(div().absolute().top(crate::theme::ui_px(10.)).left(crate::theme::ui_px(11.))
-                    .text_size(crate::theme::ui_px(12.)).text_color(theme().text_muted)
+                    .text_size(crate::theme::text_px(12.)).text_color(theme().text_muted)
                     .child("Describe the data you want, including filters and sorting…"))
                         }),
                 )
@@ -800,7 +800,7 @@ impl DbxApp {
                             div()
                                 .flex_1()
                                 .min_w(crate::theme::ui_px(140.))
-                                .text_size(crate::theme::ui_px(10.))
+                                .text_size(crate::theme::text_px(10.))
                                 .text_color(theme().text_muted)
                                 .child(if busy {
                                     "Reading schema and generating…"
@@ -821,7 +821,7 @@ impl DbxApp {
                                 div()
                                     .flex_1()
                                     .min_w(crate::theme::ui_px(180.))
-                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_size(crate::theme::text_px(11.))
                                     .text_color(theme().warning_text)
                                     .child(format!(
                                         "{} is unavailable. Check its executable in settings.",
@@ -849,13 +849,13 @@ impl DbxApp {
                             .gap(crate::theme::ui_px(6.))
                             .child(
                                 div()
-                                    .text_size(crate::theme::ui_px(12.))
+                                    .text_size(crate::theme::text_px(12.))
                                     .text_color(theme().danger_text)
                                     .child("Could not generate a query"),
                             )
                             .child(
                                 div()
-                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_size(crate::theme::text_px(11.))
                                     .text_color(theme().text_muted)
                                     .child(error),
                             )
@@ -890,7 +890,7 @@ impl DbxApp {
                                     .py(crate::theme::ui_px(6.))
                                     .child(
                                         div()
-                                            .text_size(crate::theme::ui_px(11.))
+                                            .text_size(crate::theme::text_px(11.))
                                             .font_weight(FontWeight::MEDIUM)
                                             .child("Generated query"),
                                     )
@@ -899,7 +899,7 @@ impl DbxApp {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(crate::theme::ui_px(10.))
+                                            .text_size(crate::theme::text_px(10.))
                                             .text_color(theme().text_muted)
                                             .child(generated_by.unwrap_or_default()),
                                     )
@@ -923,8 +923,8 @@ impl DbxApp {
                                     .overflow_y_scroll()
                                     .px(crate::theme::ui_px(10.))
                                     .py(crate::theme::ui_px(8.))
-                                    .font_family("monospace")
-                                    .text_size(crate::theme::ui_px(12.))
+                                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                                    .text_size(crate::theme::mono_text_px(12.))
                                     .text_color(theme().text)
                                     .child(result.query),
                             )
@@ -932,7 +932,7 @@ impl DbxApp {
                                 div()
                                     .px(crate::theme::ui_px(10.))
                                     .pb(crate::theme::ui_px(8.))
-                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_size(crate::theme::text_px(11.))
                                     .text_color(theme().text_muted)
                                     .child(result.explanation),
                             )
@@ -950,7 +950,7 @@ impl DbxApp {
                                         div()
                                             .flex_1()
                                             .min_w(crate::theme::ui_px(120.))
-                                            .text_size(crate::theme::ui_px(10.))
+                                            .text_size(crate::theme::text_px(10.))
                                             .text_color(theme().text_muted)
                                             .child("Replaces the current editor query"),
                                     )

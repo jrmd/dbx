@@ -36,7 +36,7 @@ impl DbxApp {
                     "database-export-{}",
                     table_sidebar_id(&table)
                 )))
-                .h(crate::theme::ui_px(30.))
+                .h(crate::theme::control_height(30.))
                 .w_full()
                 .px(crate::theme::ui_px(8.))
                 .rounded(crate::theme::ui_px(5.))
@@ -103,7 +103,7 @@ impl DbxApp {
                 } else {
                     theme().text_muted
                 })
-                .text_size(crate::theme::ui_px(10.))
+                .text_size(crate::theme::text_px(10.))
                 .cursor_pointer()
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.set_database_export_format(choice, cx)),
@@ -174,7 +174,7 @@ impl DbxApp {
                             .child(
                                 div().flex().flex_col().child(
                                     div()
-                                        .text_size(crate::theme::ui_px(16.))
+                                        .text_size(crate::theme::text_px(16.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme().text)
                                         .child("Export database"),
@@ -203,7 +203,7 @@ impl DbxApp {
                             .justify_between()
                             .child(
                                 div()
-                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_size(crate::theme::text_px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text_muted)
                                     .child(format!("TABLES · {selected_count} selected")),
@@ -246,7 +246,7 @@ impl DbxApp {
                             .gap(crate::theme::ui_px(6.))
                             .child(
                                 div()
-                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_size(crate::theme::text_px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text_muted)
                                     .child("OUTPUT FORMAT"),
@@ -274,7 +274,7 @@ impl DbxApp {
                             .gap(crate::theme::ui_px(5.))
                             .child(
                                 div()
-                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_size(crate::theme::text_px(10.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text_muted)
                                     .child("OUTPUT NAME"),
@@ -297,7 +297,7 @@ impl DbxApp {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_size(crate::theme::text_px(10.))
                                     .text_color(theme().text_muted)
                                     .truncate()
                                     .child(output_directory),
@@ -449,7 +449,7 @@ impl DbxApp {
                                     .gap(crate::theme::ui_px(7.))
                                     .child(
                                         div()
-                                            .text_size(crate::theme::ui_px(15.))
+                                            .text_size(crate::theme::text_px(15.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme().text)
                                             .child(title),
@@ -473,7 +473,7 @@ impl DbxApp {
                             div()
                                 .px(crate::theme::ui_px(16.))
                                 .py(crate::theme::ui_px(16.))
-                                .text_size(crate::theme::ui_px(12.))
+                                .text_size(crate::theme::text_px(12.))
                                 .text_color(theme().text_muted)
                                 .line_height(gpui::relative(1.5))
                                 .child(detail),
@@ -490,7 +490,7 @@ impl DbxApp {
                                 .py(crate::theme::ui_px(12.))
                                 .bg(theme().canvas)
                                 .font_family(cx.theme().mono_font_family.clone())
-                                .text_size(crate::theme::ui_px(11.))
+                                .text_size(crate::theme::mono_text_px(11.))
                                 .text_color(theme().text)
                                 .line_height(gpui::relative(1.5))
                                 .children(
@@ -592,7 +592,7 @@ impl DbxApp {
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .text_size(crate::theme::ui_px(15.))
+                                    .text_size(crate::theme::text_px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text)
                                     .child(title),
@@ -616,7 +616,7 @@ impl DbxApp {
                                     .border_1()
                                     .border_color(theme().border)
                                     .bg(theme().canvas)
-                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_size(crate::theme::text_px(11.))
                                     .text_color(theme().danger_text)
                                     .line_height(gpui::relative(1.5))
                                     .child(detail),
@@ -758,7 +758,7 @@ impl DbxApp {
                         .border_color(theme().hairline)
                         .bg(theme().glass_raised)
                         .shadow(glass_shadow(18.))
-                        .text_size(crate::theme::ui_px(12.))
+                        .text_size(crate::theme::text_px(12.))
                         .on_mouse_down_out(
                             cx.listener(|this, _, _, cx| this.close_table_context_menu(cx)),
                         )
@@ -767,7 +767,7 @@ impl DbxApp {
                                 .px(crate::theme::ui_px(8.))
                                 .pt(crate::theme::ui_px(5.))
                                 .pb(crate::theme::ui_px(7.))
-                                .text_size(crate::theme::ui_px(10.))
+                                .text_size(crate::theme::text_px(10.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme().text_muted)
                                 .child(table_sidebar_label(&menu.table, None)),

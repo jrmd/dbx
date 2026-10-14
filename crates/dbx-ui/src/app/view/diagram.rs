@@ -202,14 +202,14 @@ impl DbxApp {
                         .border_color(theme().border)
                         .child(
                             div()
-                                .text_size(crate::theme::ui_px(10.))
+                                .text_size(crate::theme::text_px(10.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme().text)
                                 .child("Schemas in diagram"),
                         )
                         .child(
                             div()
-                                .text_size(crate::theme::ui_px(9.))
+                                .text_size(crate::theme::text_px(9.))
                                 .text_color(theme().text_muted)
                                 .child(format!("{selected_count}/{}", available_schemas.len())),
                         ),
@@ -287,7 +287,7 @@ impl DbxApp {
                                 } else {
                                     theme().accent_soft
                                 })
-                                .text_size(crate::theme::ui_px(9.))
+                                .text_size(crate::theme::text_px(9.))
                                 .text_color(if stale {
                                     theme().warning
                                 } else {
@@ -380,7 +380,7 @@ impl DbxApp {
                                         div()
                                             .w(crate::theme::ui_px(40.))
                                             .text_center()
-                                            .text_size(crate::theme::ui_px(11.))
+                                            .text_size(crate::theme::text_px(11.))
                                             .text_color(theme().text)
                                             .child(format!("{:.0}%", zoom * 100.0)),
                                     )
@@ -1145,7 +1145,7 @@ impl DbxApp {
             .child(
                 crate::accessibility::announcement("diagram-selection", selection_summary, false)
                     .px(crate::theme::ui_px(12.))
-                    .text_size(crate::theme::ui_px(11.)),
+                    .text_size(crate::theme::text_px(11.)),
             )
             .child(body)
             .into_any_element()

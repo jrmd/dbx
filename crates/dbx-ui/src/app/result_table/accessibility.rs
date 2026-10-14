@@ -99,7 +99,7 @@ impl RenderOnce for AccessibleGrid {
             }
         });
         let table = DataTable::new(&self.state)
-            .with_size(crate::theme::ui_px(30.))
+            .with_size(crate::theme::grid_row_height())
             .stripe(false)
             .bordered(false)
             .scrollbar_visible(true, true)

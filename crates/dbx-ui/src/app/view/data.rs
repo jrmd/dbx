@@ -29,13 +29,13 @@ fn row_field_heading(
                 .gap(crate::theme::ui_px(2.))
                 .child(
                     div()
-                        .text_size(crate::theme::ui_px(11.))
+                        .text_size(crate::theme::text_px(11.))
                         .text_color(theme().text)
                         .child(name),
                 )
                 .child(
                     div()
-                        .text_size(crate::theme::ui_px(9.))
+                        .text_size(crate::theme::text_px(9.))
                         .text_color(theme().text_muted)
                         .child(metadata),
                 ),
@@ -148,6 +148,8 @@ impl DbxApp {
             .child(
                 div()
                     .key_context("DbxFilters")
+                    .flex_none()
+                    .debug_selector(|| "data-filter-toolbar".into())
                     .on_action(cx.listener(move |this, _: &ApplyFilters, _, cx| {
                         this.refresh_table_for(session_id, tab_id, cx)
                     }))
@@ -169,7 +171,7 @@ impl DbxApp {
                             .child(
                                 div().flex_none().flex().items_center().gap(crate::theme::ui_px(7.)).child(
                                     div()
-                                        .text_size(crate::theme::ui_px(12.))
+                                        .text_size(crate::theme::text_px(12.))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme().text)
                                         .child(if kind.is_sql() {
@@ -195,6 +197,7 @@ impl DbxApp {
                                     .when(kind.is_sql() && !has_filter_rows, |view| {
                                         view.child(
                                             button("add-filter", "Add filter", ButtonKind::Quiet)
+                                                .debug_selector(|| "data-add-filter".into())
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(
                                                     move |this, _, window, cx| {
@@ -410,12 +413,12 @@ impl DbxApp {
                                                 div().flex_1().min_w_0().max_w(crate::theme::ui_px(240.)).child(
                                                     Select::new(&column_selector)
                                                         .with_size(Size::Small)
-                                                        .h(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                        .h(crate::theme::control_height(FILTER_CONTROL_HEIGHT))
                                                         .rounded(crate::theme::ui_px(5.))
                                                         .w_full()
                                                         .menu_max_h(crate::theme::ui_px(220.))
                                                         .placeholder("Column")
-                                                        .text_size(crate::theme::ui_px(11.))
+                                                        .text_size(crate::theme::text_px(11.))
                                                         .bg(theme().panel_raised)
                                                         .border_color(theme().border_strong)
                                                         .text_color(theme().text)
@@ -426,11 +429,11 @@ impl DbxApp {
                                                 div().flex_1().min_w_0().max_w(crate::theme::ui_px(220.)).child(
                                                     Select::new(&operator_selector)
                                                         .with_size(Size::Small)
-                                                        .h(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                        .h(crate::theme::control_height(FILTER_CONTROL_HEIGHT))
                                                         .rounded(crate::theme::ui_px(5.))
                                                         .w_full()
                                                         .menu_max_h(crate::theme::ui_px(220.))
-                                                        .text_size(crate::theme::ui_px(11.))
+                                                        .text_size(crate::theme::text_px(11.))
                                                         .bg(theme().panel_raised)
                                                         .border_color(theme().border_strong)
                                                         .text_color(theme().text)
@@ -454,7 +457,7 @@ impl DbxApp {
                                                     .when(
                                                         !operator_requires_value(operator),
                                                         |view| {
-                                                            view.h(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                            view.h(crate::theme::control_height(FILTER_CONTROL_HEIGHT))
                                                                 .px(crate::theme::ui_px(9.))
                                                                 .flex()
                                                                 .items_center()
@@ -672,7 +675,7 @@ impl DbxApp {
                         .bg(theme().panel)
                         .child(
                             div()
-                                .text_size(crate::theme::ui_px(11.))
+                                .text_size(crate::theme::text_px(11.))
                                 .text_color(theme().text)
                                 .child(if recovered {
                                     format!("Recovered draft · {summary} · review required")
@@ -864,7 +867,7 @@ impl DbxApp {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(crate::theme::ui_px(12.))
+                            .text_size(crate::theme::text_px(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme().text)
                             .child(match draft_mode {
@@ -922,7 +925,7 @@ impl DbxApp {
                                 div()
                                     .px(crate::theme::ui_px(5.))
                                     .py(crate::theme::ui_px(12.))
-                                    .text_size(crate::theme::ui_px(12.))
+                                    .text_size(crate::theme::text_px(12.))
                                     .text_color(theme().text_muted)
                                     .child("No row selected"),
                             )
@@ -951,7 +954,7 @@ impl DbxApp {
                                 .map(|selector| {
                                     div()
                                         .w_full()
-                                        .h(crate::theme::ui_px(32.))
+                                        .h(crate::theme::control_height(32.))
                                         .flex_none()
                                         .child(crate::accessibility::focus_reveal(
                                             SharedString::from(format!("row-value-{field_id}")),
@@ -960,7 +963,7 @@ impl DbxApp {
                                                 .with_size(Size::Medium)
                                                 .w_full()
                                                 .menu_max_h(crate::theme::ui_px(220.))
-                                                .text_size(crate::theme::ui_px(11.))
+                                                .text_size(crate::theme::text_px(11.))
                                                 .bg(theme().canvas)
                                                 .border_color(theme().border_strong)
                                                 .text_color(theme().text)
@@ -1004,7 +1007,7 @@ impl DbxApp {
                                         .with_size(Size::XSmall)
                                         .w_full()
                                         .menu_max_h(crate::theme::ui_px(132.))
-                                        .text_size(crate::theme::ui_px(10.))
+                                        .text_size(crate::theme::text_px(10.))
                                         .bg(theme().panel_raised)
                                         .border_color(theme().border)
                                         .text_color(theme().text)
@@ -1066,13 +1069,13 @@ impl DbxApp {
                                     |view| {
                                         view.child(
                                             div()
-                                                .h(crate::theme::ui_px(32.))
+                                                .h(crate::theme::control_height(32.))
                                                 .px(crate::theme::ui_px(9.))
                                                 .flex()
                                                 .items_center()
                                                 .rounded(crate::theme::ui_px(6.))
                                                 .bg(theme().panel_raised)
-                                                .text_size(crate::theme::ui_px(11.))
+                                                .text_size(crate::theme::text_px(11.))
                                                 .text_color(theme().text_muted)
                                                 .child(if state == FieldValueState::Null {
                                                     "NULL"
@@ -1119,7 +1122,7 @@ impl DbxApp {
                                             .justify_between()
                                             .child(
                                                 div()
-                                                    .text_size(crate::theme::ui_px(11.))
+                                                    .text_size(crate::theme::text_px(11.))
                                                     .child(name),
                                             )
                                             .child(
@@ -1129,7 +1132,7 @@ impl DbxApp {
                                                     .gap(crate::theme::ui_px(4.))
                                                     .child(
                                                         div()
-                                                            .text_size(crate::theme::ui_px(9.))
+                                                            .text_size(crate::theme::text_px(9.))
                                                             .text_color(theme().text_muted)
                                                             .child(display_type(&data_type)),
                                                     )
@@ -1350,12 +1353,12 @@ impl DbxApp {
                     .lock_scroll_axis()
                     .child(
                         structure_row()
-                            .h(crate::theme::ui_px(30.))
+                            .h(crate::theme::control_height(30.))
                             .follow_top_corners(RADIUS_PANEL)
                             .bg(theme().panel_raised)
                             .border_b_1()
                             .border_color(theme().border_strong)
-                            .text_size(crate::theme::ui_px(10.))
+                            .text_size(crate::theme::text_px(10.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme().text_muted)
                             .child(structure_cell(STRUCTURE_ORDINAL_WIDTH).child("#"))
@@ -1389,8 +1392,8 @@ impl DbxApp {
                         structure_row()
                             .id(SharedString::from(format!("structure-column-{index}")))
                             .debug_selector(move || format!("structure-column-{index}"))
-                            .h(crate::theme::ui_px(32.))
-                            .text_size(crate::theme::ui_px(12.))
+                            .h(crate::theme::control_height(32.))
+                            .text_size(crate::theme::text_px(12.))
                             .when(index > 0, |row| {
                                 row.border_t_1().border_color(theme().border)
                             })
@@ -1401,7 +1404,7 @@ impl DbxApp {
                             .hover(|style| style.bg(theme().glass_hover))
                             .child(
                                 structure_cell(STRUCTURE_ORDINAL_WIDTH)
-                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_size(crate::theme::text_px(10.))
                                     .text_color(theme().text_muted)
                                     .child(format!("{}", index + 1)),
                             )
@@ -1465,7 +1468,7 @@ impl DbxApp {
                                     .min_w_0()
                                     .truncate()
                                     .font_family(cx.theme().mono_font_family.clone())
-                                    .text_size(crate::theme::ui_px(11.))
+                                    .text_size(crate::theme::mono_text_px(11.))
                                     .text_color(theme().text_muted)
                                     .when_some(column.default_value.clone(), |cell, default| {
                                         cell.child(default)
@@ -1541,7 +1544,7 @@ impl DbxApp {
                                         .border_1()
                                         .border_color(theme().border)
                                         .rounded(crate::theme::ui_px(6.))
-                                        .text_size(crate::theme::ui_px(11.))
+                                        .text_size(crate::theme::text_px(11.))
                                         .text_color(theme().text_muted)
                                         .child("No foreign keys"),
                                 )
@@ -1584,7 +1587,7 @@ impl DbxApp {
                                         .child(
                                             div()
                                                 .truncate()
-                                                .text_size(crate::theme::ui_px(11.))
+                                                .text_size(crate::theme::text_px(11.))
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(
                                                     foreign_key
@@ -1597,7 +1600,7 @@ impl DbxApp {
                                         )
                                         .child(
                                             div()
-                                                .text_size(crate::theme::ui_px(10.))
+                                                .text_size(crate::theme::text_px(10.))
                                                 .text_color(theme().text_muted)
                                                 .child(source),
                                         ),
@@ -1635,7 +1638,7 @@ impl DbxApp {
                                                 .child(
                                                     div()
                                                         .truncate()
-                                                        .text_size(crate::theme::ui_px(11.))
+                                                        .text_size(crate::theme::text_px(11.))
                                                         .text_color(if can_navigate {
                                                             theme().accent_text
                                                         } else {
@@ -1653,7 +1656,7 @@ impl DbxApp {
                                         .when(!actions.is_empty(), |view| {
                                             view.child(
                                                 div()
-                                                    .text_size(crate::theme::ui_px(9.))
+                                                    .text_size(crate::theme::text_px(9.))
                                                     .text_color(theme().text_muted)
                                                     .child(actions),
                                             )
@@ -1736,7 +1739,7 @@ impl DbxApp {
                             .border_color(theme().border)
                             .bg(theme().panel_raised)
                             .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(crate::theme::ui_px(11.))
+                            .text_size(crate::theme::mono_text_px(11.))
                             .text_color(theme().text)
                             .whitespace_normal()
                             .child(definition)
@@ -1838,7 +1841,7 @@ impl DbxApp {
                     .aria_expanded(expanded)
                     .cursor_pointer()
                     .px(crate::theme::ui_px(10.))
-                    .h(crate::theme::ui_px(34.))
+                    .h(crate::theme::control_height(34.))
                     .flex()
                     .items_center()
                     .gap(crate::theme::ui_px(8.))
@@ -1855,14 +1858,14 @@ impl DbxApp {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(crate::theme::ui_px(11.))
+                            .text_size(crate::theme::text_px(11.))
                             .font_weight(FontWeight::MEDIUM)
                             .child(section.label()),
                     )
                     .when_some(count, |header, count| {
                         header.child(
                             div()
-                                .text_size(crate::theme::ui_px(10.))
+                                .text_size(crate::theme::text_px(10.))
                                 .text_color(theme().text_muted)
                                 .child(count.to_string()),
                         )
@@ -1922,14 +1925,14 @@ fn structure_detail_row(
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(crate::theme::ui_px(11.))
+                        .text_size(crate::theme::text_px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(name),
                 )
                 .child(
                     div()
                         .flex_none()
-                        .text_size(crate::theme::ui_px(9.))
+                        .text_size(crate::theme::text_px(9.))
                         .text_color(theme().text_muted)
                         .child(traits),
                 ),
@@ -1937,7 +1940,7 @@ fn structure_detail_row(
         .child(
             div()
                 .font_family(cx.theme().mono_font_family.clone())
-                .text_size(crate::theme::ui_px(10.))
+                .text_size(crate::theme::mono_text_px(10.))
                 .text_color(theme().text_muted)
                 .child(body),
         )
@@ -1945,7 +1948,7 @@ fn structure_detail_row(
             row.child(
                 div()
                     .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(crate::theme::ui_px(10.))
+                    .text_size(crate::theme::mono_text_px(10.))
                     .text_color(theme().text_muted)
                     .child(predicate),
             )
@@ -1984,7 +1987,7 @@ fn key_badge(label: &'static str, color: Rgba) -> Div {
         .py(crate::theme::ui_px(1.))
         .rounded(crate::theme::ui_px(4.))
         .bg(color.alpha(0.14))
-        .text_size(crate::theme::ui_px(9.))
+        .text_size(crate::theme::text_px(9.))
         .font_weight(FontWeight::BOLD)
         .text_color(color)
         .child(label)
@@ -2228,7 +2231,11 @@ mod tests {
                 window.draw(cx).clear(cx);
             });
             let last_index = cx.debug_bounds("structure-detail-index_7").unwrap();
-            assert!(last_index.top() >= viewport.top() && last_index.bottom() <= viewport.bottom());
+            assert!(
+                last_index.top() >= viewport.top() && last_index.bottom() <= viewport.bottom(),
+                "index {last_index:?}, viewport {viewport:?}, scale {scale}, fonts {:?}",
+                app.read_with(cx, |app, _| (app.font_size, app.mono_font_size))
+            );
             let retained_offset = scroll.offset();
             cx.update(|window, cx| {
                 app.update(cx, |app, cx| {
@@ -2267,6 +2274,137 @@ mod tests {
             });
             assert!(cx.debug_bounds("structure-detail-index_0").is_none());
         }
+    }
+
+    #[gpui::test]
+    fn dragging_selects_ranges_and_respects_release_and_preference(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.settings_store = None;
+            app.ui_scale = 100;
+            app.drag_row_selection = true;
+            app.editor_scale = 100;
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Inspector test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            session.tables = vec![TableInfo::table("projects", None)];
+            let table = TableRef::new("projects");
+            let mut data = DataTab::new(session_id, tab_id, table.clone(), false, window, cx);
+            data.table_columns = (0..20)
+                .map(|index| ColumnInfo::result(format!("field_{index}"), index, "TEXT"))
+                .collect();
+            data.set_result(
+                Some(QueryResult {
+                    columns: data.table_columns.clone(),
+                    rows: vec![dbx_core::RowData::new(vec![CellValue::Null; 20]); 5],
+                    ..QueryResult::empty(None, 0)
+                }),
+                &session.tables,
+                cx,
+            );
+            data.result_table = Some(table);
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Data(Box::new(data)),
+            });
+            session.active_secondary_tab = Some(tab_id);
+            session.recent_data_tab = Some(tab_id);
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app.connection_picker_open = false;
+            app
+        });
+        for (width, zoom, font) in [
+            (1400., 100, 20),
+            (1400., 200, 20),
+            (720., 100, 20),
+            (1400., 100, 12),
+        ] {
+            cx.simulate_resize(gpui::size(px(width), px(900.)));
+            cx.update(|window, cx| {
+                app.update(cx, |app, _| {
+                    app.ui_scale = zoom;
+                    app.font_size = font;
+                    app.mono_font_size = font;
+                });
+                window.draw(cx).clear(cx);
+            });
+            let toolbar = cx.debug_bounds("data-filter-toolbar").unwrap();
+            let button = cx.debug_bounds("data-add-filter").unwrap();
+            assert!(
+                button.top() >= toolbar.top() && button.bottom() <= toolbar.bottom(),
+                "filter button clipped at {width}/{zoom}/{font}: {button:?}, {toolbar:?}"
+            );
+            assert!(
+                button.left() >= toolbar.left() && button.right() <= toolbar.right(),
+                "filter button overflow"
+            );
+        }
+        let row = |cx: &mut gpui::VisualTestContext, index| {
+            cx.debug_bounds(match index {
+                0 => "dbx-result-row-0",
+                1 => "dbx-result-row-1",
+                _ => "dbx-result-row-3",
+            })
+            .unwrap()
+            .center()
+        };
+        let first = row(cx, 0);
+        cx.simulate_mouse_down(first, MouseButton::Left, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let fourth = row(cx, 3);
+        cx.simulate_mouse_move(fourth, MouseButton::Left, Default::default());
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .data_tab(session_id, tab_id)
+                .unwrap()
+                .marked_rows
+                .clone()),
+            BTreeSet::from([0, 1, 2, 3])
+        );
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let second = row(cx, 1);
+        cx.simulate_mouse_move(second, MouseButton::Left, Default::default());
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .data_tab(session_id, tab_id)
+                .unwrap()
+                .marked_rows
+                .clone()),
+            BTreeSet::from([0, 1])
+        );
+        cx.simulate_mouse_up(second, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(fourth, None, Default::default());
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .data_tab(session_id, tab_id)
+                .unwrap()
+                .marked_rows
+                .clone()),
+            BTreeSet::from([0, 1])
+        );
+        cx.update(|_, cx| app.update(cx, |app, _| app.drag_row_selection = false));
+        cx.simulate_mouse_down(first, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(fourth, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(fourth, MouseButton::Left, Default::default());
+        assert_eq!(
+            app.read_with(cx, |app, _| app
+                .data_tab(session_id, tab_id)
+                .unwrap()
+                .marked_rows
+                .clone()),
+            BTreeSet::from([0])
+        );
     }
 
     #[gpui::test]

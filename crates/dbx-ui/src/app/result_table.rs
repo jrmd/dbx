@@ -62,7 +62,7 @@ const MIN_COLUMN_WIDTH: f32 = 60.;
 const MAX_COLUMN_WIDTH: f32 = 1_200.;
 const RESIZE_HANDLE_WIDTH: f32 = 7.;
 /// gpui-component's header sort button: a 12px icon with 2px padding.
-const SORT_ICON_WIDTH: f32 = 16.;
+const SORT_ICON_WIDTH: f32 = 12.;
 /// The right padding the table adds to headers of zero-padding columns.
 const HEADER_TRAILING_PADDING: f32 = 8.;
 
@@ -342,6 +342,12 @@ impl ResultTableDelegate {
         }
     }
 
+    pub(super) fn grow_text_widths(&mut self, ratio: f32) {
+        for column in &mut self.columns {
+            column.width = (column.width * ratio).clamp(column.min_width, column.max_width);
+        }
+    }
+
     pub(super) fn scale_column_widths(&mut self, ratio: f32) {
         for column in &mut self.columns {
             column.width *= ratio;
@@ -452,10 +458,38 @@ impl ResultTableDelegate {
         };
         let name = info.name.clone();
         let null = *value == CellValue::Null;
-        let copy = plain_cell_text(value);
-        menu = menu.item(PopupMenuItem::new("Copy cell").on_click(move |_, _, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-        }));
+        let rows = self.menu_rows(row_ix);
+        let multiple = rows.len() > 1;
+        let copy = if multiple {
+            self.result.as_ref().and_then(|result| {
+                let values = rows
+                    .iter()
+                    .map(|row| result.rows.get(*row)?.values.get(column).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                Some(
+                    values
+                        .iter()
+                        .map(|value| delimited_row(std::slice::from_ref(value), '\t'))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            })
+        } else {
+            Some(plain_cell_text(value))
+        };
+        menu = menu.item(
+            PopupMenuItem::new(if multiple {
+                format!("Copy {} cells", rows.len())
+            } else {
+                "Copy cell".into()
+            })
+            .disabled(copy.is_none())
+            .on_click(move |_, _, cx| {
+                if let Some(copy) = &copy {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                }
+            }),
+        );
         let filters: &[(&str, FilterOperator)] = if null {
             &[
                 ("Filter: is NULL", FilterOperator::IsNull),
@@ -469,18 +503,20 @@ impl ResultTableDelegate {
         };
         for (label, operator) in filters.iter().copied() {
             let app = app.clone();
-            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                let _ = app.update(cx, |this, cx| {
-                    this.filter_by_cell_for(
-                        session_id,
-                        tab_id,
-                        (row_ix, column),
-                        operator,
-                        window,
-                        cx,
-                    )
-                });
-            }));
+            menu = menu.item(PopupMenuItem::new(label).disabled(multiple).on_click(
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.filter_by_cell_for(
+                            session_id,
+                            tab_id,
+                            (row_ix, column),
+                            operator,
+                            window,
+                            cx,
+                        )
+                    });
+                },
+            ));
         }
         let pinned = self
             .grid_column(column)
@@ -575,6 +611,62 @@ impl ResultTableDelegate {
         self.accessible_rows.clear();
         self.cell_text = vec![None; result.rows.len() * result.columns.len()];
         self.result = Some(result);
+    }
+
+    /// Right-clicking inside a marked range acts on that range; outside it
+    /// acts on the clicked row without borrowing an unrelated selection.
+    fn menu_rows(&self, clicked: usize) -> Vec<usize> {
+        if self.changes.marked.contains(&clicked) {
+            self.changes.marked.iter().copied().collect()
+        } else {
+            vec![clicked]
+        }
+    }
+
+    fn rows_as_json(&self, rows: &[usize]) -> Option<String> {
+        let result = self.result.as_ref()?;
+        if rows.is_empty() {
+            return None;
+        }
+        let mut names = std::collections::HashSet::new();
+        if result
+            .columns
+            .iter()
+            .any(|column| !names.insert(&column.name))
+        {
+            let selected = QueryResult {
+                columns: result.columns.clone(),
+                rows: rows
+                    .iter()
+                    .map(|row| result.rows.get(*row).cloned())
+                    .collect::<Option<Vec<_>>>()?,
+                rows_affected: None,
+                truncated: false,
+                elapsed_ms: result.elapsed_ms,
+            };
+            return Some(json_result(&selected));
+        }
+        let objects = rows
+            .iter()
+            .map(|row| self.row_as_json(*row))
+            .collect::<Option<Vec<_>>>()?;
+        Some(if objects.len() == 1 {
+            objects[0].clone()
+        } else {
+            format!("[{}]", objects.join(","))
+        })
+    }
+
+    fn rows_as_tsv(&self, rows: &[usize]) -> Option<String> {
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            rows.iter()
+                .map(|row| self.row_as_tsv(*row))
+                .collect::<Option<Vec<_>>>()?
+                .join("\n"),
+        )
     }
 
     pub(super) fn row_as_json(&self, row_ix: usize) -> Option<String> {
@@ -801,7 +893,7 @@ impl ResultTableDelegate {
             .unwrap_or_default();
 
         // This is an initial width, not a prison sentence. The user can resize it.
-        crate::theme::ui_px(
+        crate::theme::text_px(
             ((header_chars.max(value_chars) as f32 * 7.0) + 20.0).clamp(80.0, 420.0),
         )
     }
@@ -983,7 +1075,7 @@ impl ResultTableDelegate {
             .unwrap_or_default() as f32
             * 7.0
             + 20.0;
-        Some(px(header.max(values)))
+        Some(crate::theme::text_px(header).max(crate::theme::mono_text_px(values)))
     }
 
     fn foreign_key_for_cell(&self, row_ix: usize, col_ix: usize) -> Option<ForeignKeyInfo> {
@@ -1330,7 +1422,7 @@ impl TableDelegate for ResultTableDelegate {
             .when(numeric, |cell| cell.justify_end());
         let Some(column) = column else {
             return cell
-                .text_size(crate::theme::ui_px(10.))
+                .text_size(crate::theme::text_px(10.))
                 .text_color(theme().text_muted)
                 .child(self.columns[col_ix].name.clone())
                 .into_any_element();
@@ -1343,14 +1435,14 @@ impl TableDelegate for ResultTableDelegate {
             + if self.sorting == ResultSorting::Disabled {
                 0.
             } else {
-                SORT_ICON_WIDTH
+                SORT_ICON_WIDTH * crate::theme::ui_scale() + 4.
             };
         let content = cell
             .when(column.primary_key, |cell| {
                 cell.child(
                     div()
                         .flex_none()
-                        .text_size(crate::theme::ui_px(8.))
+                        .text_size(crate::theme::text_px(8.))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme().warning_text)
                         .child("PK"),
@@ -1361,21 +1453,26 @@ impl TableDelegate for ResultTableDelegate {
                     .flex_shrink(1.)
                     .min_w_0()
                     .truncate()
-                    .text_size(crate::theme::ui_px(11.))
+                    .text_size(crate::theme::text_px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme().text)
                     .child(column.name.clone()),
             )
             .child(
                 div()
-                    .flex_none()
-                    .text_size(crate::theme::ui_px(9.))
+                    .max_w(gpui::relative(0.45))
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::theme::text_px(9.))
                     .text_color(theme().text_muted)
                     .child(display_type(&column.data_type)),
             );
         // The content clips its labels; the handle sits outside that clip.
         div()
-            .size_full()
+            .h_full()
+            .flex_1()
+            .min_w_0()
             .relative()
             .child(content)
             // A generous grab zone on the right edge. The table's own handle is
@@ -1383,6 +1480,7 @@ impl TableDelegate for ResultTableDelegate {
             .child(
                 div()
                     .id(("dbx-column-resize", col_ix))
+                    .debug_selector(move || format!("dbx-column-resize-{col_ix}"))
                     .group("dbx-column-resize")
                     .absolute()
                     .top_0()
@@ -1491,19 +1589,55 @@ impl TableDelegate for ResultTableDelegate {
             )
             .debug_selector(move || format!("dbx-result-row-{row_ix}"))
             .border_color(theme().border)
-            .bg(background);
+            .bg(background)
+            // Cell handlers stop propagation and supply their column. A click
+            // on the row gutter must clear the previous menu's column instead.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|table, _, _, _| {
+                    table.delegate_mut().context_column = None;
+                }),
+            );
         let Some((app, session_id, tab_id, true)) = self.row_actions.clone() else {
             return row;
         };
         // Cell clicks select through the table; this only reads the modifiers
         // so Shift extends and Cmd/Ctrl toggles a multi-row mark.
+        let drag_app = app.clone();
         row.on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, _, cx| {
             let (extend, toggle) = (event.modifiers.shift, event.modifiers.secondary());
             let app = app.clone();
             cx.defer(move |cx| {
                 let _ = app.update(cx, |this, cx| {
+                    this.row_drag = None;
+                    if this.drag_row_selection
+                        && this.data_tab(session_id, tab_id).is_some_and(|data| {
+                            data.row_draft.is_none() && data.cell_editor.is_none()
+                        })
+                    {
+                        this.row_drag = Some((session_id, tab_id, row_ix));
+                    }
                     this.mark_row_for(session_id, tab_id, row_ix, extend, toggle, cx);
                 });
+            });
+        })
+        .on_mouse_move(move |event, _, cx| {
+            let _ = drag_app.update(cx, |this, cx| {
+                if !event.dragging() {
+                    this.row_drag = None;
+                    return;
+                }
+                if !this.drag_row_selection {
+                    return;
+                }
+                if let Some((session, tab, last_row)) = this.row_drag
+                    && session == session_id
+                    && tab == tab_id
+                    && last_row != row_ix
+                {
+                    this.mark_row_for(session_id, tab_id, row_ix, true, false, cx);
+                    this.row_drag = Some((session_id, tab_id, row_ix));
+                }
             });
         })
     }
@@ -1569,9 +1703,11 @@ impl TableDelegate for ResultTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let mut menu = menu;
+        let rows = self.menu_rows(row_ix);
+        let multiple = rows.len() > 1;
         for (label, text) in [
-            ("Copy as JSON", self.row_as_json(row_ix)),
-            ("Copy as TSV", self.row_as_tsv(row_ix)),
+            ("Copy as JSON", self.rows_as_json(&rows)),
+            ("Copy as TSV", self.rows_as_tsv(&rows)),
         ] {
             menu = menu.item(PopupMenuItem::new(label).disabled(text.is_none()).on_click(
                 move |_, _, cx| {
@@ -1595,15 +1731,20 @@ impl TableDelegate for ResultTableDelegate {
             }
             let table = &owner.data_tab(session_id, tab_id)?.table;
             let result = self.result.as_ref()?;
-            let row = result.rows.get(row_ix)?;
             let columns = result
                 .columns
                 .iter()
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>();
-            dbx_core::render_sql_insert(kind, table, &columns, &row.values)
-                .ok()
-                .map(|sql| format!("{sql};"))
+            rows.iter()
+                .map(|row| {
+                    let row = result.rows.get(*row)?;
+                    dbx_core::render_sql_insert(kind, table, &columns, &row.values)
+                        .ok()
+                        .map(|sql| format!("{sql};"))
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|statements| statements.join("\n"))
         });
         menu = menu
             .item(
@@ -1621,63 +1762,89 @@ impl TableDelegate for ResultTableDelegate {
         {
             menu = self.column_menu(menu, &app, session_id, tab_id, row_ix, column);
         }
-        let clicked_row = self
-            .result
-            .as_ref()
-            .and_then(|result| result.rows.get(row_ix))
-            .cloned();
+        let result_snapshot = self.result.clone();
+        let insert_snapshot = self.changes.inserts.clone();
         let can_edit = app.upgrade().is_some_and(|app| {
             let owner = app.read(cx);
             owner.editable_table_for(session_id, tab_id).is_some()
-                && owner
-                    .data_tab(session_id, tab_id)
-                    .is_some_and(|data| !data.busy && data.row_draft.is_none())
+                && owner.data_tab(session_id, tab_id).is_some_and(|data| {
+                    !data.busy
+                        && data.row_draft.is_none()
+                        && data.cell_editor.is_none()
+                        && data.recovered_changeset.is_none()
+                })
         });
-        let is_new = self.insert_row(row_ix).is_some();
-        let has_changes = is_new
-            || self.changes.deletes.contains(&row_ix)
-            || self.changes.edits.keys().any(|(row, _)| *row == row_ix);
-        let marked = self.changes.marked.len().max(1);
-        let delete_label: SharedString = if self.changes.deletes.contains(&row_ix) {
-            "Restore row".into()
-        } else if marked > 1 && self.changes.marked.contains(&row_ix) {
-            format!("Delete {marked} rows").into()
-        } else {
-            "Delete row".into()
+        let is_new = rows.iter().all(|row| self.insert_row(*row).is_some());
+        let has_changes = rows.iter().any(|row| {
+            self.insert_row(*row).is_some()
+                || self.changes.deletes.contains(row)
+                || self.changes.edits.keys().any(|(edited, _)| edited == row)
+        });
+        let restoring = rows.iter().all(|row| self.changes.deletes.contains(row));
+        let count_label = |verb: &str| -> SharedString {
+            if multiple {
+                format!("{verb} {} rows", rows.len()).into()
+            } else {
+                format!("{verb} row").into()
+            }
         };
+        let delete_label = count_label(if restoring { "Restore" } else { "Delete" });
         for (label, action, enabled) in [
-            ("Inspect row".into(), RowAction::Inspect, true),
-            ("Edit row".into(), RowAction::Edit, can_edit),
-            ("Duplicate row".into(), RowAction::Duplicate, can_edit),
+            ("Inspect row".into(), RowAction::Inspect, !multiple),
+            ("Edit row".into(), RowAction::Edit, can_edit && !multiple),
+            (count_label("Duplicate"), RowAction::Duplicate, can_edit),
             (delete_label, RowAction::Delete, can_edit),
             (
-                if is_new {
-                    "Remove new row"
+                if multiple {
+                    format!("Revert changes to {} rows", rows.len()).into()
+                } else if is_new {
+                    "Remove new row".into()
                 } else {
-                    "Revert changes"
-                }
-                .into(),
+                    "Revert changes".into()
+                },
                 RowAction::Revert,
                 can_edit && has_changes,
             ),
         ] {
             let app = app.clone();
-            let clicked_row = clicked_row.clone();
+            let rows = rows.clone();
+            let result_snapshot = result_snapshot.clone();
+            let insert_snapshot = insert_snapshot.clone();
             menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
                 move |_, window, cx| {
                     let _ = app.update(cx, |this, cx| {
-                        if this
-                            .data_tab(session_id, tab_id)
-                            .and_then(|data| data.result.as_ref()?.rows.get(row_ix))
-                            != clicked_row.as_ref()
-                        {
+                        // A refresh or insert removal invalidates row positions while
+                        // the menu is open. Never apply a saved menu to different rows.
+                        let valid = this.data_tab(session_id, tab_id).is_some_and(|data| {
+                            let same_result = match (&data.result, &result_snapshot) {
+                                (Some(current), Some(snapshot)) => Arc::ptr_eq(current, snapshot),
+                                _ => false,
+                            };
+                            same_result
+                                && data.data_grid.read(cx).delegate().changes.inserts
+                                    == insert_snapshot
+                                && !data.busy
+                                && data.row_draft.is_none()
+                                && data.cell_editor.is_none()
+                                && data.recovered_changeset.is_none()
+                        });
+                        if !valid {
                             return;
                         }
-                        // Bulk delete keeps the marked rows; other actions
-                        // apply to the clicked row alone.
-                        if matches!(action, RowAction::Delete) {
-                            this.delete_rows_for(session_id, tab_id, Some(row_ix), cx);
-                            return;
+                        match action {
+                            RowAction::Delete => {
+                                this.delete_explicit_rows_for(session_id, tab_id, rows.clone(), cx);
+                                return;
+                            }
+                            RowAction::Duplicate => {
+                                this.duplicate_rows_for(session_id, tab_id, &rows, cx);
+                                return;
+                            }
+                            RowAction::Revert => {
+                                this.revert_rows_for(session_id, tab_id, &rows, cx);
+                                return;
+                            }
+                            _ => {}
                         }
                         this.select_row_for(session_id, tab_id, row_ix, cx);
                         // A pending draft may reject selection. Never apply an
@@ -1691,13 +1858,10 @@ impl TableDelegate for ResultTableDelegate {
                             RowAction::Edit => {
                                 this.begin_edit_selected_for(session_id, tab_id, window, cx)
                             }
-                            RowAction::Duplicate => {
-                                this.duplicate_row_for(session_id, tab_id, row_ix, cx)
-                            }
-                            RowAction::Revert => {
-                                this.revert_row_for(session_id, tab_id, row_ix, cx)
-                            }
-                            RowAction::Delete | RowAction::Inspect => {}
+                            RowAction::Delete
+                            | RowAction::Duplicate
+                            | RowAction::Revert
+                            | RowAction::Inspect => {}
                         }
                     });
                 },
@@ -1738,7 +1902,11 @@ impl TableDelegate for ResultTableDelegate {
                     .h_auto()
                     .py(crate::theme::ui_px(0.))
                     .px(crate::theme::ui_px(7.))
-                    .text_size(crate::theme::ui_px(11.)),
+                    .text_size(if json {
+                        crate::theme::mono_text_px(11.)
+                    } else {
+                        crate::theme::text_px(11.)
+                    }),
                 )
                 .into_any_element();
         }
@@ -1769,7 +1937,11 @@ impl TableDelegate for ResultTableDelegate {
                 .flex()
                 .items_center()
                 .px(crate::theme::ui_px(8.))
-                .text_size(crate::theme::ui_px(11.))
+                .text_size(if json {
+                    crate::theme::mono_text_px(11.)
+                } else {
+                    crate::theme::text_px(11.)
+                })
                 .text_color(if muted {
                     theme().text_muted
                 } else {
@@ -1795,7 +1967,11 @@ impl TableDelegate for ResultTableDelegate {
                 .items_center()
                 .px(crate::theme::ui_px(8.))
                 .bg(theme().warning.alpha(0.16))
-                .text_size(crate::theme::ui_px(11.))
+                .text_size(if json {
+                    crate::theme::mono_text_px(11.)
+                } else {
+                    crate::theme::text_px(11.)
+                })
                 .text_color(if muted {
                     theme().text_muted
                 } else {
@@ -1865,7 +2041,11 @@ impl TableDelegate for ResultTableDelegate {
             .px(crate::theme::ui_px(8.))
             .whitespace_nowrap()
             .truncate()
-            .text_size(crate::theme::ui_px(11.))
+            .text_size(if json {
+                crate::theme::mono_text_px(11.)
+            } else {
+                crate::theme::text_px(11.)
+            })
             .text_color(if deleted {
                 theme().text_muted
             } else {
@@ -2399,6 +2579,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn column_resize_handles_work_with_large_fonts_and_zoom(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
+            grid: cx.new(|cx| TableState::new(delegate_with_export_result(), window, cx)),
+        });
+        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
+        cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+        for (zoom, normal, mono) in [(100, 12, 12), (100, 20, 20), (200, 20, 12), (200, 12, 20)] {
+            crate::theme::set_text_scales(zoom, 100);
+            crate::theme::set_font_sizes(normal, mono);
+            cx.update(|window, cx| {
+                window.set_rem_size(px(16. * crate::theme::ui_scale()));
+                grid.update(cx, |table, cx| {
+                    for column in &mut table.delegate_mut().columns {
+                        column.width = px(250.);
+                    }
+                    table.refresh(cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+            let handle = cx.debug_bounds("dbx-column-resize-1").unwrap();
+            let row = cx.debug_bounds("dbx-result-row-0").unwrap();
+            assert!(row.size.height >= crate::theme::grid_row_height() - px(1.));
+            let before = grid.read_with(cx, |table, _| table.delegate().columns[1].width);
+            cx.simulate_mouse_down(handle.center(), MouseButton::Left, Default::default());
+            cx.simulate_mouse_move(
+                handle.center() + gpui::point(px(10.), px(0.)),
+                MouseButton::Left,
+                Default::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_mouse_move(
+                handle.center() + gpui::point(px(70.), px(0.)),
+                MouseButton::Left,
+                Default::default(),
+            );
+            cx.simulate_mouse_up(
+                handle.center() + gpui::point(px(70.), px(0.)),
+                MouseButton::Left,
+                Default::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let after = grid.read_with(cx, |table, _| table.delegate().columns[1].width);
+            assert!(
+                after > before + px(40.),
+                "resize at {zoom}% / {normal}px / {mono}px: {before:?} -> {after:?}; handle {handle:?}"
+            );
+        }
+        crate::theme::set_text_scales(100, 100);
+        crate::theme::set_font_sizes(12, 12);
+    }
+
+    #[gpui::test]
     fn right_click_copies_the_clicked_row_instead_of_the_selected_row(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -2407,6 +2640,7 @@ mod tests {
             grid: cx.new(|cx| {
                 let mut grid = TableState::new(delegate_with_export_result(), window, cx);
                 grid.set_selected_row(0, cx);
+                grid.delegate_mut().changes.marked = BTreeSet::from([0]);
                 grid
             }),
         });
@@ -2564,6 +2798,64 @@ mod tests {
             serde_json::json!({"id":7,"note":text,"empty":"","missing":null,"payload":{"ok":true}})
         );
         assert!(delegate.row_as_json(1).is_none());
+    }
+
+    #[test]
+    fn menu_exports_respect_selected_rows_and_never_drop_invalid_rows() {
+        let mut delegate = delegate_with_export_result();
+        delegate.changes.marked = BTreeSet::from([0, 1]);
+        assert_eq!(delegate.menu_rows(1), vec![0, 1]);
+        assert_eq!(delegate.menu_rows(2), vec![2]);
+        let rows = delegate.menu_rows(0);
+        let json: serde_json::Value =
+            serde_json::from_str(&delegate.rows_as_json(&rows).unwrap()).unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(json["rows"][0][0], 7);
+        assert_eq!(json["rows"][1][0], 8);
+        assert_eq!(
+            delegate.rows_as_tsv(&rows).unwrap(),
+            format!(
+                "{}\n{}",
+                delegate.row_as_tsv(0).unwrap(),
+                delegate.row_as_tsv(1).unwrap()
+            )
+        );
+        assert!(delegate.rows_as_json(&[0, 100]).is_none());
+        assert!(delegate.rows_as_tsv(&[0, 100]).is_none());
+        // Unique column names use an array of ordinary row objects.
+        let result = Arc::make_mut(delegate.result.as_mut().unwrap());
+        result.columns[2].name = "other_note".into();
+        let json: serde_json::Value =
+            serde_json::from_str(&delegate.rows_as_json(&rows).unwrap()).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert_eq!(json[0]["id"], 7);
+        assert!(json[0]["note"].is_null());
+        assert_eq!(json[1]["other_note"], "NULL");
+    }
+
+    #[gpui::test]
+    fn right_click_inside_selection_copies_all_marked_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
+            grid: cx.new(|cx| {
+                let mut delegate = delegate_with_export_result();
+                delegate.changes.marked = BTreeSet::from([0, 1]);
+                TableState::new(delegate, window, cx)
+            }),
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let row = cx.debug_bounds("dbx-result-row-1").unwrap();
+        cx.simulate_mouse_down(row.center(), MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(row.center(), MouseButton::Right, Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_keystrokes("down enter");
+        let json: serde_json::Value = serde_json::from_str(
+            &cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(json["rows"][0][0], 7);
+        assert_eq!(json["rows"][1][0], 8);
     }
 
     #[test]

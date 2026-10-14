@@ -107,7 +107,7 @@ fn monospace_block(text: String, json: bool, cx: &App) -> impl IntoElement {
         .border_1()
         .border_color(theme().border)
         .font_family(cx.theme().mono_font_family.clone())
-        .text_size(crate::theme::ui_px(11.))
+        .text_size(crate::theme::mono_text_px(11.))
         .text_color(theme().text)
         .whitespace_nowrap()
         .child(
@@ -127,7 +127,7 @@ fn monospace_block(text: String, json: bool, cx: &App) -> impl IntoElement {
 pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
     let Some(value) = value else {
         return div()
-            .text_size(crate::theme::ui_px(12.))
+            .text_size(crate::theme::text_px(12.))
             .text_color(theme().text_muted)
             .child("—")
             .into_any_element();
@@ -137,7 +137,7 @@ pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
     }
     match value {
         CellValue::Null => div()
-            .text_size(crate::theme::ui_px(12.))
+            .text_size(crate::theme::text_px(12.))
             .italic()
             .text_color(theme().text_muted)
             .child("NULL")
@@ -150,7 +150,7 @@ pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
                 .gap(crate::theme::ui_px(5.))
                 .child(
                     div()
-                        .text_size(crate::theme::ui_px(10.))
+                        .text_size(crate::theme::text_px(10.))
                         .text_color(theme().text_muted)
                         .child(match format {
                             Some(format) => {
@@ -173,7 +173,7 @@ pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
                 .into_any_element()
         }
         value => div()
-            .text_size(crate::theme::ui_px(12.))
+            .text_size(crate::theme::text_px(12.))
             .text_color(theme().text)
             .whitespace_normal()
             .child(truncate_preview(value.to_string()))

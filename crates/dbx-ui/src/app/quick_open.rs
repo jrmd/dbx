@@ -471,7 +471,7 @@ impl DbxApp {
                                 list.child(
                                     crate::accessibility::announcement("quick-open-selection", selected_label.clone(), false)
                                         .p(crate::theme::ui_px(10.))
-                                        .text_size(crate::theme::ui_px(12.))
+                                        .text_size(crate::theme::text_px(12.))
                                         .text_color(theme().text_muted)
                                         .child("No matches"),
                                 )
@@ -482,7 +482,7 @@ impl DbxApp {
                                 div()
                                     .id(("quick-open-item", index))
                                     .role(gpui::Role::ListBoxOption).aria_label(item.label.clone()).aria_description(item.detail.clone()).aria_selected(active)
-                                    .h(crate::theme::ui_px(34.))
+                                    .h(crate::theme::control_height(34.))
                                     .px(crate::theme::ui_px(10.))
                                     .flex()
                                     .items_center()
@@ -506,7 +506,7 @@ impl DbxApp {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(crate::theme::ui_px(13.))
+                                            .text_size(crate::theme::text_px(13.))
                                             .child(item.label),
                                     )
                                     .child(
@@ -514,7 +514,7 @@ impl DbxApp {
                                             .flex_none()
                                             .max_w(crate::theme::ui_px(200.))
                                             .truncate()
-                                            .text_size(crate::theme::ui_px(11.))
+                                            .text_size(crate::theme::text_px(11.))
                                             .text_color(theme().text_muted)
                                             .child(item.detail),
                                     )

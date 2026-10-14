@@ -1,3 +1,4 @@
+use gpui_component::ActiveTheme as _;
 mod chrome;
 mod connection;
 mod data;
@@ -15,9 +16,21 @@ use super::*;
 impl Render for DbxApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::theme::set_text_scales(self.ui_scale, self.editor_scale);
+        crate::theme::set_font_sizes(self.font_size, self.mono_font_size);
+        {
+            let theme = gpui_component::Theme::global_mut(cx);
+            if let Some(family) = &self.font_family {
+                theme.font_family = family.clone().into();
+            }
+            if let Some(family) = &self.mono_font_family {
+                theme.mono_font_family = family.clone().into();
+            }
+            theme.font_size = px(16. * self.font_size as f32 / 12.);
+            theme.mono_font_size = crate::theme::mono_text_px(13.);
+        }
         window.set_rem_size(gpui::px(16. * crate::theme::ui_scale()));
-        self.compact_layout = window.bounds().size.width < crate::theme::ui_px(900.);
-        self.narrow_workspace = window.bounds().size.width < crate::theme::ui_px(1180.);
+        self.compact_layout = window.bounds().size.width < crate::theme::text_px(900.);
+        self.narrow_workspace = window.bounds().size.width < crate::theme::text_px(1180.);
         // Preserve focused details when resizing into the compact layout,
         // before computing the explorer and main-pane arrangement.
         if self.narrow_workspace
@@ -70,7 +83,7 @@ impl Render for DbxApp {
         let content = if !unlocked {
             self.render_connection(cx).into_any_element()
         } else if self.settings_open {
-            self.render_settings(cx)
+            self.render_settings(window, cx)
         } else if self.connection_picker_open || self.active_session().is_none() {
             self.render_connection(cx).into_any_element()
         } else {
@@ -92,12 +105,22 @@ impl Render for DbxApp {
             .flex()
             .flex_col()
             .bg(theme().window)
+            .font_family(cx.theme().font_family.clone())
+            .text_size(px(16. * self.font_size as f32 / 12.))
             .text_color(theme().text)
             .track_focus(&self.focus_handle)
             .capture_key_down(cx.listener(|this, event, window, cx| {
                 this.dismiss_overlay_on_escape(event, window, cx)
             }))
             .capture_key_down(cx.listener(Self::change_text_scale_on_key))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.row_drag = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.row_drag = None),
+            )
             .on_action(
                 cx.listener(|this, _: &FocusNext, window, cx| this.move_focus(true, window, cx)),
             )
@@ -206,7 +229,7 @@ impl DbxApp {
                 )
                 .rounded_full()
                 .max_w(crate::theme::ui_px(520.))
-                .h(crate::theme::ui_px(36.))
+                .h(crate::theme::control_height(36.))
                 .pl(crate::theme::ui_px(14.))
                 .pr(crate::theme::ui_px(18.))
                 .flex()
@@ -214,7 +237,7 @@ impl DbxApp {
                 .gap(crate::theme::ui_px(10.))
                 .occlude()
                 .cursor_pointer()
-                .text_size(crate::theme::ui_px(12.))
+                .text_size(crate::theme::text_px(12.))
                 .font_weight(FontWeight::MEDIUM)
                 .child(
                     div()

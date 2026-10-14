@@ -287,14 +287,14 @@ impl DbxApp {
                         .justify_between()
                         .child(
                             div()
-                                .text_size(crate::theme::ui_px(12.))
+                                .text_size(crate::theme::text_px(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme().text)
                                 .child("Parameters"),
                         )
                         .child(
                             div()
-                                .text_size(crate::theme::ui_px(10.))
+                                .text_size(crate::theme::text_px(10.))
                                 .text_color(theme().text_muted)
                                 .child("Bound values: text, 42, true, null, or JSON"),
                         ),
@@ -310,8 +310,10 @@ impl DbxApp {
                                 .w(crate::theme::ui_px(140.))
                                 .flex_none()
                                 .truncate()
-                                .font_family("monospace")
-                                .text_size(crate::theme::ui_px(11.))
+                                .font_family(
+                                    gpui_component::Theme::global(cx).mono_font_family.clone(),
+                                )
+                                .text_size(crate::theme::mono_text_px(11.))
                                 .text_color(theme().text)
                                 .child(parameter_label(&name)),
                         )

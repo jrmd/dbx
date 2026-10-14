@@ -579,7 +579,7 @@ impl DbxApp {
                 .gap(ui_px(5.))
                 .child(
                     div()
-                        .text_size(ui_px(11.))
+                        .text_size(crate::theme::text_px(11.))
                         .font_weight(FontWeight::MEDIUM)
                         .child(label),
                 )
@@ -591,7 +591,7 @@ impl DbxApp {
                 .when(!hint.is_empty(), |view| {
                     view.child(
                         div()
-                            .text_size(ui_px(10.))
+                            .text_size(crate::theme::text_px(10.))
                             .text_color(theme().text_muted)
                             .child(hint),
                     )
@@ -627,7 +627,7 @@ impl DbxApp {
                     ))
                     .child(
                         div()
-                            .text_size(ui_px(10.))
+                            .text_size(crate::theme::text_px(10.))
                             .text_color(theme().text_muted)
                             .child(if structure.indexes.is_empty() {
                                 "No indexes on this table."
@@ -647,7 +647,7 @@ impl DbxApp {
                             }))
                     })
                 )).when(constraints.is_empty(), |view| view.child(
-                    div().text_size(ui_px(10.)).text_color(theme().text_muted)
+                    div().text_size(crate::theme::text_px(10.)).text_color(theme().text_muted)
                         .child("No named constraints available. Enter a name if you created one in the SQL plan.")
                 ));
             }
@@ -853,7 +853,7 @@ impl DbxApp {
                     }))
             ))
             .when(session.kind == DatabaseKind::MySQL && action == 5, |view| view.child(
-                div().text_size(ui_px(11.)).text_color(theme().warning_text)
+                div().text_size(crate::theme::text_px(11.)).text_color(theme().warning_text)
                     .child("MODIFY replaces the complete column definition. Existing AUTO_INCREMENT, COLLATE, COMMENT and ON UPDATE attributes are preserved from metadata. Generated columns require manual SQL.")
             ));
         Some(
@@ -899,7 +899,7 @@ impl DbxApp {
                                         div()
                                             .px(ui_px(8.))
                                             .py(ui_px(4.))
-                                            .text_size(ui_px(10.))
+                                            .text_size(crate::theme::text_px(10.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme().text_muted)
                                             .child(label),
@@ -954,13 +954,13 @@ impl DbxApp {
                                         .gap(ui_px(4.))
                                         .child(
                                             div()
-                                                .text_size(ui_px(13.))
+                                                .text_size(crate::theme::text_px(13.))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(actions[action]),
                                         )
                                         .child(
                                             div()
-                                                .text_size(ui_px(11.))
+                                                .text_size(crate::theme::text_px(11.))
                                                 .text_color(theme().text_muted)
                                                 .child(description),
                                         ),
@@ -986,7 +986,7 @@ impl DbxApp {
                                         .gap(ui_px(8.))
                                         .child(
                                             div()
-                                                .text_size(ui_px(11.))
+                                                .text_size(crate::theme::text_px(11.))
                                                 .text_color(theme().text_muted)
                                                 .child(format!("{} queued", designer.drafts.len())),
                                         )

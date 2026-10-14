@@ -31,6 +31,17 @@ pub struct Settings {
     pub ui_scale: u16,
     #[serde(default = "text_scale_default")]
     pub editor_scale: u16,
+    #[serde(default)]
+    pub font_family: Option<String>,
+    #[serde(default)]
+    pub mono_font_family: Option<String>,
+    #[serde(default = "font_size_default")]
+    pub font_size: u16,
+    /// Older settings used font_size for both families.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mono_font_size: Option<u16>,
+    #[serde(default = "remember_device_default")]
+    pub drag_row_selection: bool,
     /// Keep the vault key in the system keychain so launches skip the
     /// passphrase.
     #[serde(default = "remember_device_default")]
@@ -45,6 +56,10 @@ pub struct Settings {
     pub explorer_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspector_width: Option<u32>,
+}
+
+fn font_size_default() -> u16 {
+    12
 }
 
 fn text_scale_default() -> u16 {
@@ -70,6 +85,11 @@ impl Settings {
             motion: crate::motion::MotionPreference::System,
             ui_scale: 100,
             editor_scale: 100,
+            font_family: None,
+            mono_font_family: None,
+            font_size: 12,
+            mono_font_size: None,
+            drag_row_selection: true,
             remember_device: true,
             agents: crate::agents::AgentPreferences::default(),
             vim_mode: false,
@@ -290,6 +310,24 @@ mod tests {
         assert!(json.contains("\"version\": 1"));
         assert!(json.contains("\"appearance\": \"light\""));
         assert!(!store.path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn typography_and_drag_preferences_migrate_and_survive_restart() {
+        let (_directory, store) = test_store();
+        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
+        let mut settings = store.load().unwrap();
+        assert_eq!(settings.font_size, 12);
+        assert!(settings.font_family.is_none());
+        assert!(settings.mono_font_family.is_none());
+        assert!(settings.drag_row_selection);
+        settings.font_family = Some("Helvetica".into());
+        settings.mono_font_family = Some("Menlo".into());
+        settings.font_size = 16;
+        settings.mono_font_size = Some(14);
+        settings.drag_row_selection = false;
+        store.save(settings.clone()).unwrap();
+        assert_eq!(store.load().unwrap(), settings);
     }
 
     #[test]

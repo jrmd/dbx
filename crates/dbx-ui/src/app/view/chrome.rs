@@ -238,7 +238,7 @@ impl DbxApp {
                 )
                 .child(
                     div()
-                        .text_size(crate::theme::ui_px(13.))
+                        .text_size(crate::theme::text_px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("DBX"),
                 )
@@ -264,7 +264,7 @@ impl DbxApp {
                 )
             });
         div()
-            .h(crate::theme::ui_px(46.))
+            .h(crate::theme::control_height(46.))
             .flex_none()
             .flex()
             .items_center()
@@ -603,7 +603,7 @@ impl DbxApp {
                                     .child(icon(Icon::Database, theme().text_muted))
                                     .child(
                                         div().id("explorer-title").debug_selector(|| "explorer-title".into()).min_w_0().truncate()
-                                            .text_size(crate::theme::ui_px(12.))
+                                            .text_size(crate::theme::text_px(12.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(theme().text)
                                             .child(if kind == DatabaseKind::Redis {
@@ -777,7 +777,7 @@ impl DbxApp {
                     .when(kind != DatabaseKind::Redis, |view| {
                         view.child(
                             div()
-                                .h(crate::theme::ui_px(SIDEBAR_CONTROL_HEIGHT))
+                                .h(crate::theme::control_height(SIDEBAR_CONTROL_HEIGHT))
                                 .px(crate::theme::ui_px(8.))
                                 .flex()
                                 .items_center()
@@ -831,7 +831,7 @@ impl DbxApp {
                         crate::accessibility::announcement("explorer-empty", note, false)
                             .px(crate::theme::ui_px(12.))
                             .py(crate::theme::ui_px(8.))
-                            .text_size(crate::theme::ui_px(11.))
+                            .text_size(crate::theme::text_px(11.))
                             .text_color(theme().text_muted)
                             .child(note)
                             .into_any_element()
@@ -930,7 +930,7 @@ impl DbxApp {
             .id("document-tabs")
             .role(gpui::Role::TabList)
             .aria_label("Documents")
-            .h(crate::theme::ui_px(40.))
+            .h(crate::theme::control_height(40.))
             .flex_none()
             .px(crate::theme::ui_px(8.))
             .flex()
@@ -1205,7 +1205,7 @@ impl DbxApp {
         let has_error = error.is_some();
         let message = error.unwrap_or(status);
         div()
-            .h(crate::theme::ui_px(30.))
+            .h(crate::theme::control_height(30.))
             .flex_none()
             .px(crate::theme::ui_px(12.))
             .flex()
@@ -1216,7 +1216,7 @@ impl DbxApp {
             .border_color(theme().border)
             .follow_bottom_corners(RADIUS_PANEL)
             .bg(theme().panel)
-            .text_size(crate::theme::ui_px(11.))
+            .text_size(crate::theme::text_px(11.))
             .text_color(theme().text_muted)
             .child(
                 crate::accessibility::announcement("workbench-status", message.clone(), has_error)
@@ -1271,7 +1271,7 @@ impl DbxApp {
         Button::new(id)
             .label(label)
             .with_size(Size::XSmall)
-            .h(crate::theme::ui_px(22.))
+            .h(crate::theme::control_height(22.))
             .px(crate::theme::ui_px(10.))
             .rounded_full()
             .outline()
@@ -1316,7 +1316,7 @@ fn document_tab(
         .pressable(label)
         .role(gpui::Role::Tab)
         .aria_selected(selected)
-        .h(crate::theme::ui_px(28.))
+        .h(crate::theme::control_height(28.))
         .pl(crate::theme::ui_px(10.))
         .pr(crate::theme::ui_px(4.))
         .flex_none()
@@ -1324,7 +1324,7 @@ fn document_tab(
         .items_center()
         .gap(crate::theme::ui_px(6.))
         .rounded_full()
-        .text_size(crate::theme::ui_px(12.))
+        .text_size(crate::theme::text_px(12.))
         .cursor_pointer()
         .when(selected, |tab| {
             tab.bg(theme().glass_selected)
@@ -1374,11 +1374,11 @@ fn window_control_button(id: &'static str, kind: Icon, destructive: bool) -> Sta
 fn sidebar_select(state: &SidebarSelect, name: &'static str) -> impl IntoElement {
     Select::new(state)
         .with_size(Size::Small)
-        .h(crate::theme::ui_px(SIDEBAR_CONTROL_HEIGHT))
+        .h(crate::theme::control_height(SIDEBAR_CONTROL_HEIGHT))
         .rounded(crate::theme::ui_px(RADIUS_CONTROL))
         .w_full()
         .menu_max_h(crate::theme::ui_px(260.))
-        .text_size(crate::theme::ui_px(12.))
+        .text_size(crate::theme::text_px(12.))
         .bg(theme().glass_hover)
         .border_color(theme().hairline)
         .text_color(theme().text)
@@ -1424,7 +1424,7 @@ fn sidebar_row(
             })
             .relative()
             .w_full()
-            .h(crate::theme::ui_px(28.))
+            .h(crate::theme::control_height(28.))
             .px(crate::theme::ui_px(8.))
             .rounded(crate::theme::ui_px(RADIUS_CONTROL))
             .when(selected, |row| {
@@ -1435,7 +1435,7 @@ fn sidebar_row(
             } else {
                 theme().text
             })
-            .text_size(crate::theme::ui_px(12.))
+            .text_size(crate::theme::text_px(12.))
             .flex()
             .items_center()
             .gap(crate::theme::ui_px(7.))

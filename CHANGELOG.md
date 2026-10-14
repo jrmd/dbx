@@ -1,3 +1,11 @@
+## 0.11.0 - 2026-10-14
+
+- Choose interface and monospace fonts with searchable font pickers, and adjust each font size independently using numeric inputs and minus/plus buttons.
+- Grow controls, table rows, and columns with larger text, wrap crowded layouts, and keep column resize handles aligned at different zoom levels.
+- Select data rows by clicking and dragging, with a preference enabled by default. Shift-click and Command/Control-click remain available.
+- Apply context-menu JSON, TSV, SQL, and cell copying, duplication, deletion/restoration, and reversion to the selected rows. Single-row inspector, editor, and value-filter actions are disabled for multiple selections.
+- Clear stale column context when right-clicking the row gutter and protect row actions from stale results.
+
 ## 0.10.2 - 2026-10-13
 
 - Fix JSON and JSONB cell editors so typing, selection, keyboard editing, and staging changes work.

@@ -375,7 +375,7 @@ impl DbxApp {
                             div()
                                 .w(crate::theme::ui_px(76.))
                                 .flex_none()
-                                .text_size(crate::theme::ui_px(11.))
+                                .text_size(crate::theme::text_px(11.))
                                 .text_color(theme().text_muted)
                                 .child(status),
                         )

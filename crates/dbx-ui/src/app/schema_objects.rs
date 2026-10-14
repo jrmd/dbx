@@ -100,7 +100,7 @@ impl DbxApp {
                     div()
                         .px(crate::theme::ui_px(14.))
                         .pt(crate::theme::ui_px(8.))
-                        .text_size(crate::theme::ui_px(11.))
+                        .text_size(crate::theme::text_px(11.))
                         .text_color(theme().text_muted)
                         .child("Schema objects"),
                 )
@@ -110,7 +110,7 @@ impl DbxApp {
                     div()
                         .p(crate::theme::ui_px(8.))
                         .text_color(theme().danger_text)
-                        .text_size(crate::theme::ui_px(10.))
+                        .text_size(crate::theme::text_px(10.))
                         .child(error),
                 )
             })
@@ -143,10 +143,10 @@ impl DbxApp {
                             )))
                             .pressable(format!("Open {kind} {} definition", object.name))
                             .w_full()
-                            .h(crate::theme::ui_px(28.))
+                            .h(crate::theme::control_height(28.))
                             .px(crate::theme::ui_px(8.))
                             .rounded(crate::theme::ui_px(RADIUS_CONTROL))
-                            .text_size(crate::theme::ui_px(12.))
+                            .text_size(crate::theme::text_px(12.))
                             .text_color(theme().text)
                             .flex()
                             .items_center()
@@ -173,7 +173,7 @@ impl DbxApp {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(crate::theme::ui_px(10.))
+                                    .text_size(crate::theme::text_px(10.))
                                     .text_color(theme().text_muted)
                                     .child(kind),
                             )

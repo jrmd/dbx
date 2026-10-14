@@ -1060,7 +1060,7 @@ impl TextEditor {
             .border_1()
             .border_color(theme().border_strong)
             .bg(theme().panel_raised)
-            .text_size(crate::theme::ui_px(12.))
+            .text_size(crate::theme::text_px(12.))
             .child(
                 div()
                     .flex()
@@ -1078,7 +1078,7 @@ impl TextEditor {
             .child(
                 div()
                     .pt(crate::theme::ui_px(3.))
-                    .text_size(crate::theme::ui_px(11.))
+                    .text_size(crate::theme::text_px(11.))
                     .text_color(theme().text_muted)
                     .child(signature.summary),
             );
@@ -1172,13 +1172,13 @@ impl TextEditor {
             .border_1()
             .border_color(theme().border_strong)
             .bg(theme().panel_raised)
-            .text_size(crate::theme::ui_px(12.))
+            .text_size(crate::theme::text_px(12.))
             .text_color(theme().text)
             .child(hover.info.title.clone())
             .children(hover.info.detail.clone().map(|detail| {
                 div()
                     .pt(crate::theme::ui_px(3.))
-                    .text_size(crate::theme::ui_px(11.))
+                    .text_size(crate::theme::text_px(11.))
                     .text_color(theme().text_muted)
                     .child(detail)
             }));
@@ -1938,7 +1938,7 @@ struct PaintCache {
     /// them, so only these are measured for the content width.
     longest_lines: Vec<usize>,
     /// The measured width and the font size it was measured at.
-    width: Option<(Pixels, Pixels)>,
+    width: Option<(Pixels, SharedString, Pixels)>,
     /// The caret offset and the uses of the identifier under it.
     occurrences: Option<(usize, Vec<Range<usize>>)>,
     /// Blocks that can fold, computed when first needed.
@@ -2639,8 +2639,12 @@ impl Element for TextEditorText {
         } else {
             let mut cache = editor.paint_cache.borrow_mut();
             cache.refresh(text, editor.language);
-            let width = match cache.width {
-                Some((size, width)) if size == font_size => width,
+            let width = match &cache.width {
+                Some((size, family, width))
+                    if *size == font_size && *family == text_style.font_family =>
+                {
+                    *width
+                }
                 _ => {
                     let width = cache
                         .longest_lines
@@ -2649,7 +2653,7 @@ impl Element for TextEditorText {
                         .map(|line| shape(window, cache.line(text, line)))
                         .max()
                         .unwrap_or(crate::theme::ui_px(1.));
-                    cache.width = Some((font_size, width));
+                    cache.width = Some((font_size, text_style.font_family.clone(), width));
                     width
                 }
             };
@@ -3322,7 +3326,12 @@ fn input_with_context(
             this.h(if multiline {
                 crate::theme::ui_px(204.)
             } else {
-                crate::theme::ui_px(32.)
+                let text = if editor.read(cx).is_code() {
+                    crate::theme::mono_text_px(12.) * crate::theme::editor_scale()
+                } else {
+                    crate::theme::text_px(12.)
+                };
+                crate::theme::ui_px(32.).max(text * 1.5 + crate::theme::ui_px(14.))
             })
         })
         .p(if multiline {
@@ -3337,14 +3346,11 @@ fn input_with_context(
         // Colour only: a width change would shift neighbouring controls.
         .focus(|style| style.border_color(theme().focus_ring))
         .rounded(crate::theme::ui_px(5.))
-        .text_size(
-            crate::theme::ui_px(12.)
-                * if editor.read(cx).is_code() {
-                    crate::theme::editor_scale()
-                } else {
-                    1.
-                },
-        )
+        .text_size(if editor.read(cx).is_code() {
+            crate::theme::mono_text_px(12.) * crate::theme::editor_scale()
+        } else {
+            crate::theme::text_px(12.)
+        })
         .text_color(theme().text)
         .on_action({
             let editor = editor.clone();
@@ -4460,7 +4466,7 @@ mod tests {
         assert!(tokens.len() < 30);
         assert!(tokens[0].range.start >= cache.line_starts[19_999]);
         // Unchanged text keeps the measured width; edits clear it.
-        cache.width = Some((px(13.), px(500.)));
+        cache.width = Some((px(13.), "monospace".into(), px(500.)));
         cache.refresh(&text, EditorLanguage::Sql(None));
         assert!(cache.width.is_some());
         cache.refresh(&format!("{text} "), EditorLanguage::Sql(None));

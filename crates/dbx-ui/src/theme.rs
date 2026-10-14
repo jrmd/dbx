@@ -255,6 +255,8 @@ static SYSTEM_IS_DARK: AtomicBool = AtomicBool::new(true);
 static REDUCE_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
+    static MONO_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
+    static FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static UI_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
     static EDITOR_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
 }
@@ -262,6 +264,33 @@ thread_local! {
 pub fn set_text_scales(ui: u16, editor: u16) {
     UI_SCALE.set(ui.clamp(100, 200));
     EDITOR_SCALE.set(editor.clamp(100, 200));
+}
+
+pub fn set_font_sizes(normal: u16, mono: u16) {
+    FONT_SIZE.set(normal.clamp(10, 20));
+    MONO_FONT_SIZE.set(mono.clamp(10, 20));
+}
+
+pub fn mono_text_px(value: f32) -> gpui::Pixels {
+    ui_px(value * MONO_FONT_SIZE.get() as f32 / 12.)
+}
+
+/// Text sizing is independent of spacing, icons, and window zoom.
+pub fn text_px(value: f32) -> gpui::Pixels {
+    ui_px(value * FONT_SIZE.get() as f32 / 12.)
+}
+
+/// Grow text-bearing controls by the extra line height, leaving spacing and icons unchanged.
+pub fn control_height(base: f32) -> gpui::Pixels {
+    ui_px(base + 18. * (font_scale().max(1.) - 1.))
+}
+
+pub fn font_scale() -> f32 {
+    FONT_SIZE.get() as f32 / 12.
+}
+
+pub fn grid_row_height() -> gpui::Pixels {
+    ui_px(30. + 18. * ((FONT_SIZE.get().max(MONO_FONT_SIZE.get()) as f32 / 12.).max(1.) - 1.))
 }
 
 pub fn ui_scale() -> f32 {
@@ -608,14 +637,14 @@ pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedStri
         .gap(crate::theme::ui_px(SPACE_2))
         .child(
             div()
-                .text_size(crate::theme::ui_px(13.))
+                .text_size(crate::theme::text_px(13.))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text)
                 .child(title.into()),
         )
         .child(
             div()
-                .text_size(crate::theme::ui_px(11.))
+                .text_size(crate::theme::text_px(11.))
                 .text_color(theme.text_muted)
                 .child(detail.into()),
         )
@@ -626,11 +655,11 @@ pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedStri
 pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active: bool) -> Div {
     let theme = theme();
     div()
-        .h(crate::theme::ui_px(28.))
+        .h(crate::theme::control_height(28.))
         .pl(crate::theme::ui_px(10.))
         .pr(crate::theme::ui_px(5.))
         .rounded_full()
-        .text_size(crate::theme::ui_px(12.))
+        .text_size(crate::theme::text_px(12.))
         .flex()
         .items_center()
         .gap(crate::theme::ui_px(6.))
@@ -661,13 +690,13 @@ pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active
 pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
     let theme = theme();
     div()
-        .h(crate::theme::ui_px(26.))
+        .h(crate::theme::control_height(26.))
         .px(crate::theme::ui_px(11.))
         .rounded_full()
         .flex()
         .items_center()
         .gap(crate::theme::ui_px(6.))
-        .text_size(crate::theme::ui_px(12.))
+        .text_size(crate::theme::text_px(12.))
         .cursor_pointer()
         .when(selected, |view| {
             view.bg(theme.glass_selected)
@@ -826,7 +855,7 @@ pub fn settings_switch(
             gpui::accesskit::Toggled::False
         })
         .w(crate::theme::ui_px(36.))
-        .h(crate::theme::ui_px(28.))
+        .h(crate::theme::control_height(28.))
         .flex()
         .items_center()
         .cursor_pointer()
@@ -896,7 +925,9 @@ pub fn button(
     let button = Button::new(id)
         .label(label)
         .with_size(Size::XSmall)
-        .h(crate::theme::ui_px(28.))
+        .flex_shrink_0()
+        .text_size(crate::theme::text_px(12.))
+        .h(crate::theme::control_height(28.))
         .px(px(SPACE_3 + 2.))
         .rounded_full()
         .border_1()
@@ -954,7 +985,9 @@ pub fn settings_row(
         .flex()
         .items_center()
         .gap(crate::theme::ui_px(SPACE_4))
-        .when(ui_scale() > 1.25, |view| view.flex_col().items_start())
+        .when(ui_scale() * font_scale() > 1.25, |view| {
+            view.flex_col().items_start()
+        })
         .child(
             div()
                 .flex_1()
@@ -964,14 +997,14 @@ pub fn settings_row(
                 .gap(crate::theme::ui_px(2.))
                 .child(
                     div()
-                        .text_size(crate::theme::ui_px(13.))
+                        .text_size(crate::theme::text_px(13.))
                         .text_color(theme.text)
                         .child(label),
                 )
                 .when_some(detail, |view, detail| {
                     view.child(
                         div()
-                            .text_size(crate::theme::ui_px(11.))
+                            .text_size(crate::theme::text_px(11.))
                             .text_color(theme.text_muted)
                             .child(detail),
                     )
@@ -980,7 +1013,7 @@ pub fn settings_row(
         .child(
             div()
                 .min_w_0()
-                .when(ui_scale() > 1.25, |view| view.w_full())
+                .when(ui_scale() * font_scale() > 1.25, |view| view.w_full())
                 .flex_none()
                 .flex()
                 .items_center()
@@ -996,7 +1029,7 @@ pub fn badge(label: impl Into<SharedString>, color: Rgba) -> Div {
         .py(crate::theme::ui_px(2.))
         .rounded_full()
         .bg(theme.glass_hover)
-        .text_size(crate::theme::ui_px(10.))
+        .text_size(crate::theme::text_px(10.))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color)
         .child(label.into())
