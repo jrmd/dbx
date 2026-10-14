@@ -97,6 +97,12 @@ pub trait TableDelegate: Sized + 'static {
         div().id(("row", row_ix))
     }
 
+    /// Whether to apply the default hover background to this row.
+    /// Disable it to preserve a delegate-owned selection highlight.
+    fn row_hover_enabled(&self, row_ix: usize, cx: &App) -> bool {
+        true
+    }
+
     /// Render the context menu for the row at the given row index.
     fn context_menu(
         &mut self,

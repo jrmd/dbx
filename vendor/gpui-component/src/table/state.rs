@@ -30,11 +30,6 @@ enum SelectionMode {
 
 impl SelectionMode {
     #[inline(always)]
-    fn is_row(&self) -> bool {
-        matches!(self, SelectionMode::Row)
-    }
-
-    #[inline(always)]
     fn is_column(&self) -> bool {
         matches!(self, SelectionMode::Column)
     }
@@ -408,6 +403,7 @@ where
 
         cx.stop_propagation();
         self.selection_mode = SelectionMode::Row;
+        self.selected_cell = None;
         self.right_clicked_row = None;
         self.selected_row = Some(row_ix);
         if let Some(row_ix) = self.selected_row {
@@ -1800,7 +1796,13 @@ where
     ) -> Stateful<Div> {
         let horizontal_scroll_handle = self.horizontal_scroll_handle.clone();
         let is_stripe_row = self.options.stripe && row_ix % 2 != 0;
-        let is_selected = self.selected_row == Some(row_ix);
+        let is_selected = match self.selection_mode {
+            SelectionMode::Row => self.selected_row == Some(row_ix),
+            SelectionMode::Cell => {
+                self.row_selectable && self.selected_cell.is_some_and(|(row, _)| row == row_ix)
+            }
+            SelectionMode::Column => false,
+        };
         let view = cx.entity().clone();
         let row_height = self.options.size.table_row_height();
 
@@ -1812,6 +1814,7 @@ where
             let style = tr.style().clone();
 
             tr.h_flex()
+                .relative()
                 .w_full()
                 .h(row_height)
                 .when(need_render_border, |this| {
@@ -1820,7 +1823,10 @@ where
                 .when(is_stripe_row, |this| this.bg(cx.theme().tokens.table_even))
                 .refine_style(&style)
                 .hover(|this| {
-                    if is_selected || self.right_clicked_row == Some(row_ix) {
+                    if is_selected
+                        || self.right_clicked_row == Some(row_ix)
+                        || !self.delegate.row_hover_enabled(row_ix, cx)
+                    {
                         this
                     } else {
                         this.bg(cx.theme().tokens.table_hover)
@@ -2044,27 +2050,30 @@ where
                         )
                         .child(self.delegate.render_last_empty_col(window, cx)),
                 )
-                // Row selected style
-                // Note: Don't show row selection if a cell is selected
-                .when_some(self.selected_row, |this, _| {
-                    this.when(is_selected && self.selection_mode.is_row(), |this| {
-                        this.map(|this| {
-                            if cx.theme().list.active_highlight {
-                                this.border_color(gpui::transparent_white()).child(
+                // Keep the active row visible when selecting individual cells too.
+                .when(is_selected, |this| {
+                    this.map(|this| {
+                        if cx.theme().list.active_highlight {
+                            this.bg(cx.theme().tokens.table_active)
+                                .border_color(gpui::transparent_white())
+                                .child(
                                     div()
+                                        .debug_selector(move || {
+                                            format!("table-row-highlight-{row_ix}")
+                                        })
                                         .top(if row_ix == 0 { px(0.) } else { px(-1.) })
                                         .left(px(0.))
                                         .right(px(0.))
                                         .bottom(px(-1.))
                                         .absolute()
-                                        .bg(cx.theme().tokens.table_active)
-                                        .border_1()
-                                        .border_color(cx.theme().table_active_border),
+                                        .when(!self.selection_mode.is_cell(), |this| {
+                                            this.border_1()
+                                                .border_color(cx.theme().table_active_border)
+                                        }),
                                 )
-                            } else {
-                                this.bg(cx.theme().tokens.accent)
-                            }
-                        })
+                        } else {
+                            this.bg(cx.theme().tokens.accent)
+                        }
                     })
                 })
                 // Row right click row style

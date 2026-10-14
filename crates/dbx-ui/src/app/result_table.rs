@@ -1540,6 +1540,10 @@ impl TableDelegate for ResultTableDelegate {
             .into_any_element()
     }
 
+    fn row_hover_enabled(&self, row_ix: usize, _cx: &App) -> bool {
+        !(self.changes.marked.len() > 1 && self.changes.marked.contains(&row_ix))
+    }
+
     fn render_tr(
         &mut self,
         row_ix: usize,
@@ -2575,6 +2579,46 @@ mod tests {
     impl gpui::Render for RowMenuHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             accessible_grid(&self.grid, "Test results", false)
+        }
+    }
+
+    #[gpui::test]
+    fn cell_clicks_highlight_the_whole_active_row(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        for row_header in [true, false] {
+            let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
+                grid: cx.new(|cx| {
+                    TableState::new(delegate_with_export_result(), window, cx)
+                        .cell_selectable(true)
+                        .row_header(row_header)
+                }),
+            });
+            let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
+            grid.update(cx, |table, cx| table.set_selected_row(0, cx));
+            for (row_ix, col_ix, cell_selector) in [
+                (1, 1, "result-cell-text-1-1"),
+                (0, 2, "result-cell-text-0-2"),
+                (1, 0, "result-cell-text-1-0"),
+            ] {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                let target = cx.debug_bounds(cell_selector).unwrap().center();
+                cx.simulate_mouse_down(target, MouseButton::Left, Default::default());
+                cx.simulate_mouse_up(target, MouseButton::Left, Default::default());
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                grid.read_with(cx, |table, _| {
+                    assert_eq!(table.selected_cell(), Some((row_ix, col_ix)));
+                });
+                let row = cx
+                    .debug_bounds(["dbx-result-row-0", "dbx-result-row-1"][row_ix])
+                    .unwrap();
+                let highlights = ["table-row-highlight-0", "table-row-highlight-1"];
+                let highlight = cx
+                    .debug_bounds(highlights[row_ix])
+                    .expect("clicking a cell must highlight its entire row");
+                assert_eq!(highlight.left(), row.left());
+                assert_eq!(highlight.right(), row.right());
+                assert!(cx.debug_bounds(highlights[1 - row_ix]).is_none());
+            }
         }
     }
 
