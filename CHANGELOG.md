@@ -1,3 +1,11 @@
+## 0.12.0 - 2026-10-15
+
+- Choose from six colour themes (DBX, Ocean, Forest, Plum, Sand, and Graphite), each with light and dark variants, in a Theme group at the top of Appearance settings.
+- Import VS Code `.json`/`.jsonc` colour themes and DBX theme files, keep several custom themes, and remove each one from its own thumbnail. Re-importing a theme with the same name updates it.
+- Edit any interface, grid, or SQL syntax colour with a searchable colour editor and live preview. Editing a preset saves it as a new custom theme, and themes can be exported to share.
+- Switch to light or dark automatically when selecting a theme made for one appearance.
+- Keep imported themes readable: faint or translucent text and borderless inputs are raised to accessible contrast, and syntax colours come from each theme's general scopes rather than language-specific overrides.
+
 ## 0.11.1 - 2026-10-14
 
 - Keep the active row highlighted across its full width when selecting individual cells, and preserve selected-row highlights when hovering.
