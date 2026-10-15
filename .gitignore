@@ -43,3 +43,7 @@ Desktop.ini
 .codegraph
 .vercel
 .env*
+
+# Marketing site source belongs in the private jrmd/dbx-site repository
+/site/
+/dbx-site/
