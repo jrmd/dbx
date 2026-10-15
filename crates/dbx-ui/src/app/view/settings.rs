@@ -1047,11 +1047,18 @@ mod tests {
             app.mono_font_size = 12;
             app
         });
-        cx.simulate_resize(gpui::size(px(1400.), px(1800.)));
+        let window_size = gpui::size(px(1400.), px(1000.));
+        cx.simulate_resize(window_size);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let inputs = app.read_with(cx, |app, _| app.font_size_inputs.clone().unwrap());
         cx.update(|window, cx| inputs[0].read(cx).focus_handle(cx).focus(window, cx));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // Revealing an offscreen focused row schedules its scroll for the next frame.
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
         cx.simulate_keystrokes("secondary-a 1 6");
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(store.load().unwrap().font_size, 16);
@@ -1060,13 +1067,22 @@ mod tests {
         assert_eq!(crate::theme::text_px(12.), px(16.));
         assert_eq!(crate::theme::mono_text_px(12.), px(12.));
         cx.update(|window, cx| inputs[1].read(cx).focus_handle(cx).focus(window, cx));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
+        for _ in 0..3 {
+            cx.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+        }
         cx.simulate_keystrokes("secondary-a 1 4");
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert_eq!(store.load().unwrap().mono_font_size, Some(14));
         assert_eq!(crate::theme::text_px(12.), px(16.));
         assert_eq!(crate::theme::mono_text_px(12.), px(14.));
         let bounds = cx.debug_bounds("mono-font-size").unwrap();
+        assert!(
+            bounds.top() >= px(0.) && bounds.bottom() <= window_size.height,
+            "font size buttons must be visible before clicking: {bounds:?}"
+        );
         cx.simulate_click(
             gpui::point(bounds.right() - px(12.), bounds.center().y),
             Default::default(),
