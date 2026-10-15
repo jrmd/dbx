@@ -17,6 +17,7 @@ mod query_actions;
 mod schema_objects;
 mod session;
 mod tabs;
+mod theme_settings;
 use session::*;
 mod backups;
 mod connection;
@@ -656,6 +657,9 @@ enum ConfirmationAction {
         tab_id: SecondaryTabId,
     },
     Quit,
+    RemoveCustomTheme {
+        index: usize,
+    },
     DiscardDataTab {
         session_id: SessionId,
         tab_id: SecondaryTabId,
@@ -692,7 +696,10 @@ enum ConfirmationAction {
 impl ConfirmationAction {
     fn session_id(&self) -> Option<SessionId> {
         match self {
-            Self::LockVault | Self::Quit | Self::DeleteProfile { .. } => None,
+            Self::LockVault
+            | Self::Quit
+            | Self::RemoveCustomTheme { .. }
+            | Self::DeleteProfile { .. } => None,
             Self::RunQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
             | Self::ClearQueryHistory { session_id }
@@ -804,6 +811,8 @@ pub struct DbxApp {
     settings_section: SettingsSection,
     tag_editor: TagEditor,
     appearance: Appearance,
+    theme_preferences: crate::theme::catalog::ThemePreferences,
+    theme_editor: Option<theme_settings::ThemeEditor>,
     reduce_transparency: bool,
     ui_scale: u16,
     editor_scale: u16,
@@ -972,6 +981,11 @@ impl DbxApp {
             settings_section: SettingsSection::Appearance,
             tag_editor,
             appearance: appearance(),
+            theme_preferences: saved_settings
+                .as_ref()
+                .map(|s| s.theme.clone())
+                .unwrap_or_default(),
+            theme_editor: None,
             reduce_transparency: reduce_transparency(),
             ui_scale: saved_settings
                 .as_ref()
@@ -1026,6 +1040,7 @@ impl DbxApp {
             _subscriptions: subscriptions,
             error: profile_error,
         };
+        crate::theme::catalog::set_preferences(&this.theme_preferences);
         this.try_device_unlock(cx);
         if !cfg!(test) && std::env::var_os("DBX_DISABLE_UPDATES").is_none() {
             this.check_for_updates(cx);
@@ -1342,12 +1357,15 @@ impl DbxApp {
         set_system_appearance(window.appearance());
         window.set_background_appearance(window_background());
         sync_component_theme(Some(window), cx);
+        self.refresh_theme_color_input(window, cx);
+        cx.refresh_windows();
     }
 
     fn persist_settings(&mut self, cx: &mut Context<Self>) {
         let mut settings = Settings::new(self.appearance)
             .with_reduce_transparency(self.reduce_transparency)
             .with_remember_device(self.remember_device);
+        settings.theme = self.theme_preferences.clone();
         settings.agents = self.agent_setup.preferences.clone();
         settings.vim_mode = self.vim_mode;
         settings.motion = crate::motion::preference(cx);
@@ -4328,6 +4346,9 @@ impl DbxApp {
             ConfirmationAction::Quit => {
                 cx.quit();
                 return;
+            }
+            ConfirmationAction::RemoveCustomTheme { index } => {
+                self.remove_custom_theme(index, window, cx)
             }
             ConfirmationAction::CommitChanges { session_id, tab_id } => {
                 self.save_pending_edits_for(session_id, tab_id, window, cx)

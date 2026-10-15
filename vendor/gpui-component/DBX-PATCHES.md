@@ -26,6 +26,10 @@ real element/accessibility identities and scoped state when stable rows sort or
 columns move. The rendered regression checks fixed and scrolling cells plus
 headers. Delegates retain responsibility for unique stable row element IDs.
 
+Active cell overlays draw a two-pixel focus border without a fill. The active
+row supplies the selection background, so opaque custom theme colours cannot
+paint over cell values (for both fixed and scrolling columns).
+
 The theme has an optional application-owned input-fill override. DBX uses an
 opaque canvas fill so stronger input edges do not also brighten the dark input
 background and reduce placeholder contrast. The upstream behavior remains the

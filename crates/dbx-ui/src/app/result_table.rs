@@ -1556,7 +1556,7 @@ impl TableDelegate for ResultTableDelegate {
             theme().grid_alternate
         };
         let background = if self.changes.marked.contains(&row_ix) && self.changes.marked.len() > 1 {
-            theme().accent.alpha(0.14)
+            theme().grid_selected
         } else if self.changes.deletes.contains(&row_ix) {
             theme().danger.alpha(0.12)
         } else if self.insert_row(row_ix).is_some() {

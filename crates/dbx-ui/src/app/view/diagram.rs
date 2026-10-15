@@ -1247,7 +1247,7 @@ fn diagram_relationship_canvas(
     routes: Vec<DiagramEdgeRoute>,
     zoom: f32,
 ) -> gpui::Canvas<Vec<DiagramPaintedEdge>> {
-    let palette = *theme();
+    let palette = theme();
     canvas(
         move |bounds, _, _| {
             let mut routes = routes;
@@ -1407,7 +1407,7 @@ fn diagram_minimap(
         (viewport.0 / zoom * scale).min(width),
         (viewport.1 / zoom * scale).min(height),
     );
-    let palette = *theme();
+    let palette = theme();
     let canvas = canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {

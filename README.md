@@ -26,7 +26,7 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 - **A visual table designer:** add, rename or drop columns and add or drop indexes through a reviewable SQL draft.
 - **Cloud authentication helpers:** fetch AWS RDS IAM or Azure PostgreSQL Entra tokens from an authenticated local CLI.
 - **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
-- **Native appearance:** light, dark, and system themes, with an option to reduce transparency.
+- **Custom themes:** six palettes with light, dark, and system appearance; edit every colour in Settings → Appearance, import VS Code JSON/JSONC themes, or export a reusable DBX theme. [Theme guide](docs/themes.md).
 
 ### Write SQL, see the results
 

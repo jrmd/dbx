@@ -121,6 +121,31 @@ The interface is intentionally native and dense. Surfaces are layered only enoug
 
 The default palette is a low-glare charcoal console: cool white text sits on layered black surfaces, with purposeful semantic color for action and state. A first-class light appearance maps the same roles onto cool paper, white panels, blue-slate dividers, and ink text; it is composed rather than mechanically inverted.
 
+### Custom palettes
+
+Palettes live in the Theme group at the top of Settings → Appearance, beside
+the System/Light/Dark choice; there is no separate Themes page. DBX, Ocean,
+Forest, Plum, Sand, and Graphite each have light and dark variants and appear
+as 104px thumbnails that sketch rail, active row, and syntax in that palette;
+the selected one gets a Command Blue ring. **Your themes** is a second row of
+the same thumbnails for imported and edited themes, each revealing a small ×
+inside its corner on hover or focus, red when targeted (removal confirms), ending in a dashed **Import…** tile, so
+add and remove sit with the themes they affect. **Edit…** expands a searchable
+semantic-colour editor inline (colour picker, hex/alpha entry, explicit Apply,
+Reset) above a live mini result grid and query line. Editing a preset adds a
+new theme; preferences and both custom variants persist across relaunches.
+
+VS Code JSON/JSONC imports map UI colours and common TextMate syntax scopes to
+DBX's semantic roles. A self-contained DBX export preserves every role in both
+appearances. The importer validates before applying and never follows include
+paths. See `docs/themes.md` for format details and compatibility limits.
+
+Grid active, grouped selection, and hover fills are independent semantic roles.
+The active row uses a stronger opaque fill; the active cell adds a two-pixel
+focus outline without painting over its value. Both the component colour table
+and resolved tokens must receive the palette, including header, footer, stripes,
+menus, scrollbars, controls, and focus states.
+
 ### Appearance modes
 
 - **Dark:** Black Canvas, Instrument Panel, Raised Utility Surface, and Navigation Rail remain the default low-glare working environment.

@@ -1868,8 +1868,8 @@ where
                                                             div()
                                                                 .absolute()
                                                                 .inset_0()
-                                                                .bg(cx.theme().tokens.table_active)
-                                                                .border_1()
+                                                                // The row already supplies the selection fill.
+                                                                .border_2()
                                                                 .border_color(
                                                                     cx.theme().table_active_border,
                                                                 ),
@@ -1987,11 +1987,8 @@ where
                                                                 div()
                                                                     .absolute()
                                                                     .inset_0()
-                                                                    .bg(cx
-                                                                        .theme()
-                                                                        .tokens
-                                                                        .table_active)
-                                                                    .border_1()
+                                                                    // The row already supplies the selection fill.
+                                                                .border_2()
                                                                     .border_color(
                                                                         cx.theme()
                                                                             .table_active_border,

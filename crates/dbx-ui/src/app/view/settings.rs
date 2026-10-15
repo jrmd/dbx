@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::theme::{SPACE_1, SPACE_2, SPACE_4};
 use gpui_component::ActiveTheme as _;
 use gpui_component::input::{InputEvent, InputState, NumberInput, NumberInputEvent, StepAction};
 
@@ -41,7 +42,9 @@ impl DbxApp {
             .find(|(section, ..)| *section == selected)
             .map_or("Settings", |(_, label, _)| *label);
         let content = match selected {
-            SettingsSection::Appearance => self.render_settings_appearance(cx).into_any_element(),
+            SettingsSection::Appearance => self
+                .render_settings_appearance(window, cx)
+                .into_any_element(),
             SettingsSection::Editor => self.render_settings_editor(cx).into_any_element(),
             SettingsSection::QueryAgent => self.render_agent_settings(cx).into_any_element(),
             SettingsSection::Connections => self.render_settings_connections(cx).into_any_element(),
@@ -450,7 +453,7 @@ impl DbxApp {
             }))
     }
 
-    fn render_settings_appearance(&mut self, cx: &mut Context<Self>) -> Div {
+    fn render_settings_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let current = self.appearance;
         let appearance_choices = Appearance::ALL.into_iter().map(|option| {
             segment(option.label(), option == current)
@@ -469,20 +472,23 @@ impl DbxApp {
                     this.set_appearance_preference(option, window, cx)
                 }))
         });
-        let mut rows = vec![
+        let mut theme_rows = vec![
             settings_row(
-                "Theme",
+                "Appearance",
                 None,
                 segmented_track()
                     .id("appearance-choices")
                     .role(gpui::Role::RadioGroup)
-                    .aria_label("Theme")
+                    .aria_label("Appearance")
                     .children(appearance_choices),
             )
             .into_any_element(),
         ];
+        theme_rows.extend(self.render_theme_rows(window, cx));
+        let mut rows = Vec::new();
         rows.push(settings_row("Interface size", Some("Grow text and controls together. Command or Control with +, −, or 0 adjusts or resets the size.".into()), self.text_scale_choices(false, cx)).into_any_element());
-        rows.push(settings_row("Motion", Some("Follow your system preference or choose static controls. System uses reduced motion when the desktop cannot report a preference.".into()),
+        let mut behaviour = Vec::new();
+        behaviour.push(settings_row("Motion", Some("Follow your system preference or choose static controls. System uses reduced motion when the desktop cannot report a preference.".into()),
             div().id("motion-choices").role(gpui::Role::RadioGroup).aria_label("Motion")
                 .flex().flex_wrap().gap(crate::theme::ui_px(4.))
                 .children(crate::motion::MotionPreference::ALL.into_iter().map(|option| {
@@ -499,7 +505,7 @@ impl DbxApp {
                         }))
                 }))).into_any_element());
         if !cfg!(target_os = "macos") {
-            rows.push(
+            behaviour.push(
                 settings_row(
                     "Reduce transparency",
                     None,
@@ -568,7 +574,7 @@ impl DbxApp {
                 }
             }
         }
-        rows.push(
+        behaviour.push(
             settings_row(
                 "Drag to select rows",
                 Some("Click and drag across rows in the data view to select a range.".into()),
@@ -586,7 +592,22 @@ impl DbxApp {
             )
             .into_any_element(),
         );
-        div().child(self.scrolling_settings_group("settings-main-row", rows))
+        div()
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(SPACE_4 + SPACE_2))
+            .child(settings_section(
+                "Theme",
+                self.scrolling_settings_group("settings-theme-row", theme_rows),
+            ))
+            .child(settings_section(
+                "Behaviour",
+                self.scrolling_settings_group("settings-behaviour-row", behaviour),
+            ))
+            .child(settings_section(
+                "Text",
+                self.scrolling_settings_group("settings-main-row", rows),
+            ))
     }
 
     fn render_settings_connections(&mut self, cx: &mut Context<Self>) -> Div {
@@ -989,6 +1010,24 @@ fn connection_count(count: usize) -> String {
     }
 }
 
+/// A titled group of settings rows; the label sits outside the inset group,
+/// as in the platform's own preference panes.
+fn settings_section(title: &'static str, group: Div) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(crate::theme::ui_px(SPACE_2))
+        .child(
+            div()
+                .px(crate::theme::ui_px(SPACE_1))
+                .text_size(crate::theme::text_px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme().text_muted)
+                .child(title),
+        )
+        .child(group)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,7 +1047,7 @@ mod tests {
             app.mono_font_size = 12;
             app
         });
-        cx.simulate_resize(gpui::size(px(1400.), px(1400.)));
+        cx.simulate_resize(gpui::size(px(1400.), px(1800.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let inputs = app.read_with(cx, |app, _| app.font_size_inputs.clone().unwrap());
         cx.update(|window, cx| inputs[0].read(cx).focus_handle(cx).focus(window, cx));
@@ -1106,6 +1145,7 @@ mod tests {
             app.settings_store = Some(store.clone());
             app
         });
+        cx.simulate_resize(gpui::size(px(1200.), px(1100.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         for (label, reduced) in [
             ("motion-Reduce", true),
@@ -1178,7 +1218,7 @@ mod tests {
             app.settings_store = Some(SettingsStore::at(directory.path().join("settings.json")));
             app
         });
-        cx.simulate_resize(gpui::size(px(800.), px(600.)));
+        cx.simulate_resize(gpui::size(px(800.), px(840.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let initial = cx.debug_bounds("motion-Full").unwrap();
         cx.simulate_mouse_down(initial.center(), MouseButton::Left, Default::default());
@@ -1203,7 +1243,7 @@ mod tests {
         }
         let before = cx.debug_bounds("motion-Full").unwrap();
         assert!(
-            before.bottom() > px(600.),
+            before.bottom() > px(840.),
             "fixture must put the control below the viewport"
         );
         cx.update(|window, cx| focus.focus(window, cx));
@@ -1218,7 +1258,7 @@ mod tests {
             assert!(focus.is_focused(window), "control focus was lost");
         });
         assert!(
-            after.top() >= px(0.) && after.bottom() <= px(600.),
+            after.top() >= px(0.) && after.bottom() <= px(840.),
             "focused control must be visible: {after:?}"
         );
         cx.update(|_, cx| {
@@ -1233,7 +1273,7 @@ mod tests {
             });
         }
         assert!(
-            cx.debug_bounds("motion-Full").unwrap().bottom() > px(600.),
+            cx.debug_bounds("motion-Full").unwrap().bottom() > px(840.),
             "manual scrolling must not be undone while focus stays on the same row"
         );
         cx.update(|window, cx| {

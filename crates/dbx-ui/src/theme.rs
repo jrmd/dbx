@@ -16,6 +16,9 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
 };
 
+#[path = "theme/catalog.rs"]
+pub mod catalog;
+
 use crate::assets;
 use dbx_core::DatabaseKind;
 
@@ -64,6 +67,9 @@ pub struct Theme {
     pub warning: Rgba,
     pub warning_text: Rgba,
     pub grid_alternate: Rgba,
+    pub grid_active: Rgba,
+    pub grid_selected: Rgba,
+    pub grid_hover: Rgba,
     pub rail: Rgba,
     pub focus_ring: Rgba,
     pub overlay: Rgba,
@@ -116,6 +122,9 @@ pub static DARK_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
     warning: rgb(0xf59e0b),
     warning_text: rgb(0xf59e0b),
     grid_alternate: rgb(0x0e1116),
+    grid_active: rgb(0x19355a),
+    grid_selected: rgb(0x182c49),
+    grid_hover: rgb(0x192230),
     rail: rgb(0x0d1016),
     focus_ring: rgb(0x60a5fa),
     overlay: rgba(0x00000088),
@@ -166,6 +175,9 @@ pub static LIGHT_THEME: LazyLock<Theme> = LazyLock::new(|| Theme {
     warning: rgb(0xa85e00),
     warning_text: rgb(0x884900),
     grid_alternate: rgb(0xf1f5f9),
+    grid_active: rgb(0xb9d6fa),
+    grid_selected: rgb(0xdce8fa),
+    grid_hover: rgb(0xe7eef8),
     rail: rgb(0xebf0f6),
     focus_ring: rgb(0x0b63ce),
     overlay: rgba(0x0f172a4d),
@@ -307,6 +319,14 @@ pub fn ui_px(value: f32) -> gpui::Pixels {
 }
 
 /// Set the appearance preference used by DBX's semantic primitives.
+/// Serialises tests that change or depend on the process-wide appearance.
+#[cfg(test)]
+pub fn appearance_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn set_appearance(appearance: Appearance) {
     CURRENT_APPEARANCE.store(appearance as u8, Ordering::Release);
 }
@@ -356,13 +376,8 @@ pub fn window_background() -> WindowBackgroundAppearance {
 }
 
 /// Return the semantic palette for the current appearance and material.
-pub fn theme() -> &'static Theme {
-    match (is_dark(), reduce_transparency()) {
-        (true, false) => &DARK_THEME,
-        (true, true) => &DARK_SOLID_THEME,
-        (false, false) => &LIGHT_THEME,
-        (false, true) => &LIGHT_SOLID_THEME,
-    }
+pub fn theme() -> Theme {
+    catalog::resolved_theme(is_dark(), reduce_transparency())
 }
 
 /// Push DBX's resolved palette into gpui-component so its menus, popovers,
@@ -410,6 +425,71 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     component.colors.button_primary_hover = component.colors.primary_hover;
     component.colors.button_primary_active = component.colors.primary_active;
 
+    component.colors.table = palette.canvas.into();
+    component.colors.table_active = palette.grid_active.into();
+    component.colors.table_active_border = palette.focus_ring.into();
+    component.colors.table_even = palette.grid_alternate.into();
+    component.colors.table_head = palette.panel_raised.into();
+    component.colors.table_head_foreground = palette.text.into();
+    component.colors.table_foot = palette.panel.into();
+    component.colors.table_foot_foreground = palette.text_muted.into();
+    component.colors.table_hover = palette.grid_hover.into();
+    component.colors.table_row_border = palette.border.into();
+    component.colors.list = palette.panel.into();
+    component.colors.list_even = palette.grid_alternate.into();
+    component.colors.list_head = palette.panel_raised.into();
+    component.colors.list_hover = palette.glass_hover.into();
+    component.colors.secondary = palette.panel_raised.into();
+    component.colors.secondary_foreground = palette.text.into();
+    component.colors.secondary_active = palette.glass_selected.into();
+    component.colors.muted = palette.panel_raised.into();
+    component.colors.scrollbar = palette.panel.into();
+    component.colors.scrollbar_thumb = palette.border_strong.into();
+    component.colors.scrollbar_thumb_hover = palette.text_muted.into();
+    component.colors.tab = palette.panel.into();
+    component.colors.tab_active = palette.canvas.into();
+    component.colors.tab_foreground = palette.text_muted.into();
+    component.colors.tab_active_foreground = palette.text.into();
+    component.colors.tab_bar = palette.rail.into();
+    component.colors.tab_bar_segmented = palette.panel_raised.into();
+    component.colors.title_bar = palette.rail.into();
+    component.colors.title_bar_border = palette.border.into();
+    component.colors.sidebar = palette.glass.into();
+    component.colors.sidebar_foreground = palette.text.into();
+    component.colors.sidebar_border = palette.hairline.into();
+    component.colors.sidebar_accent = palette.glass_selected.into();
+    component.colors.sidebar_accent_foreground = palette.text.into();
+    component.colors.sidebar_primary = palette.accent.into();
+    component.colors.sidebar_primary_foreground = palette.accent_foreground.into();
+    component.colors.status_bar = palette.panel.into();
+    component.colors.status_bar_border = palette.border.into();
+    component.colors.overlay = palette.overlay.into();
+    component.colors.link = palette.accent_text.into();
+    component.colors.link_hover = palette.accent_text.into();
+    component.colors.link_active = palette.accent_text.into();
+    component.colors.success = palette.success.into();
+    component.colors.warning = palette.warning.into();
+    component.colors.info = palette.accent.into();
+    component.colors.progress_bar = palette.accent.into();
+    component.colors.switch = palette.border_strong.into();
+    component.colors.switch_thumb = palette.panel.into();
+    component.colors.button = palette.panel_raised.into();
+    component.colors.button_foreground = palette.text.into();
+    component.colors.button_hover = palette.glass_hover.into();
+    component.colors.button_active = palette.glass_selected.into();
+    component.colors.accordion = palette.panel.into();
+    component.colors.group_box = palette.panel.into();
+    component.colors.group_box_foreground = palette.text.into();
+    component.colors.description_list_label = palette.panel_raised.into();
+    component.colors.description_list_label_foreground = palette.text_muted.into();
+    component.colors.drag_border = palette.focus_ring.into();
+    component.colors.drop_target = palette.accent_soft.into();
+    component.colors.skeleton = palette.panel_raised.into();
+    component.colors.slider_bar = palette.accent.into();
+    component.colors.slider_thumb = palette.accent.into();
+    component.colors.tiles = palette.panel.into();
+    component.colors.window_border = palette.border.into();
+
     // Components read the resolved token table rather than `colors`, and
     // `Theme::change` resolved it from the stock palette. Re-resolve every
     // token DBX overrides so hover and active states match the rest state
@@ -441,6 +521,71 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     tokens.button_primary_foreground = colors.button_primary_foreground.into();
     tokens.button_primary_hover = colors.button_primary_hover.into();
     tokens.button_primary_active = colors.button_primary_active.into();
+    tokens.table = colors.table.into();
+    tokens.table_active = colors.table_active.into();
+    tokens.table_active_border = colors.table_active_border.into();
+    tokens.table_even = colors.table_even.into();
+    tokens.table_head = colors.table_head.into();
+    tokens.table_head_foreground = colors.table_head_foreground.into();
+    tokens.table_foot = colors.table_foot.into();
+    tokens.table_foot_foreground = colors.table_foot_foreground.into();
+    tokens.table_hover = colors.table_hover.into();
+    tokens.table_row_border = colors.table_row_border.into();
+    tokens.list = colors.list.into();
+    tokens.list_even = colors.list_even.into();
+    tokens.list_head = colors.list_head.into();
+    tokens.list_hover = colors.list_hover.into();
+    tokens.secondary = colors.secondary.into();
+    tokens.secondary_foreground = colors.secondary_foreground.into();
+    tokens.secondary_active = colors.secondary_active.into();
+    tokens.muted = colors.muted.into();
+    tokens.scrollbar = colors.scrollbar.into();
+    tokens.scrollbar_thumb = colors.scrollbar_thumb.into();
+    tokens.scrollbar_thumb_hover = colors.scrollbar_thumb_hover.into();
+    tokens.tab = colors.tab.into();
+    tokens.tab_active = colors.tab_active.into();
+    tokens.tab_foreground = colors.tab_foreground.into();
+    tokens.tab_active_foreground = colors.tab_active_foreground.into();
+    tokens.tab_bar = colors.tab_bar.into();
+    tokens.tab_bar_segmented = colors.tab_bar_segmented.into();
+    tokens.title_bar = colors.title_bar.into();
+    tokens.title_bar_border = colors.title_bar_border.into();
+    tokens.sidebar = colors.sidebar.into();
+    tokens.sidebar_foreground = colors.sidebar_foreground.into();
+    tokens.sidebar_border = colors.sidebar_border.into();
+    tokens.sidebar_accent = colors.sidebar_accent.into();
+    tokens.sidebar_accent_foreground = colors.sidebar_accent_foreground.into();
+    tokens.sidebar_primary = colors.sidebar_primary.into();
+    tokens.sidebar_primary_foreground = colors.sidebar_primary_foreground.into();
+    tokens.status_bar = colors.status_bar.into();
+    tokens.status_bar_border = colors.status_bar_border.into();
+    tokens.overlay = colors.overlay.into();
+    tokens.link = colors.link.into();
+    tokens.link_hover = colors.link_hover.into();
+    tokens.link_active = colors.link_active.into();
+    tokens.success = colors.success.into();
+    tokens.warning = colors.warning.into();
+    tokens.info = colors.info.into();
+    tokens.progress_bar = colors.progress_bar.into();
+    tokens.switch = colors.switch.into();
+    tokens.switch_thumb = colors.switch_thumb.into();
+    tokens.button = colors.button.into();
+    tokens.button_foreground = colors.button_foreground.into();
+    tokens.button_hover = colors.button_hover.into();
+    tokens.button_active = colors.button_active.into();
+    tokens.accordion = colors.accordion.into();
+    tokens.group_box = colors.group_box.into();
+    tokens.group_box_foreground = colors.group_box_foreground.into();
+    tokens.description_list_label = colors.description_list_label.into();
+    tokens.description_list_label_foreground = colors.description_list_label_foreground.into();
+    tokens.drag_border = colors.drag_border.into();
+    tokens.drop_target = colors.drop_target.into();
+    tokens.skeleton = colors.skeleton.into();
+    tokens.slider_bar = colors.slider_bar.into();
+    tokens.slider_thumb = colors.slider_thumb.into();
+    tokens.tiles = colors.tiles.into();
+    tokens.window_border = colors.window_border.into();
+    tokens.foreground = colors.foreground.into();
     // Base owns a separate snapshot. Publishing only styled-component colors
     // leaves its focus rings and unstyled controls on the stock palette.
     gpui_component::Theme::sync_base(cx);
@@ -1152,6 +1297,7 @@ mod tests {
     fn resolved_input_materials_have_readable_fill_and_distinct_edges(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _appearance = appearance_test_lock();
         cx.update(gpui_component::init);
         for appearance in [Appearance::Light, Appearance::Dark] {
             set_appearance(appearance);
@@ -1163,7 +1309,7 @@ mod tests {
                 let text = Rgba::from(component.colors.foreground);
                 let placeholder = Rgba::from(component.colors.muted_foreground);
                 let palette = theme();
-                for (_, surface) in composed_surfaces(palette, rgb(0xffffff)) {
+                for (_, surface) in composed_surfaces(&palette, rgb(0xffffff)) {
                     let painted_fill = composite(fill, surface);
                     let painted_edge = composite(edge, surface);
                     assert!(
@@ -1201,6 +1347,7 @@ mod tests {
     fn resolved_destructive_outline_states_keep_error_labels_readable(
         cx: &mut gpui::TestAppContext,
     ) {
+        let _appearance = appearance_test_lock();
         cx.update(gpui_component::init);
         for appearance in [Appearance::Light, Appearance::Dark] {
             set_appearance(appearance);
@@ -1208,7 +1355,7 @@ mod tests {
             cx.update(|cx| {
                 let component = gpui_component::Theme::global(cx);
                 let foreground = Rgba::from(component.colors.danger);
-                for (_, surface) in composed_surfaces(theme(), rgb(0xffffff)) {
+                for (_, surface) in composed_surfaces(&theme(), rgb(0xffffff)) {
                     for (token, alpha) in [
                         (component.tokens.danger, 0.1),
                         (component.tokens.danger_hover, 0.2),
@@ -1227,6 +1374,7 @@ mod tests {
 
     #[gpui::test]
     fn resolved_primary_button_states_keep_white_labels_readable(cx: &mut gpui::TestAppContext) {
+        let _appearance = appearance_test_lock();
         cx.update(gpui_component::init);
         for appearance in [Appearance::Light, Appearance::Dark] {
             set_appearance(appearance);
@@ -1305,6 +1453,7 @@ mod tests {
 
     #[test]
     fn current_palette_follows_selected_appearance() {
+        let _appearance = appearance_test_lock();
         set_appearance(Appearance::Light);
         assert_eq!(theme().canvas, LIGHT_THEME.canvas);
         set_appearance(Appearance::Dark);

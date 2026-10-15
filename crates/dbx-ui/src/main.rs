@@ -149,6 +149,7 @@ fn main() {
                 });
             motion::init(settings.motion, cx);
             theme::set_appearance(settings.appearance);
+            theme::catalog::set_preferences(&settings.theme);
             theme::set_reduce_transparency(settings.reduce_transparency);
             theme::set_text_scales(settings.ui_scale, settings.editor_scale);
             theme::set_system_appearance(cx.window_appearance());

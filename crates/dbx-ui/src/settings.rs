@@ -22,6 +22,8 @@ pub struct Settings {
     pub version: u32,
     #[serde(default)]
     pub appearance: Appearance,
+    #[serde(default)]
+    pub theme: crate::theme::catalog::ThemePreferences,
     /// Replace glass materials with opaque surfaces.
     #[serde(default)]
     pub reduce_transparency: bool,
@@ -81,6 +83,7 @@ impl Settings {
         Self {
             version: SETTINGS_FILE_VERSION,
             appearance,
+            theme: Default::default(),
             reduce_transparency: false,
             motion: crate::motion::MotionPreference::System,
             ui_scale: 100,
@@ -242,6 +245,24 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary settings directory");
         let store = SettingsStore::at(directory.path().join(SETTINGS_FILE_NAME));
         (directory, store)
+    }
+
+    #[test]
+    fn custom_theme_and_preset_survive_relaunch_and_old_settings_migrate() {
+        let (_directory, store) = test_store();
+        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
+        let mut settings = store.load().unwrap();
+        assert_eq!(settings.theme, Default::default());
+        settings.theme.preset = crate::theme::catalog::Preset::Ocean;
+        settings
+            .theme
+            .edit("grid_active", "#aabbcc", false)
+            .unwrap();
+        store.save(settings.clone()).unwrap();
+        assert_eq!(
+            SettingsStore::at(store.path.clone()).load().unwrap(),
+            settings
+        );
     }
 
     #[test]
