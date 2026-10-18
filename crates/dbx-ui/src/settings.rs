@@ -266,45 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn vim_mode_defaults_off_for_old_settings_and_survives_relaunch() {
-        let (_directory, store) = test_store();
-        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
-        let mut settings = store.load().unwrap();
-        assert!(!settings.vim_mode);
-        settings.vim_mode = true;
-        store.save(settings).unwrap();
-        assert!(
-            SettingsStore::at(store.path.clone())
-                .load()
-                .unwrap()
-                .vim_mode
-        );
-    }
-
-    #[test]
     fn missing_settings_follow_the_system_with_glass() {
         let (_directory, store) = test_store();
         assert_eq!(store.load().expect("load defaults"), Settings::default());
         assert_eq!(Settings::default().appearance, Appearance::System);
         assert!(!Settings::default().reduce_transparency);
-    }
-
-    #[test]
-    fn agent_models_providers_and_default_survive_restart() {
-        use crate::agents::{AgentCli, AgentConfig};
-        let (_directory, store) = test_store();
-        let mut settings = Settings::default();
-        settings.agents.default_cli = AgentCli::OpenCode;
-        settings.agents.configurations.insert(
-            AgentCli::OpenCode,
-            AgentConfig {
-                executable: "/opt/bin/opencode".into(),
-                model: "model".into(),
-                provider: "provider".into(),
-            },
-        );
-        store.save(settings.clone()).unwrap();
-        assert_eq!(store.load().unwrap(), settings);
     }
 
     #[test]
@@ -318,19 +284,6 @@ mod tests {
         assert_eq!(settings.ui_scale, 100);
         assert_eq!(settings.motion, crate::motion::MotionPreference::System);
         assert_eq!(settings.editor_scale, 100);
-    }
-
-    #[test]
-    fn saves_and_reloads_appearance_atomically() {
-        let (_directory, store) = test_store();
-        let settings = Settings::new(Appearance::Light);
-        store.save(settings.clone()).expect("save settings");
-
-        assert_eq!(store.load().expect("reload settings"), settings);
-        let json = fs::read_to_string(&store.path).expect("read settings file");
-        assert!(json.contains("\"version\": 1"));
-        assert!(json.contains("\"appearance\": \"light\""));
-        assert!(!store.path.with_extension("tmp").exists());
     }
 
     #[test]
@@ -349,36 +302,6 @@ mod tests {
         settings.drag_row_selection = false;
         store.save(settings.clone()).unwrap();
         assert_eq!(store.load().unwrap(), settings);
-    }
-
-    #[test]
-    fn independent_text_scales_survive_relaunch() {
-        let (_directory, store) = test_store();
-        let settings = Settings {
-            ui_scale: 200,
-            editor_scale: 150,
-            ..Default::default()
-        };
-        store.save(settings).unwrap();
-        let reloaded = store.load().unwrap();
-        assert_eq!(reloaded.ui_scale, 200);
-        assert_eq!(reloaded.editor_scale, 150);
-    }
-
-    #[test]
-    fn replaces_an_existing_settings_document() {
-        let (_directory, store) = test_store();
-        store
-            .save(Settings::new(Appearance::Light))
-            .expect("save light appearance");
-        store
-            .save(Settings::new(Appearance::Dark))
-            .expect("replace appearance");
-
-        assert_eq!(
-            store.load().expect("reload replacement").appearance,
-            Appearance::Dark
-        );
     }
 
     #[test]

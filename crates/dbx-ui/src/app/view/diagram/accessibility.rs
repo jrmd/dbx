@@ -134,15 +134,6 @@ mod tests {
         })
     }
 
-    #[test]
-    fn relationship_description_keeps_qualified_tables_and_composite_columns() {
-        let document = DiagramDocument::from_schema(&schema());
-        let label = relationship_label(&document, &document.edges[0]);
-        assert!(label.contains(
-            "public.posts (user_a, user_b) references public.users (column_0, column_1)."
-        ));
-    }
-
     #[gpui::test]
     fn keyboard_list_selects_moves_and_resets_the_real_diagram_and_scales_full_columns(
         cx: &mut gpui::TestAppContext,

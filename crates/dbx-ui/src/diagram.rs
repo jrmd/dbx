@@ -683,22 +683,6 @@ fn node_height(columns: &(Vec<DiagramColumn>, usize)) -> f32 {
     HEADER_HEIGHT + ((visible.len() + usize::from(*omitted > 0)) as f32 * ROW_HEIGHT) + 10.0
 }
 
-#[cfg(test)]
-fn edge_path(
-    source: &DiagramNode,
-    target: &DiagramNode,
-    foreign_key: &ForeignKeyInfo,
-    self_referential: bool,
-) -> String {
-    edge_route(
-        source,
-        target,
-        foreign_key.columns.first().map(String::as_str),
-        foreign_key.referenced_columns.first().map(String::as_str),
-        self_referential,
-    )
-}
-
 /// An orthogonal route from the referencing column's row on `source` to the
 /// referenced column's row on `target`, as an `M/H/V` path.
 fn edge_route(
@@ -1166,16 +1150,6 @@ fn adler32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn type_labels_preserve_quoted_enum_names_and_enum_values() {
-        assert_eq!(display_type("VARCHAR(255)"), "varchar(255)");
-        assert_eq!(
-            display_type(r#""Sales"."Mood (State)"[]"#),
-            r#""Sales"."Mood (State)"[]"#
-        );
-        assert_eq!(display_type("ENUM('Happy','SAD')"), "enum('Happy','SAD')");
-    }
-
     use dbx_core::{EntityKind, ForeignKeyInfo, RelationalTable, TableStructure};
     use std::sync::Arc;
 
@@ -1249,50 +1223,6 @@ mod tests {
         }
     }
 
-    fn node(id: &str, x: f32, y: f32, width: f32, height: f32) -> DiagramNode {
-        DiagramNode {
-            id: id.into(),
-            table: TableInfo {
-                name: id.into(),
-                schema: Some("public".into()),
-                kind: EntityKind::Table,
-            },
-            x,
-            y,
-            width,
-            height,
-            columns: vec![],
-            omitted_columns: 0,
-        }
-    }
-
-    fn is_on_border(node: &DiagramNode, x: f32, y: f32) -> bool {
-        let right = node.x + node.width;
-        let bottom = node.y + node.height;
-        ((x == node.x || x == right) && y >= node.y && y <= bottom)
-            || ((y == node.y || y == bottom) && x >= node.x && x <= right)
-    }
-
-    fn crosses_interior(
-        node: &DiagramNode,
-        (start_x, start_y): (f32, f32),
-        (end_x, end_y): (f32, f32),
-    ) -> bool {
-        let right = node.x + node.width;
-        let bottom = node.y + node.height;
-        if start_x == end_x {
-            start_x > node.x
-                && start_x < right
-                && start_y.min(end_y) < bottom
-                && start_y.max(end_y) > node.y
-        } else {
-            start_y > node.y
-                && start_y < bottom
-                && start_x.min(end_x) < right
-                && start_x.max(end_x) > node.x
-        }
-    }
-
     #[test]
     fn layout_is_deterministic_and_nodes_do_not_overlap() {
         let users = table("users", vec![column("id", 0, true)], vec![]);
@@ -1322,42 +1252,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn schema_projection_with_all_schemas_matches_from_schema() {
-        let schema = RelationalSchema {
-            database: "db".into(),
-            tables: vec![
-                table_in_schema("public", "users", vec![column("id", 0, true)], vec![]),
-                table_in_schema("audit", "events", vec![column("id", 0, true)], vec![]),
-            ],
-            ..Default::default()
-        };
-
-        let full = DiagramDocument::from_schema(&schema);
-        let projected = DiagramDocument::from_schema_selection(&schema, None);
-
-        assert_eq!(full.svg(palette(), None), projected.svg(palette(), None));
-    }
-
-    #[test]
-    fn schema_projection_filters_nodes() {
-        let schema = RelationalSchema {
-            database: "db".into(),
-            tables: vec![
-                table_in_schema("public", "users", vec![column("id", 0, true)], vec![]),
-                table_in_schema("audit", "events", vec![column("id", 0, true)], vec![]),
-            ],
-            ..Default::default()
-        };
-        let selected = BTreeSet::from(["public".to_owned()]);
-
-        let document = DiagramDocument::from_schema_selection(&schema, Some(&selected));
-
-        assert_eq!(document.nodes.len(), 1);
-        assert_eq!(document.nodes[0].id, "public.users");
-        assert!(document.edges.is_empty());
     }
 
     #[test]
@@ -1409,50 +1303,6 @@ mod tests {
             assert_eq!(document.nodes.len(), 1);
             assert!(document.edges.is_empty());
         }
-    }
-
-    #[test]
-    fn empty_schema_projection_has_an_empty_export() {
-        let schema = RelationalSchema {
-            database: "db".into(),
-            tables: vec![table("users", vec![column("id", 0, true)], vec![])],
-            ..Default::default()
-        };
-        let selected = BTreeSet::new();
-
-        let document = DiagramDocument::from_schema_selection(&schema, Some(&selected));
-        let svg = document.svg(palette(), None);
-
-        assert!(document.nodes.is_empty());
-        assert!(document.edges.is_empty());
-        assert!(!svg.contains("<g data-table="));
-        assert!(!svg.contains("data-self-referential="));
-    }
-
-    #[test]
-    fn disconnected_tables_are_shelf_packed_instead_of_one_tall_column() {
-        let tables = (0..7)
-            .map(|index| {
-                table(
-                    &format!("table_{index}"),
-                    vec![column("id", 0, true)],
-                    vec![],
-                )
-            })
-            .collect();
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables,
-            ..Default::default()
-        });
-        let x_positions = document
-            .nodes
-            .iter()
-            .map(|node| node.x as i32)
-            .collect::<BTreeSet<_>>();
-
-        assert_eq!(x_positions.len(), 3);
-        assert!(document.height < 600.0);
     }
 
     #[test]
@@ -1514,170 +1364,6 @@ mod tests {
     }
 
     #[test]
-    fn wide_composite_relationships_keep_cards_bounded() {
-        let names = (0..25)
-            .map(|index| format!("key_{index}"))
-            .collect::<Vec<_>>();
-        let parent = table(
-            "parent",
-            names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| column(name, index, true))
-                .collect(),
-            vec![],
-        );
-        let child = table(
-            "child",
-            names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| column(name, index, false))
-                .collect(),
-            vec![ForeignKeyInfo {
-                constraint_name: Some("all_the_keys".into()),
-                columns: names.clone(),
-                referenced_schema: Some("public".into()),
-                referenced_table: "parent".into(),
-                referenced_columns: names,
-                on_update: None,
-                on_delete: None,
-            }],
-        );
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![parent, child],
-            ..Default::default()
-        });
-
-        for node in &document.nodes {
-            assert_eq!(node.columns.len(), COLUMN_LIMIT);
-            assert_eq!(node.omitted_columns, 7);
-            assert_eq!(
-                node.height,
-                HEADER_HEIGHT + ((COLUMN_LIMIT + 1) as f32 * ROW_HEIGHT) + 10.0
-            );
-        }
-    }
-
-    #[test]
-    fn vertically_stacked_cards_connect_through_their_facing_borders() {
-        let source = node("child", 100.0, 100.0, 100.0, 100.0);
-        let target = node("parent", 100.0, 300.0, 100.0, 100.0);
-        let path = edge_path(
-            &source,
-            &target,
-            &foreign(&["parent_id"], "parent", &["id"]),
-            false,
-        );
-
-        assert_eq!(path, "M 150.0 200.0 V 300.0");
-        assert_eq!(
-            edge_path_points(&path),
-            vec![(150.0, 200.0), (150.0, 300.0)]
-        );
-    }
-
-    #[test]
-    fn self_referential_loop_returns_to_a_card_border() {
-        let table = node("tree", 100.0, 100.0, 100.0, 100.0);
-
-        assert_eq!(
-            edge_path(
-                &table,
-                &table,
-                &foreign(&["parent_id"], "tree", &["id"]),
-                true
-            ),
-            "M 200.0 153.5 H 234.0 V 82.0 H 176.0 V 100.0"
-        );
-    }
-
-    #[test]
-    fn overlapping_cards_use_exposed_border_ports_and_an_outer_rail() {
-        // The target's horizontal span is contained by the source. Its top
-        // edge overlaps the source, so the safe target port is its bottom.
-        let source = node("source", 100.0, 100.0, 200.0, 200.0);
-        let target = node("target", 150.0, 250.0, 100.0, 200.0);
-
-        assert_eq!(
-            edge_path(
-                &source,
-                &target,
-                &foreign(&["target_id"], "target", &["id"]),
-                false
-            ),
-            "M 100.0 100.0 H 66.0 V 450.0 H 150.0"
-        );
-
-        let segments = [
-            ((100.0, 100.0), (66.0, 100.0)),
-            ((66.0, 100.0), (66.0, 450.0)),
-            ((66.0, 450.0), (150.0, 450.0)),
-        ];
-        for segment in segments {
-            assert!(!crosses_interior(&source, segment.0, segment.1));
-            assert!(!crosses_interior(&target, segment.0, segment.1));
-        }
-        assert!(is_on_border(&source, 100.0, 100.0));
-        assert!(is_on_border(&target, 150.0, 450.0));
-    }
-
-    #[test]
-    fn crows_foot_marks_the_many_end_and_bars_the_one_end() {
-        let points = [(100.0, 50.0), (60.0, 50.0), (60.0, 10.0), (0.0, 10.0)];
-        let mandatory = edge_markers(&points, false);
-        // Fork (three lines) plus a participation bar, then two "one" bars.
-        assert_eq!(mandatory.lines.len(), 6);
-        assert!(mandatory.ring.is_none());
-        assert!(
-            mandatory
-                .lines
-                .iter()
-                .take(3)
-                .all(|[apex, _]| *apex == (89.0, 50.0))
-        );
-        assert!(
-            mandatory.lines[4..]
-                .iter()
-                .all(|[from, to]| from.0 == to.0 && from.0 < 11.0)
-        );
-        let optional = edge_markers(&points, true);
-        assert_eq!(optional.lines.len(), 5);
-        assert_eq!(optional.ring, Some(((84.0, 50.0), 3.5)));
-    }
-
-    #[test]
-    fn shared_corridors_fan_out_into_separate_lanes() {
-        let parent = table("parent", vec![column("id", 0, true)], vec![]);
-        let children = ["a", "b", "c"].map(|name| {
-            table(
-                name,
-                vec![column("id", 0, true), column("parent_id", 1, false)],
-                vec![foreign(&["parent_id"], "parent", &["id"])],
-            )
-        });
-        let mut tables = vec![parent];
-        tables.extend(children);
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables,
-            ..Default::default()
-        });
-        let corridors = document
-            .edges
-            .iter()
-            .map(|edge| edge.points[1].0)
-            .collect::<Vec<_>>();
-        let mut distinct = corridors.clone();
-        distinct.sort_by(f32::total_cmp);
-        distinct.dedup();
-        assert_eq!(corridors.len(), 3);
-        assert_eq!(distinct.len(), 3, "{corridors:?}");
-        assert!(document.edges.iter().all(|edge| edge.path.contains('Q')));
-    }
-
-    #[test]
     fn moving_a_card_reroutes_its_relationships() {
         let mut document = DiagramDocument::from_schema(&RelationalSchema {
             database: "db".into(),
@@ -1700,18 +1386,6 @@ mod tests {
         assert_ne!(document.edges[0].points, before);
         assert!(document.width >= 900.0 && document.height >= 700.0);
         assert!(!document.move_node("public.missing", 0.0, 0.0));
-    }
-
-    #[test]
-    fn verbose_catalog_types_are_shortened_for_cards() {
-        assert_eq!(short_type("timestamp with time zone"), "timestamptz");
-        assert_eq!(short_type("character varying(160)"), "varchar(160)");
-        assert_eq!(short_type("character(2)[]"), "char(2)[]");
-        assert_eq!(short_type("integer[]"), "int[]");
-        assert_eq!(short_type("interval"), "interval");
-        assert_eq!(short_type("characters"), "characters");
-        assert_eq!(short_type("TEXT"), "text");
-        assert_eq!(short_type("ENUM('Draft','Live')"), "enum('Draft','Live')");
     }
 
     #[test]

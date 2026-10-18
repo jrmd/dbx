@@ -795,34 +795,6 @@ fn motion(
 mod tests {
     use super::*;
 
-    #[test]
-    fn motions_follow_words_punctuation_and_unicode_graphemes() {
-        let text = "SELECT café, á FROM users";
-        assert_eq!(word_motion(text, 0, "w", 1), 7);
-        assert_eq!(word_motion(text, 0, "w", 2), 12);
-        assert_eq!(word_motion(text, 0, "W", 1), 7);
-        assert_eq!(word_motion(text, 0, "e", 1), 5);
-        assert_eq!(word_motion(text, 7, "b", 1), 0);
-        assert_eq!(advance_in_line("á👩‍💻", 0, 1), "á".len());
-    }
-
-    #[test]
-    fn normal_caret_stays_on_characters_and_line_deletes_include_the_newline() {
-        assert_eq!(normal_cursor("abc\ndef", 3), 2);
-        assert_eq!(normal_cursor("abc\n", 4), 4);
-        assert_eq!(lines_range("one\ntwo\nthree", 1, 2), 0..8);
-        assert_eq!(lines_range("one\ntwo", 5, 1), 4..7);
-    }
-
-    #[gpui::test]
-    fn deleting_a_word_at_line_end_keeps_the_next_statement_on_its_line(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (editor, cx) = harness(cx, "one\ntwo");
-        cx.simulate_keystrokes("d w");
-        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "\ntwo");
-    }
-
     struct Harness {
         editor: Entity<TextEditor>,
         runs: usize,

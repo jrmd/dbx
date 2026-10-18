@@ -948,28 +948,6 @@ printf '%s' '{"tag_name":"v99.0.0","draft":false,"prerelease":false,"assets":[]}
         assert_eq!(fs::read(path).unwrap(), b"valid");
     }
 
-    #[test]
-    #[ignore = "downloads the published Mac release over the public network"]
-    fn published_macos_download_from_0_1_0() {
-        let client = client().unwrap();
-        let release: Release = client
-            .get("https://api.github.com/repos/jrmd/dbx/releases/tags/v0.2.0")
-            .send()
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .unwrap();
-        let update = select(
-            release,
-            &Version::parse("0.1.0").unwrap(),
-            "macos-arm64.zip",
-        )
-        .unwrap()
-        .unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        download(&client, &update, &directory.path().join(&update.asset.name)).unwrap();
-    }
     fn release(version: &str) -> Release {
         let name = format!("DBX-{version}-linux-x86_64.tar.gz");
         Release {

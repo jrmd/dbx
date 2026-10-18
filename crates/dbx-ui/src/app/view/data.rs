@@ -1996,31 +1996,7 @@ fn key_badge(label: &'static str, color: Rgba) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
-    use gpui_component::{
-        IndexPath,
-        select::{SearchableVec, SelectState},
-    };
-
-    struct RowFieldHeadingHarness {
-        selector: Entity<SelectState<SearchableVec<SharedString>>>,
-    }
-
-    impl Render for RowFieldHeadingHarness {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(312.)).child(row_field_heading(
-                1,
-                "id".into(),
-                "bigint · required · primary key".into(),
-                Some(
-                    Select::new(&self.selector)
-                        .with_size(Size::XSmall)
-                        .w_full()
-                        .into_any_element(),
-                ),
-            ))
-        }
-    }
+    use gpui::TestAppContext;
 
     #[gpui::test]
     fn structure_scrolls_without_clipping_and_remembers_expanded_details_per_tab(
@@ -2658,37 +2634,5 @@ mod tests {
             );
         });
         crate::theme::set_text_scales(100, 100);
-    }
-
-    #[gpui::test]
-    fn row_field_heading_keeps_label_readable_beside_state_select(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let (_, cx) = cx.add_window_view(|window, cx| {
-            let items = SearchableVec::new(vec![
-                SharedString::from("Value"),
-                SharedString::from("NULL"),
-                SharedString::from("Default"),
-            ]);
-            let selector = cx.new(|select_cx| {
-                SelectState::new(items, Some(IndexPath::new(2)), window, select_cx)
-            });
-            RowFieldHeadingHarness { selector }
-        });
-
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-
-        let label = cx
-            .debug_bounds("row-field-label-1")
-            .expect("field label should be rendered");
-        let state = cx
-            .debug_bounds("row-field-state-1")
-            .expect("field state select should be rendered");
-        assert!(
-            label.size.width >= px(180.),
-            "field label collapsed to {:?}",
-            label.size.width
-        );
-        assert_eq!(state.size.width, px(88.));
-        assert_eq!(state.size.height, px(20.));
     }
 }

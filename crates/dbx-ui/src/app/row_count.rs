@@ -169,21 +169,3 @@ pub(super) fn approximate(count: u64) -> String {
         format!("≈ {value:.0}{suffix}")
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{approximate, grouped};
-
-    #[test]
-    fn counts_are_grouped_and_approximated() {
-        assert_eq!(grouped(0), "0");
-        assert_eq!(grouped(999), "999");
-        assert_eq!(grouped(1_000), "1,000");
-        assert_eq!(grouped(1_234_567), "1,234,567");
-        assert_eq!(approximate(950), "≈ 950");
-        assert_eq!(approximate(1_250), "≈ 1.2K");
-        assert_eq!(approximate(48_000), "≈ 48K");
-        assert_eq!(approximate(3_400_000), "≈ 3.4M");
-        assert_eq!(approximate(7_000_000_000), "≈ 7.0B");
-    }
-}

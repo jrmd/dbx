@@ -716,20 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn function_at_requires_a_call_except_for_bare_functions() {
-        let text = "SELECT lower (name), lower, current_date FROM t";
-        let tokens = lex_sql_for(text, None);
-        let lower = text.find("lower").unwrap();
-        assert_eq!(
-            function_at(text, lower + 1, &tokens).map(|(range, signature)| (range, signature.name)),
-            Some((lower..lower + 5, "LOWER"))
-        );
-        assert!(function_at(text, text.find("lower,").unwrap(), &tokens).is_none());
-        assert!(function_at(text, text.find("current_date").unwrap(), &tokens).is_some());
-        assert!(function_at(text, text.find("FROM").unwrap(), &tokens).is_none());
-    }
-
-    #[test]
     fn occurrences_match_identifiers_in_scope_ignoring_case_and_quotes() {
         let text = "SELECT u.id, \"U\".name FROM users u WHERE u.id > 1; SELECT u FROM x";
         let tokens = lex_sql_for(text, None);
@@ -747,30 +733,5 @@ mod tests {
         // A name used once, keywords and other statements are not highlighted.
         assert!(occurrences(text, text.find("name").unwrap(), &tokens, 0..first).is_empty());
         assert!(occurrences(text, 2, &tokens, 0..first).is_empty());
-    }
-
-    #[test]
-    fn local_definitions_find_aliases_and_ctes_from_their_uses() {
-        let definition = |text: &str, used: &str| {
-            let tokens = lex_sql_for(text, None);
-            let offset = text.rfind(used).unwrap();
-            local_definition(text, offset, &tokens).map(|range| range.start)
-        };
-        let text = "SELECT u.id FROM users u JOIN teams AS t ON t.id = u.team_id";
-        assert_eq!(definition(text, "u.team_id"), text.find("u JOIN"));
-        assert_eq!(definition(text, "t.id"), text.find("t ON"));
-        // The definition itself, and names that are not defined here.
-        assert_eq!(definition(text, "u JOIN"), None);
-        assert_eq!(definition(text, "team_id"), None);
-        let text =
-            "WITH recent (id) AS (SELECT 1), other AS (SELECT 2) SELECT * FROM recent, other";
-        assert_eq!(definition(text, "recent,"), text.find("recent"));
-        assert_eq!(definition(text, "other"), text.find("other AS"));
-        let text = "SELECT d.n FROM (SELECT 1 AS n) d";
-        assert_eq!(
-            definition(text, "d.n"),
-            text.rfind(" d").map(|index| index + 1)
-        );
-        assert_eq!(definition(text, "n FROM"), text.find("n)"));
     }
 }

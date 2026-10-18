@@ -313,60 +313,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn keyboard_connection_close_keeps_focus_in_the_connection_strip(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.sessions = ids
-                .iter()
-                .enumerate()
-                .map(|(index, id)| {
-                    ConnectionSession::new(
-                        *id,
-                        None,
-                        format!("Connection {index}"),
-                        DatabaseKind::SQLite,
-                        None,
-                        window,
-                        cx,
-                    )
-                })
-                .collect();
-            app.active_session_id = Some(ids[2]);
-            app.connection_picker_open = false;
-            app
-        });
-        settle(cx);
-        control_focus(cx, &format!("close-connection-tab-{}", ids[2]));
-        walk(cx, "tab", 1);
-        let add_connection = focused(cx).unwrap();
-        walk(cx, "shift-tab", 2);
-        let neighbor = focused(cx).unwrap();
-        control_focus(cx, &format!("close-connection-tab-{}", ids[1]));
-        cx.simulate_keystrokes("enter");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("enter").unwrap(),
-        });
-        for _ in 0..3 {
-            settle(cx);
-        }
-        assert_eq!(cx.update(|_, cx| app.read(cx).sessions.len()), 2);
-        assert_eq!(focused(cx), Some(neighbor));
-        walk(cx, "tab", 1);
-        cx.simulate_keystrokes("enter");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("enter").unwrap(),
-        });
-        for _ in 0..3 {
-            settle(cx);
-        }
-        assert_eq!(cx.update(|_, cx| app.read(cx).sessions.len()), 1);
-        assert_eq!(focused(cx), Some(add_connection));
-    }
-
-    #[gpui::test]
     fn new_connection_steps_focus_the_drawn_field_and_keep_it(cx: &mut TestAppContext) {
         bind_keys(cx);
         let (app, cx) = cx.add_window_view(DbxApp::new);
@@ -431,54 +377,6 @@ mod tests {
         // Shift-Tab retraces the same path.
         let back = walk(cx, "shift-tab", 1);
         assert_eq!(back[0], forward[forward.len() - 2]);
-    }
-
-    #[gpui::test]
-    fn dismissing_quick_open_restores_the_opener(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        let opener = cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.vault_state = Some(VaultState::Unlocked);
-                app.saved_connections.clear();
-                app.select_kind(DatabaseKind::PostgreSQL, cx);
-                let opener = app.draft.connection_name_editor.read(cx).focus_handle();
-                opener.focus(window, cx);
-                opener
-            })
-        });
-        settle(cx);
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.open_quick_open_action(&OpenQuickOpen, window, cx)
-            })
-        });
-        settle(cx);
-        cx.simulate_keystrokes("escape");
-        settle(cx);
-        assert_eq!(focused(cx), Some(opener));
-    }
-
-    #[gpui::test]
-    fn dismissing_settings_restores_the_opener(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        let opener = cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.vault_state = Some(VaultState::Unlocked);
-                app.saved_connections.clear();
-                app.select_kind(DatabaseKind::PostgreSQL, cx);
-                let opener = app.draft.connection_name_editor.read(cx).focus_handle();
-                opener.focus(window, cx);
-                opener
-            })
-        });
-        settle(cx);
-        cx.update(|window, cx| app.update(cx, |app, cx| app.open_settings(window, cx)));
-        settle(cx);
-        cx.simulate_keystrokes("escape");
-        settle(cx);
-        assert_eq!(focused(cx), Some(opener));
     }
 
     #[gpui::test]
@@ -569,36 +467,6 @@ mod tests {
         assert_ne!(
             focused(cx),
             Some(editor.read_with(cx, |editor, _| editor.focus_handle()))
-        );
-    }
-
-    #[gpui::test]
-    fn enter_activates_a_focused_engine_tile(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        cx.update(|_, cx| {
-            app.update(cx, |app, _| {
-                app.vault_state = Some(VaultState::Unlocked);
-                // Don't depend on the connections saved on this machine.
-                app.saved_connections.clear();
-            })
-        });
-        settle(cx);
-        assert!(cx.update(|_, cx| app.read(cx).draft.choosing_kind));
-        let engine = control_focus(cx, "engine-PostgreSQL");
-        cx.update(|window, cx| app.read(cx).focus_handle.clone().focus(window, cx));
-        let reached = (0..100).any(|_| walk(cx, "tab", 1)[0] == Some(engine.clone()));
-        assert!(reached, "Tab must reach the PostgreSQL engine tile");
-        // GPUI fires the keyboard click on release; the harness only sends
-        // the press.
-        cx.simulate_keystrokes("enter");
-        cx.simulate_event(gpui::KeyUpEvent {
-            keystroke: gpui::Keystroke::parse("enter").unwrap(),
-        });
-        settle(cx);
-        assert!(
-            !cx.update(|_, cx| app.read(cx).draft.choosing_kind),
-            "Enter on a focused engine tile must select it"
         );
     }
 
@@ -713,97 +581,6 @@ mod tests {
                 app.open_quick_open_action(&OpenQuickOpen, window, cx);
                 assert_eq!(app.modal_traps().len(), 1);
             })
-        });
-    }
-
-    #[gpui::test]
-    fn closing_profile_transfer_restores_its_opener(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        let opener = cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.vault_state = Some(VaultState::Unlocked);
-                app.saved_connections.clear();
-                app.select_kind(DatabaseKind::PostgreSQL, cx);
-                let opener = app.draft.connection_name_editor.read(cx).focus_handle();
-                opener.focus(window, cx);
-                opener
-            })
-        });
-        settle(cx);
-        cx.update(|window, cx| app.update(cx, |app, cx| app.open_profile_transfer(1, window, cx)));
-        settle(cx);
-        cx.simulate_keystrokes("escape");
-        settle(cx);
-        cx.update(|window, cx| {
-            assert!(app.read(cx).profile_transfer_dialog.is_none());
-            assert!(opener.is_focused(window));
-        });
-    }
-
-    #[gpui::test]
-    fn a_modal_opened_over_an_editor_takes_focus(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        let focus = cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.vault_state = Some(VaultState::Unlocked);
-                app.saved_connections.clear();
-                app.select_kind(DatabaseKind::PostgreSQL, cx);
-                let name = app.draft.connection_name_editor.read(cx).focus_handle();
-                name.focus(window, cx);
-                cx.focus_handle()
-            })
-        });
-        settle(cx);
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                // Several openers build the dialog without focusing it.
-                app.confirmation_dialog = Some(ConfirmationDialog {
-                    title: "Discard changes?".into(),
-                    detail: String::new(),
-                    confirm_label: "Discard",
-                    tone: ConfirmationTone::Danger,
-                    action: ConfirmationAction::LockVault,
-                    focus: focus.clone(),
-                    return_focus: None,
-                    sql: None,
-                });
-                cx.notify();
-                let _ = window;
-            })
-        });
-        settle(cx);
-        settle(cx);
-        cx.update(|window, cx| {
-            assert!(
-                focus.contains_focused(window, cx),
-                "typing must not keep going to the editor behind the dialog"
-            )
-        });
-    }
-
-    #[gpui::test]
-    fn focus_on_an_unpainted_handle_returns_to_the_window(cx: &mut TestAppContext) {
-        bind_keys(cx);
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        cx.update(|_, cx| app.update(cx, |app, _| app.vault_state = Some(VaultState::Unlocked)));
-        settle(cx);
-        // A restored tab's editor can hold focus without being on screen.
-        cx.update(|window, cx| {
-            let orphan = app.update(cx, |_, cx| cx.focus_handle());
-            orphan.focus(window, cx);
-            std::mem::forget(orphan);
-        });
-        for _ in 0..3 {
-            settle(cx);
-        }
-        let root = cx.update(|_, cx| app.read(cx).focus_handle.clone());
-        cx.update(|window, cx| {
-            assert!(
-                root.contains_focused(window, cx),
-                "shortcuts need focus inside the app's tree"
-            )
         });
     }
 

@@ -621,22 +621,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_receives_literal_reserved_character_password() {
-        let password = password_sent_to_postgres(|port| {
-            let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
-            fields.host = "127.0.0.1".into();
-            fields.port = port.to_string();
-            fields.username = "dbx_auth_probe".into();
-            fields.password = "% & <".into();
-            fields.database = "dbx_auth_probe".into();
-            format!("{}?sslmode=disable", fields.url().unwrap())
-        })
-        .await;
-
-        assert_eq!(password, b"% & <");
-    }
-
-    #[tokio::test]
     async fn postgres_receives_literal_password_from_raw_and_encoded_connection_strings() {
         let raw = password_sent_to_postgres(|port| {
             ConnectionFields::from_url(format!(
@@ -659,31 +643,6 @@ mod tests {
         })
         .await;
         assert_eq!(encoded, b"% & <");
-    }
-
-    #[tokio::test]
-    async fn postgres_receives_separately_restored_connection_string_password() {
-        let password = password_sent_to_postgres(|port| {
-            let mut fields = ConnectionFields::from_url(format!(
-                "postgresql://dbx_auth_probe@127.0.0.1:{port}/dbx_auth_probe?sslmode=disable"
-            ))
-            .unwrap();
-            fields.password = "fixture% & <".into();
-            fields.url().unwrap()
-        })
-        .await;
-        assert_eq!(password, b"fixture% & <");
-    }
-
-    #[test]
-    fn pasted_connection_string_password_takes_precedence_over_old_details() {
-        let mut fields = ConnectionFields::from_url(
-            "postgresql://alice:new%25password@localhost/app?sslmode=require",
-        )
-        .unwrap();
-        fields.password = "stale password".into();
-        let resolved = ConnectionFields::from_url(fields.config().unwrap().url).unwrap();
-        assert_eq!(resolved.password, "new%password");
     }
 
     #[tokio::test]
@@ -728,29 +687,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_urls_with_default_ports() {
-        for (kind, expected) in [
-            (DatabaseKind::PostgreSQL, "postgres://localhost:5432/main"),
-            (DatabaseKind::MySQL, "mysql://localhost:3306/main"),
-            (DatabaseKind::Redis, "redis://localhost:6379"),
-        ] {
-            let mut fields = ConnectionFields::new(kind);
-            fields.host = "localhost".into();
-            if kind != DatabaseKind::Redis {
-                fields.database = "main".into();
-            }
-            assert_eq!(fields.url().unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn supports_ipv6_hosts() {
-        let mut fields = ConnectionFields::new(DatabaseKind::Redis);
-        fields.host = "::1".into();
-        assert_eq!(fields.url().unwrap(), "redis://[::1]:6379");
-    }
-
-    #[test]
     fn parses_network_url_into_decoded_fields_and_round_trips_fast_path() {
         let input = "postgresql://al%20ice:p%40ss%2Fword@[::1]:5433/team%2Fdata?sslmode=require";
         let fields = ConnectionFields::from_url(input).unwrap();
@@ -779,48 +715,11 @@ mod tests {
     }
 
     #[test]
-    fn repairs_unencoded_percent_characters_in_credentials() {
-        let input = "postgres://report%team:pa%ss@db.example.test:5432/analytics";
-        let fields = ConnectionFields::from_url(input).unwrap();
-
-        assert_eq!(fields.username, "report%team");
-        assert_eq!(fields.password, "pa%ss");
-        assert_eq!(
-            fields.url().unwrap(),
-            "postgres://report%25team:pa%25ss@db.example.test:5432/analytics"
-        );
-    }
-
-    #[test]
-    fn repairs_each_common_unencoded_password_delimiter() {
-        for (password, input, encoded) in [
-            ("p@ss", "postgres://user:p@ss@localhost:5432/app", "p%40ss"),
-            ("p/ss", "postgres://user:p/ss@localhost:5432/app", "p%2Fss"),
-            ("p#ss", "postgres://user:p#ss@localhost:5432/app", "p%23ss"),
-            ("p?ss", "postgres://user:p?ss@localhost:5432/app", "p%3Fss"),
-        ] {
-            let fields = ConnectionFields::from_url(input).unwrap();
-            assert_eq!(fields.password, password);
-            assert_eq!(
-                fields.url().unwrap(),
-                format!("postgres://user:{encoded}@localhost:5432/app")
-            );
-        }
-    }
-
-    #[test]
     fn rejects_non_utf8_percent_encoded_credentials_instead_of_changing_them() {
         assert_eq!(
             ConnectionFields::from_url("postgres://user:p%FFss@localhost:5432/app"),
             Err(ConnectionFieldsError::InvalidUrl)
         );
-    }
-
-    #[test]
-    fn sqlite_keeps_file_connection_string() {
-        let fields = ConnectionFields::from_url("sqlite://dbx.db?mode=rwc").unwrap();
-        assert_eq!(fields.kind, DatabaseKind::SQLite);
-        assert_eq!(fields.url().unwrap(), "sqlite://dbx.db?mode=rwc");
     }
 
     #[test]

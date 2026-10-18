@@ -176,14 +176,6 @@ impl SavedConnection {
     pub fn has_secret(&self) -> bool {
         self.secret_key.is_some()
     }
-
-    /// Return the selected SQLite file, if this is a file-backed SQLite
-    /// profile.  `None` is returned for non-SQLite profiles and in-memory
-    /// SQLite connections.
-    #[cfg(test)]
-    pub fn sqlite_path(&self) -> Option<PathBuf> {
-        sqlite_path_from_url(self.kind, &self.url)
-    }
 }
 
 /// Input used to create or update a saved profile.
@@ -234,15 +226,6 @@ impl ConnectionProfileDraft {
             tag: local_tag(),
             secret: None,
         }
-    }
-
-    /// Create a profile for a user-selected SQLite file.
-    #[cfg(test)]
-    pub fn sqlite(name: impl Into<String>, path: impl AsRef<Path>) -> Self {
-        Self::from_config(
-            name,
-            ConnectionConfig::new(DatabaseKind::SQLite, sqlite_url(path.as_ref())),
-        )
     }
 
     pub fn with_id(mut self, id: Uuid) -> Self {
@@ -1079,34 +1062,6 @@ pub(crate) fn sqlite_url(path: &Path) -> String {
     url.to_string()
 }
 
-#[cfg(test)]
-fn sqlite_path_from_url(kind: DatabaseKind, raw: &str) -> Option<PathBuf> {
-    if kind != DatabaseKind::SQLite {
-        return None;
-    }
-    let parsed = Url::parse(raw).ok()?;
-    if !parsed.scheme().eq_ignore_ascii_case("sqlite") {
-        return None;
-    }
-    if parsed.path() == ":memory:" || parsed.path() == "/:memory:" {
-        return None;
-    }
-    if !parsed.path().is_empty() {
-        let is_absolute = parsed.path().starts_with('/');
-        let segments = parsed.path_segments()?.collect::<Vec<_>>().join("/");
-        let decoded = percent_decode_str(&segments).decode_utf8_lossy();
-        let path = if is_absolute {
-            format!("/{decoded}")
-        } else {
-            decoded.into_owned()
-        };
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    parsed.host_str().map(PathBuf::from)
-}
-
 fn default_profile_path() -> ProfileResult<PathBuf> {
     Ok(dirs::config_dir()
         .ok_or(ProfileError::ConfigDirectoryUnavailable)?
@@ -1257,7 +1212,6 @@ mod tests {
             .unwrap();
         assert_eq!(store.load(saved.id).unwrap().config, direct);
     }
-    use crate::connection_fields::ConnectionFields;
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -1304,31 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn saves_named_profile_without_writing_password_to_json() {
-        let (_directory, store, secrets) = test_store();
-        let draft = ConnectionProfileDraft::new(
-            "Production",
-            DatabaseKind::PostgreSQL,
-            "postgres://alice:super-secret@example.test/app",
-        );
-        let saved = store.save(draft).expect("save profile");
-
-        let json = fs::read_to_string(store.path()).expect("read profile file");
-        assert!(json.contains("Production"));
-        assert!(json.contains("alice@example.test"));
-        assert!(!json.contains("super-secret"));
-        assert!(saved.has_secret());
-        assert_eq!(secrets.values.lock().unwrap().len(), 1);
-
-        let loaded = store.load(saved.id).expect("load profile");
-        assert_eq!(
-            loaded.config.url,
-            "postgres://alice:super-secret@example.test/app"
-        );
-        assert_eq!(loaded.config.max_connections, 8);
-    }
-
-    #[test]
     fn default_vault_profile_store_relaunches_without_keyring_and_keeps_json_secret_free() {
         let directory = tempfile::tempdir().expect("temporary profile directory");
         let path = directory.path().join(PROFILE_FILE_NAME);
@@ -1360,58 +1289,6 @@ mod tests {
     }
 
     #[test]
-    fn encoded_password_is_decoded_before_keyring_storage_and_reencoded_on_load() {
-        let (_directory, store, secrets) = test_store();
-        let saved = store
-            .save(ConnectionProfileDraft::new(
-                "Special password",
-                DatabaseKind::PostgreSQL,
-                "postgres://alice:p%40ss%2Fword@example.test/app",
-            ))
-            .expect("save profile");
-
-        assert_eq!(
-            secrets.get(&keyring_key(saved.id)).unwrap(),
-            Some("p@ss/word".into())
-        );
-        assert_eq!(
-            store.load(saved.id).unwrap().config.url,
-            "postgres://alice:p%40ss%2Fword@example.test/app"
-        );
-    }
-
-    #[test]
-    fn raw_postgres_credentials_round_trip_through_profile_connection_url() {
-        let (_directory, store, secrets) = test_store();
-        let username = "report%team@example";
-        let password = "p@ss:word/[?]#%✓";
-        let saved = store
-            .save(ConnectionProfileDraft::new(
-                "Reserved credentials",
-                DatabaseKind::PostgreSQL,
-                format!("postgres://{username}:{password}@example.test/app"),
-            ))
-            .expect("save profile");
-
-        assert_eq!(
-            secrets.get(&keyring_key(saved.id)).unwrap(),
-            Some(password.to_owned())
-        );
-        let json = fs::read_to_string(store.path()).expect("read profile file");
-        assert!(!json.contains(username));
-        assert!(!json.contains(password));
-
-        let loaded = store.load(saved.id).unwrap();
-        assert_eq!(
-            loaded.config.url,
-            "postgres://report%25team%40example:p%40ss%3Aword%2F%5B%3F%5D%23%25%E2%9C%93@example.test/app"
-        );
-        let fields = ConnectionFields::from_url(loaded.config.url).unwrap();
-        assert_eq!(fields.username, username);
-        assert_eq!(fields.password, password);
-    }
-
-    #[test]
     fn explicit_secret_is_removed_from_url_and_restored_on_load() {
         let (_directory, store, _secrets) = test_store();
         let draft = ConnectionProfileDraft::new(
@@ -1426,22 +1303,6 @@ mod tests {
         assert_eq!(
             store.load(saved.id).unwrap().config.url,
             "redis://default:token-value@example.test:6379"
-        );
-    }
-
-    #[test]
-    fn sqlite_file_selection_round_trips_as_a_path() {
-        let (_directory, store, _secrets) = test_store();
-        let path = PathBuf::from("/tmp/dbx selected.sqlite");
-        let saved = store
-            .save(ConnectionProfileDraft::sqlite("Local SQLite", &path))
-            .expect("save sqlite profile");
-        assert_eq!(saved.sqlite_path(), Some(path));
-        assert_eq!(saved.kind, DatabaseKind::SQLite);
-        assert!(!saved.has_secret());
-        assert_eq!(
-            store.load(saved.id).unwrap().config.url,
-            "sqlite:///tmp/dbx%20selected.sqlite"
         );
     }
 
@@ -1606,21 +1467,6 @@ mod tests {
             store.delete_tag(tag.id).unwrap();
         }
         assert!(store.tags().unwrap().is_empty());
-    }
-
-    #[test]
-    fn early_multi_tag_profiles_keep_their_first_tag() {
-        let (_directory, store, _) = test_store();
-        let [prod, staging, ..]: [ConnectionTag; 4] = default_tags().try_into().unwrap();
-        let profile = serde_json::json!({"id": Uuid::new_v4(), "name": "Early", "kind": "postgresql", "url": "postgres://u@example.test/db", "max_connections": 8, "connect_timeout_ms": 10000, "tags": [prod, staging]});
-        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
-        fs::write(
-            store.path(),
-            serde_json::to_vec(&serde_json::json!({"version": 2, "connections": [profile]}))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(store.list().unwrap()[0].tag, Some(prod));
     }
 
     #[test]

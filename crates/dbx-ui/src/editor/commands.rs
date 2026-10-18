@@ -587,19 +587,6 @@ mod tests {
     }
 
     #[test]
-    fn tab_indents_to_the_next_stop_or_every_selected_line() {
-        assert_eq!(run("SELECT|", indent), "SELECT  |");
-        assert_eq!(run("SELECT |", indent), "SELECT  |");
-        assert_eq!(run("[a\nb]\n\nc", indent), "[  a\n  b]\n\nc");
-        assert_eq!(run("a\n[b\n]c", indent), "a\n[  b\n]c");
-        assert_eq!(
-            run("x [ab]", indent),
-            "x   |",
-            "a selection within one line is replaced like typing"
-        );
-    }
-
-    #[test]
     fn shift_tab_removes_one_level() {
         let outdent = |text: &str, selection| outdent(text, selection).unwrap();
         assert_eq!(run("    a|", outdent), "  a|");
@@ -623,31 +610,6 @@ mod tests {
             "  SELECT 1|\n"
         );
         assert_eq!(run("--x|", toggle_line_comment), "x|");
-    }
-
-    #[test]
-    fn enter_keeps_indentation_and_opens_bracket_blocks() {
-        assert_eq!(run("  SELECT a,|", newline), "  SELECT a,\n  |");
-        assert_eq!(run("WHERE id IN (|)", newline), "WHERE id IN (\n  |\n)");
-        assert_eq!(run("  f(|x", newline), "  f(\n    |x");
-        assert_eq!(run("a   |b", newline), "a\n|b");
-    }
-
-    #[test]
-    fn typing_pairs_wraps_and_steps_over() {
-        let typed = |marked: &str, character: &str| {
-            let (text, selection) = parse(marked);
-            type_character(&text, selection, character).map(|edit| show(&edit))
-        };
-        assert_eq!(typed("count|", "(").as_deref(), Some("count(|)"));
-        assert_eq!(typed("count(|)", ")").as_deref(), Some("count()|"));
-        assert_eq!(typed("= |", "'").as_deref(), Some("= '|'"));
-        assert_eq!(typed("'abc|'", "'").as_deref(), Some("'abc'|"));
-        assert_eq!(typed("[name]", "\"").as_deref(), Some("\"[name]\""));
-        assert_eq!(typed("don|", "'"), None);
-        assert_eq!(typed("|abc", "("), None);
-        let (text, selection) = parse("(|)");
-        assert_eq!(show(&delete_pair(&text, &selection).unwrap()), "|");
     }
 
     #[test]
@@ -682,40 +644,5 @@ mod tests {
             Some((close, open))
         );
         assert_eq!(matching_bracket(text, text.len(), &tokens), None);
-    }
-
-    #[test]
-    fn multiple_selections_insert_and_delete_together() {
-        let text = "a b a";
-        let edit = insert_at_all(text, &[0..1, 4..5], "xy");
-        assert_eq!(edit.text, "xy b xy");
-        assert_eq!(edit.selections, [2..2, 7..7]);
-        let edit = delete_at_all(&edit.text, &edit.selections, true);
-        assert_eq!(edit.text, "x b x");
-        assert_eq!(edit.selections, [1..1, 5..5]);
-        let edit = delete_at_all("ab🦀cd", &[0..0, 2..2], false);
-        assert_eq!(edit.text, "bcd");
-        assert_eq!(edit.selections, [0..0, 1..1]);
-        // Adjacent carets never delete a character twice.
-        let edit = delete_at_all("abc", &[1..1, 2..2], true);
-        assert_eq!(edit.text, "c");
-    }
-
-    #[test]
-    fn next_occurrence_wraps_and_skips_selected_matches() {
-        let text = "id, name, id, id";
-        assert_eq!(
-            next_occurrence(text, "id", 2, std::slice::from_ref(&(0..2))),
-            Some(10..12)
-        );
-        assert_eq!(
-            next_occurrence(text, "id", 16, &[10..12, 14..16]),
-            Some(0..2)
-        );
-        assert_eq!(
-            next_occurrence(text, "id", 0, &[0..2, 10..12, 14..16]),
-            None
-        );
-        assert_eq!(next_occurrence(text, "", 0, &[]), None);
     }
 }

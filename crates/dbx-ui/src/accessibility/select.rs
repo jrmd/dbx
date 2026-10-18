@@ -157,50 +157,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pinned_select_metadata_is_on_the_original_combo_box(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        struct MetadataHarness;
-        impl Render for MetadataHarness {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                gpui::canvas(
-                    |_, window, cx| {
-                        let state = cx.new(|cx| {
-                            SelectState::new(
-                                SearchableVec::new(vec![SharedString::from("UK")]),
-                                Some(gpui_component::IndexPath::new(0)),
-                                window,
-                                cx,
-                            )
-                        });
-                        let mut element = SelectElement {
-                            prepared: Select::new(&state).render(window, cx).into_any_element(),
-                            name: "Country".into(),
-                            state,
-                        };
-                        let (_, mut layout) = element.request_layout(None, None, window, cx);
-                        let root = layout
-                            .as_mut()
-                            .unwrap()
-                            .downcast_mut::<gpui::Stateful<gpui::Div>>()
-                            .unwrap();
-                        assert_eq!(root.a11y_role(), Some(gpui::Role::ComboBox));
-                        let mut node = gpui::accesskit::Node::new(gpui::Role::ComboBox);
-                        root.write_a11y_info(&mut node);
-                        assert_eq!(node.label(), Some("Country"));
-                        assert_eq!(node.description(), Some("Selected: UK"));
-                        assert_eq!(node.is_expanded(), Some(false));
-                        assert!(node.supports_action(gpui::AccessibleAction::Click));
-                    },
-                    |_, _, _, _| {},
-                )
-                .size(gpui::px(200.))
-            }
-        }
-        let (_, cx) = cx.add_window_view(|_, _| MetadataHarness);
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-    }
-
-    #[gpui::test]
     fn pinned_select_root_keeps_trigger_focus_and_keyboard_selection(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| Harness {

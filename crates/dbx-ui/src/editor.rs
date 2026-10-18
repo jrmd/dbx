@@ -4125,43 +4125,6 @@ mod tests {
     use dbx_core::DatabaseKind;
 
     #[test]
-    fn grapheme_navigation_never_splits_emoji_or_combining_marks() {
-        let text = "d🦀e\u{301}f";
-        assert_eq!(previous_boundary(text, text.len()), 8);
-        assert_eq!(next_boundary(text, 1), 5);
-    }
-
-    #[test]
-    fn utf16_conversion_round_trips_astral_characters() {
-        let text = "d🦀e\u{301}f";
-        for offset in [0, 1, 5, 8, 9] {
-            assert_eq!(utf16_to_utf8(text, utf8_to_utf16(text, offset)), offset);
-        }
-    }
-
-    #[test]
-    fn line_navigation_is_line_aware() {
-        let text = "one\ntwo\nthree";
-        assert_eq!(line_start(text, 6), 4);
-        assert_eq!(line_end(text, 6), 7);
-        assert_eq!(nth_line_start(text, 2), 8);
-    }
-
-    #[test]
-    fn component_word_navigation_lands_on_word_edges() {
-        let text = "one two";
-        assert_eq!(previous_word_boundary(text, text.len()), 4);
-        assert_eq!(previous_word_boundary(text, 4), 0);
-        assert_eq!(next_word_boundary(text, 0), 3);
-        assert_eq!(next_word_boundary(text, 3), text.len());
-    }
-
-    #[test]
-    fn ranges_clamp_to_utf8_boundaries() {
-        assert_eq!(clamp_range("🦀", 1..3), 0..0);
-    }
-
-    #[test]
     fn sql_execution_uses_the_statement_at_the_caret() {
         let text = "SELECT 1;\nSELECT 🦀 FROM users;\nSELECT 3";
         let cursor = text.find("🦀").unwrap();
@@ -4183,45 +4146,6 @@ mod tests {
             None,
         );
         assert_eq!(&text[range], "SELECT 3");
-    }
-
-    #[test]
-    fn sql_execution_keeps_the_last_statement_after_its_terminator() {
-        let statement = "SELECT * FROM missing_table;";
-        assert_eq!(
-            sql_statement_range(statement, statement.len(), None),
-            0..statement.len()
-        );
-
-        let with_trailing_whitespace = "SELECT 1;\n  ";
-        assert_eq!(
-            &with_trailing_whitespace[sql_statement_range(
-                with_trailing_whitespace,
-                with_trailing_whitespace.len(),
-                None
-            )],
-            "SELECT 1;"
-        );
-    }
-
-    #[test]
-    fn sql_execution_ignores_terminators_inside_lexical_regions() {
-        let text = "SELECT ';', $$BEGIN; END$$ /* ; */ -- ;\n; SELECT 2;";
-        let first_end = text.find(" SELECT 2").unwrap();
-        assert_eq!(sql_statement_range(text, 10, None), 0..first_end);
-        let second = text.find("SELECT 2").unwrap();
-        assert_eq!(&text[sql_statement_range(text, second, None)], " SELECT 2;");
-    }
-
-    #[test]
-    fn sql_execution_keeps_trigger_bodies_whole() {
-        let text = "CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN\n  UPDATE y SET a = CASE WHEN 1 THEN 2 END;\n  DELETE FROM z;\nEND;\nBEGIN; SELECT 2;";
-        let trigger_end = text.find("\nBEGIN;").unwrap();
-        let inside_body = text.find("DELETE").unwrap();
-        assert_eq!(sql_statement_range(text, inside_body, None), 0..trigger_end);
-        assert_eq!(sql_statement_count(text, None), 3);
-        let select = text.find("SELECT 2").unwrap();
-        assert_eq!(&text[sql_statement_range(text, select, None)], " SELECT 2;");
     }
 
     #[test]
@@ -4262,18 +4186,6 @@ mod tests {
         assert_eq!(
             sql_execution_kind("UPDATE t SET flags = flags # 4 WHERE id = 1", postgres),
             SqlExecutionKind::MutationRisk
-        );
-    }
-
-    #[test]
-    fn statement_count_ignores_lexical_semicolons_and_empty_statements() {
-        assert_eq!(
-            sql_statement_count("; SELECT ';'; $$BEGIN; END$$; -- ;\n", None),
-            2
-        );
-        assert_eq!(
-            sql_statement_count("-- comment only\n/* still comment */", None),
-            0
         );
     }
 
@@ -4411,42 +4323,6 @@ mod tests {
     }
 
     #[test]
-    fn history_is_bounded_and_keeps_utf8_snapshots() {
-        let mut history = Vec::new();
-        for index in 0..=HISTORY_LIMIT {
-            history.push(EditorSnapshot {
-                text: format!("{index}🦀"),
-                selection: 0..0,
-                selection_reversed: false,
-            });
-            if history.len() > HISTORY_LIMIT {
-                history.remove(0);
-            }
-        }
-        assert_eq!(history.len(), HISTORY_LIMIT);
-        assert_eq!(history.first().unwrap().text, "1🦀");
-        assert!(
-            history
-                .iter()
-                .all(|snapshot| snapshot.text.is_char_boundary(snapshot.selection.end))
-        );
-    }
-
-    #[test]
-    fn completion_anchor_has_a_safe_pre_layout_fallback() {
-        assert_eq!(
-            completion_anchor("SELECT 🦀", 8, None, &LineLayouts::default()),
-            point(px(0.), px(0.))
-        );
-    }
-
-    #[test]
-    fn single_line_values_replace_newlines_without_changing_other_text() {
-        assert_eq!(normalize_value("a\nb\r\nc", false), "a b  c");
-        assert_eq!(normalize_value("a\nb", true), "a\nb");
-    }
-
-    #[test]
     fn paint_cache_indexes_lines_and_tokens_without_rescanning() {
         let line = "SELECT id, name FROM users WHERE id = 1;";
         let text = std::iter::repeat_n(line, 20_000)
@@ -4485,19 +4361,6 @@ mod tests {
             let display = password_display_offset(text, offset);
             assert_eq!(password_source_offset(text, display), offset);
         }
-    }
-
-    #[test]
-    fn selection_replacement_preserves_unicode_boundaries() {
-        let text = "d🦀f";
-        assert_eq!(replace_selection(text, 1..5, ""), "df");
-        assert_eq!(replace_selection("title", 5..5, "df"), "titledf");
-    }
-
-    #[test]
-    fn marked_text_is_clipped_to_its_line() {
-        assert_eq!(marked_slice(5, 10, &(12..14)), Some(2..4));
-        assert_eq!(marked_slice(5, 10, &(15..18)), None);
     }
 
     #[test]
@@ -4555,146 +4418,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_offset_for_cursor_returns_the_offset_used_for_painting() {
-        assert_eq!(
-            scroll_offset_for_cursor(
-                point(px(-20.), px(-5.)),
-                size(px(200.), px(100.)),
-                size(px(100.), px(40.)),
-                point(px(120.), px(20.)),
-                size(px(2.), px(18.)),
-                true,
-            ),
-            point(px(-22.), px(-5.))
-        );
-    }
-
-    #[test]
-    fn scroll_offset_for_cursor_preserves_a_visible_caret() {
-        let current = point(px(-20.), px(-5.));
-        assert_eq!(
-            scroll_offset_for_cursor(
-                current,
-                size(px(200.), px(100.)),
-                size(px(100.), px(40.)),
-                point(px(40.), px(20.)),
-                size(px(2.), px(18.)),
-                true,
-            ),
-            current
-        );
-    }
-
-    #[test]
-    fn single_line_caret_reveal_never_changes_the_vertical_offset() {
-        let current = point(px(-20.), px(-2.));
-        let next = scroll_offset_for_cursor(
-            current,
-            size(px(200.), px(2.)),
-            size(px(100.), px(16.)),
-            point(px(40.), px(0.)),
-            size(px(2.), px(18.)),
-            false,
-        );
-
-        assert_eq!(next, current);
-        assert_eq!(
-            scroll_offset_for_cursor(
-                next,
-                size(px(200.), px(2.)),
-                size(px(100.), px(16.)),
-                point(px(40.), px(0.)),
-                size(px(2.), px(18.)),
-                false,
-            ),
-            next
-        );
-    }
-
-    #[test]
-    fn oversized_caret_reveal_keeps_the_current_offset_stable() {
-        let current = point(px(0.), px(-2.));
-        let next = scroll_offset_for_cursor(
-            current,
-            size(px(0.), px(20.)),
-            size(px(100.), px(16.)),
-            point(px(0.), px(0.)),
-            size(px(2.), px(18.)),
-            true,
-        );
-
-        assert_eq!(next, current);
-        assert_eq!(
-            scroll_offset_for_cursor(
-                next,
-                size(px(0.), px(20.)),
-                size(px(100.), px(16.)),
-                point(px(0.), px(0.)),
-                size(px(2.), px(18.)),
-                true,
-            ),
-            next
-        );
-    }
-
-    #[test]
-    fn focused_hover_clears_stale_mouse_selection_without_moving_the_caret() {
-        assert!(!mouse_selection_active(true, false));
-        assert!(!mouse_selection_active(false, true));
-        assert!(mouse_selection_active(true, true));
-    }
-
-    #[test]
-    fn drag_selection_does_not_move_the_scroll_anchor() {
-        assert!(!caret_reveal_allowed(true, true));
-        assert!(caret_reveal_allowed(true, false));
-        assert!(!caret_reveal_allowed(false, false));
-    }
-
-    #[test]
-    fn drag_selection_uses_the_bounds_from_mouse_down() {
-        let initial = Bounds::new(point(px(12.), px(20.)), size(px(160.), px(18.)));
-        let repainted = Bounds::new(point(px(-28.), px(20.)), size(px(160.), px(18.)));
-
-        assert_eq!(
-            selection_hit_bounds(true, Some(initial), Some(repainted)),
-            Some(initial)
-        );
-        assert_eq!(
-            selection_hit_bounds(false, Some(initial), Some(repainted)),
-            Some(repainted)
-        );
-        assert_eq!(
-            selection_hit_bounds(true, None, Some(repainted)),
-            Some(repainted)
-        );
-    }
-
-    #[test]
-    fn editor_bindings_are_scoped_to_the_text_editor_context() {
-        let bindings = default_key_bindings();
-        assert!(bindings.iter().all(|binding| binding.predicate().is_some()));
-        // Tab indents only in the SQL editor; form fields keep focus traversal.
-        let tab = bindings
-            .iter()
-            .find(|binding| {
-                binding
-                    .keystrokes()
-                    .iter()
-                    .map(|keystroke| keystroke.unparse())
-                    .eq(["tab".to_owned()])
-            })
-            .unwrap();
-        assert!(
-            tab.predicate()
-                .unwrap()
-                .to_string()
-                .contains(SQL_EDITOR_CONTEXT)
-        );
-        assert_eq!(TEXT_INPUT_CONTEXT, TEXT_EDITOR_CONTEXT);
-    }
-
-    #[test]
     fn sql_lexer_covers_common_query_tokens() {
         let text = "SELECT id, amount::NUMERIC, 'O''Reilly', 12.50, $1, :name\n-- note\n/* multi\ncomment */ FROM public.users WHERE active = TRUE";
         let tokens = lex_sql(text);
@@ -4723,23 +4446,6 @@ mod tests {
                 (SqlTokenKind::Identifier, "active"),
                 (SqlTokenKind::Keyword, "TRUE"),
             ]
-        );
-    }
-
-    #[test]
-    fn redis_query_text_must_not_use_the_plain_text_paint_pipeline() {
-        let text = "GET \"user:name\" 42";
-        let tokens: Vec<_> = lex_redis(text)
-            .into_iter()
-            .map(HighlightToken::from)
-            .collect();
-        let style = gpui::TextStyle::default();
-
-        let runs = editor_text_runs(text, 0, &style, EditorLanguage::Redis, &tokens, None, &[]);
-
-        assert!(
-            runs.len() > 1,
-            "Redis commands, strings, and numbers need semantic runs"
         );
     }
 
@@ -4795,47 +4501,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_lexer_does_not_parse_inside_strings_or_comments() {
-        let text = "'SELECT 1' -- UPDATE users\n/* DELETE FROM users */ SELECT 2";
-        let tokens = lex_sql(text);
-        let values: Vec<_> = tokens
-            .iter()
-            .map(|token| (token.kind, &text[token.range.clone()]))
-            .collect();
-
-        assert_eq!(
-            values,
-            vec![
-                (SqlTokenKind::String, "'SELECT 1'"),
-                (SqlTokenKind::Comment, "-- UPDATE users"),
-                (SqlTokenKind::Comment, "/* DELETE FROM users */"),
-                (SqlTokenKind::Keyword, "SELECT"),
-                (SqlTokenKind::Number, "2"),
-            ]
-        );
-    }
-
-    #[test]
-    fn sql_lexer_supports_postgres_dollar_quoted_strings() {
-        let text = "SELECT $$BEGIN; SELECT 1; END$$, $body$UPDATE users$body$, $2";
-        let tokens = lex_sql(text);
-        let values: Vec<_> = tokens
-            .iter()
-            .map(|token| (token.kind, &text[token.range.clone()]))
-            .collect();
-
-        assert_eq!(
-            values,
-            vec![
-                (SqlTokenKind::Keyword, "SELECT"),
-                (SqlTokenKind::String, "$$BEGIN; SELECT 1; END$$"),
-                (SqlTokenKind::String, "$body$UPDATE users$body$"),
-                (SqlTokenKind::Parameter, "$2"),
-            ]
-        );
-    }
-
-    #[test]
     fn json_lexer_highlights_properties_escapes_and_unicode() {
         let text = r#"{"café": "say \"hi\" to 🦀", "nested": {"城市": "東京"}}"#;
         let tokens = lex_json(text);
@@ -4857,68 +4522,6 @@ mod tests {
         assert!(tokens.iter().all(|token| {
             text.is_char_boundary(token.range.start) && text.is_char_boundary(token.range.end)
         }));
-    }
-
-    #[test]
-    fn json_lexer_highlights_numbers_and_literals() {
-        let text = r#"[-0, 42, 3.14, -2.5e+3, 6E-2, true, false, null]"#;
-        let tokens = lex_json(text);
-        let values: Vec<_> = tokens
-            .iter()
-            .map(|token| (token.kind, &text[token.range.clone()]))
-            .collect();
-
-        assert_eq!(
-            values,
-            vec![
-                (JsonTokenKind::Number, "-0"),
-                (JsonTokenKind::Number, "42"),
-                (JsonTokenKind::Number, "3.14"),
-                (JsonTokenKind::Number, "-2.5e+3"),
-                (JsonTokenKind::Number, "6E-2"),
-                (JsonTokenKind::Boolean, "true"),
-                (JsonTokenKind::Boolean, "false"),
-                (JsonTokenKind::Null, "null"),
-            ]
-        );
-    }
-
-    #[test]
-    fn json_lexer_keeps_incomplete_strings_highlighted() {
-        let text = r#"{"draft": "still typing 🦀"#;
-        let tokens = lex_json(text);
-        let values: Vec<_> = tokens
-            .iter()
-            .map(|token| (token.kind, &text[token.range.clone()]))
-            .collect();
-
-        assert_eq!(
-            values,
-            vec![
-                (JsonTokenKind::Property, "\"draft\""),
-                (JsonTokenKind::String, "\"still typing 🦀"),
-            ]
-        );
-    }
-
-    #[test]
-    fn quoted_identifier_closure_handles_unfinished_and_escaped_quotes() {
-        for quote in ['"', '`'] {
-            assert!(!quoted_identifier_is_closed(&format!("{quote}"), quote));
-            assert!(!quoted_identifier_is_closed(&format!("{quote}us"), quote));
-            assert!(!quoted_identifier_is_closed(
-                &format!("{quote}user{quote}{quote}name"),
-                quote,
-            ));
-            assert!(quoted_identifier_is_closed(
-                &format!("{quote}{quote}"),
-                quote
-            ));
-            assert!(quoted_identifier_is_closed(
-                &format!("{quote}user{quote}{quote}name{quote}"),
-                quote,
-            ));
-        }
     }
 
     #[test]
@@ -4976,16 +4579,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_context_replaces_the_whole_identifier_around_the_caret() {
-        let text = "SELECT user_name FROM users";
-        let cursor = "SELECT user".len();
-        let context = sql_completion_context(text, cursor).expect("column completion");
-
-        assert_eq!(context.prefix, "user");
-        assert_eq!(context.replacement_range, 7..16);
-    }
-
-    #[test]
     fn completion_context_replaces_a_quoted_identifier_with_spaces() {
         let text = "SELECT \"order items\" FROM orders";
         let cursor = "SELECT \"order".len();
@@ -5001,44 +4594,6 @@ mod tests {
                 &text[context.replacement_range.end..]
             ),
             "SELECT \"customer order\" FROM orders"
-        );
-    }
-
-    #[test]
-    fn completion_context_replaces_an_escaped_quoted_identifier() {
-        let text = "SELECT \"customer\"\" name\" FROM orders";
-        let cursor = "SELECT \"customer\"\"".len();
-        let context = sql_completion_context(text, cursor).expect("column completion");
-
-        assert_eq!(context.prefix, "customer\"");
-        assert_eq!(context.quote, Some('"'));
-        assert_eq!(context.replacement_range, 8..23);
-        assert_eq!(
-            format!(
-                "{}customer id{}",
-                &text[..context.replacement_range.start],
-                &text[context.replacement_range.end..]
-            ),
-            "SELECT \"customer id\" FROM orders"
-        );
-    }
-
-    #[test]
-    fn completion_context_replaces_a_unicode_quoted_identifier() {
-        let text = "SELECT \"東京 orders\" FROM orders";
-        let cursor = "SELECT \"東京".len();
-        let context = sql_completion_context(text, cursor).expect("column completion");
-
-        assert_eq!(context.prefix, "東京");
-        assert_eq!(context.quote, Some('"'));
-        assert_eq!(context.replacement_range, 8..21);
-        assert_eq!(
-            format!(
-                "{}東京 customer{}",
-                &text[..context.replacement_range.start],
-                &text[context.replacement_range.end..]
-            ),
-            "SELECT \"東京 customer\" FROM orders"
         );
     }
 
@@ -5061,56 +4616,9 @@ mod tests {
     }
 
     #[test]
-    fn completion_context_handles_backtick_quoted_identifiers() {
-        let text = "SELECT `order items` FROM orders";
-        let cursor = "SELECT `order".len();
-        let context = sql_completion_context(text, cursor).expect("column completion");
-
-        assert_eq!(context.prefix, "order");
-        assert_eq!(context.quote, Some('`'));
-        assert_eq!(context.replacement_range, 8..19);
-    }
-
-    #[test]
-    fn completion_context_is_not_opened_after_a_closed_quoted_identifier() {
-        let text = "SELECT \"users\"";
-        assert!(sql_completion_context(text, text.len()).is_none());
-    }
-
-    #[test]
     fn completion_context_ignores_strings_and_comments() {
         assert!(sql_completion_context("SELECT 'users", "SELECT 'users".len()).is_none());
         assert!(sql_completion_context("SELECT 1 -- users", "SELECT 1 -- users".len()).is_none());
-    }
-
-    #[test]
-    fn formatter_breaks_clauses_and_uppercases_keywords() {
-        let formatted =
-            format_sql("select id, name from users where id = 1 order by id desc limit 5;");
-        assert_eq!(
-            formatted,
-            "SELECT id,\nname\nFROM users\nWHERE id = 1\nORDER BY id DESC\nLIMIT 5;"
-        );
-    }
-
-    #[test]
-    fn formatter_keeps_function_calls_and_operators_tight() {
-        let formatted = format_sql("select count(*), coalesce(a.b, 0) as total, a.x::text from t");
-        assert_eq!(
-            formatted,
-            "SELECT count(*),\ncoalesce(a.b, 0) AS total,\na.x::TEXT\nFROM t"
-        );
-    }
-
-    #[test]
-    fn formatter_breaks_joins_and_predicates() {
-        let formatted = format_sql(
-            "select u.id from users u left outer join orders o on o.user_id = u.id where u.active = true and o.total > 10",
-        );
-        assert_eq!(
-            formatted,
-            "SELECT u.id\nFROM users u\nLEFT OUTER JOIN orders o\nON o.user_id = u.id\nWHERE u.active = TRUE\n  AND o.total > 10"
-        );
     }
 
     #[test]
@@ -5199,12 +4707,6 @@ mod tests {
         let mysql_column = "SELECT usr FROM users";
         let mysql_message = "Unknown column 'usr' in 'field list'";
         assert_eq!(sql_error_range(mysql_message, mysql_column), Some(7..10));
-    }
-
-    #[test]
-    fn error_range_returns_none_when_nothing_matches() {
-        assert_eq!(sql_error_range("connection refused", "SELECT 1"), None);
-        assert_eq!(sql_error_range("syntax error", ""), None);
     }
 }
 

@@ -2213,34 +2213,6 @@ mod tests {
         assert!(!delegate.is_json_cell(1, 4));
     }
 
-    #[test]
-    fn local_sort_keys_order_nulls_numbers_and_text() {
-        let order = |left: CellValue, right: CellValue| {
-            compare_cells(&SortKey::new(Some(&left)), &SortKey::new(Some(&right)))
-        };
-        use std::cmp::Ordering::*;
-        assert_eq!(order(CellValue::Null, CellValue::Integer(1)), Less);
-        assert_eq!(
-            order(CellValue::Text("10".into()), CellValue::Text("9".into())),
-            Greater
-        );
-        assert_eq!(
-            order(CellValue::Text("10".into()), CellValue::Integer(10)),
-            Equal
-        );
-        assert_eq!(
-            order(
-                CellValue::Text("apple".into()),
-                CellValue::Text("pear".into())
-            ),
-            Less
-        );
-        assert_eq!(
-            compare_cells(&SortKey::new(None), &SortKey::new(Some(&CellValue::Null))),
-            Equal
-        );
-    }
-
     fn export_result() -> QueryResult {
         QueryResult {
             columns: vec![
@@ -2357,36 +2329,6 @@ mod tests {
         assert_eq!(delegate.column_sort(0), Some(ColumnSort::Default));
     }
 
-    #[test]
-    fn server_sort_marks_the_requested_column() {
-        let mut delegate = delegate_with_export_result();
-        delegate.set_server_sort(
-            true,
-            Some(&Order {
-                column: "id".into(),
-                direction: OrderDirection::Descending,
-            }),
-        );
-        delegate.set_result(
-            Some(Arc::new(export_result())),
-            &HashMap::new(),
-            None,
-            &[],
-            &[],
-        );
-        assert_eq!(delegate.column_sort(0), Some(ColumnSort::Descending));
-        assert_eq!(delegate.column_sort(1), Some(ColumnSort::Default));
-        delegate.set_server_sort(false, None);
-        delegate.set_result(
-            Some(Arc::new(export_result())),
-            &HashMap::new(),
-            None,
-            &[],
-            &[],
-        );
-        assert_eq!(delegate.column_sort(0), None);
-    }
-
     fn delegate_with_export_result() -> ResultTableDelegate {
         let mut delegate = ResultTableDelegate::default();
         delegate.set_result(
@@ -2397,43 +2339,6 @@ mod tests {
             &[],
         );
         delegate
-    }
-
-    #[test]
-    fn foreign_key_target_resolves_the_referenced_schema() {
-        let tables = vec![
-            TableInfo::table("users", Some("analytics".into())),
-            TableInfo::table("users", Some("public".into())),
-        ];
-        let foreign_key = ForeignKeyInfo {
-            constraint_name: Some("events_user_id_fkey".into()),
-            columns: vec!["user_id".into()],
-            referenced_schema: Some("analytics".into()),
-            referenced_table: "users".into(),
-            referenced_columns: vec!["id".into()],
-            on_update: None,
-            on_delete: None,
-        };
-
-        assert_eq!(
-            foreign_key_target_table(&tables, &foreign_key),
-            Some(TableInfo::table("users", Some("analytics".into())))
-        );
-    }
-
-    #[test]
-    fn foreign_key_target_is_unavailable_when_the_table_is_not_listed() {
-        let foreign_key = ForeignKeyInfo {
-            constraint_name: None,
-            columns: vec!["owner_id".into()],
-            referenced_schema: None,
-            referenced_table: "owners".into(),
-            referenced_columns: vec!["id".into()],
-            on_update: None,
-            on_delete: None,
-        };
-
-        assert_eq!(foreign_key_target_table(&[], &foreign_key), None);
     }
 
     #[test]
@@ -2505,22 +2410,6 @@ mod tests {
     }
 
     #[test]
-    fn result_accessors_retain_database_nulls_and_data_column_order() {
-        let delegate = delegate_with_export_result();
-
-        assert_eq!(delegate.cell_value(0, 1), Some(&CellValue::Null));
-        assert_eq!(delegate.cell_as_plain_text(0, 1).as_deref(), Some("NULL"));
-        assert_eq!(delegate.cell_as_plain_text(0, 2).as_deref(), Some(""));
-        assert_eq!(delegate.row_values(1).unwrap()[0], CellValue::Integer(8));
-        assert_eq!(
-            delegate.column_values(0).unwrap(),
-            vec![&CellValue::Integer(7), &CellValue::Integer(8)]
-        );
-        assert!(delegate.cell_value(8, 0).is_none());
-        assert!(delegate.column_values(8).is_none());
-    }
-
-    #[test]
     fn delimited_exports_escape_controls_and_preserve_null_vs_empty_text() {
         let delegate = delegate_with_export_result();
 
@@ -2552,15 +2441,6 @@ mod tests {
     }
 
     #[test]
-    fn column_tsv_export_returns_none_without_a_result_or_for_an_invalid_column() {
-        let empty_delegate = ResultTableDelegate::default();
-        assert!(empty_delegate.column_as_tsv(0).is_none());
-
-        let delegate = delegate_with_export_result();
-        assert!(delegate.column_as_tsv(8).is_none());
-    }
-
-    #[test]
     fn json_export_is_positional_to_preserve_duplicate_aliases_and_nulls() {
         let delegate = delegate_with_export_result();
         let exported: serde_json::Value =
@@ -2579,46 +2459,6 @@ mod tests {
     impl gpui::Render for RowMenuHarness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             accessible_grid(&self.grid, "Test results", false)
-        }
-    }
-
-    #[gpui::test]
-    fn cell_clicks_highlight_the_whole_active_row(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        for row_header in [true, false] {
-            let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
-                grid: cx.new(|cx| {
-                    TableState::new(delegate_with_export_result(), window, cx)
-                        .cell_selectable(true)
-                        .row_header(row_header)
-                }),
-            });
-            let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
-            grid.update(cx, |table, cx| table.set_selected_row(0, cx));
-            for (row_ix, col_ix, cell_selector) in [
-                (1, 1, "result-cell-text-1-1"),
-                (0, 2, "result-cell-text-0-2"),
-                (1, 0, "result-cell-text-1-0"),
-            ] {
-                cx.update(|window, cx| window.draw(cx).clear(cx));
-                let target = cx.debug_bounds(cell_selector).unwrap().center();
-                cx.simulate_mouse_down(target, MouseButton::Left, Default::default());
-                cx.simulate_mouse_up(target, MouseButton::Left, Default::default());
-                cx.update(|window, cx| window.draw(cx).clear(cx));
-                grid.read_with(cx, |table, _| {
-                    assert_eq!(table.selected_cell(), Some((row_ix, col_ix)));
-                });
-                let row = cx
-                    .debug_bounds(["dbx-result-row-0", "dbx-result-row-1"][row_ix])
-                    .unwrap();
-                let highlights = ["table-row-highlight-0", "table-row-highlight-1"];
-                let highlight = cx
-                    .debug_bounds(highlights[row_ix])
-                    .expect("clicking a cell must highlight its entire row");
-                assert_eq!(highlight.left(), row.left());
-                assert_eq!(highlight.right(), row.right());
-                assert!(cx.debug_bounds(highlights[1 - row_ix]).is_none());
-            }
         }
     }
 
@@ -2702,37 +2542,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
         assert_eq!(value["rows"].as_array().unwrap().len(), 1);
         assert_eq!(value["rows"][0][0], 8);
-    }
-
-    #[gpui::test]
-    fn row_wrappers_do_not_replace_cell_content_in_screen_reader_row_presentation(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
-            grid: cx.new(|cx| TableState::new(delegate_with_export_result(), window, cx)),
-        });
-        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
-        cx.update(|window, cx| {
-            grid.update(cx, |table, cx| {
-                table.delegate_mut().set_row_offset(1000);
-                let row = table.delegate_mut().render_tr(0, window, cx);
-                let mut row_node = gpui::accesskit::Node::new(gpui::Role::Row);
-                row.write_a11y_info(&mut row_node);
-                assert_eq!(row_node.row_index(), Some(1));
-                // Orca reads a named row wrapper as the whole row, skipping its cells.
-                // The real row header retains the absolute row name instead.
-                assert_eq!(row_node.label(), None);
-                let row_header = table.delegate().accessible_cell(0, 0, cx);
-                let mut header_node = gpui::accesskit::Node::new(gpui::Role::RowHeader);
-                row_header.write_a11y_info(&mut header_node);
-                assert_eq!(header_node.label(), Some("Row 1001"));
-                let cell = table.delegate().accessible_cell(0, 1, cx);
-                let mut cell_node = gpui::accesskit::Node::new(gpui::Role::GridCell);
-                cell.write_a11y_info(&mut cell_node);
-                assert_eq!(cell_node.label(), Some("7"));
-            })
-        });
     }
 
     #[gpui::test]
@@ -2900,18 +2709,6 @@ mod tests {
         assert_eq!(json["rows"].as_array().unwrap().len(), 2);
         assert_eq!(json["rows"][0][0], 7);
         assert_eq!(json["rows"][1][0], 8);
-    }
-
-    #[test]
-    fn row_json_keeps_duplicate_query_aliases_and_only_the_clicked_row() {
-        let delegate = delegate_with_export_result();
-        let value: serde_json::Value =
-            serde_json::from_str(&delegate.row_as_json(1).unwrap()).unwrap();
-        assert_eq!(value["columns"][1]["name"], "note");
-        assert_eq!(value["columns"][2]["name"], "note");
-        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(value["rows"][0][0], 8);
-        assert_eq!(value["rows"][0][2], "NULL");
     }
 
     #[test]

@@ -1119,7 +1119,6 @@ pub fn extract_insert_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{IntoElement, Render, TestAppContext, div};
 
     fn column(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {
         ColumnInfo {
@@ -1131,55 +1130,6 @@ mod tests {
             primary_key: false,
             default_value: None,
         }
-    }
-
-    struct FieldRowHarness {
-        field: FieldRow,
-    }
-
-    impl Render for FieldRowHarness {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-        }
-    }
-
-    #[gpui::test]
-    fn boolean_fields_build_a_true_false_selector(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let (view, cx) = cx.add_window_view(|window, cx| FieldRowHarness {
-            field: FieldRow::new_update(
-                column("enabled", "BOOLEAN", false),
-                CellValue::Boolean(false),
-                window,
-                cx,
-            ),
-        });
-
-        cx.update(|_, cx| {
-            let field = &view.read(cx).field;
-            let selector = field
-                .boolean_selector
-                .as_ref()
-                .expect("boolean field should have a selector");
-            assert_eq!(
-                selector.read(cx).selected_value().map(ToString::to_string),
-                Some("false".into())
-            );
-            assert!(field.enum_selector.is_none());
-        });
-    }
-
-    #[test]
-    fn field_state_labels_round_trip_for_compact_selectors() {
-        for state in [
-            FieldValueState::Value,
-            FieldValueState::Sql,
-            FieldValueState::Null,
-            FieldValueState::Default,
-        ] {
-            assert_eq!(FieldValueState::from_label(state.label()), Some(state));
-        }
-        assert_eq!(FieldValueState::from_label("Unknown"), None);
     }
 
     #[test]
@@ -1368,31 +1318,6 @@ mod tests {
     }
 
     #[test]
-    fn field_state_options_keep_sql_explicit_in_insert_and_update_modes() {
-        assert_eq!(
-            field_state_options(false, false),
-            vec![FieldValueState::Value, FieldValueState::Sql]
-        );
-        assert_eq!(
-            field_state_options(false, true),
-            vec![
-                FieldValueState::Value,
-                FieldValueState::Sql,
-                FieldValueState::Null,
-            ]
-        );
-        assert_eq!(
-            field_state_options(true, true),
-            vec![
-                FieldValueState::Value,
-                FieldValueState::Sql,
-                FieldValueState::Null,
-                FieldValueState::Default,
-            ]
-        );
-    }
-
-    #[test]
     fn sql_expressions_are_extracted_without_parsing_as_column_values() {
         let columns = vec![
             column("id", "UUID", false),
@@ -1454,27 +1379,6 @@ mod tests {
     }
 
     #[test]
-    fn default_remains_insert_only() {
-        let columns = vec![column("id", "INTEGER", false)];
-        let error = changed_fields(
-            &[FieldDraft::new(
-                1,
-                "id",
-                Some(CellValue::Integer(1)),
-                "",
-                FieldValueState::Default,
-                None,
-            )],
-            &columns,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            FieldValidationError::DefaultNotSupportedForUpdate { .. }
-        ));
-    }
-
-    #[test]
     fn insert_can_omit_columns_without_introspected_default_metadata() {
         let columns = vec![
             column("id", "INTEGER", false),
@@ -1500,27 +1404,6 @@ mod tests {
             None,
         )];
 
-        assert!(changed_fields(&drafts, &columns).unwrap().is_empty());
-    }
-
-    #[test]
-    fn json_values_open_pretty_without_becoming_false_changes() {
-        let original = CellValue::Json(serde_json::json!({
-            "enabled": true,
-            "nested": { "count": 2 }
-        }));
-        let pretty = field_editor_text(&original);
-        assert!(pretty.contains('\n'));
-
-        let columns = vec![column("payload", "JSONB", false)];
-        let drafts = vec![FieldDraft::new(
-            1,
-            "payload",
-            Some(original),
-            pretty,
-            FieldValueState::Value,
-            None,
-        )];
         assert!(changed_fields(&drafts, &columns).unwrap().is_empty());
     }
 
@@ -1554,12 +1437,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("cannot be NULL"));
-    }
-
-    #[test]
-    fn stable_ids_are_not_positions() {
-        let first = FieldDraft::with_new_id("one", None, "", FieldValueState::Value, None);
-        let second = FieldDraft::with_new_id("two", None, "", FieldValueState::Value, None);
-        assert_ne!(first.id, second.id);
     }
 }

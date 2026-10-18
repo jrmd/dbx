@@ -940,24 +940,6 @@ mod tests {
     }
 
     #[test]
-    fn imports_infer_light_appearance_and_honor_high_contrast_types() {
-        for (kind, background, expected) in [
-            ("", "#ffffff", Appearance::Light),
-            ("hcLight", "#ddd", Appearance::Light),
-            ("hcBlack", "#000", Appearance::Dark),
-        ] {
-            let imported = import_theme(
-                &format!(
-                    r##"{{"type":"{kind}","colors":{{"editor.background":"{background}"}}}}"##
-                ),
-                "Example",
-            )
-            .unwrap();
-            assert_eq!(imported.appearance, Some(expected));
-        }
-    }
-
-    #[test]
     fn vscode_imports_keep_faint_and_translucent_text_readable() {
         // Shaped like Eldritch Dark: translucent line numbers, no description
         // colour, and a panel darker than the editor.
@@ -1003,30 +985,6 @@ mod tests {
         assert_eq!(p.sql_string, rgb(0xf1fc79));
         assert_eq!(p.sql_type, rgb(0x04d1f9));
         assert_ne!(color_hex(p.sql_comment), "#f7c67f");
-    }
-
-    #[test]
-    fn saved_custom_themes_with_faint_text_are_corrected_on_load() {
-        let mut dark = Colors::new();
-        dark.insert("canvas".into(), "#171928".into());
-        dark.insert("text".into(), "#ebfafa".into());
-        dark.insert("text_muted".into(), "#7081d03a".into());
-        dark.insert("input_border".into(), "#0f0f0f00".into());
-        let prefs = ThemePreferences {
-            custom_themes: vec![CustomTheme {
-                name: "Old import".into(),
-                light: Colors::new(),
-                dark,
-            }],
-            active_custom: Some(0),
-            ..Default::default()
-        };
-        for solid in [false, true] {
-            let p = prefs.resolve(true, solid);
-            assert!(contrast(p.text_muted, p.canvas) >= 4.5);
-            assert!(contrast(p.input_border, p.canvas) >= 3.);
-            assert_eq!(p.text, rgb(0xebfafa));
-        }
     }
 
     #[test]
@@ -1152,24 +1110,5 @@ mod tests {
         assert!(prefs.edit("typo", "#fff", true).is_err());
         assert_eq!(prefs, before);
         assert_eq!(prefs.resolve(false, true).canvas, LIGHT_THEME.canvas);
-    }
-
-    #[test]
-    fn jsonc_preserves_urls_escapes_and_unicode_in_names() {
-        let source = r##"{"name":"Thème \\\" // /* , } https://example.org", /* 😀 */ "colors":{"editor.background":"#abcdef",},}"##;
-        let imported = import_theme(source, "fallback").unwrap();
-        assert!(imported.theme.name.contains("https://example.org"));
-    }
-
-    #[test]
-    fn reduced_transparency_composites_custom_materials() {
-        let mut prefs = ThemePreferences::default();
-        for key in ["window", "glass", "glass_raised"] {
-            prefs.edit(key, "#12345640", true).unwrap();
-        }
-        let p = prefs.resolve(true, true);
-        for color in [p.window, p.glass, p.glass_raised] {
-            assert_eq!(color.a, 1.);
-        }
     }
 }

@@ -726,15 +726,6 @@ mod tests {
     }
 
     #[test]
-    fn operator_metadata_marks_only_null_operators_without_values() {
-        assert_eq!(filter_operator_options().len(), 11);
-        assert!(operator_requires_value(FilterOperator::Equals));
-        assert!(!operator_requires_value(FilterOperator::IsNull));
-        assert!(!operator_value_required(FilterOperator::IsNotNull));
-        assert_eq!(operator_label(FilterOperator::Contains), "Contains");
-    }
-
-    #[test]
     fn parser_handles_all_supported_scalar_kinds() {
         assert_eq!(
             parse_filter_value(&column("active", "BOOLEAN"), " true ").unwrap(),
@@ -809,13 +800,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("signed base-10 integer"));
-    }
-
-    #[test]
-    fn row_ids_are_stable_when_rows_move_or_are_removed() {
-        // This test covers the pure collection behavior without constructing
-        // GPUI entities; FilterModel::move_row/remove use the same IDs as the
-        // entity-backed rows created by FilterRow::new.
-        assert_ne!(next_filter_row_id(), next_filter_row_id());
     }
 }

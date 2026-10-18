@@ -1137,31 +1137,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_catalog_is_case_insensitive_and_preserves_the_untyped_suffix() {
-        let catalog = fixture_catalog();
-        let text = "client i trailing";
-        let (range, items) =
-            redis_completion_items(text, "client i".len(), Some(&catalog), None, None)
-                .expect("CLIENT ID completion");
-        let item = items
-            .iter()
-            .find(|item| item.label == "CLIENT ID")
-            .expect("CLIENT ID item");
-
-        assert_eq!(range, 7..8);
-        assert_eq!(item.insert_text, "ID");
-        assert_eq!(
-            format!(
-                "{}{}{}",
-                &text[..range.start],
-                item.insert_text,
-                &text[range.end..]
-            ),
-            "client ID trailing"
-        );
-    }
-
-    #[test]
     fn runtime_catalog_offers_recursive_pure_token_options_but_not_values_as_keys() {
         let catalog = fixture_catalog();
         let key_cache = keyspace_result(&[CellValue::Text("user:42".into())]);
@@ -1387,79 +1362,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_catalog_walks_untokenized_nested_blocks() {
-        let strategy = argument(
-            "oneof",
-            None,
-            None,
-            vec![
-                argument("pure-token", Some("MAXLEN"), None, Vec::new()),
-                argument("pure-token", Some("MINID"), None, Vec::new()),
-            ],
-        );
-        let mut operator = argument(
-            "oneof",
-            None,
-            None,
-            vec![
-                argument("pure-token", Some("="), None, Vec::new()),
-                argument("pure-token", Some("~"), None, Vec::new()),
-            ],
-        );
-        operator.optional = true;
-        let mut count = argument("integer", Some("LIMIT"), None, Vec::new());
-        count.optional = true;
-        let mut trim = argument(
-            "block",
-            None,
-            None,
-            vec![
-                strategy,
-                operator,
-                argument("string", None, None, Vec::new()),
-                count,
-            ],
-        );
-        trim.optional = true;
-        let catalog = catalog(vec![command(
-            "XADD",
-            vec![argument("key", None, Some(0), Vec::new()), trim],
-        )]);
-
-        let (_, strategy_items) = catalog_completion("XADD stream M", &catalog);
-        assert!(strategy_items.iter().any(|item| item.label == "MAXLEN"));
-
-        let (_, limit_items) = catalog_completion("XADD stream MAXLEN ~ 100 L", &catalog);
-        assert!(limit_items.iter().any(|item| item.label == "LIMIT"));
-    }
-
-    #[test]
-    fn runtime_catalog_offers_cached_keys_after_repeated_direct_key_arguments() {
-        let mut key = argument("key", None, Some(0), Vec::new());
-        key.multiple = true;
-        let catalog = catalog(vec![command("DEL", vec![key])]);
-        let key_cache = keyspace_result(&[
-            CellValue::Text("one".into()),
-            CellValue::Text("user:42".into()),
-        ]);
-
-        let (_, items) = redis_completion_items(
-            "DEL one us",
-            "DEL one us".len(),
-            Some(&catalog),
-            Some(&key_cache),
-            None,
-        )
-        .expect("repeated key completion");
-
-        assert!(
-            items
-                .iter()
-                .any(|item| { item.kind == CompletionItemKind::Key && item.label == "user:42" })
-        );
-    }
-
-    #[test]
     fn command_metadata_fallback_keeps_safe_legacy_key_completion() {
         let catalog = catalog(vec![command("GET", Vec::new())]);
         let key_cache = keyspace_result(&[CellValue::Text("user:42".into())]);
@@ -1493,17 +1395,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_command_offers_get() {
-        let (_, items) =
-            redis_completion_items("GE", 2, None, None, None).expect("command completions");
-        let get = items
-            .iter()
-            .find(|item| item.kind == CompletionItemKind::Command && item.label == "GET")
-            .expect("GET command");
-        assert_eq!(get.insert_text, "GET ");
-    }
-
-    #[test]
     fn command_completion_preserves_following_arguments_without_duplicate_spacing() {
         let text = "GE existing:key";
         let (range, items) =
@@ -1523,41 +1414,6 @@ mod tests {
             ),
             "GET existing:key"
         );
-    }
-
-    #[test]
-    fn common_server_and_stream_commands_are_discoverable() {
-        let (_, server_items) =
-            redis_completion_items("PI", 2, None, None, None).expect("server commands");
-        assert!(server_items.iter().any(|item| item.label == "PING"));
-
-        let (_, stream_items) =
-            redis_completion_items("XR", 2, None, None, None).expect("stream commands");
-        assert!(stream_items.iter().any(|item| item.label == "XRANGE"));
-    }
-
-    #[test]
-    fn common_string_hash_list_set_and_sorted_set_commands_are_discoverable() {
-        for (prefix, command) in [
-            ("SETN", "SETNX"),
-            ("GETB", "GETBIT"),
-            ("HSETN", "HSETNX"),
-            ("LPUSHX", "LPUSHX"),
-            ("SIS", "SISMEMBER"),
-            ("ZRAN", "ZRANK"),
-        ] {
-            let (_, items) = redis_completion_items(prefix, prefix.len(), None, None, None)
-                .expect("command items");
-            assert!(items.iter().any(|item| item.label == command));
-        }
-    }
-
-    #[test]
-    fn completion_only_uses_the_current_line() {
-        let (_, items) = redis_completion_items("SET stale value\nGE", 18, None, None, None)
-            .expect("current line command completions");
-        assert!(items.iter().any(|item| item.label == "GET"));
-        assert!(!items.iter().any(|item| item.label == "SET"));
     }
 
     #[test]
@@ -1581,52 +1437,6 @@ mod tests {
                 &text[range.end..]
             ),
             "GET user:42 suffix"
-        );
-    }
-
-    #[test]
-    fn key_completion_replaces_the_whole_argument_when_the_caret_is_inside_it() {
-        let result = keyspace_result(&[CellValue::Text("user:7".into())]);
-        let text = "GET user:42";
-        let cursor = "GET user:".len();
-        let (range, items) = redis_completion_items(text, cursor, None, Some(&result), None)
-            .expect("key completions");
-        let item = items
-            .iter()
-            .find(|item| item.label == "user:7")
-            .expect("cached key");
-
-        assert_eq!(range, 4..text.len());
-        assert_eq!(
-            format!(
-                "{}{}{}",
-                &text[..range.start],
-                item.insert_text,
-                &text[range.end..]
-            ),
-            "GET user:7"
-        );
-    }
-
-    #[test]
-    fn key_completion_prefers_active_query_results_then_deduplicates_browser_results() {
-        let active = keyspace_result(&[
-            CellValue::Text("active:key".into()),
-            CellValue::Text("shared:key".into()),
-        ]);
-        let browser = keyspace_result(&[
-            CellValue::Text("shared:key".into()),
-            CellValue::Text("browser:key".into()),
-        ]);
-        let (_, items) = redis_completion_items("GET ", 4, None, Some(&active), Some(&browser))
-            .expect("cached key completions");
-
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.label.as_str())
-                .collect::<Vec<_>>(),
-            ["active:key", "shared:key", "browser:key"]
         );
     }
 

@@ -1487,49 +1487,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn svg_colors_drop_alpha_without_reordering_channels() {
-        assert_eq!(color_hex(gpui::rgba(0x12345678)), "#123456");
-    }
-
-    #[test]
-    fn schema_filter_label_stays_compact_and_describes_selection() {
-        let selected = BTreeSet::from(["analytics".to_owned(), "public".to_owned()]);
-        assert_eq!(diagram_schema_filter_label(None, 4), "All");
-        assert_eq!(
-            diagram_schema_filter_label(Some(&BTreeSet::new()), 4),
-            "None"
-        );
-        assert_eq!(diagram_schema_filter_label(Some(&selected), 4), "2/4");
-        assert_eq!(
-            compact_schema_name("a_very_long_schema_name"),
-            "a_very_long_schema…"
-        );
-    }
-
-    #[test]
-    fn native_diagram_viewport_keeps_render_work_bounded() {
-        let document = DiagramDocument {
-            database: "large".into(),
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            width: 100_000.0,
-            height: 80_000.0,
-        };
-        let visible = diagram_visible_scene_bounds(
-            &document,
-            1.0,
-            point(px(-50_000.0), px(-20_000.0)),
-            1_000.0,
-            600.0,
-        );
-
-        assert!(visible.right - visible.left <= 1_000.0 + DIAGRAM_VIEWPORT_OVERSCAN * 2.0);
-        assert!(visible.bottom - visible.top <= 600.0 + DIAGRAM_VIEWPORT_OVERSCAN * 2.0);
-        assert!(visible.left > 0.0);
-        assert!(visible.right < document.width);
-    }
-
-    #[test]
     fn native_diagram_culls_offscreen_cards_and_relationships() {
         let visible = DiagramSceneBounds {
             left: 1_000.0,

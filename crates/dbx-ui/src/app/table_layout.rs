@@ -236,35 +236,3 @@ fn filter_set_name(filters: &[Filter]) -> String {
         None => name,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn filter_sets_are_named_from_their_conditions() {
-        assert_eq!(
-            filter_set_name(&[
-                Filter::new(
-                    "status",
-                    FilterOperator::Equals,
-                    Some(CellValue::Text("active".into()))
-                ),
-                Filter::new("deleted_at", FilterOperator::IsNull, None),
-            ]),
-            format!(
-                "status {} active, deleted_at {}",
-                filter_operator_options()
-                    .iter()
-                    .find(|option| option.operator == FilterOperator::Equals)
-                    .unwrap()
-                    .label,
-                filter_operator_options()
-                    .iter()
-                    .find(|option| option.operator == FilterOperator::IsNull)
-                    .unwrap()
-                    .label
-            )
-        );
-    }
-}

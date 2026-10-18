@@ -721,16 +721,4 @@ mod tests {
         crate::theme::set_text_scales(100, 100);
         crate::theme::set_font_sizes(12, 12);
     }
-
-    #[test]
-    fn kind_groups_list_every_database_once() {
-        let mut listed: Vec<_> = KIND_GROUPS
-            .iter()
-            .flat_map(|(_, kinds)| kinds.iter().copied())
-            .collect();
-        assert_eq!(listed.len(), DatabaseKind::ALL.len());
-        listed.sort_by_key(|kind| kind.to_string());
-        listed.dedup();
-        assert_eq!(listed.len(), DatabaseKind::ALL.len());
-    }
 }

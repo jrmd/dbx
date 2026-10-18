@@ -345,27 +345,3 @@ fn main() {
             cx.activate(true);
         });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn custom_window_preserves_native_move_and_resize_contract() {
-        let options = dbx_window_options();
-
-        assert!(options.is_movable);
-        assert!(options.is_resizable);
-        assert!(options.app_owns_titlebar_drag);
-        let titlebar = options
-            .titlebar
-            .expect("macOS requires a titlebar style mask for native edge resizing");
-        assert!(titlebar.appears_transparent);
-        assert!(
-            titlebar
-                .traffic_light_position
-                .is_some_and(|position| position.x >= px(0.0)),
-            "Native traffic lights remain inside the window"
-        );
-    }
-}

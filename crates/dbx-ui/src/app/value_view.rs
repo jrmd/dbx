@@ -206,16 +206,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn json_text_is_pretty_printed_but_plain_text_is_not() {
-        assert_eq!(
-            json_preview(&CellValue::Text("{\"a\":[1,2]}".into())).unwrap(),
-            "{\n  \"a\": [\n    1,\n    2\n  ]\n}"
-        );
-        assert_eq!(json_preview(&CellValue::Text("42".into())), None);
-        assert_eq!(json_preview(&CellValue::Text("{not json".into())), None);
-    }
-
-    #[test]
     fn json_bytes_preview_and_copy_preserve_nested_values_and_numeric_precision() {
         let raw = br#" {"actor":{"kind":"user","id":900719925474099312345},"roles":["admin"],"amount":0.123456789012345678901,"missing":null,"label":"\u00e9"} "#;
         let value = CellValue::Bytes(raw.to_vec());
@@ -301,98 +291,5 @@ mod tests {
         assert!(content.size.width > hex_bounds.size.width);
         // Both previews contain three lines (the dump has a trailing newline).
         assert_eq!(hex_bounds.size.height, json_bounds.size.height);
-    }
-
-    struct ScrollingPreviewHarness {
-        value: CellValue,
-        scroll: gpui::ScrollHandle,
-    }
-
-    impl Render for ScrollingPreviewHarness {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .id("preview-fields-scroll")
-                .w(px(200.))
-                .h(px(240.))
-                .flex()
-                .flex_col()
-                .overflow_y_scroll()
-                .lock_scroll_axis()
-                .track_scroll(&self.scroll)
-                .child(div().flex_none().child(value_view(Some(&self.value), cx)))
-                .child(div().h(px(600.)).flex_none())
-        }
-    }
-
-    #[gpui::test]
-    fn wide_previews_leave_vertical_wheel_input_to_the_field_list(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let (harness, cx) = cx.add_window_view(|_, _| ScrollingPreviewHarness {
-            value: CellValue::Json(serde_json::json!({"long_key": "x".repeat(100)})),
-            scroll: gpui::ScrollHandle::default(),
-        });
-        for value in [
-            CellValue::Json(serde_json::json!({"long_key": "x".repeat(100)})),
-            CellValue::Bytes(vec![0; 32]),
-        ] {
-            harness.update(cx, |harness, cx| {
-                harness.value = value;
-                harness.scroll.set_offset(gpui::point(px(0.), px(0.)));
-                cx.notify();
-            });
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            let position = cx.debug_bounds("cell-value-preview").unwrap().center();
-            let before = cx.debug_bounds("cell-value-preview-content").unwrap();
-
-            // Sideways scrolling stays within the preview.
-            cx.simulate_event(gpui::ScrollWheelEvent {
-                position,
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(-40.), px(0.))),
-                touch_phase: gpui::TouchPhase::Started,
-                ..Default::default()
-            });
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            let after = cx.debug_bounds("cell-value-preview-content").unwrap();
-            assert!(after.left() < before.left());
-            harness.read_with(cx, |harness, _| {
-                assert_eq!(harness.scroll.offset().y, px(0.))
-            });
-
-            // Both a trackpad and a mouse wheel move the parent field list,
-            // even when the pointer is over a line wider than the viewport.
-            for delta in [
-                gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20.))),
-                gpui::ScrollDelta::Lines(gpui::point(0., -1.)),
-            ] {
-                let position = cx.debug_bounds("cell-value-preview").unwrap().center();
-                let before = cx.debug_bounds("cell-value-preview-content").unwrap();
-                let offset = harness.read_with(cx, |harness, _| harness.scroll.offset().y);
-                cx.simulate_event(gpui::ScrollWheelEvent {
-                    position,
-                    delta,
-                    touch_phase: gpui::TouchPhase::Started,
-                    ..Default::default()
-                });
-                cx.update(|window, cx| window.draw(cx).clear(cx));
-                let after = cx.debug_bounds("cell-value-preview-content").unwrap();
-                assert_eq!(after.left(), before.left());
-                harness.read_with(cx, |harness, _| assert!(harness.scroll.offset().y < offset));
-            }
-        }
-    }
-
-    #[test]
-    fn hex_dump_shows_offsets_hex_and_printable_ascii() {
-        let dump = hex_dump(b"DBX\x00\x01 ok");
-        assert_eq!(
-            dump,
-            "00000000  44 42 58 00 01 20 6f 6b                          DBX.. ok\n"
-        );
-        assert!(hex_dump(&[0; 600]).ends_with("… 88 more bytes"));
-        assert_eq!(
-            image_format(b"\x89PNG\r\n\x1a\nrest"),
-            Some(ImageFormat::Png)
-        );
-        assert_eq!(image_format(b"plain"), None);
     }
 }

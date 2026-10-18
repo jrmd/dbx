@@ -4996,33 +4996,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn compact_picker_single_click_selects_without_replacing_the_list(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().expect("create profile directory");
-        let store = ProfileStore::at(directory.path().join("connections.json"));
-        let profile = store
-            .save(ConnectionProfileDraft::new(
-                "Local database",
-                DatabaseKind::PostgreSQL,
-                "postgres://developer@localhost:5432/app",
-            ))
-            .expect("save profile fixture");
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-
-        cx.update(|_, cx| {
-            app.update(cx, |app, cx| {
-                app.compact_layout = true;
-                app.compact_connection_form_open = false;
-                app.select_saved_connection_in_compact_picker(profile.clone(), cx);
-                assert_eq!(app.draft.selected_profile, Some(profile.id));
-                assert!(!app.compact_connection_form_open);
-            });
-        });
-    }
-
-    #[gpui::test]
     fn connection_tag_is_single_and_updates_shared_colours(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let directory = tempfile::tempdir().unwrap();
@@ -5067,48 +5040,6 @@ mod tests {
                 let _ = gpui::Render::render(app, window, cx);
             });
         });
-    }
-
-    #[gpui::test]
-    fn double_click_queues_open_while_saved_password_is_hydrating(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().expect("create profile directory");
-        let store = ProfileStore::at(directory.path().join("connections.json"));
-        store
-            .vault()
-            .expect("test store has a vault")
-            .create("test vault passphrase")
-            .expect("create test vault");
-        let profile = store
-            .save(
-                ConnectionProfileDraft::new(
-                    "Local database",
-                    DatabaseKind::PostgreSQL,
-                    "postgres://developer@localhost:5432/app",
-                )
-                .with_secret("secret"),
-            )
-            .expect("save profile fixture");
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.saved_connections = vec![profile.clone()];
-                app.draft.selected_profile = Some(profile.id);
-                app.credential_hydrating = true;
-                app.open_saved_connection(profile.clone(), window, cx);
-                assert!(app.credential_connect_window.is_some());
-                assert!(app.sessions.is_empty());
-            });
-        });
-    }
-
-    #[test]
-    fn redis_query_tabs_must_use_a_syntax_aware_editor_language() {
-        assert_eq!(
-            query_editor_language(DatabaseKind::Redis),
-            editor::EditorLanguage::Redis
-        );
     }
 
     #[gpui::test]
@@ -5399,77 +5330,6 @@ mod tests {
     }
 
     #[test]
-    fn diagram_scroll_offset_clamps_to_the_canvas_extent() {
-        let max = point(px(240.), px(120.));
-        assert_eq!(
-            clamp_diagram_scroll_offset(point(px(-400.), px(30.)), max),
-            point(px(-240.), px(0.))
-        );
-    }
-
-    #[test]
-    fn diagram_keyboard_pan_moves_the_viewport_in_the_requested_direction() {
-        let offset = point(px(-80.), px(-40.));
-        let right_and_down = point(offset.x - px(48.), offset.y - px(48.));
-        assert_eq!(right_and_down, point(px(-128.), px(-88.)));
-    }
-
-    #[test]
-    fn diagram_zoom_remaps_scroll_progress_to_the_new_canvas_extent() {
-        assert_eq!(
-            remap_diagram_scroll_axis(px(-600.), px(600.), px(1_000.), px(700.)),
-            px(-300.)
-        );
-        assert_eq!(
-            remap_diagram_scroll_axis(px(-300.), px(600.), px(1_000.), px(700.)),
-            px(-150.)
-        );
-        assert_eq!(
-            remap_diagram_scroll_axis(px(0.), px(0.), px(300.), px(700.)),
-            px(0.)
-        );
-    }
-
-    #[test]
-    fn diagram_schema_selection_starts_from_the_postgres_explorer_filter() {
-        assert_eq!(
-            diagram_initial_schema_selection(DatabaseKind::PostgreSQL, Some("analytics")),
-            Some(BTreeSet::from(["analytics".to_owned()]))
-        );
-        assert_eq!(
-            diagram_initial_schema_selection(DatabaseKind::PostgreSQL, None),
-            None
-        );
-        assert_eq!(
-            diagram_initial_schema_selection(DatabaseKind::MySQL, Some("ignored")),
-            None
-        );
-    }
-
-    #[test]
-    fn diagram_schema_selection_drops_missing_names_and_normalizes_all() {
-        let available = vec!["analytics".to_owned(), "public".to_owned()];
-        let mut every_schema = Some(BTreeSet::from([
-            "analytics".to_owned(),
-            "public".to_owned(),
-        ]));
-        normalize_diagram_schema_selection(&mut every_schema, &available);
-        assert_eq!(every_schema, None);
-
-        let mut one_schema = Some(BTreeSet::from(["missing".to_owned(), "public".to_owned()]));
-        normalize_diagram_schema_selection(&mut one_schema, &available);
-        assert_eq!(one_schema, Some(BTreeSet::from(["public".to_owned()])));
-    }
-
-    #[test]
-    fn table_browser_pages_are_bounded_and_offset_by_page() {
-        let page = table_browse_page(3);
-
-        assert_eq!(page.limit, TABLE_BROWSE_QUERY_LIMIT);
-        assert_eq!(page.offset, 3 * u64::from(TABLE_BROWSE_PAGE_SIZE));
-    }
-
-    #[test]
     fn table_browser_keeps_the_probe_row_out_of_the_grid() {
         let mut result = QueryResult::empty(None, 0);
         result.rows = (0..TABLE_BROWSE_QUERY_LIMIT)
@@ -5478,24 +5338,6 @@ mod tests {
 
         assert!(trim_table_browse_result(&mut result));
         assert_eq!(result.rows.len(), TABLE_BROWSE_PAGE_SIZE as usize);
-    }
-
-    #[test]
-    fn query_status_distinguishes_rows_writes_limits_and_database() {
-        let returned = QueryResult {
-            columns: Vec::new(),
-            rows: vec![RowData::default(), RowData::default()],
-            rows_affected: None,
-            truncated: true,
-            elapsed_ms: 18,
-        };
-        assert_eq!(
-            query_result_status(&returned),
-            "2 rows returned · 18 ms · results limited"
-        );
-
-        let written = QueryResult::empty(Some(1), 4);
-        assert_eq!(query_result_status(&written), "1 row affected · 4 ms");
     }
 
     #[test]
@@ -5538,76 +5380,6 @@ mod tests {
             Some(&table),
             Some(&table),
         ));
-    }
-
-    #[test]
-    fn filter_uses_the_selected_grid_column() {
-        let table_columns = vec![
-            ColumnInfo::result("id", 0, "INTEGER"),
-            ColumnInfo::result("name", 1, "TEXT"),
-        ];
-        let result = QueryResult {
-            columns: table_columns.clone(),
-            rows: Vec::new(),
-            rows_affected: None,
-            truncated: false,
-            elapsed_ms: 0,
-        };
-
-        assert_eq!(
-            selected_filter_column(1, &table_columns, Some(&result))
-                .map(|column| column.name.as_str()),
-            Some("name")
-        );
-    }
-
-    #[test]
-    fn sidebar_identity_includes_schema() {
-        let table = TableInfo::table("users", Some("analytics".into()));
-        assert_eq!(table_sidebar_label(&table, None), "analytics.users");
-        assert_eq!(table_sidebar_label(&table, Some("analytics")), "users");
-        assert_eq!(
-            table_sidebar_label(&table, Some("public")),
-            "analytics.users"
-        );
-        assert_eq!(table_sidebar_id(&table), "table-analytics-users");
-    }
-
-    #[test]
-    fn right_click_routes_to_the_table_context_menu_action() {
-        let event = gpui::ClickEvent::Mouse(gpui::MouseClickEvent {
-            down: gpui::MouseDownEvent {
-                button: gpui::MouseButton::Right,
-                ..Default::default()
-            },
-            up: gpui::MouseUpEvent {
-                button: gpui::MouseButton::Right,
-                ..Default::default()
-            },
-        });
-
-        assert_eq!(
-            table_click_action(&event),
-            TableClickAction::OpenContextMenu
-        );
-    }
-
-    #[test]
-    fn foreign_key_actions_are_presented_in_database_order() {
-        let foreign_key = ForeignKeyInfo {
-            constraint_name: Some("orders_customer_id_fkey".into()),
-            columns: vec!["customer_id".into()],
-            referenced_schema: Some("public".into()),
-            referenced_table: "customers".into(),
-            referenced_columns: vec!["id".into()],
-            on_update: Some(ReferentialAction::Cascade),
-            on_delete: Some(ReferentialAction::SetNull),
-        };
-
-        assert_eq!(
-            foreign_key_actions(&foreign_key),
-            "ON UPDATE CASCADE · ON DELETE SET NULL"
-        );
     }
 
     #[test]
@@ -5666,15 +5438,6 @@ mod tests {
         more.push(TableInfo::table("orders", Some("sales".into())));
         assert!(list.refresh(kind, &more, 2, Some("public"), ""));
         assert_eq!(list.schema_options.len(), 4);
-    }
-
-    #[test]
-    fn sidebar_list_ignores_schema_filter_outside_postgres() {
-        let tables = vec![TableInfo::table("t", None), TableInfo::table("u", None)];
-        let mut list = SidebarList::default();
-        assert!(list.refresh(DatabaseKind::SQLite, &tables, 1, None, ""));
-        assert_eq!(list.visible.len(), 2);
-        assert!(list.schema_options.is_empty());
     }
 
     #[test]

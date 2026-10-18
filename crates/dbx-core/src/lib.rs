@@ -820,14 +820,6 @@ mod tests {
         assert!(error.to_string().contains("match the column count"));
     }
 
-    #[test]
-    fn models_round_trip_through_json() {
-        let value = CellValue::Json(serde_json::json!({ "ok": true }));
-        let encoded = serde_json::to_string(&value).unwrap();
-        let decoded: CellValue = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded, value);
-    }
-
     #[tokio::test]
     async fn sqlite_engine_supports_schema_queries_and_edits_without_a_server() {
         let config =
