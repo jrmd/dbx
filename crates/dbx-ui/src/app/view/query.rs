@@ -309,13 +309,10 @@ impl DbxApp {
                             )
                         })
                         .collect::<Vec<_>>(),
-                    matches!(
-                        session.kind,
-                        DatabaseKind::PostgreSQL
-                            | DatabaseKind::CockroachDB
-                            | DatabaseKind::MySQL
-                            | DatabaseKind::SQLite
-                    ),
+                    session
+                        .engine
+                        .as_ref()
+                        .is_some_and(|engine| engine.capabilities().independent_query_sessions),
                 ))
             })
             .unwrap_or_default();
@@ -341,13 +338,14 @@ impl DbxApp {
             .session(session_id)
             .and_then(|session| session.engine.as_ref())
             .is_some_and(|engine| QuerySession::supports_isolated_reads(engine));
-        let analyze_supported = watch_supported
-            && self.session(session_id).is_some_and(|session| {
-                matches!(
-                    session.kind,
-                    DatabaseKind::PostgreSQL | DatabaseKind::MySQL | DatabaseKind::CockroachDB
-                )
-            });
+        let explain_supported = self
+            .session(session_id)
+            .is_some_and(|session| Self::supports_query_explain(session.kind));
+        let analyze_supported = self
+            .session(session_id)
+            .and_then(|session| session.engine.as_deref())
+            .is_some_and(Self::supports_query_analyze);
+        let has_query = !query_editor.read(cx).text(cx).trim().is_empty();
         let plan_view = (error.is_none() && plan_tree)
             .then(|| {
                 self.active_query_tab(session_id)
@@ -688,17 +686,17 @@ impl DbxApp {
                             .flex()
                             .items_center()
                             .gap(crate::theme::ui_px(7.))
-                            .when(transactions_supported && !busy, |actions| {
+                            .when(transactions_supported, |actions| {
                                 if in_transaction {
                                     actions
                                         .child(button("commit-query", "Commit", ButtonKind::Primary)
-                                            .debug_selector(|| "commit-query".into())
+                                            .debug_selector(|| "commit-query".into()).disabled(busy)
                                             .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "COMMIT", cx))))
                                         .child(button("rollback-query", "Rollback", ButtonKind::Quiet)
-                                            .debug_selector(|| "rollback-query".into())
+                                            .debug_selector(|| "rollback-query".into()).disabled(busy)
                                             .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "ROLLBACK", cx))))
                                 } else {
-                                    actions.child(button("begin-query", "Begin", ButtonKind::Quiet)
+                                    actions.child(button("begin-query", "Begin", ButtonKind::Quiet).disabled(busy)
                                         .accessible_name("Begin a transaction in this query tab").tooltip("Begin a transaction in this query tab")
                                         .on_click(cx.listener(move |this, _, _, cx| this.run_console_command_for(session_id, "BEGIN", cx))))
                                 }
@@ -741,6 +739,7 @@ impl DbxApp {
                                             app: app.clone(),
                                             session_id,
                                             sql: sql_dialect,
+                                            session_busy: self.session(session_id).is_some_and(|session| session.busy),
                                             full_export: self.session(session_id).and_then(|session| session.engine.as_ref()).is_some_and(|engine| engine.capabilities().streaming_query_export),
                                             busy,
                                             has_rowset,
@@ -748,6 +747,10 @@ impl DbxApp {
                                             watch_interval,
                                             watch_supported,
                                             analyze_supported,
+                                            explain_supported,
+                                            monitor_supported: self.session(session_id).is_some_and(|session| dbx_core::monitor_query(session.kind, dbx_core::Monitor::Sessions).is_ok()),
+                                            has_query,
+                                            in_transaction,
                                             saved: saved_queries.clone(),
                                             compare_connections: compare_connections.clone(),
                                             sql_files: sql_files.clone(),
@@ -963,12 +966,17 @@ struct QueryOptions {
     session_id: SessionId,
     sql: bool,
     full_export: bool,
+    session_busy: bool,
     busy: bool,
     has_rowset: bool,
     timeout_secs: u64,
     watch_interval: Option<u64>,
     watch_supported: bool,
     analyze_supported: bool,
+    explain_supported: bool,
+    monitor_supported: bool,
+    has_query: bool,
+    in_transaction: bool,
     saved: Vec<SavedQuery>,
     compare_connections: Vec<(SessionId, String)>,
     sql_files: Vec<crate::query_library::SqlFileEntry>,
@@ -1010,76 +1018,97 @@ impl QueryOptions {
                 .item(self.item("Format query", move |this, window, cx| {
                     this.format_query_for(session_id, window, cx)
                 }))
-                .separator()
-                .item(
+                .separator();
+            if self.explain_supported {
+                menu = menu.item(
                     self.item("Explain query", move |this, _, cx| {
                         this.explain_query_for(session_id, cx)
                     })
-                    .disabled(self.busy),
-                )
-                .item(
+                    .disabled(self.busy || !self.has_query),
+                );
+            }
+            if self.analyze_supported {
+                menu = menu.item(
                     self.item(
                         "EXPLAIN ANALYZE… (executes query)",
                         move |this, window, cx| {
                             this.request_analyze_query_for(session_id, window, cx)
                         },
                     )
-                    .disabled(self.busy || !self.analyze_supported),
+                    .disabled(self.busy || !self.has_query),
                 );
-            let options = self.clone();
-            menu = menu.submenu(
-                "Watch read query (isolated read-only)",
-                window,
-                cx,
-                move |mut menu, _, _| {
-                    for interval in [5, 10, 30, 60] {
-                        menu = menu.item(
+            }
+            if self.watch_supported {
+                let options = self.clone();
+                menu = menu.submenu(
+                    "Watch read query (isolated read-only)",
+                    window,
+                    cx,
+                    move |mut menu, _, _| {
+                        for interval in [5, 10, 30, 60] {
+                            menu = menu.item(
+                                options
+                                    .item(
+                                        format!("Every {interval} seconds while visible"),
+                                        move |this, _, cx| {
+                                            this.start_query_watch(session_id, interval, cx)
+                                        },
+                                    )
+                                    .checked(options.watch_interval == Some(interval))
+                                    .disabled(
+                                        options.busy
+                                            || !options.has_query
+                                            || options.in_transaction,
+                                    ),
+                            );
+                        }
+                        menu.separator().item(
                             options
-                                .item(
-                                    format!("Every {interval} seconds while visible"),
-                                    move |this, _, cx| {
-                                        this.start_query_watch(session_id, interval, cx)
-                                    },
-                                )
-                                .checked(options.watch_interval == Some(interval))
-                                .disabled(options.busy || !options.watch_supported),
-                        );
-                    }
-                    menu.separator().item(
-                        options
-                            .item("Stop watch", move |this, _, cx| {
-                                this.stop_query_watch(session_id, cx)
-                            })
-                            .disabled(options.watch_interval.is_none()),
-                    )
-                },
-            );
+                                .item("Stop watch", move |this, _, cx| {
+                                    this.stop_query_watch(session_id, cx)
+                                })
+                                .disabled(options.watch_interval.is_none()),
+                        )
+                    },
+                );
+            }
             let options = self.clone();
-            menu = menu.submenu("Diagnostics", window, cx, move |menu, _, _| {
+            menu = menu.submenu("Diagnostics", window, cx, move |mut menu, _, _| {
                 let busy = options.busy;
+                if options.explain_supported {
+                    menu = menu
+                        .item(
+                            options
+                                .item("Capture plan", move |this, _, cx| {
+                                    this.pin_plan_for(session_id, cx)
+                                })
+                                .disabled(busy),
+                        )
+                        .item(
+                            options
+                                .item("Compare plans", move |this, _, cx| {
+                                    this.compare_plan_for(session_id, cx)
+                                })
+                                .disabled(busy),
+                        )
+                        .separator();
+                }
+                if options.monitor_supported {
+                    menu = menu
+                        .item(options.item("Server sessions", move |this, window, cx| {
+                            this.open_monitor_for(
+                                session_id,
+                                dbx_core::Monitor::Sessions,
+                                window,
+                                cx,
+                            )
+                        }))
+                        .item(options.item("Lock waits", move |this, window, cx| {
+                            this.open_monitor_for(session_id, dbx_core::Monitor::Locks, window, cx)
+                        }))
+                        .separator();
+                }
                 menu.item(
-                    options
-                        .item("Capture plan", move |this, _, cx| {
-                            this.pin_plan_for(session_id, cx)
-                        })
-                        .disabled(busy),
-                )
-                .item(
-                    options
-                        .item("Compare plans", move |this, _, cx| {
-                            this.compare_plan_for(session_id, cx)
-                        })
-                        .disabled(busy),
-                )
-                .separator()
-                .item(options.item("Server sessions", move |this, window, cx| {
-                    this.open_monitor_for(session_id, dbx_core::Monitor::Sessions, window, cx)
-                }))
-                .item(options.item("Lock waits", move |this, window, cx| {
-                    this.open_monitor_for(session_id, dbx_core::Monitor::Locks, window, cx)
-                }))
-                .separator()
-                .item(
                     options
                         .item("Capture schema baseline", move |this, window, cx| {
                             this.inspect_schema_for(session_id, true, window, cx)
@@ -1193,7 +1222,7 @@ impl QueryOptions {
                         .disabled(!options.has_rowset),
                 );
             }
-            if options.sql {
+            if options.full_export {
                 menu = menu.separator().label("Full query · fresh read-only rerun");
                 for (label, format) in [
                     ("CSV…", dbx_core::QueryExportFormat::Csv),
@@ -1205,7 +1234,12 @@ impl QueryOptions {
                             .item(label, move |this, _, cx| {
                                 this.export_full_query_for(session_id, format, cx)
                             })
-                            .disabled(options.busy),
+                            .disabled(
+                                options.busy
+                                    || options.session_busy
+                                    || !options.has_query
+                                    || options.in_transaction,
+                            ),
                     );
                 }
                 menu = menu.item(
@@ -1213,7 +1247,12 @@ impl QueryOptions {
                         .item("Excel XLSX…", move |this, _, cx| {
                             this.export_full_query_xlsx_for(session_id, cx)
                         })
-                        .disabled(options.busy || !options.full_export),
+                        .disabled(
+                            options.busy
+                                || options.session_busy
+                                || !options.has_query
+                                || options.in_transaction,
+                        ),
                 );
             }
             menu

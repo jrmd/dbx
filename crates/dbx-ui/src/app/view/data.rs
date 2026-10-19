@@ -356,7 +356,7 @@ impl DbxApp {
                                                 this.open_inspector_for(session_id, tab_id, window, cx)
                                             })))
                                     })
-                                    .when(can_mutate, |view| {
+                                    .when(self.driver_supports_row_edits(session_id), |view| {
                                         view.child(
                                             div()
                                                 .mx(crate::theme::ui_px(2.))
@@ -366,6 +366,7 @@ impl DbxApp {
                                         )
                                         .child(
                                             button("add-row", if has_draft { "Continue row draft" } else { "New row" }, ButtonKind::Quiet)
+                                                .disabled(!can_mutate)
                                                 .debug_selector(|| "add-row".into())
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(
@@ -1861,22 +1862,30 @@ impl DbxApp {
                             String::new()
                         },
                     )))
-                    .child(
-                        button(
-                            "open-table-designer",
-                            if designer_open {
-                                "Close designer"
-                            } else {
-                                "Design table…"
-                            },
-                            ButtonKind::Quiet,
-                        )
-                        .map(|button| gpui::Styled::rounded(button, crate::theme::ui_px(5.)))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.toggle_designer_for(session_id, window, cx);
-                            },
-                        )),
+                    .when(
+                        self.session(session_id)
+                            .is_some_and(|session| session.kind.is_sql()),
+                        |view| {
+                            view.child(
+                                button(
+                                    "open-table-designer",
+                                    if designer_open {
+                                        "Close designer"
+                                    } else {
+                                        "Design table…"
+                                    },
+                                    ButtonKind::Quiet,
+                                )
+                                .map(|button| {
+                                    gpui::Styled::rounded(button, crate::theme::ui_px(5.))
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.toggle_designer_for(session_id, window, cx);
+                                    },
+                                )),
+                            )
+                        },
                     ),
             )
             .child(

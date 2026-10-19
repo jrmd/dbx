@@ -550,7 +550,15 @@ impl ResultTableDelegate {
                 ("Filter: not equal", FilterOperator::NotEquals),
             ]
         };
-        for (label, operator) in filters.iter().copied() {
+        let supports_filters = app.upgrade().is_some_and(|app| {
+            app.read(cx).session(session_id).is_some_and(|session| {
+                session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.capabilities().structured_filters)
+            })
+        });
+        for (label, operator) in filters.iter().copied().filter(|_| supports_filters) {
             let app = app.clone();
             menu = menu.item(PopupMenuItem::new(label).disabled(multiple).on_click(
                 move |_, window, cx| {
@@ -585,6 +593,9 @@ impl ResultTableDelegate {
                 (editable, nullable)
             })
             .unwrap_or((false, false));
+        let supports_edits = app
+            .upgrade()
+            .is_some_and(|app| app.read(cx).driver_supports_row_edits(session_id));
         for (label, set_null) in [
             (
                 format!(
@@ -600,7 +611,10 @@ impl ResultTableDelegate {
                 ),
                 true,
             ),
-        ] {
+        ]
+        .into_iter()
+        .filter(|_| supports_edits)
+        {
             let app = app.clone();
             let rows = rows.clone();
             let snapshot = self.result.clone();
@@ -1909,6 +1923,19 @@ impl TableDelegate for ResultTableDelegate {
             }
             return menu;
         }
+        let supports_full_export = app.upgrade().is_some_and(|app| {
+            app.read(cx).session(session_id).is_some_and(|session| {
+                session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.capabilities().streaming_query_export)
+            })
+        });
+        let supports_sql = app.upgrade().is_some_and(|app| {
+            app.read(cx)
+                .session(session_id)
+                .is_some_and(|session| session.kind.is_sql())
+        });
         let full_export = app.upgrade().is_some_and(|app| {
             app.read(cx).session(session_id).is_some_and(|session| {
                 !session.busy
@@ -1954,20 +1981,24 @@ impl TableDelegate for ResultTableDelegate {
                                     });
                                 }),
                         )
-                        .separator()
-                        .label("Full table · filters and staged edits excluded")
-                        .item(
-                            PopupMenuItem::new("All table rows…")
-                                .disabled(!full_export)
-                                .on_click(move |_, _, cx| {
-                                    let app = full.clone();
-                                    cx.defer(move |cx| {
-                                        let _ = app.update(cx, |this, cx| {
-                                            this.export_full_table_xlsx_for(session_id, tab_id, cx);
-                                        });
-                                    });
-                                }),
-                        )
+                        .when(supports_full_export, |menu| {
+                            menu.separator()
+                                .label("Full table · filters and staged edits excluded")
+                                .item(
+                                    PopupMenuItem::new("All table rows…")
+                                        .disabled(!full_export)
+                                        .on_click(move |_, _, cx| {
+                                            let app = full.clone();
+                                            cx.defer(move |cx| {
+                                                let _ = app.update(cx, |this, cx| {
+                                                    this.export_full_table_xlsx_for(
+                                                        session_id, tab_id, cx,
+                                                    );
+                                                });
+                                            });
+                                        }),
+                                )
+                        })
                 }),
             ))
             .separator();
@@ -1994,8 +2025,8 @@ impl TableDelegate for ResultTableDelegate {
                 .collect::<Option<Vec<_>>>()
                 .map(|statements| statements.join("\n"))
         });
-        menu = menu
-            .item(
+        menu = menu.when(supports_sql, |menu| {
+            menu.item(
                 PopupMenuItem::new("Copy as SQL")
                     .disabled(sql.is_none())
                     .on_click(move |_, _, cx| {
@@ -2004,7 +2035,8 @@ impl TableDelegate for ResultTableDelegate {
                         }
                     }),
             )
-            .separator();
+            .separator()
+        });
         if let Some(column) = self.context_column
             && row_ix < self.loaded_rows()
         {
@@ -2022,7 +2054,13 @@ impl TableDelegate for ResultTableDelegate {
                         && data.recovered_changeset.is_none()
                 })
         });
-        for (label, redo) in [("Undo staged edit", false), ("Redo staged edit", true)] {
+        let supports_edits = app
+            .upgrade()
+            .is_some_and(|app| app.read(cx).driver_supports_row_edits(session_id));
+        for (label, redo) in [("Undo staged edit", false), ("Redo staged edit", true)]
+            .into_iter()
+            .filter(|_| supports_edits)
+        {
             let enabled = can_edit
                 && app.upgrade().is_some_and(|app| {
                     app.read(cx)
@@ -2076,6 +2114,9 @@ impl TableDelegate for ResultTableDelegate {
                 can_edit && has_changes,
             ),
         ] {
+            if !supports_edits && !matches!(action, RowAction::Inspect) {
+                continue;
+            }
             let app = app.clone();
             let rows = rows.clone();
             let result_snapshot = result_snapshot.clone();

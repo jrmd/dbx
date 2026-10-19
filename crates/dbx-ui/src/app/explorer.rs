@@ -449,6 +449,26 @@ impl DbxApp {
         }
     }
 
+    /// Keep supported edit actions visible when connection protection blocks writes.
+    pub(super) fn driver_supports_row_edits(&self, session_id: SessionId) -> bool {
+        self.session(session_id).is_some_and(|session| {
+            session.engine.as_ref().is_some_and(|engine| {
+                let capabilities = engine.capabilities();
+                capabilities.row_edits
+                    || (capabilities.protected
+                        && session.kind.supports_row_mutations()
+                        && session
+                            .profile_id
+                            .and_then(|id| {
+                                self.saved_connections
+                                    .iter()
+                                    .find(|profile| profile.id == id)
+                            })
+                            .is_none_or(|profile| profile.driver_manifest.is_none()))
+            })
+        })
+    }
+
     /// Rows for `menu`, with write-capable items enabled only when the
     /// connection can take them.
     pub(super) fn table_menu_rows_for(&self, menu: &TableContextMenu) -> Vec<TableMenuRow> {
@@ -464,8 +484,34 @@ impl DbxApp {
         let sql = self
             .session(menu.session_id)
             .is_some_and(|session| session.kind.is_sql());
+        let engine = self
+            .session(menu.session_id)
+            .and_then(|session| session.engine.as_ref());
+        let full_statistics =
+            engine.is_some_and(|engine| QuerySession::supports_isolated_reads(engine));
+        let imports =
+            engine.is_some_and(|engine| matches!(engine.as_ref(), DatabaseEngine::Sql(_)));
         table_menu_rows(writable)
             .into_iter()
+            .filter(|row| match row {
+                TableMenuRow::Item { command, .. } => match command {
+                    TableMenuCommand::ViewDdl
+                    | TableMenuCommand::CopyDdl
+                    | TableMenuCommand::CopyInsert
+                    | TableMenuCommand::Rename
+                    | TableMenuCommand::Duplicate
+                    | TableMenuCommand::Export
+                    | TableMenuCommand::Capture
+                    | TableMenuCommand::Append
+                    | TableMenuCommand::Compare
+                    | TableMenuCommand::Truncate
+                    | TableMenuCommand::Drop => sql,
+                    TableMenuCommand::Import => imports,
+                    TableMenuCommand::FullColumnStatistics => full_statistics,
+                    _ => true,
+                },
+                TableMenuRow::Separator => sql,
+            })
             .map(|row| match row {
                 TableMenuRow::Item {
                     command: TableMenuCommand::Export,

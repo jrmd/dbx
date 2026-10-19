@@ -322,6 +322,28 @@ pub(super) fn command_icon(name: &str) -> Icon {
     }
 }
 impl DbxApp {
+    pub(super) fn supports_query_explain(kind: DatabaseKind) -> bool {
+        matches!(
+            kind,
+            DatabaseKind::PostgreSQL
+                | DatabaseKind::MySQL
+                | DatabaseKind::SQLite
+                | DatabaseKind::Turso
+                | DatabaseKind::CloudflareD1
+                | DatabaseKind::DuckDB
+                | DatabaseKind::CockroachDB
+                | DatabaseKind::ClickHouse
+        )
+    }
+
+    pub(super) fn supports_query_analyze(engine: &DatabaseEngine) -> bool {
+        dbx_core::QuerySession::supports_isolated_reads(engine)
+            && matches!(
+                engine.kind(),
+                DatabaseKind::PostgreSQL | DatabaseKind::CockroachDB | DatabaseKind::MySQL
+            )
+    }
+
     pub(super) fn open_command_palette_action(
         &mut self,
         _: &OpenCommandPalette,
@@ -405,27 +427,9 @@ impl DbxApp {
             "dbx_ui::RunQuery" | "dbx_ui::RunQueryAll" => query.is_some_and(|query| !query.busy),
             "dbx_ui::FormatQuery" => sql_query,
             "dbx_ui::RefreshData" => data.is_some_and(|data| !data.busy) && !session.busy,
-            "dbx_ui::ExplainQuery" => {
-                sql_query
-                    && matches!(
-                        session.kind,
-                        DatabaseKind::PostgreSQL
-                            | DatabaseKind::MySQL
-                            | DatabaseKind::SQLite
-                            | DatabaseKind::Turso
-                            | DatabaseKind::CloudflareD1
-                            | DatabaseKind::DuckDB
-                            | DatabaseKind::CockroachDB
-                            | DatabaseKind::ClickHouse
-                    )
-            }
+            "dbx_ui::ExplainQuery" => sql_query && Self::supports_query_explain(session.kind),
             "dbx_ui::AnalyzeQuery" => {
-                sql_query
-                    && matches!(
-                        session.kind,
-                        DatabaseKind::PostgreSQL | DatabaseKind::CockroachDB | DatabaseKind::MySQL
-                    )
-                    && matches!(session.engine.as_deref(), Some(DatabaseEngine::Sql(_)))
+                sql_query && session.engine.as_deref().is_some_and(Self::supports_query_analyze)
             }
             "dbx_ui::WatchQuery" => {
                 sql_query

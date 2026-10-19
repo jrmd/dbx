@@ -559,6 +559,17 @@ impl DbxApp {
                 .session(session_id)
                 .and_then(|session| session.engine.as_ref())
                 .is_some_and(|engine| !engine.is_read_only());
+        let import_supported = self
+            .session(session_id)
+            .and_then(|session| session.engine.as_ref())
+            .is_some_and(|engine| matches!(engine.as_ref(), DatabaseEngine::Sql(_)));
+        let import_available = self.session(session_id).is_some_and(|session| {
+            !session.busy
+                && session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| !engine.is_read_only())
+        });
         let empty_note = visible_tables.is_empty().then(|| {
             let session = self.session(session_id);
             if session.is_some_and(|session| session.busy) {
@@ -697,8 +708,8 @@ impl DbxApp {
                                                                 );
                                                             }),
                                                     )
-                                                    .item(
-                                                        PopupMenuItem::new("Native backup…").disabled(!native_backup_available)
+                                                    .when(native_backup_available, |menu| menu.item(
+                                                        PopupMenuItem::new("Native backup…")
                                                             .on_click(move |_, _, cx| {
                                                                 let _ = backup.update(
                                                                     cx,
@@ -733,7 +744,7 @@ impl DbxApp {
                                                                         )
                                                                     });
                                                             }),
-                                                    )
+                                                    ))
                                                     .item(PopupMenuItem::new(if mcp_active { "Stop MCP sharing" } else { "Share this database read-only via MCP" }).on_click(move |_, _, cx| { let _ = mcp_toggle.update(cx, |this, cx| this.toggle_mcp(session_id, cx)); }))
                                                     .item(PopupMenuItem::new("Copy private MCP pairing configuration").disabled(!mcp_active).on_click(move |_, _, cx| { let _ = mcp_copy.update(cx, |this, cx| this.copy_mcp_pairing(session_id, cx)); }))
                                                     .item(PopupMenuItem::new("View MCP activity").disabled(!mcp_active).on_click(move |_, window, cx| { let _ = mcp_log.update(cx, |this, cx| this.show_mcp_activity(session_id, window, cx)); }))
@@ -751,8 +762,9 @@ impl DbxApp {
                                                                 );
                                                             }),
                                                     )
-                                                    .item(
+                                                    .when(import_supported, |menu| menu.item(
                                                         PopupMenuItem::new("Import database…")
+                                                            .disabled(!import_available)
                                                             .on_click(move |_, window, cx| {
                                                                 let _ = import_database.update(
                                                                     cx,
@@ -763,7 +775,7 @@ impl DbxApp {
                                                                     },
                                                                 );
                                                             }),
-                                                    )
+                                                    ))
                                                 }),
                                         )
                                     }),

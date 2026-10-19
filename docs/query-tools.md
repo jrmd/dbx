@@ -2,6 +2,8 @@
 
 Open the query tab's **Query options** menu for plans, schema comparisons,
 watched queries, exports, and statistics.
+Menus hide actions the active driver does not support. Supported actions can
+remain disabled while busy, without a query or result, or when protection blocks writes.
 
 ## Execution plans
 
@@ -24,7 +26,7 @@ connection and uses its native `ANALYZE FORMAT=JSON`, including measured rows, t
 Unsupported older server versions report their native error; DBX never falls
 back to a writable transaction.
 SQLite has no equivalent execution-plan ANALYZE command; its **Explain query**
-uses non-executing `EXPLAIN QUERY PLAN`.
+uses non-executing `EXPLAIN QUERY PLAN`, and the ANALYZE action is hidden.
 
 Analysis uses the tab's timeout and normal cancellation controls. PostgreSQL
 cancels the backend query, MySQL uses `KILL QUERY`, and CockroachDB cancels queries
