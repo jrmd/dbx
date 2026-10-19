@@ -282,8 +282,11 @@ explicitly approximate. Limited source results remain labelled as limited.
 
 ## Loaded-result clipboard and files
 
-Copy Markdown and export XLSX operate on loaded rows. Use the streaming
-CSV/TSV/SQL workflows for full-query exports. XLSX preserves exact wide
+The grid's right-click menu offers Markdown copy and XLSX export. Copy can use
+the selected rows or all loaded rows; XLSX offers loaded rows or a fresh
+full-table export. Staged edits are excluded, and the full-table option also
+excludes grid filters. See [query tools](query-tools.md#excel-and-markdown-exports)
+for full-query exports and supported drivers. XLSX preserves exact wide
 integers as text, writes user strings literally (including strings beginning
 with `=`), and includes a notes sheet describing NULL/empty-text handling.
 Table **Copy as INSERT** reads at most 1,000 rows and labels a limited copy;

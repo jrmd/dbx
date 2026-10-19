@@ -133,14 +133,6 @@ impl DbxApp {
         let app = cx.entity().downgrade();
         let columns_app = app.clone();
         let saved_app = app.clone();
-        let export_app = app.clone();
-        let full_export = self.session(session_id).is_some_and(|session| {
-            !session.busy
-                && session
-                    .engine
-                    .as_ref()
-                    .is_some_and(|engine| engine.capabilities().streaming_query_export)
-        });
         let redis_filter_focus = redis_filter_editor.read(cx).focus_handle();
         div()
             .key_context("DbxDataTab")
@@ -152,17 +144,6 @@ impl DbxApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .when(!inspector_page, |view| view.child(div().flex_none().px(crate::theme::ui_px(8.)).py(crate::theme::ui_px(4.)).flex().items_center().gap(crate::theme::ui_px(8.))
-                .child(div().flex_1().min_w_0().truncate().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(format!("{} loaded rows · staged edits excluded", self.data_tab(session_id, tab_id).and_then(|data| data.result.as_ref()).map_or(0, |result| result.rows.len()))))
-                .child(button("copy-loaded-markdown", "Copy Markdown", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.copy_data_markdown_for(session_id, tab_id, cx))))
-                .child(button("export-loaded-xlsx", "Export XLSX…", ButtonKind::Quiet).dropdown_menu(move |menu, _, _| {
-                    let loaded = export_app.clone();
-                    let full = export_app.clone();
-                    menu.label("Choose row scope")
-                        .item(PopupMenuItem::new("Loaded rows only…").on_click(move |_, _, cx| { let _ = loaded.update(cx, |this, cx| this.export_data_xlsx_for(session_id, tab_id, cx)); }))
-                        .separator().label("Full table · fresh read-only export")
-                        .item(PopupMenuItem::new("All rows · filters and staged edits excluded…").disabled(!full_export).on_click(move |_, _, cx| { let _ = full.update(cx, |this, cx| this.export_full_table_xlsx_for(session_id, tab_id, cx)); }))
-                }))))
             .when(!inspector_page, |view| view
             .child(
                 div()

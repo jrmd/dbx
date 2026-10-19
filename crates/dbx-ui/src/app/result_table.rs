@@ -1844,7 +1844,7 @@ impl TableDelegate for ResultTableDelegate {
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let mut menu = menu;
@@ -1909,6 +1909,68 @@ impl TableDelegate for ResultTableDelegate {
             }
             return menu;
         }
+        let full_export = app.upgrade().is_some_and(|app| {
+            app.read(cx).session(session_id).is_some_and(|session| {
+                !session.busy
+                    && session
+                        .engine
+                        .as_ref()
+                        .is_some_and(|engine| engine.capabilities().streaming_query_export)
+            })
+        });
+        let has_result = self.result.is_some();
+        let copy_app = app.clone();
+        let export_app = app.clone();
+        menu = menu
+            .separator()
+            .label("Loaded rows · staged edits excluded")
+            .item(
+                PopupMenuItem::new("Copy all loaded rows as Markdown")
+                    .disabled(!has_result)
+                    .on_click(move |_, _, cx| {
+                        let app = copy_app.clone();
+                        cx.defer(move |cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.copy_data_markdown_for(session_id, tab_id, cx);
+                            });
+                        });
+                    }),
+            )
+            .item(PopupMenuItem::submenu(
+                "Export XLSX…",
+                PopupMenu::build(window, cx, move |menu, _, _| {
+                    let loaded = export_app.clone();
+                    let full = export_app.clone();
+                    menu.label("Loaded rows · staged edits excluded")
+                        .item(
+                            PopupMenuItem::new("Loaded rows only…")
+                                .disabled(!has_result)
+                                .on_click(move |_, _, cx| {
+                                    let app = loaded.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.export_data_xlsx_for(session_id, tab_id, cx);
+                                        });
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .label("Full table · filters and staged edits excluded")
+                        .item(
+                            PopupMenuItem::new("All table rows…")
+                                .disabled(!full_export)
+                                .on_click(move |_, _, cx| {
+                                    let app = full.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.export_full_table_xlsx_for(session_id, tab_id, cx);
+                                        });
+                                    });
+                                }),
+                        )
+                }),
+            ))
+            .separator();
         let sql = app.upgrade().and_then(|app| {
             let owner = app.read(cx);
             let kind = owner.session(session_id)?.kind;

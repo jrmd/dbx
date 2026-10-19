@@ -136,7 +136,9 @@ statement again without the grid row limit. Finish the tab's transaction and sto
 its watch first. Parameters must be replaced with reviewed literal values before
 export; mutation statements and multiple statements are rejected.
 
-The table's **Export XLSX** menu also offers **All rows**, which exports the
+Right-click the table grid for **Copy as Markdown** (selected rows),
+**Copy all loaded rows as Markdown**, or **Export XLSX**.
+The **Export XLSX** submenu also offers **All table rows**, which exports the
 whole table and explicitly excludes grid filters and staged edits. Full exports
 use a separate read-only transaction; snapshot consistency depends on the
 server and table engine. They do not include a tab's uncommitted changes.
