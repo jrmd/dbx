@@ -3144,7 +3144,8 @@ pub fn input_fill(editor: Entity<TextEditor>, focus: FocusHandle, cx: &App) -> i
 
 /// A standard field whose viewport is limited by a containing form. Keep the
 /// editor and accessible node unchanged while allowing multiline controls to
-/// fit a short scrolling pane.
+/// fit a short scrolling pane. Single-line fields must still fit a full line
+/// at the current font size, including padding and borders.
 pub fn input_with_height(
     editor: Entity<TextEditor>,
     focus: FocusHandle,
@@ -3152,6 +3153,11 @@ pub fn input_with_height(
     height: Pixels,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
+    let height = if multiline {
+        height
+    } else {
+        height.max(single_line_input_height(&editor, cx))
+    };
     input_with_context(editor, focus, multiline, TEXT_EDITOR_CONTEXT, false, cx).h(height)
 }
 
@@ -3304,6 +3310,19 @@ fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Statefu
         })
 }
 
+fn single_line_input_height(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
+    let text = if editor.read(cx).is_code() {
+        crate::theme::mono_text_px(12.) * crate::theme::editor_scale()
+    } else {
+        crate::theme::text_px(12.)
+    };
+    // Match GPUI's default line height and pixel rounding. Both lengths are
+    // already in pixels, so the rem size is unused here.
+    let line_height = gpui::phi().to_pixels(text.into(), text).round();
+    // Seven design pixels of padding on each side, plus two unscaled borders.
+    crate::theme::ui_px(32.).max(line_height + crate::theme::ui_px(14.) + px(2.))
+}
+
 fn input_with_context(
     editor: Entity<TextEditor>,
     focus: FocusHandle,
@@ -3326,12 +3345,7 @@ fn input_with_context(
             this.h(if multiline {
                 crate::theme::ui_px(204.)
             } else {
-                let text = if editor.read(cx).is_code() {
-                    crate::theme::mono_text_px(12.) * crate::theme::editor_scale()
-                } else {
-                    crate::theme::text_px(12.)
-                };
-                crate::theme::ui_px(32.).max(text * 1.5 + crate::theme::ui_px(14.))
+                single_line_input_height(&editor, cx)
             })
         })
         .p(if multiline {
@@ -3351,6 +3365,7 @@ fn input_with_context(
         } else {
             crate::theme::text_px(12.)
         })
+        .when(!multiline, |this| this.line_height(gpui::phi()))
         .text_color(theme().text)
         .on_action({
             let editor = editor.clone();
@@ -4728,6 +4743,63 @@ mod code_editing_tests {
                 .h(px(240.))
                 .child(sql_input_fill(self.editor.clone(), focus, cx))
         }
+    }
+
+    #[gpui::test]
+    fn constrained_single_line_fields_fit_text_at_all_font_sizes(cx: &mut TestAppContext) {
+        struct FieldHarness {
+            editor: Entity<TextEditor>,
+        }
+
+        impl Render for FieldHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().w(px(480.)).child(
+                    input_with_height(
+                        self.editor.clone(),
+                        self.editor.read(cx).focus_handle(),
+                        false,
+                        crate::theme::ui_px(32.),
+                        cx,
+                    )
+                    .debug_selector(|| "constrained-field".into()),
+                )
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (harness, cx) = cx.add_window_view(|window, cx| {
+            let value = cx.new(|_| "Operations".to_owned());
+            let editor = cx.new(|cx| TextEditor::new(value, false, window, cx));
+            FieldHarness { editor }
+        });
+        let editor = harness.read_with(cx, |harness, _| harness.editor.clone());
+        for zoom in [100, 150, 200] {
+            for font in 10..=20 {
+                cx.update(|window, cx| {
+                    crate::theme::set_text_scales(zoom, 100);
+                    crate::theme::set_font_sizes(font, 12);
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                });
+                let shell = cx.debug_bounds("constrained-field").unwrap();
+                cx.update(|_, cx| {
+                    let editor = editor.read(cx);
+                    let text = editor.last_bounds.expect("text laid out");
+                    let viewport = editor.scroll_handle.bounds();
+                    assert!(
+                        text.top() >= viewport.top() && text.bottom() <= viewport.bottom(),
+                        "text clipped at font {font}, zoom {zoom}: {text:?}, {viewport:?}"
+                    );
+                    assert!(
+                        text.top() >= shell.top() + crate::theme::ui_px(7.)
+                            && text.bottom() <= shell.bottom() - crate::theme::ui_px(7.),
+                        "field must retain vertical padding: {text:?}, {shell:?}"
+                    );
+                });
+            }
+        }
+        crate::theme::set_text_scales(100, 100);
+        crate::theme::set_font_sizes(12, 12);
     }
 
     #[gpui::test]

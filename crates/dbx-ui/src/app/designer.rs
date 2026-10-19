@@ -1205,10 +1205,9 @@ mod tests {
                     );
                 }
                 let input = cx.debug_bounds("designer-input-0").unwrap();
-                assert_eq!(
-                    input.size.height,
-                    ui_px(32.),
-                    "input retains its usable height"
+                assert!(
+                    input.size.height >= ui_px(32.),
+                    "input retains its minimum height and can grow to fit the font"
                 );
                 let queue = cx.debug_bounds("designer-queue").unwrap();
                 assert!(
