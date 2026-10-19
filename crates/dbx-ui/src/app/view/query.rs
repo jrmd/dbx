@@ -339,7 +339,15 @@ impl DbxApp {
             .and_then(|query| query.watch_interval);
         let watch_supported = self
             .session(session_id)
-            .is_some_and(|session| session.kind == DatabaseKind::PostgreSQL);
+            .and_then(|session| session.engine.as_ref())
+            .is_some_and(|engine| QuerySession::supports_isolated_reads(engine));
+        let analyze_supported = watch_supported
+            && self.session(session_id).is_some_and(|session| {
+                matches!(
+                    session.kind,
+                    DatabaseKind::PostgreSQL | DatabaseKind::MySQL | DatabaseKind::CockroachDB
+                )
+            });
         let plan_view = (error.is_none() && plan_tree)
             .then(|| {
                 self.active_query_tab(session_id)
@@ -477,7 +485,8 @@ impl DbxApp {
             })
             .map(|session| (session.id, session.name.clone()))
             .collect::<Vec<_>>();
-        let (sql_files, sql_library_error) = match self.sql_library.entries() {
+        self.ensure_sql_library_loaded(cx);
+        let (sql_files, sql_library_error) = match self.sql_library.cached_entries() {
             Ok(entries) => (entries, None),
             Err(error) => (Vec::new(), Some(error)),
         };
@@ -732,11 +741,13 @@ impl DbxApp {
                                             app: app.clone(),
                                             session_id,
                                             sql: sql_dialect,
+                                            full_export: self.session(session_id).and_then(|session| session.engine.as_ref()).is_some_and(|engine| engine.capabilities().streaming_query_export),
                                             busy,
                                             has_rowset,
                                             timeout_secs,
                                             watch_interval,
                                             watch_supported,
+                                            analyze_supported,
                                             saved: saved_queries.clone(),
                                             compare_connections: compare_connections.clone(),
                                             sql_files: sql_files.clone(),
@@ -951,11 +962,13 @@ struct QueryOptions {
     app: WeakEntity<DbxApp>,
     session_id: SessionId,
     sql: bool,
+    full_export: bool,
     busy: bool,
     has_rowset: bool,
     timeout_secs: u64,
     watch_interval: Option<u64>,
     watch_supported: bool,
+    analyze_supported: bool,
     saved: Vec<SavedQuery>,
     compare_connections: Vec<(SessionId, String)>,
     sql_files: Vec<crate::query_library::SqlFileEntry>,
@@ -1011,11 +1024,11 @@ impl QueryOptions {
                             this.request_analyze_query_for(session_id, window, cx)
                         },
                     )
-                    .disabled(self.busy || !self.watch_supported),
+                    .disabled(self.busy || !self.analyze_supported),
                 );
             let options = self.clone();
             menu = menu.submenu(
-                "Watch read query (PostgreSQL)",
+                "Watch read query (isolated read-only)",
                 window,
                 cx,
                 move |mut menu, _, _| {
@@ -1181,7 +1194,7 @@ impl QueryOptions {
                 );
             }
             if options.sql {
-                menu = menu.separator().label("Full query");
+                menu = menu.separator().label("Full query · fresh read-only rerun");
                 for (label, format) in [
                     ("CSV…", dbx_core::QueryExportFormat::Csv),
                     ("TSV…", dbx_core::QueryExportFormat::Tsv),
@@ -1195,89 +1208,68 @@ impl QueryOptions {
                             .disabled(options.busy),
                     );
                 }
+                menu = menu.item(
+                    options
+                        .item("Excel XLSX…", move |this, _, cx| {
+                            this.export_full_query_xlsx_for(session_id, cx)
+                        })
+                        .disabled(options.busy || !options.full_export),
+                );
             }
             menu
         });
         menu = menu.separator();
 
         let files = self.clone();
-        menu = menu.submenu(
-            "SQL file library",
-            window,
-            cx,
-            move |mut menu, window, cx| {
-                menu = menu
-                    .label(format!("Plaintext .sql files · {}", files.sql_library_path))
-                    .item(files.item("Choose library folder…", |this, _, cx| {
-                        this.choose_sql_library_folder(cx)
-                    }))
-                    .item(files.item("Refresh files", |this, _, cx| {
-                        this.sql_library.invalidate();
-                        cx.notify();
-                    }))
-                    .item(files.item("Open .sql file…", move |this, window, cx| {
-                        this.open_sql_file_for(session_id, window, cx)
-                    }))
-                    .item(
-                        files.item("Save current query as .sql…", move |this, _, cx| {
-                            this.save_query_sql_file_for(session_id, cx)
-                        }),
-                    );
-                if let Some(error) = &files.sql_library_error {
-                    menu = menu.label(error.clone());
-                }
-                if files.sql_files.is_empty() {
-                    return menu.separator().label("No .sql files in this folder");
-                }
-                let favorites = files.clone();
-                menu = menu.submenu("Favorites", window, cx, move |mut menu, _, _| {
-                    let mut any = false;
-                    for entry in favorites.sql_files.iter().filter(|entry| entry.favorite) {
-                        any = true;
-                        let path = entry.relative_path.clone();
-                        menu = menu.item(favorites.item(entry.label(), move |this, window, cx| {
-                            this.open_library_sql_for(session_id, path.clone(), window, cx)
-                        }));
-                    }
-                    if !any {
-                        menu = menu.label("Mark a file below to add a favorite");
-                    }
-                    menu
-                });
-                menu = menu.separator();
-                for entry in &files.sql_files {
-                    let entry = entry.clone();
-                    let actions = files.clone();
-                    menu = menu.submenu(
-                        format!(
-                            "{}{}",
-                            if entry.favorite { "★ " } else { "" },
-                            entry.label()
-                        ),
-                        window,
-                        cx,
-                        move |menu, _, _| {
-                            let open_path = entry.relative_path.clone();
-                            let favorite_path = entry.relative_path.clone();
-                            menu.item(actions.item("Open as draft", move |this, window, cx| {
-                                this.open_library_sql_for(session_id, open_path.clone(), window, cx)
-                            }))
-                            .item(actions.item(
-                                if entry.favorite {
-                                    "Remove favorite"
-                                } else {
-                                    "Add favorite"
-                                },
-                                move |this, _, cx| {
-                                    this.toggle_sql_file_favorite(favorite_path.clone(), cx)
-                                },
-                            ))
-                        },
-                    );
-                }
-                menu
-            },
-        );
+        menu = menu.submenu("SQL file library", window, cx, move |mut menu, _, _| {
+            menu = menu
+                .label(format!("Plaintext .sql files · {}", files.sql_library_path))
+                .item(files.item("Choose library folder…", |this, _, cx| {
+                    this.choose_sql_library_folder(cx)
+                }))
+                .item(files.item("Refresh files", |this, _, cx| {
+                    this.refresh_sql_library(cx);
+                }))
+                .item(files.item("Open .sql file…", move |this, window, cx| {
+                    this.open_sql_file_for(session_id, window, cx)
+                }))
+                .item(
+                    files.item("Save current query as .sql…", move |this, _, cx| {
+                        this.save_query_sql_file_for(session_id, cx)
+                    }),
+                );
+            if let Some(error) = &files.sql_library_error {
+                menu = menu.label(error.clone());
+            }
+            if files.sql_files.is_empty() {
+                menu = menu.separator().label("No .sql files in this folder");
+            }
+            menu = menu
+                .separator()
+                .item(files.item("Browse SQL files…", move |this, window, cx| {
+                    this.browse_sql_files(false, window, cx)
+                }))
+                .item(
+                    files.item("Browse favorite SQL files…", move |this, window, cx| {
+                        this.browse_sql_files(true, window, cx)
+                    }),
+                );
+            for entry in files
+                .sql_files
+                .iter()
+                .filter(|entry| entry.favorite)
+                .take(8)
+            {
+                let path = entry.relative_path.clone();
+                menu = menu.item(files.item(
+                    format!("★ {}", entry.label()),
+                    move |this, window, cx| {
+                        this.open_library_sql_for(session_id, path.clone(), window, cx)
+                    },
+                ));
+            }
+            menu
+        });
 
         if !self.saved.is_empty() {
             let options = self.clone();

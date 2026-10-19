@@ -35,8 +35,8 @@ mod sqlx_engine;
 mod transfer;
 pub use diagnostics::{
     MigrationDraft, Monitor, compare_execution_plans, execution_plan_analyze_query,
-    execution_plan_query, format_execution_plan, loaded_column_statistics, monitor_query,
-    schema_migration,
+    execution_plan_query, format_execution_plan, format_table_column_statistics,
+    loaded_column_statistics, monitor_query, schema_migration, table_column_statistics_query,
 };
 mod transport;
 
@@ -70,7 +70,7 @@ pub use transfer::{
     FileFormat, ImportReport, QueryExportFormat, TransferControl, atomic_export,
     detect_file_format, export_database, export_query, export_table, import_database, import_file,
     render_row_change, render_sql_indexes, render_sql_insert, render_sql_schema,
-    with_transfer_control, write_atomic_export,
+    stream_query_export, validate_query_export, with_transfer_control, write_atomic_export,
 };
 
 #[cfg(test)]

@@ -23,6 +23,17 @@ pub(crate) fn ensure_query(kind: DatabaseKind, query: &str) -> Result<()> {
                 if words.iter().any(|word| forbidden.contains(&word.as_str())) {
                     return false;
                 }
+                if words == ["START", "TRANSACTION", "READ", "ONLY"] {
+                    return true;
+                }
+                // MariaDB's query-executing plan syntax. ANALYZE TABLE is
+                // intentionally excluded; mutation keywords were rejected above.
+                if kind == DatabaseKind::MySQL && first == "ANALYZE" {
+                    return words.get(1..3) == Some(&["FORMAT".into(), "JSON".into()])
+                        && words.get(3).is_some_and(|word| {
+                            matches!(word.as_str(), "SELECT" | "WITH" | "VALUES" | "TABLE")
+                        });
+                }
                 if first == "PRAGMA" {
                     return !statement.contains('=')
                         && words.get(1).is_some_and(|word| {

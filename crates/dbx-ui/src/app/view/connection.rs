@@ -158,7 +158,7 @@ impl DbxApp {
 
     /// The first step of a new connection: paste a URL to detect its type, or
     /// pick one from the grid.
-    fn render_kind_picker(&self, cx: &mut Context<Self>) -> Div {
+    fn render_kind_picker(&mut self, cx: &mut Context<Self>) -> Div {
         let url_focus = self.draft.import_url_editor.read(cx).focus_handle();
         let detected = self.import_url_kind(cx);
         div()

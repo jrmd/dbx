@@ -880,6 +880,9 @@ pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
         .h(crate::theme::control_height(26.))
         .px(crate::theme::ui_px(11.))
         .rounded_full()
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .font_weight(gpui::FontWeight::MEDIUM)
         .flex()
         .items_center()
         .gap(crate::theme::ui_px(6.))
@@ -887,7 +890,6 @@ pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
         .cursor_pointer()
         .when(selected, |view| {
             view.bg(theme.glass_selected)
-                .border_1()
                 .border_color(theme.hairline)
                 .shadow(glass_shadow(3.))
                 .text_color(theme.text)

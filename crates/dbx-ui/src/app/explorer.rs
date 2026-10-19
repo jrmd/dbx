@@ -76,6 +76,7 @@ pub(super) enum TableMenuCommand {
     Duplicate,
     CopyInsert,
     ColumnStatistics,
+    FullColumnStatistics,
     Refresh,
     Export,
     Import,
@@ -131,6 +132,12 @@ pub(super) fn table_menu_rows(writable: bool) -> Vec<TableMenuRow> {
         item(
             ColumnStatistics,
             "Column statistics (loaded rows)",
+            true,
+            Normal,
+        ),
+        item(
+            FullColumnStatistics,
+            "Column statistics (full table, scans all rows)",
             true,
             Normal,
         ),
@@ -512,6 +519,28 @@ impl DbxApp {
                             }),
                     tone,
                 },
+                TableMenuRow::Item {
+                    command: TableMenuCommand::FullColumnStatistics,
+                    label,
+                    enabled,
+                    tone,
+                } => {
+                    TableMenuRow::Item {
+                        command: TableMenuCommand::FullColumnStatistics,
+                        label,
+                        tone,
+                        enabled: enabled
+                            && self.session(menu.session_id).is_some_and(|session| {
+                                session.engine.as_ref().is_some_and(|engine| {
+                                    QuerySession::supports_isolated_reads(engine)
+                                }) && session.active_data_tab().is_some_and(|data| {
+                                    data.table.name == menu.table.name
+                                        && data.table.schema == menu.table.schema
+                                        && !data.table_columns.is_empty()
+                                })
+                            }),
+                    }
+                }
                 row => row,
             })
             .collect()
@@ -610,6 +639,9 @@ impl DbxApp {
         match command {
             TableMenuCommand::ColumnStatistics => {
                 self.show_loaded_table_column_statistics(session_id, window, cx)
+            }
+            TableMenuCommand::FullColumnStatistics => {
+                self.show_full_table_column_statistics(session_id, window, cx)
             }
             TableMenuCommand::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(
                 table_ref_label(&table_ref(&table)),

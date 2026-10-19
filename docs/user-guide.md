@@ -115,9 +115,14 @@ and block Visual mode are not implemented.
 ## Navigate by keyboard
 
 Cmd/Ctrl-Shift-P opens the action command palette. Cmd/Ctrl-P keeps destination
-search for tables, queries and connections. **Settings → Keyboard shortcuts**
-shows the live bindings and lets you edit/save the contextual `keymap.json`.
-The screen displays its exact path. Each JSON block has an optional `context`
+search for tables, queries, SQL files and connections. Use `files:` or
+`favorites:` to narrow SQL file search; star buttons manage favourites.
+**Settings → Keyboard shortcuts** groups live bindings by area and lets you
+search by action or key. macOS and Linux show their own shortcut labels.
+Expand **Customize shortcuts with JSON…** to edit/save the contextual
+`keymap.json`; **Restore saved content** discards unsaved editor changes.
+Unassigned palette actions can also receive custom bindings. Hover a row for
+its action identifier and context. The screen displays the keymap's exact path. Each JSON block has an optional `context`
 and a `bindings` object mapping keys to action names; `null` unbinds a shortcut.
 Changes are validated before the file and live bindings change.
 
@@ -162,8 +167,13 @@ review on production or protected connections; protected execution still
 rejects writes. MongoDB and Redis use [structured editors](structured-editors.md).
 
 The query menu's SQL file library saves and opens plain `.sql` files in a
-chosen folder, with favourites in `.dbx-favorites.json`. Use it for queries you
-intend to share through git; encrypted workspace recovery remains separate.
+chosen folder, with favourites in `.dbx-favorites.json`. Cmd/Ctrl-O and
+**File → Open SQL File…** open a file as a draft on the active SQL connection.
+The command palette also offers SQL file browsing and folder selection.
+Folder scans run in the background when quick open opens or you choose
+**Refresh files**; rendering reads the last completed snapshot. Use the library
+for queries you intend to share through git; encrypted workspace recovery
+remains separate.
 
 ## Change structure
 

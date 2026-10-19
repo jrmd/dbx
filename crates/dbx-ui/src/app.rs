@@ -184,6 +184,29 @@ gpui::actions!(
         PasteRows,
         OpenQuickOpen,
         OpenCommandPalette,
+        OpenSqlFile,
+        ChooseTheme,
+        LightAppearance,
+        DarkAppearance,
+        SystemAppearance,
+        BrowseSqlFiles,
+        FavoriteSqlFiles,
+        SaveSqlFile,
+        ChooseSqlFolder,
+        ExplainQuery,
+        AnalyzeQuery,
+        QueryStatistics,
+        TableStatistics,
+        FullTableStatistics,
+        WatchQuery,
+        StopWatch,
+        InspectSchema,
+        CaptureSchema,
+        ExportDatabase,
+        ExportQueryCsv,
+        ExportQueryXlsx,
+        ExportFullQueryXlsx,
+        ExportFullTableXlsx,
         OpenSettings,
         OpenKeyboardShortcuts,
         SearchQueryHistory,
@@ -676,6 +699,9 @@ enum ConfirmationTone {
 
 enum ConfirmationAction {
     LockVault,
+    RemoveDriver {
+        path: PathBuf,
+    },
     DeleteProfile {
         id: uuid::Uuid,
     },
@@ -749,6 +775,7 @@ impl ConfirmationAction {
             Self::LockVault
             | Self::Quit
             | Self::RemoveCustomTheme { .. }
+            | Self::RemoveDriver { .. }
             | Self::DeleteProfile { .. } => None,
             Self::RunQuery { session_id, .. }
             | Self::AnalyzeQuery { session_id, .. }
@@ -843,6 +870,9 @@ pub struct DbxApp {
     recent_query_history: Vec<QueryHistoryEntry>,
     workspace_store: Option<Arc<crate::workspace::WorkspaceStore>>,
     sql_library: crate::query_library::SqlLibrary,
+    sql_library_refreshing: bool,
+    sql_library_generation: u64,
+    sql_library_favorite_pending: bool,
     workspace_documents: HashMap<String, crate::workspace::WorkspaceDocument>,
     startup_recovery_started: bool,
     sessions: Vec<ConnectionSession>,
@@ -862,6 +892,7 @@ pub struct DbxApp {
     profile_transfer_dialog: Option<profile_transfer::ProfileTransferDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
     shortcut_editor: Option<commands::ShortcutEditor>,
+    driver_registry: driver_plugins::DriverRegistry,
     settings_open: bool,
     settings_focus: FocusHandle,
     settings_scroll: gpui::ScrollHandle,
@@ -880,6 +911,7 @@ pub struct DbxApp {
     mono_font_size: u16,
     font_size_inputs: Option<[Entity<gpui_component::input::InputState>; 2]>,
     font_pickers: Option<[Entity<SelectState<SearchableVec<SharedString>>>; 2]>,
+    font_names_loading: bool,
     drag_row_selection: bool,
     row_drag: Option<(SessionId, SecondaryTabId, usize)>,
     vim_mode: bool,
@@ -1010,6 +1042,9 @@ impl DbxApp {
             credential_hydration_generation: 0,
             credential_connect_window: None,
             sql_library: Default::default(),
+            sql_library_refreshing: false,
+            sql_library_generation: 0,
+            sql_library_favorite_pending: false,
             workspace_store: profile_store
                 .as_ref()
                 .and_then(ProfileStore::vault)
@@ -1038,6 +1073,7 @@ impl DbxApp {
             copied_table_data: None,
             mutation_error_dialog: None,
             shortcut_editor: None,
+            driver_registry: driver_plugins::DriverRegistry::default(),
             settings_open: false,
             settings_focus: cx.focus_handle(),
             settings_scroll: gpui::ScrollHandle::new(),
@@ -1069,6 +1105,7 @@ impl DbxApp {
             }),
             font_size_inputs: None,
             font_pickers: None,
+            font_names_loading: false,
             drag_row_selection: saved_settings.as_ref().is_none_or(|s| s.drag_row_selection),
             row_drag: None,
             vim_mode: saved_settings
@@ -4493,6 +4530,7 @@ impl DbxApp {
                 self.analyze_query_for(session_id, tab_id, sql, cx);
             }
             ConfirmationAction::DeleteProfile { id } => self.change_saved_profile(id, true, cx),
+            ConfirmationAction::RemoveDriver { path } => self.remove_driver_registration(path, cx),
             ConfirmationAction::LockVault => {
                 self.lock_vault(cx);
                 self.vault_editors

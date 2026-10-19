@@ -19,9 +19,9 @@ pub struct KeymapState {
 impl Global for KeymapState {}
 
 pub fn path() -> PathBuf {
-    dirs::config_dir()
+    crate::config::directory()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("dbx/keymap.json")
+        .join("keymap.json")
 }
 pub fn initial_document() -> String {
     "[\n  {\n    \"context\": \"QueryWorkbench\",\n    \"bindings\": {}\n  }\n]\n".into()

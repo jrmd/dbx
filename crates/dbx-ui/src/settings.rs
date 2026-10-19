@@ -172,9 +172,8 @@ impl SettingsStore {
 }
 
 fn default_settings_path() -> SettingsResult<PathBuf> {
-    Ok(dirs::config_dir()
+    Ok(crate::config::directory()
         .ok_or(SettingsError::ConfigDirectoryUnavailable)?
-        .join("dbx")
         .join(SETTINGS_FILE_NAME))
 }
 

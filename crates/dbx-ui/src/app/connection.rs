@@ -294,14 +294,12 @@ impl DbxApp {
     }
 
     fn clear_vault_inputs(&mut self, cx: &mut Context<Self>) {
-        self.vault_editors.passphrase.update(cx, |value, cx| {
-            value.zeroize();
-            cx.notify();
-        });
-        self.vault_editors.confirmation.update(cx, |value, cx| {
-            value.zeroize();
-            cx.notify();
-        });
+        for editor in [
+            &self.vault_editors.passphrase_editor,
+            &self.vault_editors.confirmation_editor,
+        ] {
+            editor.update(cx, |editor, cx| editor.clear_secret(cx));
+        }
     }
 
     /// The keychain entry for this vault. Tests never touch the real
@@ -557,20 +555,17 @@ impl DbxApp {
         self.connection_test_abort.cancel();
         self.testing_connection = false;
         self.cancel_credential_hydration();
-        self.draft.password.update(cx, |value, cx| {
-            value.zeroize();
-            cx.notify();
-        });
-        if !self.draft.kind.is_file() {
-            self.draft.connection_url.update(cx, |value, cx| {
-                value.zeroize();
-                cx.notify();
-            });
+        // URL fields may have held credentials even when the current value is a
+        // native file path or the selected plugin has a file compatibility family.
+        // Clear editor history and paint caches as well as the backing values.
+        for editor in [
+            &self.draft.password_editor,
+            &self.draft.connection_editor,
+            &self.draft.import_url_editor,
+            &self.draft.transport.ssh_password_editor,
+        ] {
+            editor.update(cx, |editor, cx| editor.clear_secret(cx));
         }
-        self.draft.import_url.update(cx, |value, cx| {
-            value.zeroize();
-            cx.notify();
-        });
         self.clear_vault_inputs(cx);
         self.clear_assistant_secret(cx);
         self.error = recovery_error;
@@ -1569,6 +1564,87 @@ impl DbxApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn vault_lock_forgets_plugin_file_urls_and_all_secret_editor_histories(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("profiles.json"));
+        let vault = store.vault().unwrap();
+        vault.create("test vault passphrase").unwrap();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.profile_store = Some(store);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.draft.kind = DatabaseKind::SQLite;
+            app.draft.driver_manifest = Some(directory.path().join("custom-driver.json"));
+            app.draft.mode = ConnectionFormMode::ConnectionString;
+            app.draft.choosing_kind = false;
+            app.connection_picker_open = true;
+            for editor in [
+                &app.draft.connection_editor,
+                &app.draft.import_url_editor,
+                &app.draft.password_editor,
+                &app.draft.transport.ssh_password_editor,
+                &app.vault_editors.passphrase_editor,
+                &app.vault_editors.confirmation_editor,
+            ] {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("example-sqlite://user:older-secret@localhost/database", cx);
+                    editor.set_text(
+                        "example-sqlite://user:current-secret@localhost/database",
+                        cx,
+                    );
+                });
+            }
+            app
+        });
+        // Populate the URL editor's paint cache before clearing it.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        app.update(cx, |app, cx| {
+            app.lock_vault(cx);
+            assert_eq!(app.vault_state, Some(VaultState::Locked));
+            for editor in [
+                &app.draft.connection_editor,
+                &app.draft.import_url_editor,
+                &app.draft.password_editor,
+                &app.draft.transport.ssh_password_editor,
+                &app.vault_editors.passphrase_editor,
+                &app.vault_editors.confirmation_editor,
+            ] {
+                editor.update(cx, |editor, cx| {
+                    assert!(editor.text(cx).is_empty());
+                    editor.undo(cx);
+                    assert!(editor.text(cx).is_empty());
+                    editor.redo(cx);
+                    assert!(editor.text(cx).is_empty());
+                });
+            }
+            assert!(app.draft.connection_url.read(cx).is_empty());
+            assert!(app.draft.import_url.read(cx).is_empty());
+            assert!(app.draft.password.read(cx).is_empty());
+            assert!(app.draft.transport.ssh_password.read(cx).is_empty());
+            assert!(app.vault_editors.passphrase.read(cx).is_empty());
+            assert!(app.vault_editors.confirmation.read(cx).is_empty());
+            // A native file path must not retain an earlier URL password in Undo either.
+            vault.unlock("test vault passphrase").unwrap();
+            app.vault_state = Some(VaultState::Unlocked);
+            app.draft.driver_manifest = None;
+            app.draft.connection_editor.update(cx, |editor, cx| {
+                editor.set_text("postgres://user:prior-secret@localhost/db", cx);
+                editor.set_text("sqlite:///tmp/native.sqlite", cx);
+            });
+            app.lock_vault(cx);
+            app.draft.connection_editor.update(cx, |editor, cx| {
+                editor.undo(cx);
+                assert!(editor.text(cx).is_empty());
+                editor.redo(cx);
+                assert!(editor.text(cx).is_empty());
+            });
+        });
+    }
 
     #[gpui::test]
     fn locking_with_open_connections_removes_workspace_and_cancels_requests(

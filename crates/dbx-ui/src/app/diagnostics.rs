@@ -25,6 +25,14 @@ impl DbxApp {
         let Some(session) = self.session(session_id) else {
             return;
         };
+        if session.busy {
+            self.show_toast(
+                ToastKind::Info,
+                "Finish the current connection task before starting a watch",
+                cx,
+            );
+            return;
+        }
         let Some(tab_id) = session.active_secondary_tab else {
             return;
         };
@@ -47,7 +55,15 @@ impl DbxApp {
         let text = editor.text(cx);
         let range = editor.execution_range(editor::QueryExecutionScope::SelectionOrStatement, cx);
         let sql = text[range].to_string();
-        if let Err(error) = dbx_core::execution_plan_analyze_query(session.kind, &sql) {
+        if !QuerySession::supports_isolated_reads(&engine) {
+            self.show_toast(
+                ToastKind::Info,
+                "This connector does not provide an isolated read-only session",
+                cx,
+            );
+            return;
+        }
+        if let Err(error) = dbx_core::execution_plan_query(session.kind, &sql) {
             self.show_toast(ToastKind::Error, error.to_string(), cx);
             return;
         }
@@ -75,6 +91,8 @@ impl DbxApp {
                                     .as_ref()
                                     .is_some_and(|current| Arc::ptr_eq(current, &engine))
                         });
+                        let connection_busy =
+                            this.session(session_id).is_none_or(|session| session.busy);
                         let visible = this.active_session_id() == Some(session_id)
                             && this.session(session_id).is_some_and(|session| {
                                 session.active_secondary_tab == Some(tab_id)
@@ -95,7 +113,7 @@ impl DbxApp {
                             cx.notify();
                             return false;
                         }
-                        if !visible || query.busy {
+                        if !visible || connection_busy || query.busy {
                             return true;
                         }
                         query.watch_read_only_pending = true;
@@ -148,6 +166,55 @@ impl DbxApp {
             return;
         };
         self.show_result_column_statistics(session_id, result, window, cx);
+    }
+
+    /// An explicit user action: aggregate the whole table, independently of
+    /// the loaded page/filter, through the normal cancelable query task.
+    pub(super) fn show_full_table_column_statistics(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        if !session
+            .engine
+            .as_ref()
+            .is_some_and(|engine| QuerySession::supports_isolated_reads(engine))
+        {
+            return;
+        }
+        if session.busy {
+            self.show_toast(
+                ToastKind::Info,
+                "Finish the current connection task before scanning table statistics",
+                cx,
+            );
+            return;
+        }
+        let Some(data) = session.active_data_tab() else {
+            return;
+        };
+        let columns = data.table_columns.clone();
+        let sql = match dbx_core::table_column_statistics_query(session.kind, &data.table, &columns)
+        {
+            Ok(sql) => sql,
+            Err(error) => {
+                self.show_toast(ToastKind::Error, error.to_string(), cx);
+                return;
+            }
+        };
+        self.open_saved_query_for(session_id, crate::workspace::SavedQuery {
+            name: "Column statistics · full table".into(),
+            sql: format!("-- Full-table server statistics: scans all visible rows, ignoring the loaded page and filters.\n-- Distinct and extrema use source types and database collation; unsupported types are labeled.\n{sql}"),
+        }, window, cx);
+        if let Some(query) = self.active_query_tab_mut(session_id) {
+            query.full_table_statistics_pending = Some(columns);
+            query.watch_read_only_pending = true;
+        }
+        self.run_query_for_execution(session_id, true, cx);
     }
 
     fn show_result_column_statistics(
@@ -280,7 +347,7 @@ impl DbxApp {
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
             title: "Execute EXPLAIN ANALYZE?".into(),
-            detail: "ANALYZE executes this read query to measure its plan. DBX uses a separate PostgreSQL connection in a read-only transaction and rolls it back; your query tab’s transaction stays open. External effects of database functions cannot be undone by rollback.".into(),
+            detail: "ANALYZE executes this read query to measure its plan. DBX uses a separate native connection in a server-enforced read-only transaction and rolls it back; your query tab’s transaction stays open. External effects of database functions cannot be undone by rollback.".into(),
             confirm_label: "Execute ANALYZE",
             tone: ConfirmationTone::Warning,
             action: ConfirmationAction::AnalyzeQuery { session_id, tab_id, sql: sql.clone() },

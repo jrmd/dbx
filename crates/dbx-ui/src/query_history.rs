@@ -610,9 +610,8 @@ fn now_ms() -> QueryHistoryResult<u64> {
 }
 
 fn default_query_history_path() -> QueryHistoryResult<PathBuf> {
-    Ok(dirs::config_dir()
+    Ok(crate::config::directory()
         .ok_or(QueryHistoryError::ConfigDirectoryUnavailable)?
-        .join("dbx")
         .join(QUERY_HISTORY_FILE_NAME))
 }
 

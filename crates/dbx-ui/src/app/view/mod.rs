@@ -167,6 +167,73 @@ impl Render for DbxApp {
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::open_quick_open_action))
             .on_action(cx.listener(Self::open_command_palette_action))
+            .on_action(cx.listener(Self::open_sql_file_action))
+            .on_action(cx.listener(|this, _: &ChooseTheme, window, cx| {
+                this.run_palette_command("dbx_ui::ChooseTheme", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LightAppearance, window, cx| {
+                this.run_palette_command("dbx_ui::LightAppearance", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DarkAppearance, window, cx| {
+                this.run_palette_command("dbx_ui::DarkAppearance", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SystemAppearance, window, cx| {
+                this.run_palette_command("dbx_ui::SystemAppearance", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BrowseSqlFiles, window, cx| {
+                this.run_palette_command("dbx_ui::BrowseSqlFiles", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FavoriteSqlFiles, window, cx| {
+                this.run_palette_command("dbx_ui::FavoriteSqlFiles", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SaveSqlFile, window, cx| {
+                this.run_palette_command("dbx_ui::SaveSqlFile", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ChooseSqlFolder, window, cx| {
+                this.run_palette_command("dbx_ui::ChooseSqlFolder", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExplainQuery, window, cx| {
+                this.run_palette_command("dbx_ui::ExplainQuery", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AnalyzeQuery, window, cx| {
+                this.run_palette_command("dbx_ui::AnalyzeQuery", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &QueryStatistics, window, cx| {
+                this.run_palette_command("dbx_ui::QueryStatistics", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TableStatistics, window, cx| {
+                this.run_palette_command("dbx_ui::TableStatistics", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FullTableStatistics, window, cx| {
+                this.run_palette_command("dbx_ui::FullTableStatistics", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &WatchQuery, window, cx| {
+                this.run_palette_command("dbx_ui::WatchQuery", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &StopWatch, window, cx| {
+                this.run_palette_command("dbx_ui::StopWatch", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &InspectSchema, window, cx| {
+                this.run_palette_command("dbx_ui::InspectSchema", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CaptureSchema, window, cx| {
+                this.run_palette_command("dbx_ui::CaptureSchema", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportDatabase, window, cx| {
+                this.run_palette_command("dbx_ui::ExportDatabase", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportQueryCsv, window, cx| {
+                this.run_palette_command("dbx_ui::ExportQueryCsv", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportQueryXlsx, window, cx| {
+                this.run_palette_command("dbx_ui::ExportQueryXlsx", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportFullQueryXlsx, window, cx| {
+                this.run_palette_command("dbx_ui::ExportFullQueryXlsx", window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ExportFullTableXlsx, window, cx| {
+                this.run_palette_command("dbx_ui::ExportFullTableXlsx", window, cx)
+            }))
             .on_action(cx.listener(|this, _: &SubmitTableName, window, cx| {
                 this.submit_table_name_prompt(window, cx)
             }))

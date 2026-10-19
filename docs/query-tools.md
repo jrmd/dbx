@@ -11,17 +11,27 @@ grid** switches to the same data in a table. Other supported connectors keep
 native plan rows in the result grid. The tree shows operation, estimated rows,
 planner cost, and relation/index/filter details. Planner cost is not elapsed time.
 
-**EXPLAIN ANALYZE… (executes query)** is available for PostgreSQL only. The review
-dialog displays the SQL before execution. DBX opens a separate connection, runs
-`BEGIN READ ONLY`, executes `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, and rolls
-back. Your query tab's connection and any open transaction are kept separate;
-uncommitted changes in that tab are not visible to this plan. Actual rows, time
-per loop, and loop count appear alongside the estimates when PostgreSQL supplies
-them. Database functions can have external effects that a rollback cannot undo.
+**EXPLAIN ANALYZE… (executes query)** supports native PostgreSQL, MySQL
+8.0.18+, MariaDB, and CockroachDB connections. The review dialog displays the SQL before
+execution. Each analysis opens a separate connection and a server-enforced
+read-only transaction, then rolls it back. Your query tab's connection and open
+transaction stay separate; its uncommitted changes are not visible to analysis.
+PostgreSQL returns its JSON plan with actual rows, time per loop, and loop counts.
+MySQL `TREE` and CockroachDB `PLAN` output also open as indented trees. Explicit
+actual metrics are shown where the native plan names them; all native node
+attributes remain in the detail column. DBX detects MariaDB on the isolated
+connection and uses its native `ANALYZE FORMAT=JSON`, including measured rows, table time, and loop counts.
+Unsupported older server versions report their native error; DBX never falls
+back to a writable transaction.
+SQLite has no equivalent execution-plan ANALYZE command; its **Explain query**
+uses non-executing `EXPLAIN QUERY PLAN`.
 
-Analysis uses the tab's timeout and normal cancellation controls. Errors or
-cancellation close the isolated connection and its transaction. Other providers
-keep non-executing EXPLAIN; DBX does not emulate transaction isolation for them.
+Analysis uses the tab's timeout and normal cancellation controls. PostgreSQL
+cancels the backend query, MySQL uses `KILL QUERY`, and CockroachDB cancels queries
+belonging to the isolated session ID. Errors or cancellation close the isolated
+connection and its transaction. Database functions can still have external effects
+that rollback cannot undo. Read-only transactions protect database tables; they
+are not a sandbox for untrusted functions or external services.
 
 Under **Diagnostics**, **Capture plan** stores the current plan in the tab;
 explain another statement and choose **Compare plans** to compare steps. Actual
@@ -47,9 +57,14 @@ available for comparing one connection against an earlier snapshot.
 
 ## Watch a read query
 
-For PostgreSQL, **Watch read query** repeats the selected or current read
-statement every 5, 10, 30, or 60 seconds while its query tab is visible. Each
+For native PostgreSQL, MySQL/MariaDB, CockroachDB, and file-backed SQLite,
+**Watch read query** repeats the selected or current read statement every 5, 10, 30, or 60 seconds while its query tab is visible. Each
 sample uses a fresh server-enforced read-only transaction and rolls it back.
+SQLite opens the database file through an independent read-only connection with
+`query_only=ON`; it never changes the tab or pool’s PRAGMAs. Private in-memory
+SQLite databases cannot be reopened as an independent committed snapshot, so
+watching them reports an unsupported-operation error. Community drivers and
+remote SQLite services do not share this native isolation path.
 Only one sample runs at a time; a slow sample makes the timer skip that tick.
 Normal result limits and the query timeout apply.
 
@@ -75,6 +90,28 @@ summaries marked `~` use floating-point approximations; nonnumeric columns have
 empty numeric summaries. These are exploratory summaries, not database-wide
 statistics or exact decimal accounting.
 
+## Full-table statistics
+
+The loaded table’s menu also offers **Column statistics (full table, scans all
+rows)** for native PostgreSQL, MySQL/MariaDB, CockroachDB, and file-backed SQLite.
+This explicit action queries all rows visible to the database user in one
+isolated read-only aggregate statement, ignoring the loaded page and grid
+filters. It opens a separate query tab showing the SQL; use its normal **Stop**
+and timeout controls. It may scan the table and use server memory for exact
+`COUNT(DISTINCT ...)`, so run it when that cost is appropriate.
+
+Results include full-table row counts, nulls, distinct non-null counts, and
+minimum/maximum values. The server computes extrema using each column’s native
+type and collation. Large integers and exact decimals retain their decoded values;
+DBX does not convert them through floating point. Floating-point source columns
+retain their native floating-point precision. Complex/custom types without
+supported aggregate operators show counts/nulls and an explicit unsupported
+marker for distinct/min/max; booleans and UUIDs have distinct counts but no range
+where native range operators are unavailable. SQLite uses its native dynamic
+storage-class comparison order. Server privileges, row-level security, and
+statement-width limits still apply. These statistics are separate from the
+approximate, client-only **loaded rows** statistics.
+
 ## Foreign-key JOIN completion
 
 Immediately after `JOIN`, table completions can include **FK JOIN** snippets
@@ -83,3 +120,36 @@ its `ON` predicate, including every column in a composite foreign key. Existing
 aliases and provider identifier quoting are respected. Incoming and outgoing
 relationships are offered; ambiguous unqualified source names are skipped.
 The snippet is inserted into the editor for review and does not execute SQL.
+
+Engine references: [MySQL read-only transactions](https://dev.mysql.com/doc/refman/8.4/en/commit.html),
+[SQLite query_only](https://www.sqlite.org/pragma.html#pragma_query_only), and
+[CockroachDB cancellation](https://docs.cockroachlabs.com/docs/stable/cancel-query).
+
+## Excel and Markdown exports
+
+**Copy as Markdown** and loaded-row **Excel XLSX** export use the rows already
+in the grid. They exclude staged edits and do not silently fetch missing pages.
+
+For native PostgreSQL, MySQL/MariaDB, CockroachDB and SQLite connections, choose
+**Export → Full query · fresh read-only rerun → Excel XLSX** to execute one read
+statement again without the grid row limit. Finish the tab's transaction and stop
+its watch first. Parameters must be replaced with reviewed literal values before
+export; mutation statements and multiple statements are rejected.
+
+The table's **Export XLSX** menu also offers **All rows**, which exports the
+whole table and explicitly excludes grid filters and staged edits. Full exports
+use a separate read-only transaction; snapshot consistency depends on the
+server and table engine. They do not include a tab's uncommitted changes.
+
+Rows spool to private temporary files instead of accumulating in memory.
+Progress reports rows and output bytes; **Cancel** stops streaming or workbook
+finalization. The destination is replaced atomically only after success. Failure,
+cancellation, or an Excel format limit leaves an existing destination intact.
+Excel permits 1,048,575 data rows plus the header, 16,384 columns and 32,767
+characters per cell; exceeding a limit produces an error instead of truncating.
+
+Formula-looking values and URLs remain literal text. SQL NULL is blank, empty
+text uses the fixed formula `=""`, and integers beyond 15 digits are stored as
+exact text. JSON and hexadecimal bytes are text. A **Column types** sheet records
+the export scope and database types. Other full-result formats remain available
+through the existing CSV/TSV/SQL export tools.

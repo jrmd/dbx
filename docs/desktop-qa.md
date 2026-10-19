@@ -1,6 +1,6 @@
 # Isolated desktop QA
 
-On Linux, run `scripts/run-ui-test.sh` from any directory. It builds DBX and launches the real native app with a separate config directory and working directory under `target/ui-test/`.
+On Linux or macOS, run `scripts/run-ui-test.sh` from any directory. It builds DBX and launches the real native app with a separate config directory and working directory under `target/ui-test/`.
 
 - `config/dbx/credentials.vault`: disposable encrypted QA vault.
 - `config/dbx/connections.json`: four QA profiles, without embedded passwords.
@@ -9,6 +9,8 @@ On Linux, run `scripts/run-ui-test.sh` from any directory. It builds DBX and lau
 - `artifacts/`: screenshots and run evidence.
 
 The launcher creates only missing fixtures. Relaunching preserves the vault, saved credentials, data edits, and appearance. Normal user config is not read or modified. The working directory is isolated too, so the default relative SQLite path cannot open the repository's database. All generated state stays in the ignored `target/` tree.
+
+`DBX_CONFIG_DIR` overrides the complete DBX state directory on every platform, including the vault, settings, history, keymap, registered drivers, library preferences, and default SQL library. An overridden profile is labelled “DBX — isolated profile” in the native window title. Use an absolute path for repeatable QA sessions.
 
 The launcher provisions the vault through DBX's own Rust vault implementation. Unlock it using the deliberately public, test-only passphrase `dbx-ui-test-vault`. Never put real credentials in this vault. Fresh PostgreSQL and MySQL profiles receive `dbx_test_password` in the encrypted vault. Existing credentials are retained. A vault with a different passphrase causes the launcher to stop rather than overwrite it.
 

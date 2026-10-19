@@ -1,6 +1,6 @@
-//! Exports of an already-loaded database snapshot. No query is executed here.
+//! Typed loaded-result exports and atomic, bounded-memory full read exports.
 use dbx_core::{CellValue, QueryResult};
-use rust_xlsxwriter::{Format, Formula, Workbook};
+use rust_xlsxwriter::{Format, Formula, Workbook, Worksheet};
 
 fn plain(value: &CellValue) -> String {
     match value {
@@ -70,6 +70,33 @@ pub fn markdown(result: &QueryResult) -> String {
     output
 }
 
+fn write_cell(
+    sheet: &mut Worksheet,
+    row: u32,
+    column: u16,
+    value: &CellValue,
+) -> Result<(), String> {
+    let write = match value {
+        CellValue::Null => return Ok(()),
+        // XLSX has no literal empty string in this writer. A fixed, data-independent
+        // expression preserves empty text while leaving SQL NULL genuinely blank.
+        CellValue::Text(value) if value.is_empty() => {
+            sheet.write_formula(row, column, Formula::new("=\"\"").set_result(""))
+        }
+        CellValue::Boolean(value) => sheet.write_boolean(row, column, *value),
+        CellValue::Integer(value) if value.unsigned_abs() <= 999_999_999_999_999 => {
+            sheet.write_number(row, column, *value as f64)
+        }
+        CellValue::Unsigned(value) if *value <= 999_999_999_999_999 => {
+            sheet.write_number(row, column, *value as f64)
+        }
+        CellValue::Real(value) if value.is_finite() => sheet.write_number(row, column, *value),
+        value => sheet.write_string(row, column, plain(value)),
+    };
+    write.map_err(|error| format!("Row {}, column {}: {error}", row + 1, column + 1))?;
+    Ok(())
+}
+
 /// The explicit string methods ensure formula-looking values and URLs remain text.
 /// Integers beyond Excel's 15 significant digits are text to retain every digit.
 pub fn xlsx(result: &QueryResult) -> Result<Vec<u8>, String> {
@@ -93,26 +120,7 @@ pub fn xlsx(result: &QueryResult) -> Result<Vec<u8>, String> {
     for (row, record) in result.rows.iter().enumerate() {
         for (column, value) in record.values.iter().take(result.columns.len()).enumerate() {
             let (row, column) = ((row + 1) as u32, column as u16);
-            let write = match value {
-                CellValue::Null => continue,
-                // XLSX has no literal empty string in this writer. A fixed, data-independent
-                // expression preserves empty text while leaving SQL NULL genuinely blank.
-                CellValue::Text(value) if value.is_empty() => {
-                    sheet.write_formula(row, column, Formula::new("=\"\"").set_result(""))
-                }
-                CellValue::Boolean(value) => sheet.write_boolean(row, column, *value),
-                CellValue::Integer(value) if value.unsigned_abs() <= 999_999_999_999_999 => {
-                    sheet.write_number(row, column, *value as f64)
-                }
-                CellValue::Unsigned(value) if *value <= 999_999_999_999_999 => {
-                    sheet.write_number(row, column, *value as f64)
-                }
-                CellValue::Real(value) if value.is_finite() => {
-                    sheet.write_number(row, column, *value)
-                }
-                value => sheet.write_string(row, column, plain(value)),
-            };
-            write.map_err(|error| format!("Row {}, column {}: {error}", row + 1, column + 1))?;
+            write_cell(sheet, row, column, value)?;
         }
     }
     sheet
@@ -142,6 +150,188 @@ pub fn xlsx(result: &QueryResult) -> Result<Vec<u8>, String> {
             .map_err(|error| error.to_string())?;
     }
     workbook.save_to_buffer().map_err(|error| error.to_string())
+}
+
+/// Cancels a blocking ZIP finalizer if its owning async task is aborted/closed.
+struct CancelOnDrop(dbx_core::TransferControl);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+struct CancelWriter<'a> {
+    file: &'a mut std::fs::File,
+    control: dbx_core::TransferControl,
+    bytes: u64,
+}
+impl std::io::Write for CancelWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.control.is_cancelled() {
+            return Err(std::io::Error::other("XLSX export cancelled"));
+        }
+        let written = std::io::Write::write(self.file, bytes)?;
+        self.bytes += written as u64;
+        self.control.set_bytes(self.bytes);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.file)
+    }
+}
+
+struct StreamingWorkbook {
+    workbook: Workbook,
+    columns: Vec<dbx_core::ColumnInfo>,
+    rows: u64,
+    row_limit: u64,
+    _spool: tempfile::TempDir,
+}
+impl StreamingWorkbook {
+    fn new(parent: &std::path::Path) -> Result<Self, String> {
+        let spool = tempfile::Builder::new()
+            .prefix(".dbx-xlsx-")
+            .tempdir_in(parent)
+            .map_err(|e| e.to_string())?;
+        let mut workbook = Workbook::new();
+        workbook
+            .set_tempdir(spool.path())
+            .map_err(|e| e.to_string())?;
+        workbook
+            .add_worksheet_with_constant_memory()
+            .map_err(|e| e.to_string())?
+            .set_name("Full result")
+            .map_err(|e| e.to_string())?
+            .set_freeze_panes(1, 0)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            workbook,
+            columns: Vec::new(),
+            rows: 0,
+            row_limit: 1_048_575,
+            _spool: spool,
+        })
+    }
+    fn consume(
+        &mut self,
+        columns: &[dbx_core::ColumnInfo],
+        values: Option<Vec<CellValue>>,
+    ) -> Result<(), String> {
+        let sheet = self
+            .workbook
+            .worksheet_from_index(0)
+            .map_err(|e| e.to_string())?;
+        if let Some(values) = values {
+            if self.rows >= self.row_limit {
+                return Err("Excel supports at most 1,048,575 data rows plus the header. Use CSV or JSONL for larger results; the destination was not replaced.".into());
+            }
+            if values.len() != self.columns.len() {
+                return Err("Export row does not match its column metadata".into());
+            }
+            // Preserve trailing/all-NULL row positions without turning NULL into text.
+            if values.iter().all(|value| matches!(value, CellValue::Null)) {
+                sheet
+                    .write_blank((self.rows + 1) as u32, 0, &Format::new())
+                    .map_err(|e| e.to_string())?;
+            }
+            for (column, value) in values.iter().enumerate() {
+                write_cell(sheet, (self.rows + 1) as u32, column as u16, value)?;
+            }
+            self.rows += 1;
+        } else {
+            if columns.is_empty() || columns.len() > 16_384 {
+                return Err("Excel requires between 1 and 16,384 columns".into());
+            }
+            self.columns = columns.to_vec();
+            let header = Format::new().set_bold();
+            for (column, info) in columns.iter().enumerate() {
+                sheet
+                    .write_string_with_format(0, column as u16, &info.name, &header)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    fn finish(
+        mut self,
+        destination: &std::path::Path,
+        scope: &str,
+        control: dbx_core::TransferControl,
+    ) -> Result<u64, String> {
+        if control.is_cancelled() {
+            return Err("XLSX export cancelled".into());
+        }
+        let notes = self
+            .workbook
+            .add_worksheet_with_constant_memory()
+            .map_err(|e| e.to_string())?;
+        notes.set_name("Column types").map_err(|e| e.to_string())?;
+        for (row, text) in [
+            format!("{} rows. {scope}. Fresh read-only export; consistency depends on the database/table engine. Staged edits excluded.", self.rows),
+            "SQL NULL is blank; empty text uses the fixed formula =\"\". Formula-like values and URLs stay literal text.".into(),
+            "Integers beyond 15 digits are exact text. Non-finite numbers are text; bytes are hexadecimal; JSON is text.".into(),
+        ].iter().enumerate() { notes.write_string(row as u32, 0, text).map_err(|e| e.to_string())?; }
+        for (row, column) in self.columns.iter().enumerate() {
+            notes
+                .write_string((row + 4) as u32, 0, &column.name)
+                .map_err(|e| e.to_string())?;
+            notes
+                .write_string((row + 4) as u32, 1, &column.data_type)
+                .map_err(|e| e.to_string())?;
+        }
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut output = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        control.add_log("Finalizing XLSX workbook…");
+        self.workbook
+            .save_to_writer(CancelWriter {
+                file: output.as_file_mut(),
+                control: control.clone(),
+                bytes: 0,
+            })
+            .map_err(|e| e.to_string())?;
+        output.as_file().sync_all().map_err(|e| e.to_string())?;
+        if control.is_cancelled() {
+            return Err("XLSX export cancelled".into());
+        }
+        output.persist(destination).map_err(|e| e.to_string())?;
+        Ok(self.rows)
+    }
+}
+
+/// Stream a validated single read through the existing core read-only transaction.
+/// Constant-memory worksheets spool to private files; ZIP finalization never blocks UI/runtime.
+pub async fn full_xlsx(
+    engine: &dbx_core::DatabaseEngine,
+    sql: &str,
+    destination: std::path::PathBuf,
+    scope: String,
+    control: dbx_core::TransferControl,
+) -> dbx_core::Result<u64> {
+    let _cancel_on_drop = CancelOnDrop(control.clone());
+    dbx_core::validate_query_export(engine.kind(), sql)?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut workbook = StreamingWorkbook::new(parent).map_err(dbx_core::DbxError::Io)?;
+    dbx_core::stream_query_export(engine, sql, |columns, values| {
+        if control.is_cancelled() {
+            return Err(dbx_core::DbxError::Interrupted(
+                "XLSX export cancelled".into(),
+            ));
+        }
+        workbook
+            .consume(columns, values)
+            .map_err(dbx_core::DbxError::Io)
+    })
+    .await?;
+    tokio::task::spawn_blocking(move || workbook.finish(&destination, &scope, control))
+        .await
+        .map_err(|e| dbx_core::DbxError::Io(e.to_string()))?
+        .map_err(dbx_core::DbxError::Io)
 }
 
 #[cfg(test)]
@@ -208,6 +398,198 @@ mod tests {
         assert!(strings.contains("HYPERLINK"));
         assert!(strings.contains("truncated"));
     }
+    fn sheet_xml(path: &std::path::Path) -> String {
+        let file = std::fs::File::open(path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut xml = String::new();
+        zip.by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        xml
+    }
+
+    #[test]
+    fn streaming_workbook_keeps_types_and_inline_strings_without_shared_string_growth() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("typed.xlsx");
+        let result = fixture();
+        let mut workbook = StreamingWorkbook::new(directory.path()).unwrap();
+        workbook.consume(&result.columns, None).unwrap();
+        workbook
+            .consume(&result.columns, Some(result.rows[0].values.clone()))
+            .unwrap();
+        assert_eq!(
+            workbook
+                .finish(&path, "Full fixture", dbx_core::TransferControl::default())
+                .unwrap(),
+            1
+        );
+        let xml = sheet_xml(&path);
+        assert!(!xml.contains("r=\"A2\""));
+        assert!(xml.contains("r=\"B2\""));
+        assert_eq!(xml.matches("<f>").count(), 1);
+        assert!(xml.contains("r=\"C2\" t=\"inlineStr\""));
+        assert!(xml.contains("HYPERLINK"));
+        assert!(xml.contains("r=\"D2\" t=\"b\"><v>1</v>"));
+        assert!(xml.contains("r=\"E2\"><v>42</v>"));
+        assert!(xml.contains("18446744073709551615"));
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(
+            zip.by_name("xl/sharedStrings.xml").is_err(),
+            "Constant memory must use inline strings, not an unbounded shared-string table"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "Private worksheet spools are removed"
+        );
+    }
+
+    #[test]
+    fn streaming_workbook_retains_trailing_all_null_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nulls.xlsx");
+        let result = fixture();
+        let mut workbook = StreamingWorkbook::new(directory.path()).unwrap();
+        workbook.consume(&result.columns, None).unwrap();
+        for _ in 0..3 {
+            workbook
+                .consume(
+                    &result.columns,
+                    Some(vec![CellValue::Null; result.columns.len()]),
+                )
+                .unwrap();
+        }
+        workbook
+            .finish(&path, "All NULL rows", dbx_core::TransferControl::default())
+            .unwrap();
+        let xml = sheet_xml(&path);
+        assert_eq!(xml.matches("<row ").count(), 4);
+        assert!(xml.contains("<row r=\"4\""));
+        assert!(!xml.contains("r=\"A4\""), "NULL stays an empty cell");
+    }
+
+    #[test]
+    fn row_limit_and_cancelled_finalization_preserve_destination_and_remove_spools() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.xlsx");
+        std::fs::write(&path, b"original destination").unwrap();
+        let result = fixture();
+        {
+            let mut workbook = StreamingWorkbook::new(directory.path()).unwrap();
+            workbook.row_limit = 1;
+            workbook.consume(&result.columns, None).unwrap();
+            workbook
+                .consume(&result.columns, Some(result.rows[0].values.clone()))
+                .unwrap();
+            let error = workbook
+                .consume(&result.columns, Some(result.rows[0].values.clone()))
+                .unwrap_err();
+            assert!(error.contains("1,048,575"));
+        }
+        let mut workbook = StreamingWorkbook::new(directory.path()).unwrap();
+        workbook.consume(&result.columns, None).unwrap();
+        let control = dbx_core::TransferControl::default();
+        control.cancel();
+        assert!(
+            workbook
+                .finish(&path, "Cancelled", control)
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original destination");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let mut file = tempfile::tempfile().unwrap();
+        let control = dbx_core::TransferControl::default();
+        let mut writer = CancelWriter {
+            file: &mut file,
+            control: control.clone(),
+            bytes: 0,
+        };
+        std::io::Write::write_all(&mut writer, b"first ZIP chunk").unwrap();
+        control.cancel();
+        assert!(std::io::Write::write_all(&mut writer, b"next ZIP chunk").is_err());
+    }
+
+    async fn database(directory: &std::path::Path) -> dbx_core::DatabaseEngine {
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.join("source.sqlite").display()
+        );
+        dbx_core::DatabaseEngine::connect(dbx_core::ConnectionConfig::new(
+            dbx_core::DatabaseKind::SQLite,
+            url,
+        ))
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_xlsx_streams_beyond_grid_limit_and_preserves_existing_output_on_failure() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let engine = database(source.path()).await;
+        let path = output.path().join("all.xlsx");
+        let control = dbx_core::TransferControl::default();
+        let sql = "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20001) SELECT x, NULL AS missing, '' AS empty, '=1+1' AS literal FROM n";
+        let rows = dbx_core::with_transfer_control(
+            control.clone(),
+            full_xlsx(
+                &engine,
+                sql,
+                path.clone(),
+                "Full query rerun".into(),
+                control.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows, 20001);
+        assert_eq!(control.progress().0, 20001);
+        assert!(control.byte_progress() > 0);
+        let xml = sheet_xml(&path);
+        assert_eq!(xml.matches("<row ").count(), 20002);
+        assert!(xml.contains("r=\"A20002\"><v>20001</v>"));
+        assert!(xml.contains("=1+1"));
+        let previous = std::fs::read(&path).unwrap();
+        for sql in [
+            "CREATE TABLE forbidden(id int)",
+            "SELECT 1; SELECT 2",
+            "SELECT printf('%.*c', 32768, 'x') AS too_long",
+        ] {
+            assert!(
+                full_xlsx(
+                    &engine,
+                    sql,
+                    path.clone(),
+                    "Rejected".into(),
+                    dbx_core::TransferControl::default()
+                )
+                .await
+                .is_err(),
+                "{sql}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), previous);
+            assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 1);
+        }
+        let control = dbx_core::TransferControl::default();
+        control.cancel();
+        assert!(
+            full_xlsx(
+                &engine,
+                "SELECT 1",
+                path.clone(),
+                "Cancelled".into(),
+                control
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), previous);
+        assert_eq!(std::fs::read_dir(output.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn markdown_escapes_pipes_markup_and_embedded_lines() {
         let mut result = fixture();

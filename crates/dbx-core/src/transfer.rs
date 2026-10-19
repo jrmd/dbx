@@ -40,7 +40,8 @@ impl TransferControl {
     pub(crate) async fn cancelled(&self) {
         self.cancellation.cancelled().await;
     }
-    pub(crate) fn set_bytes(&self, bytes: u64) {
+    /// Report encoded output bytes, including blocking finalization stages.
+    pub fn set_bytes(&self, bytes: u64) {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
     pub fn byte_progress(&self) -> u64 {
@@ -52,7 +53,8 @@ impl TransferControl {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
-    pub(crate) fn add_log(&self, text: &str) {
+    /// Append a bounded progress-stage message for the transfer UI.
+    pub fn add_log(&self, text: &str) {
         let mut log = self.log.lock().unwrap_or_else(|error| error.into_inner());
         log.push_str(text);
         log.push('\n');
@@ -63,6 +65,9 @@ impl TransferControl {
             }
             log.drain(..start);
         }
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
     pub fn cancel(&self) {
         self.cancellation.cancel();
@@ -198,19 +203,15 @@ pub enum QueryExportFormat {
     JsonLines,
 }
 
-pub async fn export_query(
-    engine: &DatabaseEngine,
-    sql: &str,
-    path: &Path,
-    format: QueryExportFormat,
-) -> Result<u64> {
-    let statements = checked_split_sql_for(Some(engine.kind()), sql)?;
+/// Validate one read statement before prompting for an export destination.
+pub fn validate_query_export(kind: DatabaseKind, sql: &str) -> Result<String> {
+    let statements = checked_split_sql_for(Some(kind), sql)?;
     if statements.len() != 1 {
         return Err(DbxError::Query(
             "Full query export requires exactly one read statement".into(),
         ));
     }
-    crate::protected::ensure_query(engine.kind(), &statements[0])?;
+    crate::protected::ensure_query(kind, &statements[0])?;
     let operation =
         crate::sqlx_engine::top_level_operation_keyword(&statements[0]).unwrap_or_default();
     if ![
@@ -222,60 +223,93 @@ pub async fn export_query(
             "Full query export accepts read statements only".into(),
         ));
     }
+    Ok(statements.into_iter().next().unwrap())
+}
+
+/// Consume metadata once (`None`), then each row of a fresh read-only transaction.
+/// The consumer must not accumulate rows if bounded memory is required.
+pub async fn stream_query_export(
+    engine: &DatabaseEngine,
+    sql: &str,
+    mut consume: impl FnMut(&[ColumnInfo], Option<Vec<CellValue>>) -> Result<()> + Send,
+) -> Result<u64> {
+    let statement = validate_query_export(engine.kind(), sql)?;
+    if !engine.capabilities().streaming_query_export {
+        return Err(DbxError::Unsupported {
+            operation: "streaming query export".into(),
+            kind: engine.kind(),
+        });
+    }
     let mut transaction = SqlTransaction::begin(engine, true).await?;
-    let mut output = ExportFile::new(path, false)?;
     let rows = transaction
-        .stream_rows(&statements[0], |columns, values| {
-            match (format, values) {
-                (QueryExportFormat::Csv | QueryExportFormat::Tsv, None) => {
-                    let delimiter = if format == QueryExportFormat::Csv {
-                        ','
-                    } else {
-                        '\t'
-                    };
-                    let header = columns
-                        .iter()
-                        .map(|column| delimited_text(&column.name, delimiter))
-                        .collect::<Vec<_>>()
-                        .join(&delimiter.to_string());
-                    writeln!(output, "{header}").map_err(io_error)?;
-                }
-                (QueryExportFormat::Csv | QueryExportFormat::Tsv, Some(values)) => {
-                    let delimiter = if format == QueryExportFormat::Csv {
-                        ','
-                    } else {
-                        '\t'
-                    };
-                    let fields = values
-                        .iter()
-                        .map(|value| match value {
-                            CellValue::Null => String::new(),
-                            _ => delimited_text(&value.to_string(), delimiter),
-                        })
-                        .collect::<Vec<_>>();
-                    writeln!(output, "{}", fields.join(&delimiter.to_string()))
-                        .map_err(io_error)?;
-                    report_transfer(1, 0);
-                }
-                (QueryExportFormat::JsonLines, Some(values)) => {
-                    // An array retains duplicate column names and exact typed CellValues.
-                    serde_json::to_writer(&mut output, &RowData::new(values))
-                        .map_err(|error| DbxError::Io(error.to_string()))?;
-                    writeln!(output).map_err(io_error)?;
-                    report_transfer(1, 0);
-                }
-                (QueryExportFormat::JsonLines, None) => {
-                    serde_json::to_writer(&mut output, &serde_json::json!({"columns": columns}))
-                        .map_err(|error| DbxError::Io(error.to_string()))?;
-                    writeln!(output).map_err(io_error)?;
-                }
+        .stream_rows(&statement, |columns, values| {
+            let row = values.is_some();
+            consume(columns, values)?;
+            if row {
+                report_transfer(1, 0);
             }
             Ok(())
         })
         .await?;
     transaction.commit().await?;
-    output.finish()?;
     report_transfer(0, 1);
+    Ok(rows)
+}
+
+pub async fn export_query(
+    engine: &DatabaseEngine,
+    sql: &str,
+    path: &Path,
+    format: QueryExportFormat,
+) -> Result<u64> {
+    validate_query_export(engine.kind(), sql)?;
+    let mut output = ExportFile::new(path, false)?;
+    let rows = stream_query_export(engine, sql, |columns, values| {
+        match (format, values) {
+            (QueryExportFormat::Csv | QueryExportFormat::Tsv, None) => {
+                let delimiter = if format == QueryExportFormat::Csv {
+                    ','
+                } else {
+                    '\t'
+                };
+                let header = columns
+                    .iter()
+                    .map(|column| delimited_text(&column.name, delimiter))
+                    .collect::<Vec<_>>()
+                    .join(&delimiter.to_string());
+                writeln!(output, "{header}").map_err(io_error)?;
+            }
+            (QueryExportFormat::Csv | QueryExportFormat::Tsv, Some(values)) => {
+                let delimiter = if format == QueryExportFormat::Csv {
+                    ','
+                } else {
+                    '\t'
+                };
+                let fields = values
+                    .iter()
+                    .map(|value| match value {
+                        CellValue::Null => String::new(),
+                        _ => delimited_text(&value.to_string(), delimiter),
+                    })
+                    .collect::<Vec<_>>();
+                writeln!(output, "{}", fields.join(&delimiter.to_string())).map_err(io_error)?;
+            }
+            (QueryExportFormat::JsonLines, Some(values)) => {
+                // An array retains duplicate column names and exact typed CellValues.
+                serde_json::to_writer(&mut output, &RowData::new(values))
+                    .map_err(|error| DbxError::Io(error.to_string()))?;
+                writeln!(output).map_err(io_error)?;
+            }
+            (QueryExportFormat::JsonLines, None) => {
+                serde_json::to_writer(&mut output, &serde_json::json!({"columns": columns}))
+                    .map_err(|error| DbxError::Io(error.to_string()))?;
+                writeln!(output).map_err(io_error)?;
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    output.finish()?;
     Ok(rows)
 }
 

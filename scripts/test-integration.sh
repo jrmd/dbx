@@ -80,3 +80,4 @@ mariadb_tests=(env PATH="${mariadb_path:-$PATH}"
   cargo test --locked "${cargo_profile[@]}" -p dbx-core)
 "${mariadb_tests[@]}" --test integration mysql -- --ignored --test-threads=1
 "${mariadb_tests[@]}" --test workbench_safety mysql -- --ignored --test-threads=1
+"${mariadb_tests[@]}" --test diagnostics_watch mysql -- --ignored --test-threads=1

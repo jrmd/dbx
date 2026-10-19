@@ -256,9 +256,8 @@ impl DbxApp {
         if self.font_pickers.is_some() {
             return;
         }
-        let mut names = cx.text_system().all_font_names();
-        names.sort_by_key(|name| name.to_lowercase());
-        names.dedup();
+        // Paint the controls immediately. Enumerating installed fonts can be slow
+        // on real desktops and must not block the first Appearance interaction.
         let pickers = [false, true].map(|mono| {
             let current = if mono {
                 self.mono_font_family
@@ -269,10 +268,7 @@ impl DbxApp {
                     .clone()
                     .unwrap_or_else(|| cx.theme().font_family.to_string())
             };
-            let mut options = names.clone();
-            if !options.contains(&current) {
-                options.insert(0, current.clone());
-            }
+            let options = vec![current.clone()];
             let index = options.iter().position(|name| name == &current);
             let picker = cx.new(|cx| {
                 SelectState::new(
@@ -306,7 +302,43 @@ impl DbxApp {
             .detach();
             picker
         });
-        self.font_pickers = Some(pickers);
+        self.font_pickers = Some(pickers.clone());
+        self.font_names_loading = true;
+        let text_system = cx.text_system().clone();
+        let font_names = cx.background_executor().spawn(async move {
+            let mut names = text_system.all_font_names();
+            names.sort_by_key(|name| name.to_lowercase());
+            names.dedup();
+            names
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let names = font_names.await;
+            this.update_in(cx, |this, window, cx| {
+                this.font_names_loading = false;
+                for picker in pickers {
+                    picker.update(cx, |picker, cx| {
+                        let current = picker.selected_value().cloned();
+                        let mut options = names
+                            .iter()
+                            .cloned()
+                            .map(SharedString::from)
+                            .collect::<Vec<_>>();
+                        if let Some(current) = &current
+                            && !options.contains(current)
+                        {
+                            options.insert(0, current.clone());
+                        }
+                        picker.set_items(SearchableVec::new(options), window, cx);
+                        if let Some(current) = current {
+                            picker.set_selected_value(&current, window, cx);
+                        }
+                    });
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
         self.font_size_inputs = Some([false, true].map(|mono| {
             let size = if mono {
                 self.mono_font_size
@@ -537,9 +569,11 @@ impl DbxApp {
                 rows.push(
                     settings_row(
                         label,
-                        None,
+                        self.font_names_loading
+                            .then(|| "Loading installed fonts…".into()),
                         div().w(crate::theme::ui_px(240.)).child(
                             Select::new(&pickers[index])
+                                .disabled(self.font_names_loading)
                                 .h(crate::theme::control_height(32.))
                                 .w_full()
                                 .menu_max_h(crate::theme::ui_px(280.))
@@ -1122,6 +1156,7 @@ mod tests {
         });
         cx.simulate_resize(gpui::size(px(1400.), px(1400.)));
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
         let pickers = app.read_with(cx, |app, _| app.font_pickers.clone().unwrap());
         for (index, picker) in pickers.into_iter().enumerate() {
             cx.update(|window, cx| {

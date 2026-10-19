@@ -24,6 +24,7 @@ enum Target {
     Session(SessionId),
     Connection(Box<SavedConnection>),
     Command(&'static str),
+    SqlFile(SessionId, PathBuf, bool),
 }
 
 #[derive(Clone)]
@@ -95,6 +96,12 @@ impl DbxApp {
         if self.vault_state != Some(VaultState::Unlocked) {
             return;
         }
+        if self
+            .active_session()
+            .is_some_and(|session| session.kind.is_sql() && session.engine.is_some())
+        {
+            self.refresh_sql_library(cx);
+        }
         if let Some(open) = &self.quick_open {
             open.query.update(cx, |editor, cx| {
                 if editor.text(cx).trim_start().starts_with('>') {
@@ -107,7 +114,7 @@ impl DbxApp {
         }
         let query = cx.new(|cx| {
             TextEditor::empty(false, window, cx)
-                .accessibility_label("Search destinations, or type > for commands")
+                .accessibility_label("Search destinations, > commands, files: or favorites:")
         });
         let subscription = cx.observe(&query, |this, _, cx| {
             if let Some(open) = this.quick_open.as_mut() {
@@ -177,29 +184,11 @@ impl DbxApp {
             }
             Target::Session(session_id) => self.activate_session(session_id, cx),
             Target::Connection(profile) => self.open_saved_connection(*profile, window, cx),
-            Target::Command(name) => {
-                if let Some(session_id) = self.active_session_id() {
-                    match name {
-                        "dbx_ui::RunQuery" | "dbx_ui::RunQueryAll" => {
-                            self.request_run_query_for(
-                                session_id,
-                                name.ends_with("All"),
-                                window,
-                                cx,
-                            );
-                            return;
-                        }
-                        "dbx_ui::FormatQuery" => {
-                            self.format_query_for(session_id, window, cx);
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                if let Ok(action) = cx.build_action(name, None) {
-                    window.dispatch_action(action, cx);
-                }
+            Target::SqlFile(session_id, path, _) => {
+                self.activate_session(session_id, cx);
+                self.open_library_sql_for(session_id, path, window, cx);
             }
+            Target::Command(name) => self.run_palette_command(name, window, cx),
         }
     }
 
@@ -214,6 +203,7 @@ impl DbxApp {
             let mut commands = commands::palette_commands()
                 .iter()
                 .enumerate()
+                .filter(|(_, (name, _))| self.palette_command_available(name))
                 .filter_map(|(index, (name, label))| {
                     fuzzy_score(search, label).map(|score| {
                         (
@@ -222,7 +212,7 @@ impl DbxApp {
                             Item {
                                 label: (*label).to_owned(),
                                 detail: commands::shortcut_for(name, cx),
-                                icon: Icon::Query,
+                                icon: commands::command_icon(name),
                                 target: Target::Command(name),
                             },
                         )
@@ -231,6 +221,12 @@ impl DbxApp {
                 .collect::<Vec<_>>();
             commands.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
             return commands.into_iter().map(|(_, _, item)| item).collect();
+        }
+        if let Some(search) = query.strip_prefix("files:") {
+            return self.sql_file_items(search, false, cx);
+        }
+        if let Some(search) = query.strip_prefix("favorites:") {
+            return self.sql_file_items(search, true, cx);
         }
         if let Some(search) = query.strip_prefix("history:") {
             return self.history_search_items(search);
@@ -300,6 +296,7 @@ impl DbxApp {
                 target: Target::Connection(Box::new(profile.clone())),
             });
         }
+        items.extend(self.sql_file_items("", false, cx));
         let mut scored = items
             .into_iter()
             .enumerate()
@@ -314,6 +311,46 @@ impl DbxApp {
             .into_iter()
             .take(MAX_RESULTS)
             .map(|(_, _, item)| item)
+            .collect()
+    }
+
+    fn sql_file_items(&self, search: &str, favorites_only: bool, _cx: &App) -> Vec<Item> {
+        let Some(session) = self
+            .active_session()
+            .filter(|session| session.kind.is_sql() && session.engine.is_some())
+        else {
+            return Vec::new();
+        };
+        let mut scored = self
+            .sql_library
+            .cached_entries()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| !favorites_only || entry.favorite)
+            .filter_map(|entry| fuzzy_score(search, &entry.label()).map(|score| (score, entry)))
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .favorite
+                .cmp(&left.1.favorite)
+                .then(right.0.cmp(&left.0))
+                .then(left.1.relative_path.cmp(&right.1.relative_path))
+        });
+        scored
+            .into_iter()
+            .take(MAX_RESULTS)
+            .map(|(_, entry)| Item {
+                label: entry.label(),
+                detail: if entry.favorite {
+                    "Favorite SQL file"
+                } else {
+                    "SQL file"
+                }
+                .into(),
+                icon: Icon::Query,
+                target: Target::SqlFile(session.id, entry.relative_path, entry.favorite),
+            })
             .collect()
     }
 
@@ -442,7 +479,27 @@ impl DbxApp {
         let editor = open.query.clone();
         let focus = editor.read(cx).focus_handle();
         let modal_focus = open.focus.clone();
-        let command_mode = editor.read(cx).text(cx).trim_start().starts_with('>');
+        let query_text = editor.read(cx).text(cx);
+        let command_mode = query_text.trim_start().starts_with('>');
+        let file_mode = query_text.starts_with("files:") || query_text.starts_with("favorites:");
+        let empty_label = if file_mode && self.sql_library_refreshing {
+            "Loading SQL files…".to_owned()
+        } else if file_mode
+            && !self
+                .active_session()
+                .is_some_and(|session| session.kind.is_sql() && session.engine.is_some())
+        {
+            "Open a SQL connection to browse query files".to_owned()
+        } else if file_mode {
+            self.sql_library
+                .cached_entries()
+                .err()
+                .unwrap_or_else(|| "No matching SQL files".into())
+        } else if command_mode {
+            "No matching commands available here".to_owned()
+        } else {
+            "No matches".to_owned()
+        };
         let items = self.quick_open_items(cx);
         let selected = open.selected.min(items.len().saturating_sub(1));
         let selected_label = items
@@ -456,10 +513,10 @@ impl DbxApp {
                     item.detail
                 )
             })
-            .unwrap_or_else(|| "No matches".into());
+            .unwrap_or_else(|| empty_label.clone());
         div()
             .id("quick-open-overlay")
-            .role(gpui::Role::Dialog).aria_label(if command_mode { "Command palette" } else { "Quick open" }).aria_description("Search destinations, or type > for commands. Use Up and Down to select a result and Enter to open it.")
+            .role(gpui::Role::Dialog).aria_label(if command_mode { "Command palette" } else { "Quick open" }).aria_description("Search destinations, > commands, files: or favorites:. Use Up and Down to select and Enter to open. Star buttons manage SQL file favorites.")
             .a11y_synthetic_children({ let background = self.modal_is_background(&modal_focus); move |builder| { let node = builder.parent_node(); node.set_modal(); if background { node.set_hidden(); } } })
             .track_focus(&modal_focus)
             .occlude()
@@ -524,7 +581,7 @@ impl DbxApp {
                                         .p(crate::theme::ui_px(10.))
                                         .text_size(crate::theme::text_px(12.))
                                         .text_color(theme().text_muted)
-                                        .child("No matches"),
+                                        .child(empty_label.clone()),
                                 )
                             })
                             .child(crate::accessibility::announcement("quick-open-selected-result", selected_label, false))
@@ -569,6 +626,12 @@ impl DbxApp {
                                             .text_color(theme().text_muted)
                                             .child(item.detail),
                                     )
+                                    .when_some(match &item.target { Target::SqlFile(_, path, favorite) => Some((path.clone(), *favorite)), _ => None }, |row, (path, favorite)| {
+                                        row.child(button(SharedString::from(format!("sql-favorite-{index}")), if favorite { "★" } else { "☆" }, ButtonKind::Quiet)
+                                            .disabled(self.sql_library_favorite_pending)
+                                            .accessible_name(if favorite { "Remove SQL file favorite" } else { "Favorite SQL file" })
+                                            .on_click(cx.listener(move |this, _, _, cx| { cx.stop_propagation(); this.toggle_sql_file_favorite(path.clone(), cx); })))
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if let Some(open) = this.quick_open.as_mut() {
                                             open.selected = index;
@@ -614,7 +677,9 @@ mod tests {
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 for (name, _) in commands::palette_commands() {
-                    assert!(cx.build_action(name, None).is_ok(), "missing action {name}");
+                    if name.starts_with("dbx_ui::") {
+                        assert!(cx.build_action(name, None).is_ok(), "missing action {name}");
+                    }
                 }
                 app.open_command_palette_action(&OpenCommandPalette, window, cx);
                 assert!(
@@ -626,8 +691,10 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .query
-                    .update(cx, |editor, cx| editor.set_text(">new query", cx));
-                assert_eq!(app.quick_open_items(cx)[0].label, "New query");
+                    .update(cx, |editor, cx| editor.set_text(">choose theme", cx));
+                assert_eq!(app.quick_open_items(cx)[0].label, "Choose theme");
+                assert!(!app.palette_command_available("dbx_ui::RunQuery"));
+                assert!(!app.palette_command_available("dbx_ui::ExportQueryXlsx"));
                 app.open_quick_open_action(&OpenQuickOpen, window, cx);
                 assert_eq!(app.quick_open.as_ref().unwrap().query.read(cx).text(cx), "");
                 assert!(
@@ -635,6 +702,94 @@ mod tests {
                         .iter()
                         .all(|item| !matches!(item.target, Target::Command(_))),
                     "Cmd-P must remain destination mode (saved destinations may exist)"
+                );
+            })
+        });
+    }
+    #[gpui::test]
+    fn sql_files_are_searchable_destinations_and_commands_follow_active_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::*;
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            app.vault_state = Some(VaultState::Unlocked);
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                assert!(!app.palette_command_available("dbx_ui::OpenSqlFile"));
+                assert!(!app.palette_command_available("dbx_ui::ExplainQuery"));
+                assert!(app.palette_command_available("dbx_ui::ChooseTheme"));
+                let id = Uuid::new_v4();
+                let mut session = ConnectionSession::new(
+                    id,
+                    None,
+                    "SQL search".into(),
+                    DatabaseKind::SQLite,
+                    None,
+                    window,
+                    cx,
+                );
+                session.engine = Some(Arc::new(
+                    app.runtime
+                        .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                            DatabaseKind::SQLite,
+                            "sqlite::memory:",
+                        )))
+                        .unwrap(),
+                ));
+                app.sessions.push(session);
+                app.active_session_id = Some(id);
+                app.add_query_tab_for(id, window, cx);
+                assert!(app.palette_command_available("dbx_ui::RunQuery"));
+                assert!(app.palette_command_available("dbx_ui::OpenSqlFile"));
+                assert!(!app.palette_command_available("dbx_ui::ExportQueryCsv"));
+                app.active_query_tab_mut(id).unwrap().busy = true;
+                assert!(!app.palette_command_available("dbx_ui::RunQuery"));
+                app.active_query_tab_mut(id).unwrap().busy = false;
+                app.open_quick_open_action(&OpenQuickOpen, window, cx);
+                app.sql_library.cache_entries(Ok(vec![
+                    crate::query_library::SqlFileEntry {
+                        relative_path: "reports/count.sql".into(),
+                        favorite: true,
+                    },
+                    crate::query_library::SqlFileEntry {
+                        relative_path: "reports/audit.sql".into(),
+                        favorite: false,
+                    },
+                ]));
+                app.quick_open
+                    .as_ref()
+                    .unwrap()
+                    .query
+                    .update(cx, |editor, cx| editor.set_text("files:count", cx));
+                let entries = app.quick_open_items(cx);
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].label, "reports/count.sql");
+                assert!(matches!(entries[0].target, Target::SqlFile(_, _, true)));
+                app.quick_open
+                    .as_ref()
+                    .unwrap()
+                    .query
+                    .update(cx, |editor, cx| editor.set_text("favorites:", cx));
+                assert_eq!(app.quick_open_items(cx).len(), 1);
+                app.quick_open
+                    .as_ref()
+                    .unwrap()
+                    .query
+                    .update(cx, |editor, cx| editor.set_text("count", cx));
+                assert!(
+                    app.quick_open_items(cx)
+                        .iter()
+                        .any(|item| matches!(item.target, Target::SqlFile(_, _, _)))
                 );
             })
         });

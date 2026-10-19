@@ -16,6 +16,7 @@ pub(super) struct NonrelationalEditor {
     editor: Entity<TextEditor>,
     error: Option<String>,
     review: Option<String>,
+    review_summary: String,
     busy: bool,
     pub(super) focus: FocusHandle,
     return_focus: Option<FocusHandle>,
@@ -165,6 +166,7 @@ impl DbxApp {
                             editor,
                             error: None,
                             review: None,
+                            review_summary: String::new(),
                             busy: false,
                             focus: cx.focus_handle(),
                             return_focus,
@@ -219,6 +221,12 @@ impl DbxApp {
             });
         match validation {
             Ok(()) => {
+                let original = match &editor.source {
+                    EditSource::Mongo { original, .. } => original,
+                    EditSource::Redis(snapshot) => &snapshot.document,
+                };
+                let document: Value = serde_json::from_str(&text).expect("validated JSON");
+                editor.review_summary = describe_changes(original, &document);
                 editor.review = Some(text);
                 editor.error = None;
             }
@@ -324,11 +332,33 @@ impl DbxApp {
         let busy = editor.busy;
         let review = editor.review.clone();
         let error = editor.error.clone();
-        let title = match &editor.source {
-            EditSource::Mongo { .. } => "Edit MongoDB document",
-            EditSource::Redis(_) => "Edit Redis value",
+        let (title, detail) = match &editor.source {
+            EditSource::Mongo {
+                collection,
+                original,
+            } => (
+                format!("Edit {} in {}", short_json(&original["_id"]), collection),
+                "Review the document replacement before applying. _id cannot change. Concurrent changes require a reload.",
+            ),
+            EditSource::Redis(snapshot) if snapshot.document["type"] == "stream" => (
+                format!("Edit stream {}", snapshot.key),
+                "Review stream operations before applying. The first 1,000 entries are read-only. Add [field,value] pairs to append, or entry IDs to delete. TTL is preserved; concurrent changes require a reload.",
+            ),
+            EditSource::Redis(snapshot) => (
+                format!("Edit key {}", snapshot.key),
+                "Review the value replacement before applying. TTL is preserved; empty collections remove the key. Concurrent changes require a reload.",
+            ),
         };
-        let detail = "Review changes before applying. MongoDB _id is immutable. Redis values keep their TTL; empty collections remove the key. Streams show the first 1,000 entries; entries are read-only: add [field,value] pairs to append, or entry IDs to delete. Concurrent changes require a reload.";
+        let environment = self
+            .session(editor.session_id)
+            .and_then(|session| session.tag.as_ref())
+            .map(|tag| {
+                if tag.is_production() {
+                    format!("Production · {}", tag.name)
+                } else {
+                    tag.name.clone()
+                }
+            });
         let background = self.modal_is_background(&focus);
         deferred(
             div()
@@ -349,7 +379,10 @@ impl DbxApp {
                         .flex()
                         .flex_col()
                         .gap(crate::theme::ui_px(12.))
-                        .child(title)
+                        .child(div().text_ellipsis().child(title.clone()))
+                        .when_some(environment, |view, label| {
+                            view.child(div().font_weight(gpui::FontWeight::MEDIUM).child(label))
+                        })
                         .child(
                             div()
                                 .text_color(theme().text_muted)
@@ -363,6 +396,20 @@ impl DbxApp {
                                         .id("nonrelational-review")
                                         .h(crate::theme::ui_px(360.))
                                         .overflow_y_scroll()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(crate::theme::ui_px(12.))
+                                        .font_family(
+                                            gpui_component::Theme::global(cx)
+                                                .mono_font_family
+                                                .clone(),
+                                        )
+                                        .child(editor.review_summary.clone())
+                                        .child(
+                                            div()
+                                                .text_color(theme().text_muted)
+                                                .child("Complete reviewed document"),
+                                        )
                                         .child(text),
                                 )
                             } else {
@@ -439,5 +486,127 @@ impl DbxApp {
         )
         .with_priority(44)
         .into_any_element()
+    }
+}
+
+/// A bounded summary accompanies the complete reviewed JSON; omission is explicit.
+fn short_json(value: &impl serde::Serialize) -> String {
+    struct Preview(Vec<u8>);
+    impl std::io::Write for Preview {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let length = bytes.len().min(1024 - self.0.len());
+            self.0.extend_from_slice(&bytes[..length]);
+            if length < bytes.len() {
+                return Err(std::io::Error::other("preview limit"));
+            }
+            Ok(length)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Serialize into a bounded sink instead of allocating an entire large value.
+    let mut output = Preview(Vec::new());
+    let limited = serde_json::to_writer(&mut output, value).is_err();
+    let valid = std::str::from_utf8(&output.0).map_or_else(|error| error.valid_up_to(), str::len);
+    let text = std::str::from_utf8(&output.0[..valid]).expect("valid prefix");
+    let mut chars = text.chars();
+    let preview = chars.by_ref().take(240).collect::<String>();
+    if limited || chars.next().is_some() {
+        format!("{preview}… [truncated]")
+    } else {
+        preview
+    }
+}
+fn describe_changes(original: &Value, edited: &Value) -> String {
+    let (Some(before), Some(after)) = (original.as_object(), edited.as_object()) else {
+        return if original == edited {
+            "No changes.".into()
+        } else {
+            format!(
+                "Changed value\nBefore: {}\nAfter: {}",
+                short_json(original),
+                short_json(edited)
+            )
+        };
+    };
+    let mut count = 0;
+    let mut changes = Vec::new();
+    for (key, old) in before {
+        let new = after.get(key);
+        if new == Some(old) {
+            continue;
+        }
+        count += 1;
+        if changes.len() < 200 {
+            changes.push(match new {
+                Some(new) => format!(
+                    "Changed {}\nBefore: {}\nAfter: {}",
+                    short_json(key),
+                    short_json(old),
+                    short_json(new)
+                ),
+                None => format!("Removed {}\nBefore: {}", short_json(key), short_json(old)),
+            });
+        }
+    }
+    for (key, new) in after {
+        if before.contains_key(key) {
+            continue;
+        }
+        count += 1;
+        if changes.len() < 200 {
+            changes.push(format!(
+                "Added {}\nAfter: {}",
+                short_json(key),
+                short_json(new)
+            ));
+        }
+    }
+    if count == 0 {
+        return "No changes.".into();
+    }
+    let mut summary = changes.join("\n\n");
+    if count > 200 {
+        summary.push_str(&format!(
+            "\n\n{} more changed fields. Inspect the complete document below.",
+            count - 200
+        ));
+    }
+    summary
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[test]
+    fn review_distinguishes_removed_null_added_and_nested_changes() {
+        let before = json!({"_id": 7, "removed": null, "nested": {"x": 1}});
+        let after = json!({"_id": 7, "added": null, "nested": {"x": 2}});
+        let summary = describe_changes(&before, &after);
+        assert!(summary.contains("Removed \"removed\"\nBefore: null"));
+        assert!(summary.contains("Added \"added\"\nAfter: null"));
+        assert!(summary.contains("Changed \"nested\""));
+        assert!(!summary.contains("_id"));
+        assert_eq!(describe_changes(&before, &before), "No changes.");
+    }
+    #[test]
+    fn large_reviews_bound_names_values_and_number_of_formatted_fields() {
+        let after = (0..205)
+            .map(|index| {
+                (
+                    format!("{index:03}{}", "x".repeat(1000)),
+                    json!("y".repeat(5000)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let summary = describe_changes(&json!({}), &Value::Object(after));
+        assert!(summary.contains("5 more changed fields"));
+        assert!(summary.len() < 110_000);
+        assert!(summary.contains("[truncated]"));
+    }
+    #[test]
+    fn preview_truncates_unicode_without_breaking_codepoints() {
+        assert!(short_json(&json!("é".repeat(300))).ends_with("… [truncated]"));
     }
 }

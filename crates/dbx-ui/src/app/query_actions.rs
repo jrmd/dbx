@@ -307,6 +307,7 @@ impl DbxApp {
         // stays behind so failures can locate the offending token in it.
         let executed_query = query.clone();
         let analyzing = std::mem::take(&mut query_tab.plan_analyze_pending);
+        let statistics_columns = query_tab.full_table_statistics_pending.take();
         let in_transaction = query_tab.in_transaction;
         let analyze_engine = engine.clone();
         let console = query_tab
@@ -337,6 +338,12 @@ impl DbxApp {
                     )
                     .await
                 };
+                let result = result.and_then(|result| match &statistics_columns {
+                    Some(columns) => {
+                        dbx_core::format_table_column_statistics(kind, columns, &result)
+                    }
+                    None => Ok(result),
+                });
                 result.map(|result| dbx_core::ScriptResult {
                     statements: vec![StatementResult {
                         statement: executed_query,

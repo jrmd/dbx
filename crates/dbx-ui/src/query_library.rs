@@ -6,7 +6,6 @@ use std::{
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
 };
 
 const MAX_QUERY_BYTES: u64 = 4 * 1024 * 1024;
@@ -24,7 +23,7 @@ impl SqlFileEntry {
     }
 }
 
-type CachedEntries = Option<(Instant, Result<Vec<SqlFileEntry>, String>)>;
+type CachedEntries = Option<Result<Vec<SqlFileEntry>, String>>;
 
 #[derive(Clone)]
 pub struct SqlLibrary {
@@ -39,11 +38,15 @@ struct Preferences {
 
 impl Default for SqlLibrary {
     fn default() -> Self {
-        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-        let preferences = base.join("dbx/sql-library.json");
-        let default_root = dirs::document_dir()
-            .unwrap_or_else(|| base.clone())
-            .join("DBX/queries");
+        let base = crate::config::directory().unwrap_or_else(|| PathBuf::from("."));
+        let preferences = base.join("sql-library.json");
+        let default_root = crate::config::override_directory()
+            .map(|path| path.join("queries"))
+            .unwrap_or_else(|| {
+                dirs::document_dir()
+                    .map(|path| path.join("DBX/queries"))
+                    .unwrap_or_else(|| base.join("queries"))
+            });
         let root = read_bounded(&preferences, 64 * 1024)
             .ok()
             .filter(|bytes| bytes.len() < 64 * 1024)
@@ -59,6 +62,14 @@ impl Default for SqlLibrary {
 }
 
 impl SqlLibrary {
+    #[cfg(test)]
+    pub fn at(root: PathBuf) -> Self {
+        Self {
+            preferences: root.join(".test-library-preferences.json"),
+            root,
+            cache: Default::default(),
+        }
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -95,15 +106,22 @@ impl SqlLibrary {
     pub fn invalidate(&self) {
         *self.cache.borrow_mut() = None;
     }
+    /// Render-safe snapshot. Filesystem access belongs in a background refresh.
+    pub fn cached_entries(&self) -> Result<Vec<SqlFileEntry>, String> {
+        self.cache
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| Ok(Vec::new()))
+    }
+    pub fn needs_refresh(&self) -> bool {
+        self.cache.borrow().is_none()
+    }
+    pub fn cache_entries(&self, entries: Result<Vec<SqlFileEntry>, String>) {
+        *self.cache.borrow_mut() = Some(entries);
+    }
+    /// Explicit scan; callers in the application run this on a worker thread.
     pub fn entries(&self) -> Result<Vec<SqlFileEntry>, String> {
-        if let Some((at, entries)) = self.cache.borrow().as_ref()
-            && at.elapsed() < Duration::from_secs(2)
-        {
-            return entries.clone();
-        }
-        let entries = self.scan();
-        *self.cache.borrow_mut() = Some((Instant::now(), entries.clone()));
-        entries
+        self.scan()
     }
     fn scan(&self) -> Result<Vec<SqlFileEntry>, String> {
         if !self.root.exists() {
@@ -306,6 +324,25 @@ mod tests {
             .unwrap();
         assert!(!reload.entries().unwrap()[0].favorite);
         assert!(reload.read(Path::new("../elsewhere.sql")).is_err());
+    }
+    #[test]
+    fn rendering_reads_only_the_last_background_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = SqlLibrary {
+            root: directory.path().join("does-not-exist"),
+            preferences: directory.path().join("prefs.json"),
+            cache: Default::default(),
+        };
+        assert!(library.needs_refresh());
+        library.cache_entries(Ok(vec![SqlFileEntry {
+            relative_path: "saved.sql".into(),
+            favorite: true,
+        }]));
+        assert_eq!(library.cached_entries().unwrap()[0].label(), "saved.sql");
+        assert!(!library.needs_refresh());
+        library.invalidate();
+        assert!(library.cached_entries().unwrap().is_empty());
+        assert!(library.needs_refresh());
     }
     #[cfg(unix)]
     #[test]

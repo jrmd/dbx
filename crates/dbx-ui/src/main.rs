@@ -3,6 +3,7 @@ mod agents;
 mod app;
 mod assets;
 mod binary_values;
+mod config;
 mod connection_fields;
 mod device_unlock;
 mod diagram;
@@ -80,6 +81,7 @@ fn app_menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New Connection", app::NewConnection),
                 MenuItem::action("New Query", app::NewQuery),
+                MenuItem::action("Open SQL File…", app::OpenSqlFile),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", app::CloseTab),
             ],
@@ -229,6 +231,8 @@ fn main() {
             KeyBinding::new("ctrl-,", app::OpenSettings, None),
             KeyBinding::new("cmd-alt-,", app::OpenKeyboardShortcuts, None),
             KeyBinding::new("ctrl-alt-,", app::OpenKeyboardShortcuts, None),
+            KeyBinding::new("cmd-o", app::OpenSqlFile, None),
+            KeyBinding::new("ctrl-o", app::OpenSqlFile, None),
             KeyBinding::new("cmd-p", app::OpenQuickOpen, None),
             KeyBinding::new("ctrl-p", app::OpenQuickOpen, None),
             KeyBinding::new("cmd-enter", app::RunQuery, Some(editor::SQL_EDITOR_CONTEXT)),
@@ -364,7 +368,11 @@ fn main() {
         cx.set_menus(app_menus());
         let main_window = cx
             .open_window(dbx_window_options(), |window, cx| {
-                window.set_window_title(APP_NAME);
+                window.set_window_title(if config::override_directory().is_some() {
+                    "DBX — isolated profile"
+                } else {
+                    APP_NAME
+                });
                 let app = cx.new(|cx| DbxApp::new(window, cx));
                 let closing = app.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {

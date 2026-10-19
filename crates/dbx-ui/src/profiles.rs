@@ -1182,9 +1182,8 @@ pub(crate) fn sqlite_url(path: &Path) -> String {
 }
 
 fn default_profile_path() -> ProfileResult<PathBuf> {
-    Ok(dirs::config_dir()
+    Ok(crate::config::directory()
         .ok_or(ProfileError::ConfigDirectoryUnavailable)?
-        .join("dbx")
         .join(PROFILE_FILE_NAME))
 }
 

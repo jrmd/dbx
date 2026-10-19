@@ -27,7 +27,7 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml = "0.9"
-rust_xlsxwriter = "0.100"
+rust_xlsxwriter = { version = "0.100", features = ["constant_memory"] }
 secrecy.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

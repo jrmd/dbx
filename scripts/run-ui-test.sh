@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
-# Linux desktop QA with a persistent, isolated vault and disposable databases.
+# Native desktop QA with a persistent, isolated vault and disposable databases.
 set -Eeuo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 project_root=$(cd -- "$script_dir/.." && pwd)
-if [[ $(uname -s) != Linux ]]; then
-  echo "This launcher uses Linux XDG config isolation." >&2
-  exit 1
-fi
 qa_dir="$project_root/target/ui-test"
 umask 077
 mkdir -p "$qa_dir/config/dbx" "$qa_dir/artifacts"
@@ -19,4 +15,4 @@ fi
 echo "QA state: $qa_dir"
 echo "Use a disposable vault passphrase; never save real connections here."
 cd "$qa_dir"
-exec env XDG_CONFIG_HOME="$qa_dir/config" "$project_root/target/debug/dbx" "$@"
+exec env DBX_CONFIG_DIR="$qa_dir/config/dbx" DBX_DISABLE_UPDATES=1 "$project_root/target/debug/dbx" "$@"

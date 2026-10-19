@@ -52,22 +52,153 @@ pub fn execution_plan_query(kind: DatabaseKind, sql: &str) -> Result<String> {
     Ok(format!("{prefix} {}", statements[0]))
 }
 
-/// ANALYZE executes a query. Only PostgreSQL's isolated read-only transaction
-/// path is supported; callers must use QuerySession::explain_analyze.
+/// ANALYZE executes a query; callers must use QuerySession::explain_analyze
+/// to enforce an isolated read-only transaction. Unsupported server versions
+/// reject the command; DBX never retries with a writing transaction.
 pub fn execution_plan_analyze_query(kind: DatabaseKind, sql: &str) -> Result<String> {
-    if kind != DatabaseKind::PostgreSQL {
-        return Err(DbxError::Unsupported {
-            operation: "isolated read-only EXPLAIN ANALYZE".into(),
-            kind,
-        });
-    }
     let plain = execution_plan_query(kind, sql)?;
-    let sql = plain
-        .strip_prefix("EXPLAIN (FORMAT JSON) ")
-        .expect("PostgreSQL plan prefix");
-    Ok(format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}"))
+    let (prefix, analyze) = match kind {
+        DatabaseKind::PostgreSQL => (
+            "EXPLAIN (FORMAT JSON) ",
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)",
+        ),
+        DatabaseKind::MySQL => ("EXPLAIN FORMAT=JSON ", "EXPLAIN ANALYZE FORMAT=TREE"),
+        DatabaseKind::CockroachDB => ("EXPLAIN ", "EXPLAIN ANALYZE (PLAN)"),
+        _ => {
+            return Err(DbxError::Unsupported {
+                operation: "isolated read-only EXPLAIN ANALYZE".into(),
+                kind,
+            });
+        }
+    };
+    Ok(format!(
+        "{analyze} {}",
+        plain.strip_prefix(prefix).expect("matching plan prefix")
+    ))
 }
+fn plan_columns() -> Vec<ColumnInfo> {
+    [
+        "Depth",
+        "Operation",
+        "Estimated rows",
+        "Estimated cost",
+        "Actual rows",
+        "Actual time (ms)",
+        "Actual loops",
+        "Detail",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, name)| ColumnInfo::result(name, ordinal, "TEXT"))
+    .collect()
+}
+
+/// Native text plans retain the original node and attributes in Detail. Only
+/// explicitly named metrics are normalized; missing measurements stay blank.
+fn format_native_plan(kind: DatabaseKind, result: &QueryResult) -> Option<QueryResult> {
+    if !matches!(kind, DatabaseKind::MySQL | DatabaseKind::CockroachDB) {
+        return None;
+    }
+    let mut output = QueryResult::empty(None, result.elapsed_ms);
+    output.columns = plan_columns();
+    let mut indent_stack = Vec::new();
+    let mut preamble = Vec::new();
+    let metric = |text: &str, key: &str| -> CellValue {
+        text.split_once(key)
+            .and_then(|(_, tail)| tail.split([' ', ')']).next())
+            .filter(|value| !value.is_empty())
+            .map(|value| CellValue::Text(value.into()))
+            .unwrap_or_default()
+    };
+    for line in result
+        .rows
+        .iter()
+        .filter_map(|row| row.values.first())
+        .filter_map(|value| match value {
+            CellValue::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .flat_map(str::lines)
+    {
+        let marker = if kind == DatabaseKind::MySQL {
+            line.find("-> ").map(|index| (index, 3))
+        } else {
+            line.find('•').map(|index| (index, '•'.len_utf8()))
+        };
+        let marker = marker.filter(|(index, _)| {
+            line[..*index].chars().all(|ch| {
+                ch.is_whitespace()
+                    || (kind == DatabaseKind::CockroachDB && matches!(ch, '│' | '├' | '└' | '─'))
+            })
+        });
+        if let Some((indent, marker_length)) = marker {
+            while indent_stack
+                .last()
+                .is_some_and(|previous| *previous >= indent)
+            {
+                indent_stack.pop();
+            }
+            let depth = indent_stack.len();
+            indent_stack.push(indent);
+            let node = line[indent + marker_length..].trim();
+            let operation = node
+                .split_once("  (")
+                .map_or(node, |(operation, _)| operation);
+            let actual = node.split_once("(actual ").map(|(_, actual)| actual);
+            let elapsed = actual
+                .map(|actual| metric(actual, "time="))
+                .map(|value| match value {
+                    CellValue::Text(text) => {
+                        CellValue::Text(text.rsplit("..").next().unwrap_or_default().into())
+                    }
+                    value => value,
+                })
+                .unwrap_or_default();
+            output.rows.push(RowData::new(vec![
+                CellValue::Integer(depth as i64),
+                CellValue::Text(operation.into()),
+                metric(node.split("(actual ").next().unwrap_or_default(), "rows="),
+                metric(node, "cost="),
+                actual
+                    .map(|actual| metric(actual, "rows="))
+                    .unwrap_or_default(),
+                elapsed,
+                actual
+                    .map(|actual| metric(actual, "loops="))
+                    .unwrap_or_default(),
+                CellValue::Text(node.into()),
+            ]));
+        } else if kind == DatabaseKind::CockroachDB {
+            let detail = line.trim();
+            if let Some(row) = output.rows.last_mut() {
+                if let CellValue::Text(text) = &mut row.values[7] {
+                    text.push('\n');
+                    text.push_str(detail);
+                }
+                if let Some(count) = detail.strip_prefix("actual row count: ") {
+                    row.values[4] = CellValue::Text(count.into());
+                }
+                if let Some(count) = detail.strip_prefix("estimated row count: ") {
+                    row.values[2] = CellValue::Text(count.into());
+                }
+            } else if !detail.is_empty() {
+                preamble.push(detail.to_string());
+            }
+        }
+    }
+    if let Some(row) = output.rows.first_mut()
+        && !preamble.is_empty()
+        && let CellValue::Text(detail) = &mut row.values[7]
+    {
+        *detail = format!("{}\n{detail}", preamble.join("\n"));
+    }
+    (!output.rows.is_empty()).then_some(output)
+}
+
 pub fn format_execution_plan(kind: DatabaseKind, result: &QueryResult) -> QueryResult {
+    if let Some(plan) = format_native_plan(kind, result) {
+        return plan;
+    }
     if !matches!(kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL) {
         return result.clone();
     }
@@ -83,20 +214,7 @@ pub fn format_execution_plan(kind: DatabaseKind, result: &QueryResult) -> QueryR
         return result.clone();
     };
     let mut output = QueryResult::empty(None, result.elapsed_ms);
-    output.columns = [
-        "Depth",
-        "Operation",
-        "Estimated rows",
-        "Estimated cost",
-        "Actual rows",
-        "Actual time (ms)",
-        "Actual loops",
-        "Detail",
-    ]
-    .iter()
-    .enumerate()
-    .map(|(ordinal, name)| ColumnInfo::result(*name, ordinal, "TEXT"))
-    .collect();
+    output.columns = plan_columns();
     fn walk(value: &serde_json::Value, depth: usize, rows: &mut Vec<RowData>) {
         match value {
             serde_json::Value::Object(object) => {
@@ -133,14 +251,17 @@ pub fn format_execution_plan(kind: DatabaseKind, result: &QueryResult) -> QueryR
                             .unwrap_or_default(),
                         object
                             .get("Actual Rows")
+                            .or_else(|| object.get("r_rows"))
                             .map(|value| CellValue::Text(value.to_string()))
                             .unwrap_or_default(),
                         object
                             .get("Actual Total Time")
+                            .or_else(|| object.get("r_table_time_ms"))
                             .map(|value| CellValue::Text(value.to_string()))
                             .unwrap_or_default(),
                         object
                             .get("Actual Loops")
+                            .or_else(|| object.get("r_loops"))
                             .map(|value| CellValue::Text(value.to_string()))
                             .unwrap_or_default(),
                         CellValue::Text(detail),
@@ -202,6 +323,179 @@ pub fn compare_execution_plans(before: &QueryResult, after: &QueryResult) -> Que
         ]));
     }
     result
+}
+
+/// Full-table server aggregates. Native comparisons retain the source type;
+/// decimal/integer extrema are never converted through floating point.
+/// The generated query deliberately has no page/filter limit.
+pub fn table_column_statistics_query(
+    kind: DatabaseKind,
+    table: &TableRef,
+    columns: &[ColumnInfo],
+) -> Result<String> {
+    if !matches!(
+        kind,
+        DatabaseKind::PostgreSQL
+            | DatabaseKind::MySQL
+            | DatabaseKind::SQLite
+            | DatabaseKind::CockroachDB
+    ) {
+        return Err(DbxError::Unsupported {
+            operation: "full-table column statistics".into(),
+            kind,
+        });
+    }
+    if columns.is_empty() {
+        return Err(DbxError::Parse("Table has no columns to summarize".into()));
+    }
+    let mut expressions = vec!["COUNT(*) AS dbx_rows".to_string()];
+    for (index, column) in columns.iter().enumerate() {
+        let name = quote_identifier(kind, &column.name)?;
+        let (distinct, range) = statistics_operators(kind, &column.data_type);
+        expressions.push(format!("COUNT(*) - COUNT({name}) AS dbx_nulls_{index}"));
+        expressions.push(format!(
+            "{} AS dbx_distinct_{index}",
+            if distinct {
+                format!("COUNT(DISTINCT {name})")
+            } else {
+                "NULL".into()
+            }
+        ));
+        for operator in ["MIN", "MAX"] {
+            expressions.push(format!(
+                "{} AS dbx_{}_{index}",
+                if range {
+                    format!("{operator}({name})")
+                } else {
+                    "NULL".into()
+                },
+                operator.to_ascii_lowercase()
+            ));
+        }
+    }
+    Ok(format!(
+        "SELECT\n  {}\nFROM {}",
+        expressions.join(",\n  "),
+        quote_table(kind, table)?
+    ))
+}
+
+fn statistics_operators(kind: DatabaseKind, data_type: &str) -> (bool, bool) {
+    let data_type = data_type.trim().to_ascii_lowercase();
+    if data_type.contains('[')
+        || data_type.contains("json")
+        || data_type.contains("blob")
+        || data_type == "bytea"
+    {
+        return (false, false);
+    }
+    if kind == DatabaseKind::SQLite {
+        // SQLite defines comparison order for all its native storage classes.
+        return (true, true);
+    }
+    let base = data_type.split(['(', ' ']).next().unwrap_or_default();
+    let range = matches!(
+        base,
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "numeric"
+            | "decimal"
+            | "dec"
+            | "real"
+            | "float"
+            | "float4"
+            | "float8"
+            | "double"
+            | "text"
+            | "varchar"
+            | "character"
+            | "char"
+            | "bpchar"
+            | "string"
+            | "date"
+            | "datetime"
+            | "timestamp"
+            | "timestamptz"
+            | "time"
+            | "timetz"
+            | "interval"
+            | "year"
+    );
+    (
+        range || matches!(base, "bool" | "boolean" | "uuid" | "bit"),
+        range,
+    )
+}
+
+pub fn format_table_column_statistics(
+    kind: DatabaseKind,
+    columns: &[ColumnInfo],
+    raw: &QueryResult,
+) -> Result<QueryResult> {
+    let values = raw
+        .rows
+        .first()
+        .map(|row| &row.values)
+        .filter(|values| values.len() == 1 + 4 * columns.len())
+        .ok_or_else(|| {
+            DbxError::Query("Full-table aggregate returned an unexpected result shape".into())
+        })?;
+    let mut output = QueryResult::empty(None, raw.elapsed_ms);
+    output.columns = [
+        "Column",
+        "Source type",
+        "Full table rows",
+        "Nulls",
+        "Distinct non-null (server)",
+        "Minimum (source type)",
+        "Maximum (source type)",
+        "Scope / support",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, name)| {
+        ColumnInfo::result(
+            name,
+            index,
+            if (2..=4).contains(&index) {
+                "INTEGER"
+            } else {
+                "TEXT"
+            },
+        )
+    })
+    .collect();
+    for (index, column) in columns.iter().enumerate() {
+        let offset = 1 + 4 * index;
+        let (distinct, range) = statistics_operators(kind, &column.data_type);
+        output.rows.push(RowData::new(vec![
+            CellValue::Text(column.name.clone()),
+            CellValue::Text(column.data_type.clone()),
+            values[0].clone(),
+            values[offset].clone(),
+            values[offset + 1].clone(),
+            values[offset + 2].clone(),
+            values[offset + 3].clone(),
+            CellValue::Text(
+                if !distinct {
+                    "Full table · distinct/min/max unsupported for this type"
+                } else if !range {
+                    "Full table · min/max unsupported for this type"
+                } else {
+                    "Full table · server comparison and collation"
+                }
+                .into(),
+            ),
+        ]));
+    }
+    Ok(output)
 }
 
 /// Statistics over the supplied client result only, never an implicit query
@@ -752,8 +1046,67 @@ mod tests {
     }
 
     #[test]
-    fn analyze_requires_postgres_and_one_read_statement() {
-        assert!(execution_plan_analyze_query(DatabaseKind::MySQL, "SELECT 1").is_err());
+    fn native_analyze_trees_preserve_hierarchy_and_only_report_measured_metrics() {
+        let mut raw = QueryResult::empty(None, 8);
+        raw.columns = vec![ColumnInfo::result("EXPLAIN", 0, "TEXT")];
+        raw.rows = vec![RowData::new(vec![CellValue::Text("-> Filter: (x > 0)  (cost=0.35 rows=2) (actual time=0.01..0.03 rows=1 loops=1)\n    -> Table scan on t  (cost=0.35 rows=2) (actual time=0.01..0.02 rows=2 loops=1)".into())])];
+        let plan = format_execution_plan(DatabaseKind::MySQL, &raw);
+        assert_eq!(plan.rows[1].values[0], CellValue::Integer(1));
+        assert_eq!(
+            plan.rows[0].values[1],
+            CellValue::Text("Filter: (x > 0)".into())
+        );
+        assert_eq!(plan.rows[0].values[4], CellValue::Text("1".into()));
+        assert_eq!(plan.rows[0].values[5], CellValue::Text("0.03".into()));
+        raw.rows = [
+            "planning time: 12µs",
+            "• render",
+            "  actual row count: 2",
+            "  • scan",
+            "    estimated row count: 3",
+            "    table: t",
+        ]
+        .into_iter()
+        .map(|line| RowData::new(vec![CellValue::Text(line.into())]))
+        .collect();
+        let plan = format_execution_plan(DatabaseKind::CockroachDB, &raw);
+        assert_eq!(plan.rows.len(), 2);
+        assert_eq!(plan.rows[1].values[0], CellValue::Integer(1));
+        assert_eq!(plan.rows[0].values[4], CellValue::Text("2".into()));
+        assert_eq!(plan.rows[1].values[2], CellValue::Text("3".into()));
+        assert_eq!(plan.rows[0].values[5], CellValue::Null);
+        assert!(plan.rows[0].values[7].to_string().contains("planning time"));
+    }
+
+    #[test]
+    fn table_statistics_quote_identifiers_and_skip_unsupported_operators() {
+        let columns = vec![
+            ColumnInfo::result("a\"b", 0, "NUMERIC(40,12)"),
+            ColumnInfo::result("doc", 1, "JSONB"),
+            ColumnInfo::result("flag", 2, "BOOLEAN"),
+        ];
+        let sql = table_column_statistics_query(
+            DatabaseKind::PostgreSQL,
+            &TableRef::in_schema("public", "a.b"),
+            &columns,
+        )
+        .unwrap();
+        assert!(sql.contains("MIN(\"a\"\"b\")"));
+        assert!(sql.contains("FROM \"public\".\"a.b\""));
+        assert!(!sql.contains("MIN(\"doc\")"));
+        assert!(!sql.contains("COUNT(DISTINCT \"doc\")"));
+        assert!(sql.contains("COUNT(DISTINCT \"flag\")"));
+        assert!(!sql.contains("MIN(\"flag\")"));
+        assert!(!sql.contains("LIMIT"));
+    }
+
+    #[test]
+    fn analyze_requires_supported_engine_and_one_read_statement() {
+        assert!(execution_plan_analyze_query(DatabaseKind::SQLite, "SELECT 1").is_err());
+        assert_eq!(
+            execution_plan_analyze_query(DatabaseKind::MySQL, "SELECT 1").unwrap(),
+            "EXPLAIN ANALYZE FORMAT=TREE SELECT 1"
+        );
         assert!(execution_plan_analyze_query(DatabaseKind::PostgreSQL, "DELETE FROM t").is_err());
         assert!(
             execution_plan_analyze_query(DatabaseKind::PostgreSQL, "SELECT 1; COMMIT").is_err()

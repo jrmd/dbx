@@ -838,7 +838,11 @@ mod tests {
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let dark = cx.debug_bounds("settings-appearance-Dark").unwrap();
+        let light = cx.debug_bounds("settings-appearance-Light").unwrap();
         cx.simulate_click(dark.center(), Default::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(cx.debug_bounds("settings-appearance-Dark").unwrap(), dark);
+        assert_eq!(cx.debug_bounds("settings-appearance-Light").unwrap(), light);
         app.read_with(cx, |app, cx| {
             assert_eq!(app.appearance, Appearance::Dark);
             assert!(crate::theme::is_dark());
