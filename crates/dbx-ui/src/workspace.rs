@@ -69,6 +69,9 @@ impl SavedChangeset {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct TableLayout {
     #[serde(default)]
+    pub(crate) binary_formats:
+        std::collections::BTreeMap<String, crate::binary_values::BinaryFormat>,
+    #[serde(default)]
     pub widths: std::collections::BTreeMap<String, f32>,
     #[serde(default)]
     pub hidden: std::collections::BTreeSet<String>,

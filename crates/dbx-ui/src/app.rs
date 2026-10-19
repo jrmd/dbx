@@ -39,7 +39,7 @@ mod row_count;
 mod sql_completion;
 mod table_layout;
 mod transfer;
-mod value_view;
+pub(crate) mod value_view;
 mod view;
 mod workspace;
 
@@ -3853,7 +3853,7 @@ impl DbxApp {
                     None => return,
                 },
             };
-            let field = match staged.get(index).cloned().flatten() {
+            let mut field = match staged.get(index).cloned().flatten() {
                 Some(MutationValue::Parameter(CellValue::Null)) => FieldRow::with_state(
                     column,
                     original,
@@ -3886,6 +3886,45 @@ impl DbxApp {
                     None => FieldRow::new_insert(column, None, window, cx),
                 },
             };
+            if crate::row_drafts::field_value_kind(&field.column)
+                == crate::row_drafts::FieldValueKind::Bytes
+            {
+                let mut format = self
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .data_grid
+                    .read(cx)
+                    .delegate()
+                    .binary_format(index);
+                let value = staged
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .and_then(|value| {
+                        if let MutationValue::Parameter(value) = value {
+                            Some(value)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| field.original.clone());
+                if matches!(&value, Some(CellValue::Bytes(bytes)) if bytes.len() != 16)
+                    && matches!(
+                        format,
+                        value_view::BinaryFormat::Uuid | value_view::BinaryFormat::UuidSwapped
+                    )
+                {
+                    format = value_view::BinaryFormat::Hex;
+                }
+                if field.state == FieldValueState::Value {
+                    if let Some(value @ CellValue::Bytes(_)) = value {
+                        field.editor.update(cx, |editor, cx| {
+                            editor.set_text(format.editor_text(&value), cx)
+                        });
+                    }
+                }
+                field.binary_format = Some(format);
+            }
             draft.push(field);
         }
         self.watch_draft_fields_for(session_id, tab_id, &draft, window, cx);

@@ -3,6 +3,8 @@
 use super::*;
 use gpui_component::InteractiveElementExt as _;
 
+pub(crate) use crate::binary_values::BinaryFormat;
+
 /// Large values are summarized; the inspector is not a hex editor.
 const HEX_PREVIEW_BYTES: usize = 512;
 const IMAGE_PREVIEW_BYTES: usize = 4 * 1024 * 1024;
@@ -89,7 +91,7 @@ pub(super) fn json_text(text: SharedString) -> gpui::StyledText {
     gpui::StyledText::new(text).with_highlights(highlights)
 }
 
-fn monospace_block(text: String, json: bool, cx: &App) -> impl IntoElement {
+pub(super) fn monospace_block(text: String, json: bool, cx: &App) -> impl IntoElement {
     use gpui_component::ActiveTheme;
 
     div()
@@ -204,6 +206,61 @@ pub(super) fn value_clipboard_text(value: &CellValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_formats_round_trip_and_validate_without_swapping_implicitly() {
+        let uuid = "6ccd780c-baba-1026-9564-5b8c656024db";
+        let standard = BinaryFormat::Uuid.parse(uuid).unwrap();
+        let swapped = BinaryFormat::UuidSwapped.parse(uuid).unwrap();
+        assert_eq!(standard.to_string(), "0x6ccd780cbaba102695645b8c656024db");
+        assert_eq!(swapped.to_string(), "0x1026baba6ccd780c95645b8c656024db");
+        assert_eq!(BinaryFormat::Uuid.text(&standard), uuid);
+        assert_eq!(BinaryFormat::UuidSwapped.text(&swapped), uuid);
+        assert_ne!(BinaryFormat::Uuid.text(&swapped), uuid);
+        for format in [
+            BinaryFormat::Hex,
+            BinaryFormat::Uuid,
+            BinaryFormat::UuidSwapped,
+        ] {
+            assert_eq!(
+                format.parse(&format.editor_text(&standard)).unwrap(),
+                standard
+            );
+        }
+        assert!(BinaryFormat::Uuid.parse("").is_err());
+        assert!(BinaryFormat::Uuid.parse("not-a-uuid").is_err());
+        assert!(
+            BinaryFormat::Uuid
+                .text(&CellValue::Bytes(vec![0; 15]))
+                .contains("requires 16 bytes")
+        );
+        assert_eq!(
+            BinaryFormat::Hex.parse("0X00 ff\n80").unwrap(),
+            CellValue::Bytes(vec![0, 255, 128])
+        );
+        assert_eq!(
+            BinaryFormat::Hex.parse("").unwrap(),
+            CellValue::Bytes(vec![])
+        );
+        assert!(BinaryFormat::Hex.parse("abc").is_err());
+        assert!(BinaryFormat::Hex.parse("zz").is_err());
+        assert!(BinaryFormat::Hex.parse("+f").is_err());
+        assert!(BinaryFormat::Hex.parse("é").is_err());
+        let bytes = CellValue::Bytes(vec![0, 255, 128]);
+        assert_eq!(
+            BinaryFormat::Binary.text(&bytes),
+            "00000000 11111111 10000000"
+        );
+        assert_eq!(
+            BinaryFormat::Binary
+                .parse(&BinaryFormat::Binary.text(&bytes))
+                .unwrap(),
+            bytes
+        );
+        assert!(BinaryFormat::Binary.parse("101").is_err());
+        assert!(BinaryFormat::Binary.parse("00000002").is_err());
+        assert_eq!(BinaryFormat::Uuid.text(&CellValue::Null), "NULL");
+    }
 
     #[test]
     fn json_bytes_preview_and_copy_preserve_nested_values_and_numeric_precision() {

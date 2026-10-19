@@ -29,10 +29,14 @@ impl DbxApp {
             let label = counted(rows.len(), "row", "rows");
             Some((rows.join("\n"), label))
         } else if let Some((row, column)) = grid.selected_cell() {
-            delegate
-                .result_column(column)
-                .and_then(|column| data.shown_value(row, column))
-                .map(|value| (value.to_string(), "cell".to_owned()))
+            delegate.result_column(column).and_then(|column| {
+                data.shown_value(row, column).map(|value| {
+                    (
+                        delegate.binary_format(column).editor_text(&value),
+                        "cell".to_owned(),
+                    )
+                })
+            })
         } else if let Some(row) = grid.selected_row() {
             delegate
                 .row_as_tsv(row)
@@ -112,7 +116,13 @@ impl DbxApp {
                     .unwrap_or(info);
                 let value = match field {
                     None => CellValue::Null,
-                    Some(text) => match parse_field_value(metadata, text) {
+                    Some(text) => match if crate::row_drafts::field_value_kind(metadata)
+                        == crate::row_drafts::FieldValueKind::Bytes
+                    {
+                        grid.delegate().binary_format(column).parse(text)
+                    } else {
+                        parse_field_value(metadata, text).map_err(|error| error.to_string())
+                    } {
                         Ok(value) => value,
                         Err(error) => {
                             self.show_toast(

@@ -254,8 +254,18 @@ pub fn parse_field_value(column: &ColumnInfo, text: &str) -> Result<CellValue, F
     }
 }
 
-fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, &'static str> {
-    let digits = text.strip_prefix("0x").unwrap_or(text);
+pub(crate) fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, &'static str> {
+    let compact: String = text
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    let digits = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+        .unwrap_or(&compact);
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("use hexadecimal digits only");
+    }
     if !digits.len().is_multiple_of(2) {
         return Err("use an even number of hexadecimal digits, optionally prefixed with 0x");
     }
@@ -298,6 +308,7 @@ pub struct FieldDraft {
     /// Read-only fields can remain in an inspector model without being sent
     /// as assignments or insert values.
     pub editable: bool,
+    pub(crate) binary_format: Option<crate::binary_values::BinaryFormat>,
 }
 
 impl FieldDraft {
@@ -317,6 +328,7 @@ impl FieldDraft {
             state,
             default_expression,
             editable: true,
+            binary_format: None,
         }
     }
 
@@ -375,6 +387,7 @@ pub struct FieldRow {
     pub state: FieldValueState,
     pub default_expression: Option<String>,
     pub editable: bool,
+    pub(crate) binary_format: Option<crate::binary_values::BinaryFormat>,
 }
 
 /// Alias emphasizing that a field row is an entity-backed draft.
@@ -540,6 +553,7 @@ impl FieldRow {
             state,
             default_expression,
             editable: true,
+            binary_format: None,
         }
     }
 
@@ -615,6 +629,7 @@ impl FieldRow {
             state: self.state,
             default_expression: self.default_expression.clone(),
             editable: self.editable,
+            binary_format: self.binary_format,
         }
     }
 }
@@ -989,16 +1004,28 @@ fn resolve_field_drafts(
                     Some(MutationValue::Expression(expression.to_owned()))
                 }
                 FieldValueState::Value => {
-                    let parsed = parse_field_value(column, &draft.current).map_err(|error| {
-                        FieldValidationError::InvalidValue {
+                    let parsed = draft
+                        .binary_format
+                        .map_or_else(
+                            || parse_field_value(column, &draft.current),
+                            |format| {
+                                format.parse(&draft.current).map_err(|error| {
+                                    FieldValueError::new(
+                                        FieldValueKind::Bytes,
+                                        &draft.current,
+                                        error,
+                                    )
+                                })
+                            },
+                        )
+                        .map_err(|error| FieldValidationError::InvalidValue {
                             field_id: draft.id,
                             field_index,
                             column: column.name.clone(),
                             expected: error.expected,
                             input: error.input,
                             reason: error.reason,
-                        }
-                    })?;
+                        })?;
                     if matches!(parsed, CellValue::Null) && !column.nullable {
                         return Err(FieldValidationError::NullNotAllowed {
                             field_id: draft.id,
@@ -1390,6 +1417,33 @@ mod tests {
         ];
 
         assert!(insert_values(&drafts, &columns).unwrap().is_empty());
+    }
+
+    #[test]
+    fn uuid_binary_drafts_preserve_bytes_and_parse_changes() {
+        use crate::binary_values::BinaryFormat;
+        let uuid = "6ccd780c-baba-1026-9564-5b8c656024db";
+        let original = BinaryFormat::Uuid.parse(uuid).unwrap();
+        let columns = vec![column("payload", "BLOB", false)];
+        let mut draft = FieldDraft::new(
+            1,
+            "payload",
+            Some(original.clone()),
+            uuid,
+            FieldValueState::Value,
+            None,
+        );
+        draft.binary_format = Some(BinaryFormat::Uuid);
+        assert!(
+            changed_fields(&[draft.clone()], &columns)
+                .unwrap()
+                .is_empty()
+        );
+        draft.current = "00000000-0000-0000-0000-000000000000".into();
+        assert_eq!(
+            changed_fields(&[draft], &columns).unwrap()[0].1,
+            MutationValue::Parameter(CellValue::Bytes(vec![0; 16]))
+        );
     }
 
     #[test]

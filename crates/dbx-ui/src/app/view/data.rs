@@ -767,7 +767,12 @@ impl DbxApp {
                             (
                                 field.id,
                                 field.column.name.clone(),
-                                field.column.data_type.clone(),
+                                field
+                                    .binary_format
+                                    .map(|format| {
+                                        format!("{} · {}", field.column.data_type, format.label())
+                                    })
+                                    .unwrap_or_else(|| field.column.data_type.clone()),
                                 field.column.nullable,
                                 field.column.primary_key,
                                 field.state,
@@ -820,6 +825,9 @@ impl DbxApp {
         };
         let has_draft = !draft_fields.is_empty();
         let data = self.data_tab(session_id, tab_id).unwrap();
+        let binary_formats = (0..static_fields.len())
+            .map(|column| data.data_grid.read(cx).delegate().binary_format(column))
+            .collect::<Vec<_>>();
         let scroll = data.inspector_scroll.clone();
         let focus = data.inspector_focus.clone();
         let label = match draft_mode {
@@ -1090,9 +1098,18 @@ impl DbxApp {
                     .when(!has_draft, |view| {
                         view.children(static_fields.into_iter().enumerate().map(
                             |(index, (name, data_type, value))| {
-                                let copy_text = value
+                                let format = binary_formats[index];
+                                let binary_text = value
                                     .as_ref()
-                                    .map(crate::app::value_view::value_clipboard_text);
+                                    .filter(|value| matches!(value, CellValue::Bytes(_)))
+                                    .map(|value| format.limited_text(value, 512));
+                                let copy_text = value.as_ref().map(|value| {
+                                    if matches!(value, CellValue::Bytes(_)) {
+                                        format.editor_text(value)
+                                    } else {
+                                        crate::app::value_view::value_clipboard_text(value)
+                                    }
+                                });
                                 let accessible_value = match value.as_ref() {
                                     None => "No value".to_owned(),
                                     Some(CellValue::Text(text)) if text.is_empty() => {
@@ -1157,7 +1174,12 @@ impl DbxApp {
                                                     }),
                                             ),
                                     )
-                                    .child(crate::app::value_view::value_view(value.as_ref(), cx))
+                                    .child(if let Some(text) = binary_text {
+                                        crate::app::value_view::monospace_block(text, false, cx)
+                                            .into_any_element()
+                                    } else {
+                                        crate::app::value_view::value_view(value.as_ref(), cx)
+                                    })
                             },
                         ))
                     }),

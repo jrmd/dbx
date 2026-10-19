@@ -230,6 +230,7 @@ pub(super) struct ResultTableDelegate {
     /// Lazily filled display text, row-major over data columns, so scrolling
     /// never re-formats or re-copies values that were already rendered.
     cell_text: Vec<Option<SharedString>>,
+    pub(super) binary_formats: HashMap<usize, super::value_view::BinaryFormat>,
     foreign_keys: Vec<ForeignKeyInfo>,
     row_actions: Option<(WeakEntity<DbxApp>, SessionId, SecondaryTabId, bool)>,
     /// Catalog primary keys identify table rows, but can repeat in query joins.
@@ -292,6 +293,7 @@ impl Default for ResultTableDelegate {
             columns: vec![Self::row_number_column(0)],
             numeric: Vec::new(),
             cell_text: Vec::new(),
+            binary_formats: HashMap::new(),
             foreign_keys: Vec::new(),
             row_actions: None,
             is_data_result: false,
@@ -433,6 +435,27 @@ impl ResultTableDelegate {
             .map(|index| index + 1)
     }
 
+    pub(super) fn binary_format(&self, column: usize) -> super::value_view::BinaryFormat {
+        self.binary_formats
+            .get(&column)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn formatted_value(&self, column: usize, value: &CellValue) -> String {
+        if matches!(value, CellValue::Bytes(_)) {
+            let format = self.binary_format(column);
+            let limit = if format == super::value_view::BinaryFormat::Binary {
+                CELL_TEXT_LIMIT / 9
+            } else {
+                CELL_TEXT_LIMIT / 2
+            };
+            format.limited_text(value, limit)
+        } else {
+            cell_display_text(value)
+        }
+    }
+
     /// Result columns in display order.
     pub(super) fn display_order(&self) -> &[usize] {
         &self.order
@@ -469,13 +492,20 @@ impl ResultTableDelegate {
                 Some(
                     values
                         .iter()
-                        .map(|value| delimited_row(std::slice::from_ref(value), '\t'))
+                        .map(|value| {
+                            let value = if matches!(value, CellValue::Bytes(_)) {
+                                CellValue::Text(self.binary_format(column).editor_text(value))
+                            } else {
+                                value.clone()
+                            };
+                            delimited_row(std::slice::from_ref(&value), '\t')
+                        })
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )
             })
         } else {
-            Some(plain_cell_text(value))
+            Some(self.binary_format(column).editor_text(value))
         };
         menu = menu.item(
             PopupMenuItem::new(if multiple {
@@ -490,6 +520,26 @@ impl ResultTableDelegate {
                 }
             }),
         );
+        if matches!(value, CellValue::Bytes(_)) || field_value_kind(info) == FieldValueKind::Bytes {
+            use super::value_view::BinaryFormat;
+            for (label, format) in [
+                ("View as binary", BinaryFormat::Binary),
+                ("View as hex / edit hex", BinaryFormat::Hex),
+                ("View as UUID", BinaryFormat::Uuid),
+                ("View as UUID (MySQL swapped)", BinaryFormat::UuidSwapped),
+            ] {
+                let app = app.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .checked(self.binary_format(column) == format)
+                        .on_click(move |_, _, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.set_binary_format_for(session_id, tab_id, column, format, cx);
+                            });
+                        }),
+                );
+            }
+        }
         let filters: &[(&str, FilterOperator)] = if null {
             &[
                 ("Filter: is NULL", FilterOperator::IsNull),
@@ -765,13 +815,26 @@ impl ResultTableDelegate {
         row_ix: usize,
         data_column_ix: usize,
     ) -> Option<String> {
-        self.cell_value(row_ix, data_column_ix).map(plain_cell_text)
+        self.cell_value(row_ix, data_column_ix)
+            .map(|value| self.binary_format(data_column_ix).editor_text(value))
     }
 
     /// Render a single row as TSV, using quoted empty strings and a bare `NULL` sentinel so
     /// downstream consumers can distinguish database NULL from an empty text value.
     pub(super) fn row_as_tsv(&self, row_ix: usize) -> Option<String> {
-        self.row_values(row_ix).map(|row| delimited_row(row, '\t'))
+        let row = self.row_values(row_ix)?;
+        let values = row
+            .iter()
+            .enumerate()
+            .map(|(column, value)| {
+                if matches!(value, CellValue::Bytes(_)) {
+                    CellValue::Text(self.binary_format(column).editor_text(value))
+                } else {
+                    value.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(delimited_row(&values, '\t'))
     }
 
     /// Render one data column as a headered TSV document. The header makes a copied column
@@ -784,7 +847,17 @@ impl ResultTableDelegate {
 
         Some(delimited_column(
             column.name.as_str(),
-            values.into_iter(),
+            values
+                .into_iter()
+                .map(|value| {
+                    if matches!(value, CellValue::Bytes(_)) {
+                        CellValue::Text(self.binary_format(data_column_ix).editor_text(value))
+                    } else {
+                        value.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .iter(),
             '\t',
         ))
     }
@@ -933,6 +1006,19 @@ impl ResultTableDelegate {
             _ => None,
         };
 
+        self.binary_formats = result
+            .as_ref()
+            .map(|result| {
+                result
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, column)| {
+                        Some((index, *layout?.binary_formats.get(&column.name)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.order = result
             .as_deref()
             .map(|result| display_order(&result.columns, layout))
@@ -1725,6 +1811,31 @@ impl TableDelegate for ResultTableDelegate {
             return menu;
         };
         if !is_data {
+            if let Some(column) = self.context_column
+                && matches!(self.cell_value(row_ix, column), Some(CellValue::Bytes(_)))
+            {
+                use super::value_view::BinaryFormat;
+                for (label, format) in [
+                    ("View as binary", BinaryFormat::Binary),
+                    ("View as hex", BinaryFormat::Hex),
+                    ("View as UUID", BinaryFormat::Uuid),
+                    ("View as UUID (MySQL swapped)", BinaryFormat::UuidSwapped),
+                ] {
+                    let table = cx.entity().downgrade();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(self.binary_format(column) == format)
+                            .on_click(move |_, _, cx| {
+                                let _ = table.update(cx, |table, cx| {
+                                    let delegate = table.delegate_mut();
+                                    delegate.binary_formats.insert(column, format);
+                                    delegate.cell_text.fill(None);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+            }
             return menu;
         }
         let sql = app.upgrade().and_then(|app| {
@@ -1933,7 +2044,10 @@ impl TableDelegate for ResultTableDelegate {
                     .get(column)
                     .cloned()
                     .flatten()
-                    .map(|value| staged_text(&value)),
+                    .map(|value| match &value {
+                        MutationValue::Parameter(value) => self.formatted_value(column, value),
+                        _ => staged_text(&value),
+                    }),
             };
             let muted = text.is_none() || col_ix == 0;
             return semantic_cell
@@ -1982,10 +2096,18 @@ impl TableDelegate for ResultTableDelegate {
                     theme().text
                 })
                 .when(muted, |cell| cell.italic())
-                .child(div().min_w_0().truncate().child(rendered_cell_text(
-                    staged_text(&value).into(),
-                    json && !muted,
-                )))
+                .child(
+                    div().min_w_0().truncate().child(rendered_cell_text(
+                        match &value {
+                            MutationValue::Parameter(value) => {
+                                self.formatted_value(data_column.unwrap(), value)
+                            }
+                            _ => staged_text(&value),
+                        }
+                        .into(),
+                        json && !muted,
+                    )),
+                )
                 .on_mouse_down(MouseButton::Right, remember_column)
                 .into_any_element();
         }
@@ -2014,7 +2136,7 @@ impl TableDelegate for ResultTableDelegate {
                         None => {
                             let text: SharedString = self
                                 .cell_value(row_ix, data_column)
-                                .map(cell_display_text)
+                                .map(|value| self.formatted_value(data_column, value))
                                 .unwrap_or_default()
                                 .into();
                             if let Some(cached) = self.cell_text.get_mut(slot) {
@@ -2163,6 +2285,49 @@ pub(super) fn foreign_key_target_table(
 mod tests {
     use super::*;
     use dbx_core::RowData;
+
+    #[test]
+    fn binary_clipboard_is_full_and_follows_column_representation() {
+        let mut delegate = ResultTableDelegate::default();
+        let bytes = CellValue::Bytes(vec![0xff; CELL_TEXT_LIMIT * 2]);
+        let text = "long text ".repeat(CELL_TEXT_LIMIT);
+        delegate.set_result(
+            Some(Arc::new(QueryResult {
+                columns: vec![
+                    ColumnInfo::result("bytes", 0, "BLOB"),
+                    ColumnInfo::result("text", 1, "TEXT"),
+                ],
+                rows: vec![RowData::new(vec![
+                    bytes.clone(),
+                    CellValue::Text(text.clone()),
+                ])],
+                ..QueryResult::empty(None, 0)
+            })),
+            &HashMap::new(),
+            None,
+            &[],
+            &[],
+        );
+        assert_eq!(delegate.cell_as_plain_text(0, 0), Some(bytes.to_string()));
+        assert_eq!(delegate.cell_as_plain_text(0, 1), Some(text));
+        assert!(delegate.formatted_value(0, &bytes).contains('…'));
+        delegate
+            .binary_formats
+            .insert(0, super::super::value_view::BinaryFormat::Binary);
+        assert!(
+            delegate
+                .row_as_tsv(0)
+                .unwrap()
+                .starts_with("11111111 11111111")
+        );
+        assert!(!delegate.cell_as_plain_text(0, 0).unwrap().contains('…'));
+        let invalid = CellValue::Bytes(vec![0; 1024]);
+        assert!(
+            super::super::value_view::BinaryFormat::Uuid
+                .limited_text(&invalid, 4)
+                .contains("1024 bytes")
+        );
+    }
 
     #[test]
     fn json_cells_follow_column_types_and_loaded_or_staged_json_values() {

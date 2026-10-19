@@ -41,6 +41,22 @@ impl DbxApp {
         self.load_data_tab_for(session_id, tab_id, filters, window, cx);
     }
 
+    pub(super) fn set_binary_format_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        column: usize,
+        format: value_view::BinaryFormat,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = self.result_column_name(session_id, tab_id, column) else {
+            return;
+        };
+        self.update_table_layout_for(session_id, tab_id, cx, |layout| {
+            layout.binary_formats.insert(name, format);
+        });
+    }
+
     pub(super) fn hide_column_for(
         &mut self,
         session_id: SessionId,

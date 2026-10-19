@@ -2,6 +2,7 @@ mod accessibility;
 mod agents;
 mod app;
 mod assets;
+mod binary_values;
 mod connection_fields;
 mod device_unlock;
 mod diagram;

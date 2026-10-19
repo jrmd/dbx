@@ -31,6 +31,7 @@ pub(super) struct CellEditor {
     pub(super) column: usize,
     pub(super) editor: Entity<TextEditor>,
     pub(super) structured: bool,
+    binary_format: Option<value_view::BinaryFormat>,
     _blur: Subscription,
 }
 
@@ -308,14 +309,37 @@ impl DbxApp {
             }
             Some(StagedCell::Default) | None => CellValue::Null,
         };
-        let structured = value_view::json_preview(&value).is_some()
-            || data
-                .table_columns
-                .get(column)
-                .is_some_and(|column| column.data_type.to_ascii_lowercase().contains("json"));
+        let binary_format = (matches!(value, CellValue::Bytes(_))
+            || data.table_columns.get(column).is_some_and(|column| {
+                crate::row_drafts::field_value_kind(column)
+                    == crate::row_drafts::FieldValueKind::Bytes
+            }))
+        .then(|| data.data_grid.read(cx).delegate().binary_format(column));
+        let binary_format = binary_format.map(|format| match &value {
+            CellValue::Bytes(bytes)
+                if bytes.len() != 16
+                    && matches!(
+                        format,
+                        value_view::BinaryFormat::Uuid | value_view::BinaryFormat::UuidSwapped
+                    ) =>
+            {
+                value_view::BinaryFormat::Hex
+            }
+            _ => format,
+        });
+        let structured = binary_format.is_none()
+            && (value_view::json_preview(&value).is_some()
+                || data
+                    .table_columns
+                    .get(column)
+                    .is_some_and(|column| column.data_type.to_ascii_lowercase().contains("json")));
         let text = match &value {
             CellValue::Null => String::new(),
-            value => value_view::json_preview(value).unwrap_or_else(|| field_editor_text(value)),
+            value => binary_format
+                .map(|format| format.editor_text(value))
+                .unwrap_or_else(|| {
+                    value_view::json_preview(value).unwrap_or_else(|| field_editor_text(value))
+                }),
         };
         let column_name = data
             .table_columns
@@ -335,7 +359,13 @@ impl DbxApp {
                 window,
                 cx,
             )
-            .accessibility_label(format!("{column_name}, row {}", row + 1))
+            .accessibility_label(format!(
+                "{column_name}, row {}{}",
+                row + 1,
+                binary_format
+                    .map(|format| format!(", {}", format.label()))
+                    .unwrap_or_default()
+            ))
         });
         let focus = editor.read(cx).focus_handle();
         let blur = cx.on_blur(&focus, window, move |this, window, cx| {
@@ -351,6 +381,7 @@ impl DbxApp {
             column,
             editor: editor.clone(),
             structured,
+            binary_format,
             _blur: blur,
         });
         data.sync_cell_edits(cx);
@@ -377,6 +408,7 @@ impl DbxApp {
         };
         let (row, column) = (cell.row, cell.column);
         let structured = cell.structured;
+        let binary_format = cell.binary_format;
         let text = cell.editor.read(cx).text(cx);
         let Some((metadata, was_null)) = data.result.as_ref().and_then(|result| {
             let result_column = result.columns.get(column)?;
@@ -408,7 +440,10 @@ impl DbxApp {
         let staged = if unchanged_empty {
             None
         } else {
-            match parse_field_value(&metadata, &text) {
+            match binary_format.map_or_else(
+                || parse_field_value(&metadata, &text).map_err(|error| error.to_string()),
+                |format| format.parse(&text),
+            ) {
                 Ok(value) => Some(Some(MutationValue::Parameter(value))),
                 Err(error) => {
                     self.show_toast(ToastKind::Error, error.to_string(), cx);
@@ -1797,7 +1832,11 @@ mod tests {
             let mut id = ColumnInfo::result("id", 0, "INTEGER");
             id.primary_key = true;
             id.nullable = false;
-            let columns = vec![id, ColumnInfo::result("name", 1, "TEXT")];
+            let columns = vec![
+                id,
+                ColumnInfo::result("name", 1, "TEXT"),
+                ColumnInfo::result("payload", 2, "BLOB"),
+            ];
             let mut data =
                 DataTab::new(session_id, tab_id, TableRef::new("items"), true, window, cx);
             data.table_columns = columns.clone();
@@ -1808,6 +1847,7 @@ mod tests {
                     rows: vec![RowData::new(vec![
                         CellValue::Integer(1),
                         CellValue::Text("original".into()),
+                        CellValue::Bytes(vec![0; 16]),
                     ])],
                     ..QueryResult::empty(None, 0)
                 }),
@@ -1823,6 +1863,83 @@ mod tests {
             app.sessions = vec![session];
             app.active_session_id = Some(session_id);
             app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                use value_view::BinaryFormat;
+                app.data_tab_mut(session_id, tab_id)
+                    .unwrap()
+                    .data_grid
+                    .update(cx, |table, _| {
+                        table
+                            .delegate_mut()
+                            .binary_formats
+                            .insert(2, BinaryFormat::Uuid);
+                    });
+                app.begin_cell_edit_for(session_id, tab_id, 0, 2, window, cx);
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                assert_eq!(
+                    editor.read(cx).text(cx),
+                    "00000000-0000-0000-0000-000000000000"
+                );
+                editor.update(cx, |editor, cx| editor.set_text("invalid", cx));
+                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+                assert!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .cell_editor
+                        .is_some()
+                );
+                let uuid = "6ccd780c-baba-1026-9564-5b8c656024db";
+                editor.update(cx, |editor, cx| editor.set_text(uuid, cx));
+                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .get(&(0, 2)),
+                    Some(&MutationValue::Parameter(
+                        BinaryFormat::Uuid.parse(uuid).unwrap()
+                    ))
+                );
+                app.data_tab_mut(session_id, tab_id)
+                    .unwrap()
+                    .data_grid
+                    .update(cx, |table, _| {
+                        table
+                            .delegate_mut()
+                            .binary_formats
+                            .insert(2, BinaryFormat::Hex);
+                    });
+                app.begin_cell_edit_for(session_id, tab_id, 0, 2, window, cx);
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| editor.set_text("00 ff 80", cx));
+                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .get(&(0, 2)),
+                    Some(&MutationValue::Parameter(CellValue::Bytes(vec![
+                        0, 255, 128
+                    ])))
+                );
+                app.discard_pending_edits_for(session_id, tab_id, cx);
+            })
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let text_before = cx.debug_bounds("result-cell-text-0-2").unwrap();
