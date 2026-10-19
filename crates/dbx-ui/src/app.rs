@@ -3916,12 +3916,12 @@ impl DbxApp {
                 {
                     format = value_view::BinaryFormat::Hex;
                 }
-                if field.state == FieldValueState::Value {
-                    if let Some(value @ CellValue::Bytes(_)) = value {
-                        field.editor.update(cx, |editor, cx| {
-                            editor.set_text(format.editor_text(&value), cx)
-                        });
-                    }
+                if field.state == FieldValueState::Value
+                    && let Some(value @ CellValue::Bytes(_)) = value
+                {
+                    field.editor.update(cx, |editor, cx| {
+                        editor.set_text(format.editor_text(&value), cx)
+                    });
                 }
                 field.binary_format = Some(format);
             }
