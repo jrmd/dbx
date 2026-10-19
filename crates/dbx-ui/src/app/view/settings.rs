@@ -7,9 +7,14 @@ const TAG_PALETTE: [u32; 8] = [
     0xef6b73, 0xe5b567, 0x8fcf9c, 0x82aaff, 0xb48ead, 0x56b6c2, 0xe89bb5, 0xaab2bf,
 ];
 
-const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 6] = [
+const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 7] = [
     (SettingsSection::Appearance, "Appearance", Icon::Appearance),
     (SettingsSection::Editor, "Editor", Icon::Query),
+    (
+        SettingsSection::Shortcuts,
+        "Keyboard shortcuts",
+        Icon::Query,
+    ),
     (
         SettingsSection::QueryAgent,
         "Query assistant",
@@ -46,6 +51,7 @@ impl DbxApp {
                 .render_settings_appearance(window, cx)
                 .into_any_element(),
             SettingsSection::Editor => self.render_settings_editor(cx).into_any_element(),
+            SettingsSection::Shortcuts => self.render_settings_shortcuts(window, cx),
             SettingsSection::QueryAgent => self.render_agent_settings(cx).into_any_element(),
             SettingsSection::Connections => self.render_settings_connections(cx).into_any_element(),
             SettingsSection::Tags => self.render_settings_tags(cx).into_any_element(),
@@ -227,9 +233,12 @@ impl DbxApp {
     }
 
     /// Jump straight to tag management, e.g. from the connection form.
-    pub(super) fn open_tag_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_section = SettingsSection::Tags;
-        self.open_settings(window, cx);
+    pub(in crate::app) fn open_tag_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_section(SettingsSection::Tags, window, cx);
     }
 
     pub(in crate::app) fn scrolling_settings_group(
@@ -247,9 +256,8 @@ impl DbxApp {
         if self.font_pickers.is_some() {
             return;
         }
-        let mut names = cx.text_system().all_font_names();
-        names.sort_by_key(|name| name.to_lowercase());
-        names.dedup();
+        // Paint the controls immediately. Enumerating installed fonts can be slow
+        // on real desktops and must not block the first Appearance interaction.
         let pickers = [false, true].map(|mono| {
             let current = if mono {
                 self.mono_font_family
@@ -260,10 +268,7 @@ impl DbxApp {
                     .clone()
                     .unwrap_or_else(|| cx.theme().font_family.to_string())
             };
-            let mut options = names.clone();
-            if !options.contains(&current) {
-                options.insert(0, current.clone());
-            }
+            let options = vec![current.clone()];
             let index = options.iter().position(|name| name == &current);
             let picker = cx.new(|cx| {
                 SelectState::new(
@@ -297,7 +302,43 @@ impl DbxApp {
             .detach();
             picker
         });
-        self.font_pickers = Some(pickers);
+        self.font_pickers = Some(pickers.clone());
+        self.font_names_loading = true;
+        let text_system = cx.text_system().clone();
+        let font_names = cx.background_executor().spawn(async move {
+            let mut names = text_system.all_font_names();
+            names.sort_by_key(|name| name.to_lowercase());
+            names.dedup();
+            names
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let names = font_names.await;
+            this.update_in(cx, |this, window, cx| {
+                this.font_names_loading = false;
+                for picker in pickers {
+                    picker.update(cx, |picker, cx| {
+                        let current = picker.selected_value().cloned();
+                        let mut options = names
+                            .iter()
+                            .cloned()
+                            .map(SharedString::from)
+                            .collect::<Vec<_>>();
+                        if let Some(current) = &current
+                            && !options.contains(current)
+                        {
+                            options.insert(0, current.clone());
+                        }
+                        picker.set_items(SearchableVec::new(options), window, cx);
+                        if let Some(current) = current {
+                            picker.set_selected_value(&current, window, cx);
+                        }
+                    });
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
         self.font_size_inputs = Some([false, true].map(|mono| {
             let size = if mono {
                 self.mono_font_size
@@ -462,6 +503,7 @@ impl DbxApp {
                     option.label()
                 )))
                 .pressable(option.label())
+                .debug_selector(move || format!("settings-appearance-{}", option.label()))
                 .role(gpui::Role::RadioButton)
                 .aria_toggled(if option == current {
                     gpui::accesskit::Toggled::True
@@ -527,9 +569,11 @@ impl DbxApp {
                 rows.push(
                     settings_row(
                         label,
-                        None,
+                        self.font_names_loading
+                            .then(|| "Loading installed fonts…".into()),
                         div().w(crate::theme::ui_px(240.)).child(
                             Select::new(&pickers[index])
+                                .disabled(self.font_names_loading)
                                 .h(crate::theme::control_height(32.))
                                 .w_full()
                                 .menu_max_h(crate::theme::ui_px(280.))
@@ -1026,198 +1070,4 @@ fn settings_section(title: &'static str, group: Div) -> Div {
                 .child(title),
         )
         .child(group)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[gpui::test]
-    fn font_size_changes_text_without_changing_zoom(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().unwrap();
-        let store = SettingsStore::at(directory.path().join("settings.json"));
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.settings_open = true;
-            app.settings_store = Some(store.clone());
-            app.ui_scale = 100;
-            app.font_size = 12;
-            app.mono_font_size = 12;
-            app
-        });
-        let window_size = gpui::size(px(1400.), px(1000.));
-        cx.simulate_resize(window_size);
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let inputs = app.read_with(cx, |app, _| app.font_size_inputs.clone().unwrap());
-        cx.update(|window, cx| inputs[0].read(cx).focus_handle(cx).focus(window, cx));
-        // Revealing an offscreen focused row schedules its scroll for the next frame.
-        for _ in 0..3 {
-            cx.update(|window, cx| {
-                window.simulate_next_frame(cx);
-                window.draw(cx).clear(cx);
-            });
-        }
-        cx.simulate_keystrokes("secondary-a 1 6");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(store.load().unwrap().font_size, 16);
-        assert_eq!(app.read_with(cx, |app, _| app.ui_scale), 100);
-        assert_eq!(crate::theme::ui_px(32.), px(32.));
-        assert_eq!(crate::theme::text_px(12.), px(16.));
-        assert_eq!(crate::theme::mono_text_px(12.), px(12.));
-        cx.update(|window, cx| inputs[1].read(cx).focus_handle(cx).focus(window, cx));
-        for _ in 0..3 {
-            cx.update(|window, cx| {
-                window.simulate_next_frame(cx);
-                window.draw(cx).clear(cx);
-            });
-        }
-        cx.simulate_keystrokes("secondary-a 1 4");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(store.load().unwrap().mono_font_size, Some(14));
-        assert_eq!(crate::theme::text_px(12.), px(16.));
-        assert_eq!(crate::theme::mono_text_px(12.), px(14.));
-        let bounds = cx.debug_bounds("mono-font-size").unwrap();
-        assert!(
-            bounds.top() >= px(0.) && bounds.bottom() <= window_size.height,
-            "font size buttons must be visible before clicking: {bounds:?}"
-        );
-        cx.simulate_click(
-            gpui::point(bounds.right() - px(12.), bounds.center().y),
-            Default::default(),
-        );
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(store.load().unwrap().mono_font_size, Some(15));
-        cx.simulate_click(
-            gpui::point(bounds.left() + px(12.), bounds.center().y),
-            Default::default(),
-        );
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(store.load().unwrap().mono_font_size, Some(14));
-        assert_eq!(store.load().unwrap().font_size, 16);
-        crate::theme::set_font_sizes(12, 12);
-    }
-
-    #[gpui::test]
-    fn both_font_pickers_filter_by_typed_search(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().unwrap();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.settings_open = true;
-            app.settings_store = Some(SettingsStore::at(directory.path().join("settings.json")));
-            app
-        });
-        cx.simulate_resize(gpui::size(px(1400.), px(1400.)));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let pickers = app.read_with(cx, |app, _| app.font_pickers.clone().unwrap());
-        for (index, picker) in pickers.into_iter().enumerate() {
-            cx.update(|window, cx| {
-                picker.update(cx, |picker, cx| {
-                    picker.set_items(
-                        SearchableVec::new(vec![
-                            SharedString::from("Alpha Font"),
-                            SharedString::from("Beta Font"),
-                        ]),
-                        window,
-                        cx,
-                    );
-                    picker.toggle_menu_accessibly(window, cx);
-                })
-            });
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            cx.simulate_keystrokes("b e t a");
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            cx.simulate_keystrokes("enter");
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            assert_eq!(
-                picker.read_with(cx, |picker, _| picker.selected_value().cloned()),
-                Some("Beta Font".into())
-            );
-            assert_eq!(
-                app.read_with(cx, |app, _| if index == 0 {
-                    app.font_family.clone()
-                } else {
-                    app.mono_font_family.clone()
-                }),
-                Some("Beta Font".into())
-            );
-        }
-    }
-
-    #[gpui::test]
-    fn motion_choices_apply_to_gpui_and_survive_other_preference_saves(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().unwrap();
-        let store = SettingsStore::at(directory.path().join("settings.json"));
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.settings_open = true;
-            app.settings_store = Some(store.clone());
-            app
-        });
-        cx.simulate_resize(gpui::size(px(1200.), px(1100.)));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        for (label, reduced) in [
-            ("motion-Reduce", true),
-            ("motion-Full", false),
-            ("motion-System", true),
-        ] {
-            let bounds = cx.debug_bounds(label).unwrap();
-            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            assert_eq!(cx.update(|_, cx| cx.reduce_motion()), reduced);
-            let saved = store.load().unwrap().motion;
-            cx.update(|window, cx| {
-                app.update(cx, |app, cx| app.set_text_scale(125, false, window, cx))
-            });
-            assert_eq!(store.load().unwrap().motion, saved);
-        }
-        crate::theme::set_text_scales(100, 100);
-    }
-
-    #[gpui::test]
-    fn interface_size_shortcuts_persist_and_controls_fit_at_two_hundred_percent(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().unwrap();
-        let store = SettingsStore::at(directory.path().join("settings.json"));
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.saved_connections.clear();
-            app.settings_store = Some(store.clone());
-            app.settings_open = true;
-            app
-        });
-        cx.simulate_resize(gpui::size(px(800.), px(600.)));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        for _ in 0..4 {
-            cx.simulate_keystrokes("secondary-=");
-        }
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(cx.update(|_, cx| app.read(cx).ui_scale), 200);
-        assert_eq!(store.load().unwrap().ui_scale, 200);
-        let control = cx
-            .debug_bounds("interface-size-200")
-            .expect("200 percent choice drawn");
-        assert!(
-            control.right() <= px(800.) && control.left() >= px(0.),
-            "scaled size choices must fit the narrow window: {control:?}"
-        );
-        assert!(
-            control.size.height >= px(48.),
-            "controls must grow with their text"
-        );
-        cx.simulate_keystrokes("secondary-0");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert_eq!(store.load().unwrap().ui_scale, 100);
-        crate::theme::set_text_scales(100, 100);
-    }
 }

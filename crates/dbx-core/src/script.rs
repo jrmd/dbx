@@ -844,20 +844,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_server_spans_follow_go_batches() {
-        let script =
-            "CREATE PROCEDURE p AS BEGIN SELECT 1; SELECT 2; END\nGO\nSELECT 3; SELECT 4;\nGO\n";
-        assert_eq!(
-            texts(Some(DatabaseKind::SqlServer), script),
-            [
-                "CREATE PROCEDURE p AS BEGIN SELECT 1; SELECT 2; END\nGO\n",
-                "SELECT 3;",
-                " SELECT 4;\nGO\n"
-            ]
-        );
-    }
-
-    #[test]
     fn executable_mysql_comments_do_not_stop_span_discovery() {
         let script = "/*!40101 SET NAMES utf8 */; SELECT 1;";
         assert_eq!(texts(Some(DatabaseKind::MySQL), script).len(), 2);

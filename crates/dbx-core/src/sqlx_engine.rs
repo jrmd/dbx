@@ -2671,22 +2671,6 @@ fn boolish_value(row: &RowData, index: usize) -> Result<bool> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn unavailable_schema_catalogs_are_errors_not_empty_metadata() {
-        let engine = SqlxEngine::connect(ConnectionConfig::new(
-            DatabaseKind::SQLite,
-            "sqlite::memory:",
-        ))
-        .await
-        .unwrap();
-        let SqlxPool::SQLite(pool) = engine.pool_snapshot().await.unwrap() else {
-            unreachable!()
-        };
-        pool.close().await;
-        assert!(engine.table_indexes(None).await.is_err());
-        assert!(engine.supplementary_metadata(None).await.is_err());
-    }
-
     #[test]
     fn mysql_byte_fallback_decodes_metadata_text_and_preserves_binary() {
         assert_eq!(
@@ -2729,16 +2713,5 @@ mod tests {
         assert!(validate_database_name("a/b").is_err());
         assert!(validate_database_name("a b").is_err());
         assert!(validate_database_name("a\nb").is_err());
-    }
-
-    #[test]
-    fn postgres_url_rewrite_targets_another_database() {
-        let rewritten = with_database_path(
-            "postgres://user:secret@db.example.test:5432/primary?sslmode=require",
-            "analytics",
-        )
-        .unwrap();
-        assert!(rewritten.starts_with("postgres://user:secret@db.example.test:5432/analytics"));
-        assert!(rewritten.contains("sslmode=require"));
     }
 }

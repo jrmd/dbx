@@ -1,6 +1,6 @@
 # Product gap fixes — 8 October 2026
 
-The implementation follows the [dated competitor audit](product-gap-audit-2026-10-08.md). It remains unreleased. Verification uses disposable local databases and hosted CI as requested. No production database profiles, provider credentials or physical Mac are used.
+The implementation follows the [dated competitor audit](product-gap-audit-2026-10-08.md) and shipped in v0.6.0. The evidence below records the October 8 work, not a new verification run. See the [changelog](../CHANGELOG.md) and [current capabilities](capability-matrix.md) for later changes. Intel Mac packages mentioned below were subsequently removed in v0.7.1. Verification used disposable local databases; no production database profiles or provider credentials were used.
 
 ## Implementation map
 
@@ -23,7 +23,7 @@ The implementation follows the [dated competitor audit](product-gap-audit-2026-1
 
 ## Evidence
 
-Verification is in progress. Final local and hosted results, exact commit and run links are recorded here after the gates finish. Earlier v0.5.0 hosted runs in the audit are baseline evidence only.
+The original report did not record a final run summary. Earlier v0.5.0 hosted runs in the audit are baseline evidence only; release publication alone does not establish every acceptance boundary in the table. Consult the repository's Actions runs for a specific release rather than treating this dated note as a current test result.
 
 The website production build and lint pass. Collaborative browser checks at 1280×800 and 390×844 found no horizontal overflow, the staged-change tile and correct task-oriented documentation links.
 

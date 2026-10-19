@@ -66,7 +66,7 @@ impl DbxApp {
                 files: true,
                 directories: false,
                 multiple: false,
-                prompt: Some("Choose DBX or TablePro profile export".into()),
+                prompt: Some("Choose connection import file".into()),
             });
             cx.spawn(async move |this, cx| {
                 if let Ok(Ok(Some(paths))) = receiver.await
@@ -203,9 +203,9 @@ impl DbxApp {
             .child(glass_raised(div(), RADIUS_GLASS).w(crate::theme::ui_px(660.)).max_w(relative(0.95)).max_h(relative(0.9)).id("profile-transfer-dialog").overflow_y_scroll().p(crate::theme::ui_px(20.)).flex().flex_col().gap(crate::theme::ui_px(12.))
                 .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(div().text_sm().child(match dialog.mode {
-                    0 => "Includes names, hosts, tags, TLS and SSH file references. Passwords and unknown URL options are excluded. Keep this file private.",
+                    0 => "Includes names, hosts, folders, tags, TLS and SSH file references. Passwords and unknown URL options are excluded. Keep this file private.",
                     1 => "Includes database and SSH credentials, protected by a separate passphrase. Key and certificate files are not copied.",
-                    _ => "Choose a DBX or TablePro export. Imported profiles start protected and never connect automatically. TablePlus migration uses pasted connection URLs.",
+                    _ => "Choose DBX, TablePro, DBeaver data-sources.json, Docker Compose YAML, or .env (DATABASE_URL). Review credentials, TLS and ports. Imported profiles start protected and never connect automatically. TablePlus migration uses pasted connection URLs.",
                 }))
                 .child(button("profile-transfer-path", dialog.path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "Choose file…".into()), ButtonKind::Quiet).disabled(dialog.busy).on_click(cx.listener(|this, _, _, cx| this.choose_profile_transfer_path(cx))))
                 .when(dialog.mode != 0 && dialog.preview.is_none(), |view| view

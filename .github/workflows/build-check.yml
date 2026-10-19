@@ -1,4 +1,4 @@
-name: Release build check
+name: Fast CI
 
 on:
   push:
@@ -7,6 +7,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'vendor/**'
       - 'scripts/**'
       - 'packaging/**'
       - '.github/actions/prepare-rust-build/**'
@@ -16,6 +17,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'vendor/**'
       - 'scripts/**'
       - 'packaging/**'
       - '.github/actions/prepare-rust-build/**'
@@ -31,12 +33,8 @@ concurrency:
 
 jobs:
   check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, macos-15]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
@@ -45,19 +43,17 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/prepare-rust-build
-      - name: Validate release build and populate default-branch cache
-        run: |
-          cargo fmt --all -- --check
-          cargo test --locked --release --workspace
-          cargo clippy --locked --release --workspace --all-targets -- -D warnings
-          python3 scripts/test-macos-release.py
-          cargo build --locked --release --package dbx-ui
-      - name: Measure disposable workbench workload
-        run: cargo run --locked --release -p dbx-core --example workbench_perf -- workbench-perf.json
-      - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: workbench-perf-${{ runner.os }}-${{ runner.arch }}
-          path: workbench-perf.json
-          if-no-files-found: ignore
-
+          cache-profile: ci
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Check Rust warnings
+        run: cargo clippy --locked --profile ci --workspace --all-targets -- -D warnings
+      - name: Compile workspace tests
+        run: cargo test --locked --profile ci --workspace --no-run
+      - name: Run workspace tests
+        run: cargo test --locked --profile ci --workspace
+      - name: Test macOS release packaging
+        run: python3 scripts/test-macos-release.py
+      - name: Test release notes
+        run: python3 scripts/test-release-notes.py

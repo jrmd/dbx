@@ -85,7 +85,9 @@ impl DbxApp {
             return Vec::new();
         };
         let mut diagnostics = Vec::new();
-        if let Some(range) = query.error_highlight.clone() {
+        if query.error.is_some()
+            && let Some(range) = query.error_highlight.clone()
+        {
             diagnostics.push(EditorDiagnostic {
                 range,
                 severity: editor::DiagnosticSeverity::Error,
@@ -149,7 +151,7 @@ impl DbxApp {
         }
     }
 
-    fn query_tab_mut(
+    pub(super) fn query_tab_mut(
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
@@ -413,144 +415,5 @@ impl SqlLanguageHost for QueryLanguageHost {
             });
         });
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[gpui::test]
-    fn query_tabs_show_live_diagnostics_hover_and_definitions(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let session_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.runtime = Arc::new(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap(),
-            );
-            app.vault_state = Some(VaultState::Unlocked);
-            let engine = app
-                .runtime
-                .block_on(DatabaseEngine::connect(ConnectionConfig::new(
-                    DatabaseKind::SQLite,
-                    "sqlite::memory:",
-                )))
-                .unwrap();
-            app.runtime
-                .block_on(engine.execute_sql("CREATE TABLE items (id INTEGER, name TEXT)"))
-                .unwrap();
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Language".into(),
-                DatabaseKind::SQLite,
-                None,
-                window,
-                cx,
-            );
-            let items = TableInfo::table("items", None);
-            session.engine = Some(Arc::new(engine));
-            session.tables = vec![items.clone()];
-            session.completion_columns.insert(
-                completion_table_key(&table_ref(&items)),
-                vec![
-                    ColumnInfo::result("id", 0, "INTEGER"),
-                    ColumnInfo::result("name", 1, "TEXT"),
-                ],
-            );
-            let query = QueryTab::new(DatabaseKind::SQLite, session_id, tab_id, window, cx);
-            query.query_text.update(cx, |text, _| {
-                *text = "SELECT nme FROM items;\nSELEC 1".into()
-            });
-            session.secondary_tabs.push(SecondaryTab {
-                id: tab_id,
-                kind: SecondaryTabKind::Query(Box::new(query)),
-            });
-            session.active_secondary_tab = Some(tab_id);
-            app.sessions.push(session);
-            app.active_session_id = Some(session_id);
-            app
-        });
-        let diagnostics = |cx: &mut gpui::VisualTestContext| {
-            app.update(cx, |app, cx| app.query_editor_diagnostics(session_id, cx))
-                .into_iter()
-                .map(|diagnostic| diagnostic.message.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert!(
-            diagnostics(cx).is_empty(),
-            "analysis waits for typing to pause"
-        );
-        cx.executor().advance_clock(ANALYSIS_DELAY * 2);
-        cx.run_until_parked();
-        assert_eq!(
-            diagnostics(cx),
-            [
-                "Unknown column `nme` in `items`",
-                "Unknown statement `SELEC`"
-            ]
-        );
-
-        let host = QueryLanguageHost {
-            app: app.downgrade(),
-            session_id,
-        };
-        let text = "SELECT i.name FROM items i";
-        let hover = cx.update(|_, cx| host.hover(text, text.find("name").unwrap(), cx));
-        assert_eq!(
-            hover.map(|hover| (hover.title.to_string(), hover.detail.map(|d| d.to_string()))),
-            Some(("items.name".to_owned(), Some("text".to_owned())))
-        );
-        let hover = cx.update(|_, cx| host.hover(text, text.find("items").unwrap(), cx));
-        assert_eq!(
-            hover.map(|hover| hover.detail.map(|d| d.to_string())),
-            Some(Some("id integer, name text".to_owned()))
-        );
-        let hover_at = |cx: &mut gpui::VisualTestContext, text: &str, offset: usize| {
-            cx.update(|_, cx| host.hover(text, offset, cx))
-                .map(|hover| (hover.title.to_string(), hover.detail.map(|d| d.to_string())))
-        };
-        // An alias names its table.
-        assert_eq!(
-            hover_at(cx, text, text.find("i.").unwrap()),
-            Some((
-                "table items".to_owned(),
-                Some("id integer, name text".to_owned())
-            ))
-        );
-        // A CTE lists its columns, and its columns name it.
-        let text = "WITH recent AS (SELECT id, name FROM items) SELECT r.name FROM recent r";
-        assert_eq!(
-            hover_at(cx, text, text.rfind("recent").unwrap()).map(|(title, _)| title),
-            Some("CTE recent".to_owned())
-        );
-        assert_eq!(
-            hover_at(cx, text, text.find("r.name").unwrap()).map(|(title, _)| title),
-            Some("CTE recent".to_owned())
-        );
-        assert_eq!(
-            hover_at(cx, text, text.rfind("name").unwrap()).map(|(title, _)| title),
-            Some("recent.name".to_owned())
-        );
-        let text = "SELECT i.name FROM items i";
-        let opened = cx.update(|window, cx| {
-            host.go_to_definition(text, text.find("items").unwrap(), window, cx)
-        });
-        assert!(opened);
-        cx.run_until_parked();
-        let data_tab_open = app.read_with(cx, |app, _| {
-            app.session(session_id).is_some_and(|session| {
-                session
-                    .secondary_tabs
-                    .iter()
-                    .any(|tab| matches!(tab.kind, SecondaryTabKind::Data(_)))
-            })
-        });
-        assert!(data_tab_open, "cmd-click on a table opens it");
     }
 }

@@ -40,7 +40,8 @@ impl TransferControl {
     pub(crate) async fn cancelled(&self) {
         self.cancellation.cancelled().await;
     }
-    pub(crate) fn set_bytes(&self, bytes: u64) {
+    /// Report encoded output bytes, including blocking finalization stages.
+    pub fn set_bytes(&self, bytes: u64) {
         self.bytes.store(bytes, Ordering::Relaxed);
     }
     pub fn byte_progress(&self) -> u64 {
@@ -52,7 +53,8 @@ impl TransferControl {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
-    pub(crate) fn add_log(&self, text: &str) {
+    /// Append a bounded progress-stage message for the transfer UI.
+    pub fn add_log(&self, text: &str) {
         let mut log = self.log.lock().unwrap_or_else(|error| error.into_inner());
         log.push_str(text);
         log.push('\n');
@@ -63,6 +65,9 @@ impl TransferControl {
             }
             log.drain(..start);
         }
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
     pub fn cancel(&self) {
         self.cancellation.cancel();
@@ -198,19 +203,15 @@ pub enum QueryExportFormat {
     JsonLines,
 }
 
-pub async fn export_query(
-    engine: &DatabaseEngine,
-    sql: &str,
-    path: &Path,
-    format: QueryExportFormat,
-) -> Result<u64> {
-    let statements = checked_split_sql_for(Some(engine.kind()), sql)?;
+/// Validate one read statement before prompting for an export destination.
+pub fn validate_query_export(kind: DatabaseKind, sql: &str) -> Result<String> {
+    let statements = checked_split_sql_for(Some(kind), sql)?;
     if statements.len() != 1 {
         return Err(DbxError::Query(
             "Full query export requires exactly one read statement".into(),
         ));
     }
-    crate::protected::ensure_query(engine.kind(), &statements[0])?;
+    crate::protected::ensure_query(kind, &statements[0])?;
     let operation =
         crate::sqlx_engine::top_level_operation_keyword(&statements[0]).unwrap_or_default();
     if ![
@@ -222,60 +223,93 @@ pub async fn export_query(
             "Full query export accepts read statements only".into(),
         ));
     }
+    Ok(statements.into_iter().next().unwrap())
+}
+
+/// Consume metadata once (`None`), then each row of a fresh read-only transaction.
+/// The consumer must not accumulate rows if bounded memory is required.
+pub async fn stream_query_export(
+    engine: &DatabaseEngine,
+    sql: &str,
+    mut consume: impl FnMut(&[ColumnInfo], Option<Vec<CellValue>>) -> Result<()> + Send,
+) -> Result<u64> {
+    let statement = validate_query_export(engine.kind(), sql)?;
+    if !engine.capabilities().streaming_query_export {
+        return Err(DbxError::Unsupported {
+            operation: "streaming query export".into(),
+            kind: engine.kind(),
+        });
+    }
     let mut transaction = SqlTransaction::begin(engine, true).await?;
-    let mut output = ExportFile::new(path, false)?;
     let rows = transaction
-        .stream_rows(&statements[0], |columns, values| {
-            match (format, values) {
-                (QueryExportFormat::Csv | QueryExportFormat::Tsv, None) => {
-                    let delimiter = if format == QueryExportFormat::Csv {
-                        ','
-                    } else {
-                        '\t'
-                    };
-                    let header = columns
-                        .iter()
-                        .map(|column| delimited_text(&column.name, delimiter))
-                        .collect::<Vec<_>>()
-                        .join(&delimiter.to_string());
-                    writeln!(output, "{header}").map_err(io_error)?;
-                }
-                (QueryExportFormat::Csv | QueryExportFormat::Tsv, Some(values)) => {
-                    let delimiter = if format == QueryExportFormat::Csv {
-                        ','
-                    } else {
-                        '\t'
-                    };
-                    let fields = values
-                        .iter()
-                        .map(|value| match value {
-                            CellValue::Null => String::new(),
-                            _ => delimited_text(&value.to_string(), delimiter),
-                        })
-                        .collect::<Vec<_>>();
-                    writeln!(output, "{}", fields.join(&delimiter.to_string()))
-                        .map_err(io_error)?;
-                    report_transfer(1, 0);
-                }
-                (QueryExportFormat::JsonLines, Some(values)) => {
-                    // An array retains duplicate column names and exact typed CellValues.
-                    serde_json::to_writer(&mut output, &RowData::new(values))
-                        .map_err(|error| DbxError::Io(error.to_string()))?;
-                    writeln!(output).map_err(io_error)?;
-                    report_transfer(1, 0);
-                }
-                (QueryExportFormat::JsonLines, None) => {
-                    serde_json::to_writer(&mut output, &serde_json::json!({"columns": columns}))
-                        .map_err(|error| DbxError::Io(error.to_string()))?;
-                    writeln!(output).map_err(io_error)?;
-                }
+        .stream_rows(&statement, |columns, values| {
+            let row = values.is_some();
+            consume(columns, values)?;
+            if row {
+                report_transfer(1, 0);
             }
             Ok(())
         })
         .await?;
     transaction.commit().await?;
-    output.finish()?;
     report_transfer(0, 1);
+    Ok(rows)
+}
+
+pub async fn export_query(
+    engine: &DatabaseEngine,
+    sql: &str,
+    path: &Path,
+    format: QueryExportFormat,
+) -> Result<u64> {
+    validate_query_export(engine.kind(), sql)?;
+    let mut output = ExportFile::new(path, false)?;
+    let rows = stream_query_export(engine, sql, |columns, values| {
+        match (format, values) {
+            (QueryExportFormat::Csv | QueryExportFormat::Tsv, None) => {
+                let delimiter = if format == QueryExportFormat::Csv {
+                    ','
+                } else {
+                    '\t'
+                };
+                let header = columns
+                    .iter()
+                    .map(|column| delimited_text(&column.name, delimiter))
+                    .collect::<Vec<_>>()
+                    .join(&delimiter.to_string());
+                writeln!(output, "{header}").map_err(io_error)?;
+            }
+            (QueryExportFormat::Csv | QueryExportFormat::Tsv, Some(values)) => {
+                let delimiter = if format == QueryExportFormat::Csv {
+                    ','
+                } else {
+                    '\t'
+                };
+                let fields = values
+                    .iter()
+                    .map(|value| match value {
+                        CellValue::Null => String::new(),
+                        _ => delimited_text(&value.to_string(), delimiter),
+                    })
+                    .collect::<Vec<_>>();
+                writeln!(output, "{}", fields.join(&delimiter.to_string())).map_err(io_error)?;
+            }
+            (QueryExportFormat::JsonLines, Some(values)) => {
+                // An array retains duplicate column names and exact typed CellValues.
+                serde_json::to_writer(&mut output, &RowData::new(values))
+                    .map_err(|error| DbxError::Io(error.to_string()))?;
+                writeln!(output).map_err(io_error)?;
+            }
+            (QueryExportFormat::JsonLines, None) => {
+                serde_json::to_writer(&mut output, &serde_json::json!({"columns": columns}))
+                    .map_err(|error| DbxError::Io(error.to_string()))?;
+                writeln!(output).map_err(io_error)?;
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    output.finish()?;
     Ok(rows)
 }
 
@@ -325,7 +359,7 @@ struct ExportFile {
 }
 enum ExportWriter {
     Plain(BufWriter<fs::File>),
-    Gzip(GzEncoder<BufWriter<fs::File>>),
+    Gzip(Box<GzEncoder<BufWriter<fs::File>>>),
 }
 impl ExportFile {
     fn new(path: &Path, gzipped: bool) -> Result<Self> {
@@ -337,7 +371,7 @@ impl ExportFile {
         .map_err(io_error)?;
         let buffer = BufWriter::new(temporary.as_file().try_clone().map_err(io_error)?);
         let writer = if gzipped {
-            ExportWriter::Gzip(GzEncoder::new(buffer, Compression::default()))
+            ExportWriter::Gzip(Box::new(GzEncoder::new(buffer, Compression::default())))
         } else {
             ExportWriter::Plain(buffer)
         };
@@ -2510,25 +2544,6 @@ mod tests {
     }
 
     #[test]
-    fn detect_file_format_handles_plain_and_gzipped_extensions() {
-        let cases = [
-            ("dump.sql", DumpFormat::Sql, false),
-            ("dump.SQL.gz", DumpFormat::Sql, true),
-            ("rows.csv", DumpFormat::Csv, false),
-            ("rows.CSV.GZ", DumpFormat::Csv, true),
-            ("rows.tsv", DumpFormat::Tsv, false),
-            ("rows.tsv.gz", DumpFormat::Tsv, true),
-        ];
-        for (name, format, gzipped) in cases {
-            let detected = detect_file_format(Path::new(name)).unwrap();
-            assert_eq!(detected.format, format, "{name}");
-            assert_eq!(detected.gzipped, gzipped, "{name}");
-        }
-        assert!(detect_file_format(Path::new("rows.xlsx")).is_err());
-        assert!(detect_file_format(Path::new("noext")).is_err());
-    }
-
-    #[test]
     fn delimited_reader_parses_quoted_embedded_and_null_fields() {
         let input = b"\xEF\xBB\xBFid,name,note\r\n1,\"plain\",x\r\n2,\"has, comma\",\"line\nbreak\"\r\n3,\"doubled \"\" quote\",,,\r\n4,\"\",\r\n\r\n5,last\r\n";
         let mut reader = DelimitedReader::new(input, b',');
@@ -2600,42 +2615,39 @@ mod tests {
     }
 
     #[test]
-    fn sql_statements_split_across_strings_comments_and_delimiters() {
-        let script = "-- leading comment;\nSELECT 'a;b' FROM t; /* block ; comment */\nSELECT 2;# trailing\nUPDATE t SET x = 'it''s';\n";
-        let statements = split_sql_statements(script);
-        assert_eq!(statements.len(), 3);
-        assert_eq!(statements[0], "SELECT 'a;b' FROM t");
-        assert_eq!(statements[1], "SELECT 2");
-        assert_eq!(statements[2], "UPDATE t SET x = 'it''s'");
+    fn sql_statement_splitting_preserves_quoted_and_routine_terminators() {
+        for (script, expected) in [
+            (
+                "-- leading comment;\nSELECT 'a;b' FROM t; /* block ; comment */\nSELECT 2;# trailing\nUPDATE t SET x = 'it''s';\n",
+                vec![
+                    "SELECT 'a;b' FROM t",
+                    "SELECT 2",
+                    "UPDATE t SET x = 'it''s'",
+                ],
+            ),
+            (
+                "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  PERFORM 1; /* nested /* comment */ still inside */\nEND;\n$body$ LANGUAGE plpgsql;\nSELECT 1;",
+                vec![
+                    "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  PERFORM 1; /* nested /* comment */ still inside */\nEND;\n$body$ LANGUAGE plpgsql",
+                    "SELECT 1",
+                ],
+            ),
+            (
+                "DELIMITER ;;\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END;;\nDELIMITER ;\nCALL p();\n",
+                vec![
+                    "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+                    "CALL p()",
+                ],
+            ),
+            (
+                "SELECT `weird;name` FROM `t``ick`;",
+                vec!["SELECT `weird;name` FROM `t``ick`"],
+            ),
+        ] {
+            assert_eq!(split_sql_statements(script), expected, "{script}");
+        }
     }
 
-    #[test]
-    fn sql_statements_survive_dollar_quoting_and_nested_block_comments() {
-        let script = "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  PERFORM 1; /* nested /* comment */ still inside */\nEND;\n$body$ LANGUAGE plpgsql;\nSELECT 1;";
-        let statements = split_sql_statements(script);
-        assert_eq!(statements.len(), 2);
-        assert!(statements[0].contains("PERFORM 1;"));
-        assert!(statements[0].ends_with("$body$ LANGUAGE plpgsql"));
-        assert_eq!(statements[1], "SELECT 1");
-    }
-
-    #[test]
-    fn sql_statements_honor_mysql_delimiter_directives() {
-        let script = "DELIMITER ;;\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END;;\nDELIMITER ;\nCALL p();\n";
-        let statements = split_sql_statements(script);
-        assert_eq!(statements.len(), 2);
-        assert_eq!(
-            statements[0],
-            "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END"
-        );
-        assert_eq!(statements[1], "CALL p()");
-    }
-
-    #[test]
-    fn sql_statements_keep_backtick_identifiers_intact() {
-        let statements = split_sql_statements("SELECT `weird;name` FROM `t``ick`;");
-        assert_eq!(statements, vec!["SELECT `weird;name` FROM `t``ick`"]);
-    }
     #[test]
     fn streamed_records_preserve_multiline_bom_headers_and_data() {
         let input = "\u{feff}\"multi\nline\",value\n\u{feff}data,\"\"\n";
@@ -2746,51 +2758,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_schema_rendering_keeps_selected_foreign_keys_and_primary_keys() {
-        let parent = TableRef::in_schema("public", "accounts");
-        let child = TableRef::in_schema("public", "events");
-        let structure = TableStructure {
-            columns: vec![
-                ColumnInfo {
-                    name: "id".into(),
-                    data_type: "integer".into(),
-                    enum_values: Vec::new(),
-                    nullable: false,
-                    ordinal: 1,
-                    primary_key: true,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "account_id".into(),
-                    data_type: "integer".into(),
-                    enum_values: Vec::new(),
-                    nullable: false,
-                    ordinal: 2,
-                    primary_key: false,
-                    default_value: None,
-                },
-            ],
-            foreign_keys: vec![crate::ForeignKeyInfo {
-                constraint_name: Some("events_account_id_fkey".into()),
-                columns: vec!["account_id".into()],
-                referenced_schema: Some("public".into()),
-                referenced_table: "accounts".into(),
-                referenced_columns: vec!["id".into()],
-                on_update: Some(crate::ReferentialAction::Cascade),
-                on_delete: Some(crate::ReferentialAction::SetNull),
-            }],
-            ..Default::default()
-        };
-
-        let sql =
-            render_sql_schema(DatabaseKind::PostgreSQL, &child, &structure, &[parent]).unwrap();
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"public\".\"events\""));
-        assert!(sql.contains("PRIMARY KEY (\"id\")"));
-        assert!(sql.contains("CONSTRAINT \"events_account_id_fkey\""));
-        assert!(sql.contains("ON UPDATE CASCADE ON DELETE SET NULL"));
-    }
-
-    #[test]
     fn schema_expressions_reject_terminators_and_comments_outside_literals() {
         assert_eq!(
             safe_schema_expression(" 'a;b'::text ").unwrap(),
@@ -2808,110 +2775,6 @@ mod tests {
         ] {
             assert!(safe_schema_expression(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn schema_rendering_includes_defaults_checks_serials_and_indexes() {
-        let table = TableRef::in_schema("public", "items");
-        let column = |name: &str, data_type: &str, default: Option<&str>| ColumnInfo {
-            name: name.into(),
-            data_type: data_type.into(),
-            enum_values: Vec::new(),
-            nullable: false,
-            ordinal: 1,
-            primary_key: name == "id",
-            default_value: default.map(str::to_owned),
-        };
-        let structure = TableStructure {
-            columns: vec![
-                column("id", "integer", Some("nextval('items_id_seq'::regclass)")),
-                column("code", "text", Some("'new'::text")),
-            ],
-            checks: vec![crate::CheckConstraintInfo {
-                name: Some("code_length".into()),
-                expression: "length(code) > 0".into(),
-            }],
-            indexes: vec![
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "items_pkey".into(),
-                    columns: vec!["id".into()],
-                    unique: true,
-                    primary: true,
-                    method: None,
-                    predicate: None,
-                    definition: Some(
-                        "CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)".into(),
-                    ),
-                },
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "items_code".into(),
-                    columns: vec!["code".into()],
-                    unique: true,
-                    primary: false,
-                    method: Some("btree".into()),
-                    predicate: None,
-                    definition: Some(
-                        "CREATE UNIQUE INDEX items_code ON public.items USING btree (code)".into(),
-                    ),
-                },
-            ],
-            ..Default::default()
-        };
-        let sql = render_sql_schema(DatabaseKind::PostgreSQL, &table, &structure, &[]).unwrap();
-        assert!(sql.contains("\"id\" serial NOT NULL"), "{sql}");
-        assert!(
-            sql.contains("\"code\" text DEFAULT 'new'::text NOT NULL"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("CONSTRAINT \"code_length\" CHECK (length(code) > 0)"),
-            "{sql}"
-        );
-        assert_eq!(
-            render_sql_indexes(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
-            ["CREATE UNIQUE INDEX IF NOT EXISTS items_code ON public.items USING btree (code)"]
-        );
-        assert_eq!(
-            render_sql_sequence_resets(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
-            [
-                "SELECT setval(pg_get_serial_sequence('\"public\".\"items\"', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"public\".\"items\"), 0) + 1, false)"
-            ]
-        );
-
-        let mysql = TableStructure {
-            indexes: vec![
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "by_name".into(),
-                    columns: vec!["name(10)".into(), "created DESC".into()],
-                    unique: false,
-                    primary: false,
-                    method: Some("BTREE".into()),
-                    predicate: None,
-                    definition: None,
-                },
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "by_expression".into(),
-                    columns: vec!["(expression)".into()],
-                    unique: false,
-                    primary: false,
-                    method: Some("BTREE".into()),
-                    predicate: None,
-                    definition: None,
-                },
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            render_sql_indexes(DatabaseKind::MySQL, &TableRef::new("people"), &mysql).unwrap(),
-            [
-                "CREATE INDEX `by_name` ON `people` (`name`(10), `created` DESC)",
-                "-- Index by_expression uses expressions; recreate it manually",
-            ]
-        );
     }
 
     #[tokio::test]

@@ -98,6 +98,23 @@ impl Engine for MongoEngine {
         *self.database.write().await = name.into();
         Ok(())
     }
+    async fn document_for_edit(
+        &self,
+        table: &TableRef,
+        identity: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let filter = parse_command(&serde_json::json!({"_id":identity}).to_string())?;
+        let database = self.database.read().await.clone();
+        let document = self
+            .client
+            .database(&database)
+            .collection::<Document>(&table.name)
+            .find_one(filter)
+            .await
+            .map_err(error)?
+            .ok_or_else(|| DbxError::Query("The document no longer exists".into()))?;
+        Ok(mongodb::bson::Bson::Document(document).into_canonical_extjson())
+    }
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
         Ok(self
             .query(

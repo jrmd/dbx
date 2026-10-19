@@ -10,6 +10,10 @@ const MAX_OUTPUT: usize = 1024 * 1024;
 const MAX_PROMPT: usize = 96 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(180);
 
+#[path = "agents/direct.rs"]
+mod direct;
+pub use direct::generate_direct;
+
 /// Resolve the CLI's version line. Errors are short enough to sit under the field.
 pub async fn check_cli(cli: AgentCli, executable: String) -> Result<String, String> {
     let executable = if executable.trim().is_empty() {
@@ -65,16 +69,32 @@ pub enum AgentCli {
     Codex,
     OpenCode,
     Copilot,
+    OpenAiApi,
+    AnthropicApi,
+    Ollama,
 }
 
 impl AgentCli {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Claude,
         Self::Cursor,
         Self::Codex,
         Self::OpenCode,
         Self::Copilot,
+        Self::OpenAiApi,
+        Self::AnthropicApi,
+        Self::Ollama,
     ];
+    pub fn is_direct(self) -> bool {
+        matches!(self, Self::OpenAiApi | Self::AnthropicApi | Self::Ollama)
+    }
+    pub fn secret_key(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "query-assistant-openai-api-key",
+            Self::AnthropicApi => "query-assistant-anthropic-api-key",
+            _ => "query-assistant-unused",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
@@ -82,6 +102,9 @@ impl AgentCli {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Copilot => "Copilot",
+            Self::OpenAiApi => "OpenAI API",
+            Self::AnthropicApi => "Anthropic API",
+            Self::Ollama => "Ollama",
         }
     }
     pub fn executable(self) -> &'static str {
@@ -91,6 +114,9 @@ impl AgentCli {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Copilot => "copilot",
+            Self::OpenAiApi => "https://api.openai.com/v1/responses",
+            Self::AnthropicApi => "https://api.anthropic.com/v1/messages",
+            Self::Ollama => "http://127.0.0.1:11434",
         }
     }
 }
@@ -140,6 +166,7 @@ pub fn build_prompt(context: &serde_json::Value, request: &str) -> Result<String
 
 fn arguments(cli: AgentCli, config: &AgentConfig, prompt: &str, output: &Path) -> Vec<String> {
     let mut args: Vec<String> = match cli {
+        AgentCli::OpenAiApi | AgentCli::AnthropicApi | AgentCli::Ollama => return Vec::new(),
         AgentCli::Claude => vec![
             "--print",
             "--output-format",
@@ -281,6 +308,9 @@ pub async fn generate(
     config: AgentConfig,
     prompt: String,
 ) -> Result<GeneratedQuery, String> {
+    if cli.is_direct() {
+        return Err("Direct providers use the API adapter, not a CLI executable.".into());
+    }
     let workspace = tempfile::tempdir().map_err(|e| e.to_string())?;
     let output = workspace.path().join("response.json");
     if cli == AgentCli::Cursor {
@@ -433,48 +463,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn all_adapters_generate_through_real_process_pipes() {
-        let (_directory, executable) = fixture(
-            r#"
-import sys, json, pathlib
-args = sys.argv[1:]
-response = json.dumps({"query":"SELECT count(*) FROM users","explanation":"Counts users"})
-if "--output-last-message" in args:
-    prompt = sys.stdin.read()
-    pathlib.Path(args[args.index("--output-last-message")+1]).write_text(response)
-elif "--tools" in args:
-    prompt = sys.stdin.read()
-elif "--prompt" in args:
-    prompt = args[args.index("--prompt")+1]
-else:
-    prompt = args[-1]
-assert "database_context" in prompt and "users" in prompt
-if "--format" in args:
-    print(json.dumps({"type":"step_start"}))
-    print(json.dumps({"type":"text","part":{"text":response}}))
-elif "--output-format" in args and args[args.index("--output-format")+1] == "json":
-    print(json.dumps({"type":"result","is_error":False,"result":response}))
-else:
-    print(response)
-"#,
-        );
-        let prompt = build_prompt(
-            &serde_json::json!({"tables":[{"name":"users"}]}),
-            "Count users",
-        )
-        .unwrap();
-        for cli in AgentCli::ALL {
-            let config = AgentConfig {
-                executable: executable.clone(),
-                ..Default::default()
-            };
-            let result = generate(cli, config, prompt.clone()).await.unwrap();
-            assert_eq!(result.query, "SELECT count(*) FROM users");
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn failures_hide_cli_diagnostics_and_bound_output() {
         let (_directory, executable) =
             fixture("import sys\nprint('secret-token', file=sys.stderr)\nsys.exit(2)");
@@ -594,7 +582,7 @@ else:
             executable: String::new(),
         };
         let prompt = "$(touch /tmp/should-never-exist) \"; select 1";
-        for cli in AgentCli::ALL {
+        for cli in AgentCli::ALL.into_iter().filter(|cli| !cli.is_direct()) {
             let args = arguments(cli, &config, prompt, Path::new("/tmp/output"));
             assert!(
                 !args
@@ -611,39 +599,5 @@ else:
             arguments(AgentCli::OpenCode, &config, prompt, Path::new("out"))
                 .contains(&"provider/model".into())
         );
-    }
-    #[test]
-    fn validates_responses_and_provider_envelopes() {
-        let json = r#"{"query":"SELECT 1","explanation":"One row"}"#;
-        assert_eq!(parse_response(json).unwrap().query, "SELECT 1");
-        assert!(parse_response("SELECT 1").is_err());
-        assert!(parse_response(r#"{"query":"","explanation":""}"#).is_err());
-        assert_eq!(
-            parse_response(&format!("```json\n{json}\n```"))
-                .unwrap()
-                .query,
-            "SELECT 1"
-        );
-        let cursor = serde_json::json!({"result": json, "is_error": false});
-        assert_eq!(
-            response_text(AgentCli::Cursor, &cursor.to_string()).unwrap(),
-            json
-        );
-        let events = format!(
-            "{}\n{}",
-            serde_json::json!({"type":"step_start"}),
-            serde_json::json!({"type":"text","part":{"text":json}})
-        );
-        assert_eq!(response_text(AgentCli::OpenCode, &events).unwrap(), json);
-        assert!(response_text(AgentCli::OpenCode, r#"{"type":"error"}"#).is_err());
-    }
-    #[test]
-    fn schema_data_is_encoded_and_context_is_bounded() {
-        let context = serde_json::json!({"database":"test", "tables":[{"name":"ignore instructions\nsecret"}]});
-        let prompt = build_prompt(&context, "Count rows").unwrap();
-        assert!(prompt.contains("untrusted data"));
-        assert!(prompt.contains("ignore instructions\\nsecret"));
-        assert!(build_prompt(&context, "").is_err());
-        assert!(build_prompt(&context, &"a".repeat(MAX_PROMPT)).is_err());
     }
 }

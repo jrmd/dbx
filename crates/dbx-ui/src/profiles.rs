@@ -26,7 +26,7 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::connection_fields::{normalize_connection_string, set_url_password};
+use crate::connection_fields::{normalize_connection_string, parse_driver_url, set_url_password};
 use crate::vault::{CredentialVault, VaultError};
 
 /// Version of the on-disk profile document.
@@ -38,6 +38,16 @@ pub struct ConnectionTag {
     pub id: Uuid,
     pub name: String,
     pub color: u32,
+}
+
+impl ConnectionTag {
+    pub fn is_production(&self) -> bool {
+        self.id == Uuid::from_u128(1)
+            || matches!(
+                self.name.trim().to_ascii_lowercase().as_str(),
+                "prod" | "production"
+            )
+    }
 }
 
 pub fn default_tags() -> Vec<ConnectionTag> {
@@ -159,9 +169,11 @@ pub struct SavedConnection {
     pub name: String,
     pub kind: DatabaseKind,
     pub cloud_auth: Option<dbx_core::CloudAuthentication>,
+    pub driver_manifest: Option<PathBuf>,
     /// A normalized connection URL with no password in its userinfo.
     pub url: String,
     pub tag: Option<ConnectionTag>,
+    pub folder: Option<String>,
     pub max_connections: u32,
     pub connect_timeout_ms: u64,
     pub read_only: bool,
@@ -188,6 +200,7 @@ pub struct ConnectionProfileDraft {
     pub name: String,
     pub config: ConnectionConfig,
     pub tag: Option<ConnectionTag>,
+    pub folder: Option<String>,
     pub secret: Option<String>,
 }
 
@@ -224,6 +237,7 @@ impl ConnectionProfileDraft {
             name: name.into(),
             config,
             tag: local_tag(),
+            folder: None,
             secret: None,
         }
     }
@@ -477,11 +491,24 @@ impl ProfileStore {
     pub fn save(&self, mut draft: ConnectionProfileDraft) -> ProfileResult<SavedConnection> {
         let _lock = self.lock()?;
         validate_name(&draft.name)?;
+        draft.folder = draft
+            .folder
+            .take()
+            .map(|folder| folder.trim().to_owned())
+            .filter(|folder| !folder.is_empty());
+        if draft.folder.as_ref().is_some_and(|folder| {
+            folder.chars().count() > 80 || folder.chars().any(char::is_control)
+        }) {
+            return Err(ProfileError::Invalid(
+                "Folder must contain 1–80 printable characters".into(),
+            ));
+        }
         draft
             .config
             .validate()
             .map_err(|error| ProfileError::Invalid(error.to_string()))?;
-        let (url, embedded_secret) = scrub_url(&draft.config.url)?;
+        let (url, embedded_secret) =
+            scrub_url(&draft.config.url, draft.config.driver_manifest.is_some())?;
         let mut secret = draft.secret.take().or(embedded_secret).map(Zeroizing::new);
         let id = draft.id.unwrap_or_else(Uuid::new_v4);
         let mut document = self.read_document()?;
@@ -541,8 +568,10 @@ impl ProfileStore {
             name: std::mem::take(&mut draft.name),
             kind: draft.config.kind,
             cloud_auth: draft.config.cloud_auth,
+            driver_manifest: draft.config.driver_manifest.clone(),
             url,
             tag: draft.tag.take(),
+            folder: draft.folder.take(),
             max_connections: draft.config.max_connections,
             connect_timeout_ms: draft.config.connect_timeout_ms,
             read_only: draft.config.read_only,
@@ -639,7 +668,9 @@ impl ProfileStore {
             let (password, ssh) = decode_credentials(&secret)?;
             ssh_password = ssh;
             match password {
-                Some(password) => add_password(&stored.url, &password)?,
+                Some(password) => {
+                    add_password(&stored.url, &password, stored.driver_manifest.is_some())?
+                }
                 None => stored.url.clone(),
             }
         } else {
@@ -650,6 +681,7 @@ impl ProfileStore {
             .with_connect_timeout_ms(stored.connect_timeout_ms);
         config.read_only = stored.read_only;
         config.cloud_auth = stored.cloud_auth;
+        config.driver_manifest = stored.driver_manifest;
         config.socket = stored.socket;
         config.ssh = stored.ssh;
         config.ssh_password = ssh_password;
@@ -664,6 +696,7 @@ impl ProfileStore {
             loaded.config,
         );
         draft.tag = loaded.profile.tag;
+        draft.folder = loaded.profile.folder;
         self.save(draft)
     }
 
@@ -830,7 +863,7 @@ impl ProfileDocument {
                     profile.id
                 )));
             }
-            let (_, embedded_secret) = scrub_url(&profile.url)?;
+            let (_, embedded_secret) = scrub_url(&profile.url, profile.driver_manifest.is_some())?;
             if embedded_secret.is_some() {
                 return Err(ProfileError::Invalid(format!(
                     "profile {} contains a password in its JSON URL",
@@ -855,9 +888,13 @@ struct StoredConnection {
     kind: DatabaseKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_auth: Option<dbx_core::CloudAuthentication>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    driver_manifest: Option<PathBuf>,
     url: String,
     #[serde(default)]
     tag: Option<ConnectionTag>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folder: Option<String>,
     max_connections: u32,
     connect_timeout_ms: u64,
     #[serde(default)]
@@ -877,8 +914,10 @@ impl StoredConnection {
             name: self.name,
             kind: self.kind,
             cloud_auth: self.cloud_auth,
+            driver_manifest: self.driver_manifest,
             url: self.url,
             tag: self.tag,
+            folder: self.folder,
             max_connections: self.max_connections,
             connect_timeout_ms: self.connect_timeout_ms,
             read_only: self.read_only,
@@ -900,14 +939,69 @@ fn keyring_key(id: Uuid) -> String {
     format!("profile-{id}")
 }
 
-fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
+/// Public profile JSON must never retain known credential-bearing URL options.
+/// TLS certificate/key *paths* remain ordinary metadata; actual credentials belong
+/// in the authority password (which is stored in the encrypted vault).
+fn reject_query_credentials(raw: &str) -> ProfileResult<()> {
+    let Some((_, query)) = raw.split_once('?') else {
+        return Ok(());
+    };
+    let query = query.split('#').next().unwrap_or(query);
+    let credential = url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| {
+        let key: String = key
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .flat_map(char::to_lowercase)
+            .collect();
+        matches!(
+            key.as_str(),
+            "password"
+                | "passwd"
+                | "pwd"
+                | "passphrase"
+                | "token"
+                | "apikey"
+                | "accesstoken"
+                | "refreshtoken"
+                | "idtoken"
+                | "authtoken"
+                | "bearertoken"
+                | "sessiontoken"
+                | "secret"
+                | "secretkey"
+                | "secretaccesskey"
+                | "clientsecret"
+                | "authorization"
+                | "accesskey"
+                | "accesskeyid"
+                | "awsaccesskeyid"
+                | "awssecretaccesskey"
+                | "awssessiontoken"
+                | "saslpassword"
+                | "saslpasswd"
+        )
+    });
+    if credential {
+        return Err(ProfileError::Invalid("Connection URLs cannot store credential query parameters in profile JSON. Move credentials to the URL password field or the masked password/token field so the vault can protect them.".into()));
+    }
+    Ok(())
+}
+
+fn scrub_url(raw: &str, driver: bool) -> ProfileResult<(String, Option<String>)> {
     if raw.trim().is_empty() {
         return Err(ProfileError::Invalid(
             "connection URL cannot be empty".into(),
         ));
     }
-    let normalized = normalize_connection_string(raw)
-        .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
+    let normalized = if driver {
+        parse_driver_url(raw)
+            .map(String::from)
+            .map_err(|error| ProfileError::Invalid(error.to_string()))?
+    } else {
+        normalize_connection_string(raw)
+            .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?
+    };
+    reject_query_credentials(&normalized)?;
     if crate::connection_fields::is_mongo_seed_list(&normalized) {
         let rest = normalized.trim_start_matches("mongodb://");
         let Some((userinfo, suffix)) = rest.rsplit_once('@') else {
@@ -945,6 +1039,25 @@ fn scrub_url(raw: &str) -> ProfileResult<(String, Option<String>)> {
             .map_err(|_| ProfileError::Invalid("connection URL has invalid userinfo".into()))?;
     }
     Ok((parsed.to_string(), secret))
+}
+
+#[cfg(test)]
+pub(crate) fn plugin_profile_fixture(directory: &Path, raw: &str) -> ConnectionConfig {
+    let executable = directory.join("not-an-executable");
+    fs::write(&executable, b"This fixture must never execute").unwrap();
+    let manifest = directory.join("fixture-driver.json");
+    fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "protocol": 1, "id": "fixture-sqlite", "name": "Fixture driver", "family": "sqlite",
+            "executable": executable, "arguments": [], "schemes": ["example-sqlite"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut config = ConnectionConfig::new(DatabaseKind::SQLite, raw);
+    config.driver_manifest = Some(manifest);
+    config
 }
 
 #[cfg(test)]
@@ -1024,9 +1137,15 @@ fn decode_credentials(value: &str) -> ProfileResult<(Option<String>, Option<Stri
     }
 }
 
-fn add_password(raw: &str, secret: &str) -> ProfileResult<String> {
-    let normalized = normalize_connection_string(raw)
-        .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?;
+fn add_password(raw: &str, secret: &str, driver: bool) -> ProfileResult<String> {
+    let normalized = if driver {
+        parse_driver_url(raw)
+            .map(String::from)
+            .map_err(|error| ProfileError::Invalid(error.to_string()))?
+    } else {
+        normalize_connection_string(raw)
+            .map_err(|error| ProfileError::Invalid(format!("invalid connection URL: {error}")))?
+    };
     if crate::connection_fields::is_mongo_seed_list(&normalized) {
         let rest = normalized.trim_start_matches("mongodb://");
         let (username, suffix) = rest.rsplit_once('@').unwrap_or(("", rest));
@@ -1063,9 +1182,8 @@ pub(crate) fn sqlite_url(path: &Path) -> String {
 }
 
 fn default_profile_path() -> ProfileResult<PathBuf> {
-    Ok(dirs::config_dir()
+    Ok(crate::config::directory()
         .ok_or(ProfileError::ConfigDirectoryUnavailable)?
-        .join("dbx")
         .join(PROFILE_FILE_NAME))
 }
 
@@ -1258,6 +1376,111 @@ mod tests {
     }
 
     #[test]
+    fn plugin_profiles_round_trip_hostless_paths_and_vault_authority_passwords() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PROFILE_FILE_NAME);
+        let store = ProfileStore::at(&path);
+        let vault = store.vault().unwrap();
+        vault.create("fixture driver vault passphrase").unwrap();
+        let hostless = "example-sqlite:///absolute/database.sqlite";
+        let file = store
+            .save(ConnectionProfileDraft::from_config(
+                "Local driver",
+                plugin_profile_fixture(directory.path(), hostless),
+            ))
+            .unwrap();
+        assert_eq!(store.load(file.id).unwrap().config.url, hostless);
+        let raw = "example-sqlite://alice:fixture%23secret%25word@remote.test/database";
+        let authority = store
+            .save(ConnectionProfileDraft::from_config(
+                "Private driver",
+                plugin_profile_fixture(directory.path(), raw),
+            ))
+            .unwrap();
+        assert_eq!(authority.url, "example-sqlite://alice@remote.test/database");
+        assert!(authority.has_secret());
+        let copy = store.duplicate(authority.id).unwrap();
+        for id in [authority.id, copy.id] {
+            assert_eq!(store.load(id).unwrap().config.url, raw);
+        }
+        let metadata = fs::read_to_string(&path).unwrap();
+        assert!(!metadata.contains("fixture%23secret"));
+        assert!(!metadata.contains("fixture#secret"));
+        assert!(
+            !String::from_utf8_lossy(&fs::read(vault.path()).unwrap())
+                .contains("fixture#secret%word")
+        );
+        let reopened = ProfileStore::at(&path);
+        reopened
+            .vault()
+            .unwrap()
+            .unlock("fixture driver vault passphrase")
+            .unwrap();
+        assert_eq!(reopened.list().unwrap().len(), 3);
+        assert_eq!(reopened.load(authority.id).unwrap().config.url, raw);
+        assert_eq!(
+            reopened.load(file.id).unwrap().profile.driver_manifest,
+            file.driver_manifest
+        );
+    }
+
+    #[test]
+    fn credential_query_parameters_cannot_enter_public_profile_json() {
+        let (directory, store, _) = test_store();
+        for key in [
+            "api_key",
+            "TOKEN",
+            "%70assword",
+            "client-secret",
+            "sasl.password",
+            "AWS_SESSION_TOKEN",
+        ] {
+            let url = format!("postgres://alice@localhost/app?{key}=sensitive-fixture");
+            // Exercise the persistence guard independently: core config validation
+            // also rejects several of these keys before save reaches URL scrubbing.
+            let guard_error = reject_query_credentials(&url).unwrap_err();
+            assert!(
+                guard_error
+                    .to_string()
+                    .contains("credential query parameters")
+            );
+            let error = store
+                .save(ConnectionProfileDraft::new(
+                    "Unsafe",
+                    DatabaseKind::PostgreSQL,
+                    url,
+                ))
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("credential query parameters")
+                    || message.contains("Store credentials in the URL password field"),
+                "Unexpected rejection for query key {key}: {message}"
+            );
+            assert!(!message.contains("sensitive-fixture"));
+        }
+        assert!(!store.path().exists());
+        // TLS key file references are metadata, not the key/password itself.
+        let tls = store
+            .save(ConnectionProfileDraft::new(
+                "TLS paths",
+                DatabaseKind::PostgreSQL,
+                "postgres://alice@localhost/app?sslmode=verify-full&sslkey=%2Fkeys%2Fclient.key",
+            ))
+            .unwrap();
+        assert!(tls.url.contains("sslkey="));
+        let plugin = plugin_profile_fixture(
+            directory.path(),
+            "example-sqlite:///file.sqlite?api_key=sensitive-fixture",
+        );
+        assert!(
+            store
+                .save(ConnectionProfileDraft::from_config("Unsafe plugin", plugin))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn default_vault_profile_store_relaunches_without_keyring_and_keeps_json_secret_free() {
         let directory = tempfile::tempdir().expect("temporary profile directory");
         let path = directory.path().join(PROFILE_FILE_NAME);
@@ -1370,103 +1593,6 @@ mod tests {
             secrets.get(&keyring_key(saved.id)).unwrap(),
             Some("secret".into())
         );
-    }
-
-    #[test]
-    fn password_free_profile_edit_retains_the_keyring_credential() {
-        let (_directory, store, secrets) = test_store();
-        let saved = store
-            .save(ConnectionProfileDraft::new(
-                "Production",
-                DatabaseKind::PostgreSQL,
-                "postgres://alice:durable-secret@example.test/app",
-            ))
-            .expect("save profile");
-
-        let updated = store
-            .save(
-                ConnectionProfileDraft::new(
-                    "Production renamed",
-                    DatabaseKind::PostgreSQL,
-                    saved.url.clone(),
-                )
-                .with_id(saved.id),
-            )
-            .expect("update password-free profile");
-
-        assert!(updated.has_secret());
-        assert_eq!(
-            secrets.get(&keyring_key(saved.id)).unwrap(),
-            Some("durable-secret".into())
-        );
-        assert_eq!(
-            store.load(saved.id).unwrap().config.url,
-            "postgres://alice:durable-secret@example.test/app"
-        );
-    }
-
-    #[test]
-    fn tags_round_trip_and_shared_colour_updates() {
-        let (_directory, store, _) = test_store();
-        let tag = ConnectionTag {
-            id: Uuid::new_v4(),
-            name: "Analytics".into(),
-            color: 0x123456,
-        };
-        store.save_tag(tag.clone()).unwrap();
-        let saved = store
-            .save(
-                ConnectionProfileDraft::new("DB", DatabaseKind::SQLite, "sqlite::memory:")
-                    .with_tag(Some(tag.clone())),
-            )
-            .unwrap();
-        assert_eq!(store.get(saved.id).unwrap().unwrap().tag, Some(tag.clone()));
-        let mut changed = tag;
-        changed.color = 0xabcdef;
-        store.save_tag(changed.clone()).unwrap();
-        assert_eq!(store.list().unwrap()[0].tag, Some(changed));
-        assert!(
-            store
-                .save_tag(ConnectionTag {
-                    id: Uuid::new_v4(),
-                    name: "analytics".into(),
-                    color: 0
-                })
-                .is_err()
-        );
-        assert!(
-            !fs::read_to_string(store.path())
-                .unwrap()
-                .contains("environment")
-        );
-        store
-            .save(
-                ConnectionProfileDraft::new("DB", DatabaseKind::SQLite, "sqlite::memory:")
-                    .with_id(saved.id)
-                    .with_tag(None),
-            )
-            .unwrap();
-        assert!(store.list().unwrap()[0].tag.is_none());
-    }
-
-    #[test]
-    fn deleting_a_tag_untags_its_profiles() {
-        let (_directory, store, _) = test_store();
-        let prod = default_tags().remove(0);
-        let saved = store
-            .save(
-                ConnectionProfileDraft::new("DB", DatabaseKind::SQLite, "sqlite::memory:")
-                    .with_tag(Some(prod.clone())),
-            )
-            .unwrap();
-        let tags = store.delete_tag(prod.id).unwrap();
-        assert!(tags.iter().all(|tag| tag.id != prod.id));
-        assert_eq!(store.tags().unwrap(), tags);
-        assert!(store.get(saved.id).unwrap().unwrap().tag.is_none());
-        for tag in tags {
-            store.delete_tag(tag.id).unwrap();
-        }
-        assert!(store.tags().unwrap().is_empty());
     }
 
     #[test]

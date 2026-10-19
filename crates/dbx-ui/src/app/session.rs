@@ -301,6 +301,7 @@ pub(super) struct CompletionCacheKey {
     pub(super) signature: CompletionSignature,
     pub(super) tables: usize,
     pub(super) columns: usize,
+    pub(super) relational_schema: usize,
     pub(super) recent_result: usize,
 }
 
@@ -365,6 +366,12 @@ impl Drop for BackgroundTaskSet {
 pub(super) struct QueryTab {
     pub(super) timeout_secs: u64,
     pub(super) plan_pending: bool,
+    pub(super) plan_analyze_pending: bool,
+    pub(super) full_table_statistics_pending: Option<Vec<ColumnInfo>>,
+    pub(super) plan_tree: bool,
+    pub(super) watch_interval: Option<u64>,
+    pub(super) watch_generation: u64,
+    pub(super) watch_read_only_pending: bool,
     pub(super) plan: Option<QueryResult>,
     pub(super) plan_baseline: Option<QueryResult>,
     pub(super) name: Entity<String>,
@@ -473,6 +480,13 @@ impl QueryTab {
                 query.query_revision = query.query_revision.wrapping_add(1);
                 query.results_stale = query.result.is_some();
                 query.error_highlight = None;
+                if query.watch_interval.take().is_some()
+                    && query.busy
+                    && let Some(cancellation) = &query.cancellation
+                {
+                    cancellation.cancel();
+                }
+                query.watch_generation = query.watch_generation.wrapping_add(1);
                 query.completion_signature = None;
                 query.completion_dismissed_signature = None;
             }
@@ -493,6 +507,12 @@ impl QueryTab {
             name,
             timeout_secs: 60,
             plan_pending: false,
+            plan_analyze_pending: false,
+            full_table_statistics_pending: None,
+            plan_tree: false,
+            watch_interval: None,
+            watch_generation: 0,
+            watch_read_only_pending: false,
             plan: None,
             plan_baseline: None,
             name_editor,
@@ -558,6 +578,9 @@ impl QueryTab {
     }
 
     pub(super) fn invalidate_request(&mut self) {
+        self.watch_interval = None;
+        self.watch_generation = self.watch_generation.wrapping_add(1);
+        self.watch_read_only_pending = false;
         self.request_generation = self.request_generation.saturating_add(1);
         if let Some(cancellation) = self.cancellation.take() {
             cancellation.cancel();
@@ -825,6 +848,7 @@ pub(super) struct DataTab {
     /// new rows, and loaded rows marked for deletion. Nothing reaches the
     /// database until the user commits the set as a whole.
     pub(super) pending_edits: cell_edits::PendingEdits,
+    pub(super) edit_history: cell_edits::EditHistory,
     pub(super) recovered_changeset: Option<crate::workspace::SavedChangeset>,
     pub(super) pending_inserts: Vec<cell_edits::PendingInsert>,
     pub(super) pending_deletes: std::collections::BTreeSet<usize>,
@@ -900,6 +924,7 @@ impl DataTab {
             sort: None,
             sortable,
             pending_edits: Default::default(),
+            edit_history: Default::default(),
             recovered_changeset: None,
             pending_inserts: Vec::new(),
             pending_deletes: Default::default(),
@@ -931,6 +956,7 @@ impl DataTab {
         tables: &[TableInfo],
         cx: &mut Context<DbxApp>,
     ) {
+        self.edit_history = Default::default();
         self.result = result.map(Arc::new);
         self.sync_result_grid(true, tables, cx);
     }
@@ -977,6 +1003,7 @@ impl DataTab {
     /// result replaces the snapshot they point into.
     pub(super) fn reset_row_state(&mut self, cx: &mut Context<DbxApp>) {
         self.result_table = None;
+        self.edit_history = Default::default();
         self.selected_row = None;
         self.marked_rows.clear();
         self.mark_anchor = None;
@@ -1079,6 +1106,7 @@ pub(super) struct ConnectionSession {
     /// supplies table names; columns are added as tables are opened or their
     /// structure is inspected, avoiding a metadata query for every keystroke.
     pub(super) completion_columns: HashMap<String, Vec<ColumnInfo>>,
+    pub(super) completion_schema: Option<Arc<RelationalSchema>>,
     /// Authoritative command grammar discovered once from the connected
     /// Redis/Valkey server. Completion only reads this cache; it never performs
     /// network I/O while the user is typing.
@@ -1133,6 +1161,7 @@ impl ConnectionSession {
             schema_objects_error: None,
             sidebar: SidebarState::new(id, kind, window, cx),
             completion_columns: HashMap::new(),
+            completion_schema: None,
             redis_command_catalog: None,
             databases: Vec::new(),
             current_database: None,

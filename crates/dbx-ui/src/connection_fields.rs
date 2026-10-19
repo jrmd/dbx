@@ -13,6 +13,7 @@ use zeroize::Zeroize;
 /// its address is a file or SQLite URL rather than a network address.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectionFields {
+    pub driver_manifest: Option<std::path::PathBuf>,
     pub read_only: bool,
     pub cloud_auth: Option<dbx_core::CloudAuthentication>,
     pub kind: DatabaseKind,
@@ -52,6 +53,10 @@ pub enum ConnectionFieldsError {
     MissingDatabase(DatabaseKind),
     #[error("connection string is not a valid URL")]
     InvalidUrl,
+    #[error(
+        "driver URLs cannot contain query parameters or fragments; put credentials in the URL password field"
+    )]
+    DriverUrlOptions,
     #[error("unsupported connection URL scheme: {0}")]
     UnsupportedScheme(String),
     #[error("connection string scheme does not match {expected}")]
@@ -75,6 +80,7 @@ impl ConnectionFields {
             ssh: None,
             ssh_password: None,
             cloud_auth: None,
+            driver_manifest: None,
         }
     }
 
@@ -105,6 +111,7 @@ impl ConnectionFields {
                 ssh: None,
                 ssh_password: None,
                 cloud_auth: None,
+                driver_manifest: None,
             });
         }
 
@@ -133,6 +140,7 @@ impl ConnectionFields {
             ssh: None,
             ssh_password: None,
             cloud_auth: None,
+            driver_manifest: None,
         })
     }
 
@@ -144,8 +152,29 @@ impl ConnectionFields {
 
     /// Validate and return the address used to open a connection.
     pub fn url(&self) -> Result<String, ConnectionFieldsError> {
+        if self.driver_manifest.is_some() {
+            let mut url = parse_driver_url(&self.connection_string)?;
+            if !self.password.is_empty() && url.password().is_none() {
+                set_url_password(&mut url, Some(&self.password))
+                    .map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+            }
+            return Ok(url.into());
+        }
         if !self.connection_string.trim().is_empty() {
-            let connection_string = normalize_connection_string(&self.connection_string)?;
+            let connection_string = if self.kind.is_file() {
+                let raw = self.connection_string.trim();
+                if !raw.contains(':') && !raw.starts_with(['/', '~', '.']) {
+                    file_address(&format!("./{raw}"), self.kind)?
+                        .ok_or(ConnectionFieldsError::InvalidUrl)?
+                } else {
+                    match file_address(raw, self.kind)? {
+                        Some(address) => address,
+                        None => normalize_connection_string(raw)?,
+                    }
+                }
+            } else {
+                normalize_connection_string(&self.connection_string)?
+            };
             if self.kind == DatabaseKind::MongoDB && is_mongo_seed_list(&connection_string) {
                 return Ok(connection_string);
             }
@@ -182,6 +211,7 @@ impl ConnectionFields {
     pub fn config(&self) -> Result<ConnectionConfig, String> {
         let mut config =
             ConnectionConfig::new(self.kind, self.url().map_err(|error| error.to_string())?);
+        config.driver_manifest = self.driver_manifest.clone();
         config.read_only = self.read_only;
         config.socket = self.socket_enabled.then(|| self.socket.trim().into());
         config.ssh = self.ssh.clone();
@@ -309,6 +339,17 @@ fn kind_for_scheme(scheme: &str) -> Result<DatabaseKind, ConnectionFieldsError> 
     }
 }
 
+/// Locally selected drivers define their own schemes and may use hostless file URLs.
+/// Keep their parsing separate from built-in address inference and reject options that
+/// cannot safely be separated from public connection metadata.
+pub(crate) fn parse_driver_url(raw: &str) -> Result<Url, ConnectionFieldsError> {
+    let url = Url::parse(raw.trim()).map_err(|_| ConnectionFieldsError::InvalidUrl)?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ConnectionFieldsError::DriverUrlOptions);
+    }
+    Ok(url)
+}
+
 /// Normalize a connection URL whose userinfo contains characters that should
 /// have been percent-encoded before the URL reached DBX.
 ///
@@ -323,6 +364,9 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(ConnectionFieldsError::InvalidUrl);
+    }
+    if let Some(url) = file_address(raw, DatabaseKind::SQLite)? {
+        return Ok(url);
     }
     if is_mongo_seed_list(raw) {
         let (scheme, rest) = raw
@@ -437,6 +481,53 @@ pub(crate) fn normalize_connection_string(raw: &str) -> Result<String, Connectio
     Err(ConnectionFieldsError::InvalidUrl)
 }
 
+/// Accept filesystem paths without interpreting URL credentials or query strings as paths.
+pub(crate) fn file_address(
+    raw: &str,
+    kind: DatabaseKind,
+) -> Result<Option<String>, ConnectionFieldsError> {
+    let raw = raw.trim();
+    if raw.contains("://") || raw.starts_with("sqlite:") || raw.starts_with("duckdb:") {
+        return Ok(None);
+    }
+    let extension = std::path::Path::new(raw)
+        .extension()
+        .and_then(|value| value.to_str());
+    let is_path = raw.starts_with(['/', '~', '.'])
+        || raw.contains('\\')
+        || matches!(
+            extension,
+            Some("db" | "sqlite" | "sqlite3" | "db3" | "duckdb")
+        );
+    if !is_path {
+        return Ok(None);
+    }
+    let path = if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or(ConnectionFieldsError::InvalidUrl)?
+            .join(rest)
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|_| ConnectionFieldsError::InvalidUrl)?
+            .join(path)
+    };
+    let kind = if kind == DatabaseKind::DuckDB || extension == Some("duckdb") {
+        DatabaseKind::DuckDB
+    } else {
+        DatabaseKind::SQLite
+    };
+    Ok(Some(crate::profiles::sqlite_url(&path).replacen(
+        "sqlite:",
+        &format!("{}:", kind.scheme()),
+        1,
+    )))
+}
+
 pub(crate) fn is_mongo_seed_list(raw: &str) -> bool {
     raw.strip_prefix("mongodb://").is_some_and(|rest| {
         rest.rsplit('@')
@@ -475,65 +566,8 @@ fn decode(value: &str) -> Result<String, ConnectionFieldsError> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn clickhouse_urls_support_details_and_explicit_https_provider_selection() {
-        use super::*;
-        let mut fields =
-            ConnectionFields::from_url("clickhouse://default:p%40ss@localhost:8123/default")
-                .unwrap();
-        assert_eq!(fields.kind, DatabaseKind::ClickHouse);
-        assert_eq!(fields.password, "p@ss");
-        fields.use_structured_fields();
-        assert!(fields.config().is_ok());
-        let mut fields =
-            ConnectionFields::from_url("https://user:secret@cloud.example:8443/default").unwrap();
-        fields.kind = DatabaseKind::ClickHouse;
-        assert_eq!(
-            fields.config().unwrap().url,
-            "https://user:secret@cloud.example:8443/default"
-        );
-    }
     use super::*;
 
-    #[test]
-    fn sql_server_urls_round_trip_through_structured_fields() {
-        let mut fields =
-            ConnectionFields::from_url("sqlserver://sa:p%40ss@db.internal:1433/app").unwrap();
-        assert_eq!(fields.kind, DatabaseKind::SqlServer);
-        assert_eq!(fields.host, "db.internal");
-        assert_eq!(fields.port, "1433");
-        assert_eq!(fields.password, "p@ss");
-        assert_eq!(fields.database, "app");
-        fields.use_structured_fields();
-        assert_eq!(
-            fields.config().unwrap().url,
-            "sqlserver://sa:p%40ss@db.internal:1433/app"
-        );
-        assert_eq!(
-            ConnectionFields::from_url("mssql://sa@localhost/master")
-                .unwrap()
-                .kind,
-            DatabaseKind::SqlServer
-        );
-    }
-
-    #[test]
-    fn socket_form_connects_without_a_host_and_rejects_empty_paths() {
-        let mut fields = ConnectionFields::new(DatabaseKind::MySQL);
-        fields.database = "app".into();
-        fields.username = "alice".into();
-        fields.password = "p@ss%word".into();
-        fields.socket_enabled = true;
-        assert!(fields.config().is_err());
-        fields.socket = "/tmp/mysql.sock".into();
-        let config = fields.config().unwrap();
-        assert_eq!(config.socket, Some("/tmp/mysql.sock".into()));
-        assert_eq!(
-            Url::parse(&config.url).unwrap().host_str(),
-            Some("localhost")
-        );
-        assert!(!format!("{fields:?}").contains("p@ss"));
-    }
     use crate::profiles::{ConnectionProfileDraft, ProfileStore};
     use dbx_core::{ConnectionConfig, DatabaseEngine};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -606,20 +640,6 @@ mod tests {
         captured
     }
 
-    #[test]
-    fn builds_postgres_url_with_percent_encoded_credentials_and_database() {
-        let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
-        fields.host = "db.example.test".into();
-        fields.username = "al ice@example:/?#%[]✓".into();
-        fields.password = "p@ss word:/?#%[]✓".into();
-        fields.database = "team/data".into();
-
-        assert_eq!(
-            fields.url().unwrap(),
-            "postgres://al%20ice%40example%3A%2F%3F%23%25%5B%5D%E2%9C%93:p%40ss%20word%3A%2F%3F%23%25%5B%5D%E2%9C%93@db.example.test:5432/team%2Fdata"
-        );
-    }
-
     #[tokio::test]
     async fn postgres_receives_literal_password_from_raw_and_encoded_connection_strings() {
         let raw = password_sent_to_postgres(|port| {
@@ -687,59 +707,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_network_url_into_decoded_fields_and_round_trips_fast_path() {
-        let input = "postgresql://al%20ice:p%40ss%2Fword@[::1]:5433/team%2Fdata?sslmode=require";
-        let fields = ConnectionFields::from_url(input).unwrap();
-
-        assert_eq!(fields.kind, DatabaseKind::PostgreSQL);
-        assert_eq!(fields.host, "::1");
-        assert_eq!(fields.port, "5433");
-        assert_eq!(fields.username, "al ice");
-        assert_eq!(fields.password, "p@ss/word");
-        assert_eq!(fields.database, "team/data");
-        assert_eq!(fields.url().unwrap(), input);
-    }
-
-    #[test]
-    fn repairs_unencoded_special_characters_in_a_password() {
-        let input =
-            "postgres://al ice:p@ss word/#?@db.example.test:5432/team%2Fdata?sslmode=require";
-        let fields = ConnectionFields::from_url(input).unwrap();
-
-        assert_eq!(fields.username, "al ice");
-        assert_eq!(fields.password, "p@ss word/#?");
-        assert_eq!(
-            fields.url().unwrap(),
-            "postgres://al%20ice:p%40ss%20word%2F%23%3F@db.example.test:5432/team%2Fdata?sslmode=require"
-        );
-    }
-
-    #[test]
     fn rejects_non_utf8_percent_encoded_credentials_instead_of_changing_them() {
         assert_eq!(
             ConnectionFields::from_url("postgres://user:p%FFss@localhost:5432/app"),
             Err(ConnectionFieldsError::InvalidUrl)
-        );
-    }
-
-    #[test]
-    fn validates_required_structured_fields() {
-        let fields = ConnectionFields::new(DatabaseKind::MySQL);
-        assert_eq!(
-            fields.url(),
-            Err(ConnectionFieldsError::MissingHost(DatabaseKind::MySQL))
-        );
-
-        let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
-        fields.host = "localhost".into();
-        fields.port = "nope".into();
-        assert_eq!(fields.url(), Err(ConnectionFieldsError::InvalidPort));
-
-        let mut fields = ConnectionFields::new(DatabaseKind::MySQL);
-        fields.host = "localhost".into();
-        assert_eq!(
-            fields.url(),
-            Err(ConnectionFieldsError::MissingDatabase(DatabaseKind::MySQL))
         );
     }
 

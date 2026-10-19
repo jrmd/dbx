@@ -69,6 +69,7 @@ export DBX_TEST_MYSQL_ADMIN_URL
 
 cargo test --locked "${cargo_profile[@]}" -p dbx-core --test integration -- --ignored --test-threads=1 --skip socket_and_ssh_connections_integration --skip strict_tls_over_ssh_integration --skip native_postgres_backup_over_password_socket
 cargo test --locked "${cargo_profile[@]}" -p dbx-core --test workbench_safety -- --ignored --test-threads=1
+cargo test --locked "${cargo_profile[@]}" -p dbx-core --test diagnostics_watch -- --ignored --test-threads=1
 cargo test --locked "${cargo_profile[@]}" -p dbx-core --test connectors -- --ignored --test-threads=1
 
 # MariaDB speaks the MySQL protocol, so the MySQL tests run against it too.
@@ -79,3 +80,4 @@ mariadb_tests=(env PATH="${mariadb_path:-$PATH}"
   cargo test --locked "${cargo_profile[@]}" -p dbx-core)
 "${mariadb_tests[@]}" --test integration mysql -- --ignored --test-threads=1
 "${mariadb_tests[@]}" --test workbench_safety mysql -- --ignored --test-threads=1
+"${mariadb_tests[@]}" --test diagnostics_watch mysql -- --ignored --test-threads=1

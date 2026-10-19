@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">DBX</h1>
-<p align="center">A native database workbench. Built with Rust and GPUI.</p>
+<p align="center">A safety-first native database workbench for Linux and macOS.</p>
 <p align="center">PostgreSQL · MySQL · SQLite · Redis · MongoDB · CockroachDB · DuckDB · Elasticsearch · BigQuery · Kafka · Turso · Cloudflare D1 · ClickHouse · SQL Server · Snowflake</p>
 
 Browse your data, follow relationships, edit rows, and run queries in a responsive desktop app. DBX uses [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) for its window, input, and GPU rendering.
@@ -17,16 +17,16 @@ Browse your data, follow relationships, edit rows, and run queries in a responsi
 - **Fifteen database connectors:** SQL databases, document stores, Elasticsearch indices and Kafka topics, with provider-specific editors and bounded browsing. See the [connector guide](docs/database-connectors.md) for connection formats and supported operations. Supabase connects through PostgreSQL.
 - **A tabbed workspace:** simultaneous connections, independent table/query/structure tabs, and a searchable schema explorer.
 - **Data you can work with:** virtualized grids over bounded row pages, server-side header sorting, structured filters, foreign-key navigation, and an all-field row inspector with JSON and binary previews.
-- **Explicit edits:** typed insert/update drafts, inline cell editing with staged Save/Discard, Value/NULL/Default states, primary-key-guarded updates and deletes, and confirmations for truncate/drop.
-- **A query editor:** syntax highlighting, SQL completion, optional [Vim bindings](docs/user-guide.md#vim-bindings), separate statement results, saved queries, find/replace, SQL parameter prompts, encrypted tab recovery, result-file exports, and per-connection query history. Native SQL tabs retain their own transaction sessions.
-- **Bring your own query agent:** describe queries using Claude, Cursor, Codex, OpenCode or GitHub Copilot CLI, with saved agent/model defaults and schema context. See [agent setup](docs/query-agents.md).
+- **Explicit edits:** typed insert/update drafts, inline cell editing with staged Save/Discard, Value/NULL/Default states, primary-key-guarded updates and deletes, staged undo/redo and bulk edits, and confirmations for truncate/drop (type the table name on production connections).
+- **A query editor:** syntax highlighting, SQL completion, optional [Vim bindings](docs/user-guide.md#vim-bindings), separate statement results, saved queries, find/replace, SQL parameter prompts, encrypted tab recovery, Markdown/XLSX loaded-result exports, streaming full-query/table XLSX exports, shareable `.sql` files and favourites, and per-connection query history. Native SQL tabs retain their own transaction sessions.
+- **Bring your own query assistant:** use OpenAI or Anthropic with a vault-stored API key, a local Ollama model, or Claude, Cursor, Codex, OpenCode and GitHub Copilot CLIs. Generated SQL is a draft you review and run yourself. See [agent setup](docs/query-agents.md).
 - **Import and export:** streamed SQL, CSV, and TSV transfers with progress and cancellation; atomic imports and snapshot exports on supported engines. Database exports include table selection, gzip, and schema-only SQL options. See [workbench safety and limits](docs/workbench-safety.md).
 - **Database diagnostics:** execution-plan views and comparisons, PostgreSQL/MySQL session and lock queries, protected connection profiles, and reviewable schema comparison drafts.
-- **Saved connections:** named profiles, colour-coded tags managed in Settings, connection testing, and encrypted credentials in the DBX Vault.
+- **Saved connections:** named profiles and folders, production window tint, colour-coded tags, connection testing, and encrypted credentials in the DBX Vault. Import from TablePlus, DBeaver, Docker Compose or `.env` files, or open a SQLite path/database URI from the terminal.
 - **A visual table designer:** add, rename or drop columns and add or drop indexes through a reviewable SQL draft.
 - **Cloud authentication helpers:** fetch AWS RDS IAM or Azure PostgreSQL Entra tokens from an authenticated local CLI.
 - **Socket and SSH connections:** local Unix sockets and SSH forwarding to TCP endpoints or remote sockets for PostgreSQL, MySQL, and Redis.
-- **Custom themes:** six palettes with light, dark, and system appearance; edit every colour in Settings → Appearance, import VS Code JSON/JSONC themes, or export a reusable DBX theme. [Theme guide](docs/themes.md).
+- **Custom themes:** ten palettes with light, dark, and system appearance; edit every colour in Settings → Appearance, import VS Code or Zed JSON/JSONC themes, or export a reusable DBX theme. [Theme guide](docs/themes.md).
 
 ### Write SQL, see the results
 
@@ -250,10 +250,10 @@ The native UI launcher keeps its test vault, profiles, and database under `targe
 
 DBX is a client, not a database privilege boundary. GUI filters and row changes use bound parameters and quoted identifiers. Raw SQL and Redis commands execute with your connection's privileges. Use least-privilege accounts and review destructive actions.
 
-Browsing is paged and bounded; grid virtualization does not imply loading an entire database. Table creation starts from an engine-aware SQL template. Redis mutations use the command console. Migration/schema-diff workflows, server monitoring, and formal audit logs remain outside the current scope.
+Browsing is paged and bounded; grid virtualization does not imply loading an entire database. Table creation starts from an engine-aware SQL template. MongoDB documents and Redis values have separate structured editors with review and conflict checks; their native command consoles remain available. Schema comparison generates a conservative migration SQL draft for review; unsupported or ambiguous changes remain comments. PostgreSQL/MySQL session and lock diagnostics are available. Continuous server monitoring and formal audit logs remain outside the current scope.
 
 Never commit real connection strings, passwords, private keys, or local database files. Contributions should preserve native responsiveness and parameterized operations, with connector-level coverage for engine-specific changes.
 
 ## Daily workflows
 
-Start with the [user guide](docs/user-guide.md), [connector capability matrix](docs/capability-matrix.md), and [local MCP guide](docs/local-mcp.md). [Unreleased changes](CHANGELOG.md) and [gap verification](docs/gap-fix-verification-2026-10-08.md) distinguish implementation checks from released behavior and device/cloud acceptance.
+Start with the [user guide](docs/user-guide.md), [connector capability matrix](docs/capability-matrix.md), and [local MCP guide](docs/local-mcp.md). [Unreleased changes](CHANGELOG.md), the [launch backlog](docs/launch-backlog-2026-10-19.md) and [verification record](docs/launch-verification-2026-10-19.md) distinguish implementation checks from released behavior and device/cloud acceptance. Community driver authors can use the [driver protocol guide](docs/driver-plugins.md) and runnable example.

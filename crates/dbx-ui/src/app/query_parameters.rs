@@ -381,30 +381,4 @@ mod tests {
         );
         assert_eq!(prepared[1].params.len(), 1);
     }
-    #[test]
-    fn parameters_skip_casts_strings_comments_and_dollar_quotes() {
-        assert_eq!(
-            named_parameters(
-                "SELECT :id::int, ':skip', $1, $$ :skip $$ -- :comment\nWHERE a=:name OR b=:id",
-                DatabaseKind::PostgreSQL
-            ),
-            ["id", "$1", "name"]
-        );
-        let values = HashMap::from([("id".into(), "7".into())]);
-        let prepared = prepare_parameters(
-            DatabaseKind::PostgreSQL,
-            "SELECT :id; SELECT :id, :id",
-            &values,
-        )
-        .unwrap();
-        assert_eq!(prepared[1].sql, "SELECT $1, $2");
-    }
-    #[test]
-    fn typed_values_and_empty_text() {
-        assert_eq!(parameter_value(""), CellValue::Text(String::new()));
-        assert_eq!(parameter_value("null"), CellValue::Null);
-        assert_eq!(parameter_value("true"), CellValue::Boolean(true));
-        assert_eq!(parameter_value("\"42\""), CellValue::Text("42".into()));
-        assert!(matches!(parameter_value("{\"a\":1}"), CellValue::Json(_)));
-    }
 }

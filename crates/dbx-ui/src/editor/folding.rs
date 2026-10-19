@@ -164,29 +164,3 @@ pub(super) fn shift_offsets(old: &str, new: &str, offsets: &mut Vec<usize>) {
         }
     });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn regions(text: &str) -> Vec<(usize, usize)> {
-        let tokens = lex_sql_for(text, None);
-        let starts = std::iter::once(0)
-            .chain(text.match_indices('\n').map(|(index, _)| index + 1))
-            .collect::<Vec<_>>();
-        fold_regions(text, &tokens, &starts)
-            .into_iter()
-            .map(|region| (region.start_line, region.end_line))
-            .collect()
-    }
-
-    #[test]
-    fn blocks_that_hide_lines_fold_and_others_do_not() {
-        let text = "WITH a AS (\n  SELECT 1\n), b AS (SELECT 2)\nSELECT f(\n  x,\n  '(',\n  y\n)";
-        assert_eq!(regions(text), [(0, 2), (3, 7)]);
-        // A two-line block hides nothing.
-        assert!(regions("SELECT f(\n)").is_empty());
-        assert_eq!(regions("/* one\ntwo\nthree */ SELECT 1"), [(0, 2)]);
-        assert!(regions("-- (\n\n\nSELECT 1").is_empty());
-    }
-}

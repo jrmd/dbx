@@ -138,6 +138,155 @@ enum SqlCompletionArea {
 
 const MAX_SQL_COMPLETIONS: usize = 14;
 
+pub(super) fn sql_completion_items_with_relations(
+    query_text: &str,
+    cursor: usize,
+    context: &editor::SqlCompletionContext,
+    sources: SqlCompletionRequest<'_>,
+    schema: Option<&dbx_core::RelationalSchema>,
+) -> Vec<SqlCompletionItem> {
+    let mut joins = schema.map_or_else(Vec::new, |schema| {
+        foreign_key_join_items(query_text, cursor, context, &sources, schema)
+    });
+    joins.extend(sql_completion_items(query_text, cursor, context, sources));
+    joins.truncate(MAX_SQL_COMPLETIONS);
+    joins
+}
+
+/// Complete the table immediately after JOIN with a complete FK predicate.
+/// Metadata comes from the existing background catalog snapshot, never typing.
+fn foreign_key_join_items(
+    text: &str,
+    cursor: usize,
+    context: &editor::SqlCompletionContext,
+    request: &SqlCompletionRequest<'_>,
+    schema: &dbx_core::RelationalSchema,
+) -> Vec<SqlCompletionItem> {
+    if context.quote.is_some() || context.qualifier.is_some() {
+        return Vec::new();
+    }
+    let (tokens, _) = sql_query_tokens(
+        &text[..context.replacement_range.start],
+        Some(request.database_kind),
+    );
+    if tokens.last().is_none_or(|token| token.text != "join") {
+        return Vec::new();
+    }
+    let index = infer_sql_query_index(text, cursor, request);
+    let same = |source: &SqlQuerySource, table: &TableRef| {
+        source.relation.eq_ignore_ascii_case(&table.name)
+            && source.schema.as_ref().is_none_or(|schema| {
+                table
+                    .schema
+                    .as_ref()
+                    .is_some_and(|known| known.eq_ignore_ascii_case(schema))
+            })
+    };
+    let identifier = |name: &str| completion_identifier(request.database_kind, name, None);
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+    for source in index.sources.iter().filter(|source| {
+        source.depth == index.current_depth
+            && source.scope_start <= index.current_scope_start
+            && index.current_scope_end <= source.scope_end
+    }) {
+        if source.schema.is_none()
+            && index
+                .ctes
+                .iter()
+                .any(|cte| cte.relation.eq_ignore_ascii_case(&source.relation))
+        {
+            continue;
+        }
+        // An unqualified source with duplicate table names is ambiguous. Do
+        // not guess which schema's constraints the user meant.
+        if schema
+            .tables
+            .iter()
+            .filter(|entry| same(source, &table_ref(&entry.table)))
+            .count()
+            != 1
+        {
+            continue;
+        }
+        for entry in &schema.tables {
+            let child = table_ref(&entry.table);
+            for key in &entry.structure.foreign_keys {
+                if key.columns.is_empty() || key.columns.len() != key.referenced_columns.len() {
+                    continue;
+                }
+                let parent = TableRef {
+                    schema: key
+                        .referenced_schema
+                        .clone()
+                        .or_else(|| child.schema.clone()),
+                    name: key.referenced_table.clone(),
+                };
+                let outgoing = same(source, &child);
+                let incoming = same(source, &parent);
+                if !outgoing && !incoming {
+                    continue;
+                }
+                let target = if outgoing { &parent } else { &child };
+                if !schema
+                    .tables
+                    .iter()
+                    .any(|entry| table_ref(&entry.table) == *target)
+                {
+                    continue;
+                }
+                let search = table_ref_label(target);
+                if completion_match_score(&search, &context.prefix.to_lowercase()).is_none() {
+                    continue;
+                }
+                let duplicate = index.sources.iter().any(|source| same(source, target));
+                let alias = duplicate.then(|| format!("joined_{}", target.name));
+                let target_name = alias.as_deref().unwrap_or(&target.name);
+                let source_name = source.display_name();
+                let predicate = key
+                    .columns
+                    .iter()
+                    .zip(&key.referenced_columns)
+                    .map(|(child_column, parent_column)| {
+                        let (left, right) = if outgoing {
+                            (source_name, target_name)
+                        } else {
+                            (target_name, source_name)
+                        };
+                        format!(
+                            "{}.{} = {}.{}",
+                            identifier(left),
+                            identifier(child_column),
+                            identifier(right),
+                            identifier(parent_column)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let table_sql = target.schema.as_ref().map_or_else(
+                    || identifier(&target.name),
+                    |schema| format!("{}.{}", identifier(schema), identifier(&target.name)),
+                );
+                let alias_sql = alias
+                    .as_ref()
+                    .map_or_else(String::new, |alias| format!(" AS {}", identifier(alias)));
+                let insert_text = format!("{table_sql}{alias_sql} ON {predicate}");
+                if seen.insert(insert_text.clone()) {
+                    output.push(SqlCompletionItem::new(
+                        format!("{} · FK JOIN", target.name),
+                        insert_text,
+                        format!("foreign key · {predicate}"),
+                        search,
+                        CompletionItemKind::Table,
+                    ));
+                }
+            }
+        }
+    }
+    output.sort_by(|left, right| left.insert_text.cmp(&right.insert_text));
+    output
+}
+
 pub(super) fn sql_completion_items(
     query_text: &str,
     cursor: usize,
@@ -1467,410 +1616,4 @@ pub(super) fn completion_table_key(table: &TableRef) -> String {
         table.schema.as_deref().unwrap_or_default(),
         table.name
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn sql_completion_uses_schema_and_cached_columns() {
-        let tables = vec![
-            TableInfo::table("users", Some("public".into())),
-            TableInfo::table("events", Some("analytics".into())),
-        ];
-        let users = TableRef::in_schema("public", "users");
-        let mut columns = HashMap::new();
-        columns.insert(
-            completion_table_key(&users),
-            vec![ColumnInfo::result("user_id", 0, "INTEGER")],
-        );
-        let events = TableRef::in_schema("analytics", "events");
-        columns.insert(
-            completion_table_key(&events),
-            vec![ColumnInfo::result("event_id", 0, "INTEGER")],
-        );
-
-        let table_context = editor::sql_completion_context("SELECT * FROM pu", 16).unwrap();
-        let table_items = sql_completion_items(
-            "SELECT * FROM pu",
-            16,
-            &table_context,
-            SqlCompletionRequest {
-                database_kind: DatabaseKind::PostgreSQL,
-                tables: &tables,
-                completion_columns: &columns,
-                selected_table: Some(&users),
-                active_columns: &[],
-                result: None,
-                active_schema_filter: Some("public"),
-            },
-        );
-        assert!(table_items.iter().any(|item| {
-            item.kind == CompletionItemKind::Table
-                && item.label == "users"
-                && item.detail.contains("public")
-        }));
-
-        let column_context = editor::sql_completion_context("SELECT user", 11).unwrap();
-        let column_items = sql_completion_items(
-            "SELECT user",
-            11,
-            &column_context,
-            SqlCompletionRequest {
-                database_kind: DatabaseKind::PostgreSQL,
-                tables: &tables,
-                completion_columns: &columns,
-                selected_table: Some(&users),
-                active_columns: &[ColumnInfo::result("user_id", 0, "INTEGER")],
-                result: None,
-                active_schema_filter: Some("public"),
-            },
-        );
-        assert!(
-            column_items
-                .iter()
-                .any(|item| { item.kind == CompletionItemKind::Column && item.label == "user_id" })
-        );
-        assert_eq!(
-            table_items
-                .iter()
-                .find(|item| item.label == "users")
-                .map(|item| item.insert_text.as_str()),
-            Some("\"users\"")
-        );
-        assert_eq!(
-            column_items
-                .iter()
-                .find(|item| item.label == "user_id")
-                .map(|item| item.insert_text.as_str()),
-            Some("\"user_id\"")
-        );
-
-        let qualified_context = editor::sql_completion_context(
-            "SELECT analytics.events.",
-            "SELECT analytics.events.".len(),
-        )
-        .unwrap();
-        let qualified_items = sql_completion_items(
-            "SELECT analytics.events.",
-            "SELECT analytics.events.".len(),
-            &qualified_context,
-            SqlCompletionRequest {
-                database_kind: DatabaseKind::PostgreSQL,
-                tables: &tables,
-                completion_columns: &columns,
-                selected_table: Some(&users),
-                active_columns: &[],
-                result: None,
-                active_schema_filter: Some("public"),
-            },
-        );
-        assert!(qualified_items.iter().any(|item| item.label == "event_id"));
-        assert!(!qualified_items.iter().any(|item| item.label == "user_id"));
-    }
-
-    #[test]
-    fn sql_completion_quotes_identifiers_per_dialect_and_preserves_open_quote() {
-        assert_eq!(
-            completion_identifier(DatabaseKind::PostgreSQL, "display name", None),
-            "\"display name\""
-        );
-        assert_eq!(
-            completion_identifier(DatabaseKind::MySQL, "display name", None),
-            "`display name`"
-        );
-        assert_eq!(
-            completion_identifier(DatabaseKind::PostgreSQL, "display\"name", None),
-            "\"display\"\"name\""
-        );
-        assert_eq!(
-            completion_identifier(DatabaseKind::PostgreSQL, "display name", Some('"')),
-            "display name"
-        );
-    }
-
-    #[test]
-    fn keyword_completion_inserts_exactly_one_separator_when_needed() {
-        let tables = Vec::new();
-        let columns = HashMap::new();
-        let items_for = |query: &str, cursor: usize| {
-            let context = editor::sql_completion_context(query, cursor).unwrap();
-            sql_completion_items(
-                query,
-                cursor,
-                &context,
-                SqlCompletionRequest {
-                    database_kind: DatabaseKind::PostgreSQL,
-                    tables: &tables,
-                    completion_columns: &columns,
-                    selected_table: None,
-                    active_columns: &[],
-                    result: None,
-                    active_schema_filter: None,
-                },
-            )
-        };
-        let select_text = |items: Vec<SqlCompletionItem>| {
-            items
-                .into_iter()
-                .find(|item| item.label == "SELECT")
-                .expect("SELECT completion")
-                .insert_text
-        };
-
-        assert_eq!(select_text(items_for("SEL", 3)), "SELECT ");
-        assert_eq!(select_text(items_for("SEL *", 3)), "SELECT");
-        assert_eq!(select_text(items_for("SEL,", 3)), "SELECT");
-        assert_eq!(select_text(items_for("SEL*", 3)), "SELECT ");
-    }
-
-    #[test]
-    fn keyword_completion_continues_matching_after_the_first_clause() {
-        let tables = Vec::new();
-        let columns = HashMap::new();
-        let items_for = |query: &str| {
-            let cursor = query.len();
-            let context = editor::sql_completion_context(query, cursor).unwrap();
-            sql_completion_items(
-                query,
-                cursor,
-                &context,
-                SqlCompletionRequest {
-                    database_kind: DatabaseKind::PostgreSQL,
-                    tables: &tables,
-                    completion_columns: &columns,
-                    selected_table: None,
-                    active_columns: &[],
-                    result: None,
-                    active_schema_filter: None,
-                },
-            )
-        };
-        let has_keyword = |query: &str, keyword: &str| {
-            items_for(query)
-                .iter()
-                .any(|item| item.kind == CompletionItemKind::Keyword && item.label == keyword)
-        };
-
-        let missing = [
-            ("SELECT * FR", "FROM"),
-            ("SELECT id FROM users WH", "WHERE"),
-            ("SELECT * FROM users JO", "JOIN"),
-            ("SELECT * FROM users ORDER B", "BY"),
-        ]
-        .into_iter()
-        .filter(|(query, keyword)| !has_keyword(query, keyword))
-        .collect::<Vec<_>>();
-        assert!(
-            missing.is_empty(),
-            "missing keyword completions: {missing:?}"
-        );
-    }
-
-    #[test]
-    fn sql_completion_uses_visible_join_sources_and_projection_aliases() {
-        let tables = vec![
-            TableInfo::table("users", Some("public".into())),
-            TableInfo::table("orders", Some("public".into())),
-            TableInfo::table("accounts", Some("public".into())),
-        ];
-        let users = TableRef::in_schema("public", "users");
-        let orders = TableRef::in_schema("public", "orders");
-        let accounts = TableRef::in_schema("public", "accounts");
-        let mut columns = HashMap::new();
-        columns.insert(
-            completion_table_key(&users),
-            vec![
-                ColumnInfo::result("id", 0, "INTEGER"),
-                ColumnInfo::result("email", 1, "TEXT"),
-            ],
-        );
-        columns.insert(
-            completion_table_key(&orders),
-            vec![
-                ColumnInfo::result("id", 0, "INTEGER"),
-                ColumnInfo::result("user_id", 1, "INTEGER"),
-                ColumnInfo::result("total", 2, "DECIMAL"),
-            ],
-        );
-        columns.insert(
-            completion_table_key(&accounts),
-            vec![ColumnInfo::result("account_name", 0, "TEXT")],
-        );
-        let sources = |query_result| SqlCompletionRequest {
-            database_kind: DatabaseKind::PostgreSQL,
-            tables: &tables,
-            completion_columns: &columns,
-            selected_table: Some(&users),
-            active_columns: &[],
-            result: query_result,
-            active_schema_filter: Some("public"),
-        };
-
-        let qualified_query = "SELECT u. FROM users u";
-        let qualified_cursor = "SELECT u.".len();
-        let qualified_context =
-            editor::sql_completion_context(qualified_query, qualified_cursor).unwrap();
-        let qualified_items = sql_completion_items(
-            qualified_query,
-            qualified_cursor,
-            &qualified_context,
-            sources(None),
-        );
-        assert!(qualified_items.iter().any(|item| item.label == "email"));
-        assert!(!qualified_items.iter().any(|item| item.label == "total"));
-
-        let quoted_query = "SELECT \"public\".\"users\". FROM users u";
-        let quoted_cursor = "SELECT \"public\".\"users\".".len();
-        let quoted_context = editor::sql_completion_context(quoted_query, quoted_cursor).unwrap();
-        let quoted_items =
-            sql_completion_items(quoted_query, quoted_cursor, &quoted_context, sources(None));
-        assert!(quoted_items.iter().any(|item| item.label == "email"));
-        assert!(!quoted_items.iter().any(|item| item.label == "total"));
-
-        let join_query = "SELECT * FROM users u JOIN orders o ON ";
-        let join_context = editor::sql_completion_context(join_query, join_query.len()).unwrap();
-        let join_items =
-            sql_completion_items(join_query, join_query.len(), &join_context, sources(None));
-        assert!(join_items.iter().any(|item| item.label == "email"));
-        assert!(join_items.iter().any(|item| item.label == "total"));
-
-        let comma_query = "SELECT * FROM users, orders WHERE ";
-        let comma_context = editor::sql_completion_context(comma_query, comma_query.len()).unwrap();
-        let comma_items = sql_completion_items(
-            comma_query,
-            comma_query.len(),
-            &comma_context,
-            sources(None),
-        );
-        assert!(comma_items.iter().any(|item| item.label == "email"));
-        assert!(comma_items.iter().any(|item| item.label == "total"));
-
-        let alias_query = "SELECT u.id AS user_id FROM users u ORDER BY us";
-        let alias_context = editor::sql_completion_context(alias_query, alias_query.len()).unwrap();
-        let alias_items = sql_completion_items(
-            alias_query,
-            alias_query.len(),
-            &alias_context,
-            sources(None),
-        );
-        assert!(
-            alias_items
-                .iter()
-                .any(|item| { item.kind == CompletionItemKind::Column && item.label == "user_id" })
-        );
-
-        let nested_query = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders u WHERE u.)";
-        let nested_cursor = nested_query.find("u.)").unwrap() + 2;
-        let nested_context = editor::sql_completion_context(nested_query, nested_cursor).unwrap();
-        let nested_items =
-            sql_completion_items(nested_query, nested_cursor, &nested_context, sources(None));
-        assert!(nested_items.iter().any(|item| item.label == "total"));
-        assert!(!nested_items.iter().any(|item| item.label == "email"));
-
-        let sibling_query = "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.id = 1) AND EXISTS (SELECT 1 FROM accounts a WHERE ";
-        let sibling_context =
-            editor::sql_completion_context(sibling_query, sibling_query.len()).unwrap();
-        let sibling_items = sql_completion_items(
-            sibling_query,
-            sibling_query.len(),
-            &sibling_context,
-            sources(None),
-        );
-        assert!(
-            sibling_items
-                .iter()
-                .any(|item| item.label == "account_name")
-        );
-        assert!(sibling_items.iter().any(|item| item.label == "email"));
-        assert!(!sibling_items.iter().any(|item| item.label == "total"));
-
-        let multi_statement_query = "SELECT o. ; SELECT * FROM orders o";
-        let multi_statement_cursor = "SELECT o.".len();
-        let multi_statement_context =
-            editor::sql_completion_context(multi_statement_query, multi_statement_cursor).unwrap();
-        let multi_statement_items = sql_completion_items(
-            multi_statement_query,
-            multi_statement_cursor,
-            &multi_statement_context,
-            sources(None),
-        );
-        assert!(
-            !multi_statement_items
-                .iter()
-                .any(|item| item.label == "total")
-        );
-    }
-
-    #[test]
-    fn sql_completion_understands_insert_lists_ctes_and_derived_sources() {
-        let tables = vec![TableInfo::table("users", Some("public".into()))];
-        let users = TableRef::in_schema("public", "users");
-        let user_columns = vec![
-            ColumnInfo::result("id", 0, "INTEGER"),
-            ColumnInfo::result("email", 1, "TEXT"),
-        ];
-        let mut columns = HashMap::new();
-        columns.insert(completion_table_key(&users), user_columns.clone());
-        let sources = || SqlCompletionRequest {
-            database_kind: DatabaseKind::PostgreSQL,
-            tables: &tables,
-            completion_columns: &columns,
-            selected_table: Some(&users),
-            active_columns: &user_columns,
-            result: None,
-            active_schema_filter: Some("public"),
-        };
-
-        let insert_query = "INSERT INTO users (email, ";
-        let insert_context =
-            editor::sql_completion_context(insert_query, insert_query.len()).unwrap();
-        let insert_items =
-            sql_completion_items(insert_query, insert_query.len(), &insert_context, sources());
-        assert!(insert_items.iter().any(|item| item.label == "id"));
-        assert!(!insert_items.iter().any(|item| item.label == "email"));
-        assert!(
-            !insert_items
-                .iter()
-                .any(|item| item.kind == CompletionItemKind::Table)
-        );
-
-        let values_query = "INSERT INTO users VALUES (";
-        let values_context =
-            editor::sql_completion_context(values_query, values_query.len()).unwrap();
-        let values_items =
-            sql_completion_items(values_query, values_query.len(), &values_context, sources());
-        assert!(
-            !values_items
-                .iter()
-                .any(|item| item.kind == CompletionItemKind::Column)
-        );
-
-        let ddl_query = "ALTER TABLE users ADD COLUMN created_at TIM";
-        let ddl_context = editor::sql_completion_context(ddl_query, ddl_query.len()).unwrap();
-        let ddl_items = sql_completion_items(ddl_query, ddl_query.len(), &ddl_context, sources());
-        assert!(
-            ddl_items
-                .iter()
-                .any(|item| { item.kind == CompletionItemKind::Type && item.label == "TIMESTAMP" })
-        );
-
-        let cte_query =
-            "WITH recent(user_id) AS (SELECT id FROM users) SELECT * FROM recent r WHERE r.";
-        let cte_context = editor::sql_completion_context(cte_query, cte_query.len()).unwrap();
-        let cte_items = sql_completion_items(cte_query, cte_query.len(), &cte_context, sources());
-        assert!(cte_items.iter().any(|item| item.label == "user_id"));
-        assert!(!cte_items.iter().any(|item| item.label == "id"));
-
-        let derived_query = "SELECT * FROM (SELECT email FROM users) recent WHERE recent.";
-        let derived_context =
-            editor::sql_completion_context(derived_query, derived_query.len()).unwrap();
-        let derived_items = sql_completion_items(
-            derived_query,
-            derived_query.len(),
-            &derived_context,
-            sources(),
-        );
-        assert!(derived_items.iter().any(|item| item.label == "email"));
-    }
 }

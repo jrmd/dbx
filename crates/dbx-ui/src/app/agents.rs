@@ -2,6 +2,7 @@ use super::*;
 use crate::agents::{AgentCli, AgentConfig, AgentPreferences, GeneratedQuery};
 use crate::popups::DropdownMenu as _;
 use gpui_component::menu::PopupMenuItem;
+use secrecy::ExposeSecret;
 use std::time::Duration;
 
 /// The prompt field shares the editor's dispatch depth so Enter and Escape
@@ -63,6 +64,7 @@ pub(super) struct AgentSetup {
     executable: SetupField,
     model: SetupField,
     provider: SetupField,
+    api_key: SetupField,
     status: Option<CliStatus>,
     check_generation: u64,
     save_generation: u64,
@@ -84,7 +86,17 @@ impl AgentSetup {
             SetupField::new(config.executable, "Assistant executable path", window, cx);
         let model = SetupField::new(config.model, "Assistant model", window, cx);
         let provider = SetupField::new(config.provider, "Assistant provider", window, cx);
-        // Edits save themselves; there is no separate Save step to forget.
+        let api_key_value = cx.new(|_| String::new());
+        let api_key_editor = cx.new(|cx| {
+            TextEditor::new(api_key_value.clone(), false, window, cx)
+                .password()
+                .accessibility_label("Assistant API key")
+        });
+        let api_key = SetupField {
+            value: api_key_value,
+            editor: api_key_editor,
+        };
+        // Non-secret preferences save automatically. API keys are saved only to the vault.
         let _subscriptions = [&executable, &model, &provider]
             .into_iter()
             .map(|field| {
@@ -98,6 +110,7 @@ impl AgentSetup {
             executable,
             model,
             provider,
+            api_key,
             status: None,
             check_generation: 0,
             save_generation: 0,
@@ -186,6 +199,27 @@ impl AgentQuery {
 
 impl DbxApp {
     pub(super) fn check_agent_cli(&mut self, cx: &mut Context<Self>) {
+        let cli = self.agent_setup.preferences.default_cli;
+        if cli.is_direct() {
+            self.agent_setup.check_generation = self.agent_setup.check_generation.wrapping_add(1);
+            let config = self.agent_setup.fields(cx);
+            let has_key = cli == AgentCli::Ollama
+                || self
+                    .profile_store
+                    .as_ref()
+                    .and_then(|store| store.vault())
+                    .and_then(|vault| vault.get(cli.secret_key()).ok().flatten())
+                    .is_some_and(|key| !key.expose_secret().trim().is_empty());
+            self.agent_setup.status = Some(if config.model.trim().is_empty() {
+                CliStatus::Failed("Enter a model name in Query assistant settings.".into())
+            } else if !has_key {
+                CliStatus::Failed("Save an API key in the unlocked vault.".into())
+            } else {
+                CliStatus::Ready("Configured; availability is checked when you generate.".into())
+            });
+            cx.notify();
+            return;
+        }
         // The check runs on the tokio runtime, which GPUI's deterministic test
         // scheduler rejects; adapter launches have their own process tests.
         if cfg!(test) {
@@ -223,6 +257,59 @@ impl DbxApp {
         .detach();
     }
 
+    pub(super) fn clear_assistant_secret(&mut self, cx: &mut Context<Self>) {
+        self.agent_setup
+            .api_key
+            .editor
+            .update(cx, |editor, cx| editor.clear_secret(cx));
+        self.agent_setup.status = None;
+    }
+
+    fn save_assistant_api_key(&mut self, remove: bool, cx: &mut Context<Self>) {
+        let cli = self.agent_setup.preferences.default_cli;
+        if !cli.is_direct() || cli == AgentCli::Ollama {
+            return;
+        }
+        let Some(vault) = self.profile_store.as_ref().and_then(|store| store.vault()) else {
+            self.show_toast(
+                ToastKind::Error,
+                "Unlock the vault before saving an API key",
+                cx,
+            );
+            return;
+        };
+        let result = if remove {
+            vault.delete(cli.secret_key())
+        } else {
+            let key = self.agent_setup.api_key.text(cx);
+            if key.is_empty() {
+                self.show_toast(ToastKind::Error, "Enter an API key first", cx);
+                return;
+            }
+            vault.set(cli.secret_key(), secrecy::SecretString::from(key))
+        };
+        match result {
+            Ok(()) => {
+                self.clear_assistant_secret(cx);
+                self.show_toast(
+                    ToastKind::Success,
+                    if remove {
+                        "API key removed"
+                    } else {
+                        "API key saved in the encrypted vault"
+                    },
+                    cx,
+                );
+                self.check_agent_cli(cx);
+            }
+            Err(_) => self.show_toast(
+                ToastKind::Error,
+                "Could not update API key; unlock the vault and try again",
+                cx,
+            ),
+        }
+    }
+
     /// Make `cli` the agent used for generation and show its configuration.
     fn select_agent(&mut self, cli: AgentCli, cx: &mut Context<Self>) {
         if self.agent_setup.preferences.default_cli == cli {
@@ -234,6 +321,10 @@ impl DbxApp {
         let changed = setup.preferences.default_cli != cli;
         setup.preferences.default_cli = cli;
         let config = configuration(&setup.preferences, cli);
+        setup
+            .api_key
+            .editor
+            .update(cx, |editor, cx| editor.clear_secret(cx));
         setup.executable.set(config.executable, cx);
         setup.model.set(config.model, cx);
         setup.provider.set(config.provider, cx);
@@ -252,7 +343,8 @@ impl DbxApp {
         if config == saved {
             return;
         }
-        setup.recheck_pending |= config.executable != saved.executable;
+        setup.recheck_pending |= config.executable != saved.executable
+            || (cli.is_direct() && config.model != saved.model);
         if setup.recheck_pending {
             setup.check_generation = setup.check_generation.wrapping_add(1);
             setup.status = None;
@@ -290,8 +382,7 @@ impl DbxApp {
     }
 
     fn open_agent_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_section = SettingsSection::QueryAgent;
-        self.open_settings(window, cx);
+        self.open_settings_section(SettingsSection::QueryAgent, window, cx);
     }
 
     fn agent_query_mut(
@@ -340,15 +431,25 @@ impl DbxApp {
         let (status_title, detail, color) = match &self.agent_setup.status {
             None => ("Not checked", None, theme().text_muted),
             Some(CliStatus::Checking) => ("Checking…", None, theme().text_muted),
-            Some(CliStatus::Ready(version)) => {
-                ("Installed", Some(version.clone()), theme().success_text)
-            }
+            Some(CliStatus::Ready(version)) => (
+                if selected.is_direct() {
+                    "Configured"
+                } else {
+                    "Installed"
+                },
+                Some(version.clone()),
+                theme().success_text,
+            ),
             Some(CliStatus::Failed(error)) => (
                 "Unavailable",
-                Some(format!(
-                    "{error} Install and sign in to {} in a terminal.",
-                    selected.label()
-                )),
+                Some(if selected.is_direct() {
+                    error.clone()
+                } else {
+                    format!(
+                        "{error} Install and sign in to {} in a terminal.",
+                        selected.label()
+                    )
+                }),
                 theme().danger_text,
             ),
         };
@@ -378,11 +479,48 @@ impl DbxApp {
             )
             .into_any_element(),
         ];
-        if advanced {
+        if selected.is_direct() && selected != AgentCli::Ollama {
             advanced_rows.push(
                 settings_row(
-                    "Executable",
-                    Some("Command name or full path".into()),
+                    "API key",
+                    Some("Stored encrypted in DBX Vault; never in settings JSON".into()),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(crate::theme::ui_px(8.))
+                        .child(field(self.agent_setup.api_key.input(cx)))
+                        .child(
+                            button("save-assistant-api-key", "Save key", ButtonKind::Quiet)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_assistant_api_key(false, cx)
+                                })),
+                        )
+                        .child(
+                            button("remove-assistant-api-key", "Remove key", ButtonKind::Quiet)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_assistant_api_key(true, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            );
+        }
+        if advanced && (!selected.is_direct() || selected == AgentCli::Ollama) {
+            advanced_rows.push(
+                settings_row(
+                    if selected == AgentCli::Ollama {
+                        "Ollama URL"
+                    } else {
+                        "Executable"
+                    },
+                    Some(
+                        if selected == AgentCli::Ollama {
+                            "Local HTTP or remote HTTPS endpoint"
+                        } else {
+                            "Command name or full path"
+                        }
+                        .into(),
+                    ),
                     field(self.agent_setup.executable.input(cx)),
                 )
                 .into_any_element(),
@@ -413,7 +551,7 @@ impl DbxApp {
                         self.scrolling_settings_group(
                             "settings-agent-basic",
                             [
-                                settings_row("CLI", None, segmented_track().children(choices))
+                                settings_row("Provider", None, segmented_track().flex_wrap().children(choices))
                                     .into_any_element(),
                                 settings_row(
                                     div()
@@ -432,7 +570,7 @@ impl DbxApp {
                                 .into_any_element(),
                                 settings_row(
                                     "Model",
-                                    Some("Blank uses the CLI’s default".into()),
+                                    Some(if selected.is_direct() { "Required: a model available to your API key or Ollama instance" } else { "Blank uses the CLI’s default" }.into()),
                                     field(self.agent_setup.model.input(cx)),
                                 )
                                 .into_any_element(),
@@ -445,8 +583,7 @@ impl DbxApp {
                             .text_size(crate::theme::text_px(11.))
                             .text_color(theme().text_muted)
                             .child(
-                                "Your description and schema are sent through the CLI to its \
-                                 provider. Row data and credentials are not.",
+                                "Your prompt and schema go to the selected provider. Results are not automatically attached. Queries and errors you include may contain row values. Generated SQL never runs automatically.",
                             ),
                     ),
             )
@@ -484,6 +621,32 @@ impl DbxApp {
     ) {
         let open = !self.agent_panel_open(session_id, tab_id);
         self.set_agent_panel_open(session_id, tab_id, open, window, cx);
+    }
+
+    /// Prepare a repair request for review. Generating and applying SQL still
+    /// use the assistant's existing explicit controls.
+    pub(super) fn ask_agent_to_fix_query(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(query) = self.query_tab_mut(session_id, tab_id) else {
+            return;
+        };
+        let Some(error) = &query.error else {
+            return;
+        };
+        let request = format!(
+            "Fix this query using the database error below. Explain the correction and preserve the query's intent.\n\nSQL:\n{}\n\nDatabase error:\n{}",
+            query.query_editor.read(cx).text(cx),
+            error,
+        );
+        if !query.agent.busy {
+            query.agent.prompt.set(request, cx);
+        }
+        self.set_agent_panel_open(session_id, tab_id, true, window, cx);
     }
 
     fn set_agent_panel_open(
@@ -745,6 +908,12 @@ impl DbxApp {
                 )
                 .child(
                     div()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child("Your request and schema are sent to the assistant. Review query and error details in the editable request before generating."),
+                )
+                .child(
+                    div()
                         .relative()
                         .child(
                             editor::input_with_key_context(
@@ -805,7 +974,7 @@ impl DbxApp {
                                 .child(if busy {
                                     "Reading schema and generating…"
                                 } else {
-                                    "Schema shared with your CLI · no row data"
+                                    "Shares schema and your prompt · result rows aren't attached"
                                 }),
                         )
                         .child(action),
@@ -823,10 +992,11 @@ impl DbxApp {
                                     .min_w(crate::theme::ui_px(180.))
                                     .text_size(crate::theme::text_px(11.))
                                     .text_color(theme().warning_text)
-                                    .child(format!(
-                                        "{} is unavailable. Check its executable in settings.",
-                                        cli.label()
-                                    )),
+                                    .child(if cli.is_direct() {
+                                        format!("{} is unavailable. Check its model and provider settings.", cli.label())
+                                    } else {
+                                        format!("{} is unavailable. Check its executable in settings.", cli.label())
+                                    }),
                             )
                             .child(
                                 button("query-agent-setup", "Open settings", ButtonKind::Quiet)
@@ -1034,6 +1204,14 @@ impl DbxApp {
         self.commit_agent_fields(cx);
         let cli = self.agent_setup.preferences.default_cli;
         let config = configuration(&self.agent_setup.preferences, cli);
+        let api_key = if cli.is_direct() && cli != AgentCli::Ollama {
+            self.profile_store
+                .as_ref()
+                .and_then(|store| store.vault())
+                .and_then(|vault| vault.get(cli.secret_key()).ok().flatten())
+        } else {
+            None
+        };
         let generated_by = if config.model.is_empty() {
             cli.label().to_owned()
         } else {
@@ -1062,6 +1240,8 @@ impl DbxApp {
         agent.cancel();
         agent.busy = true;
         agent.error = None;
+        agent.result = None;
+        agent.generated_by = None;
         agent.database = database.clone();
         let generation = agent.generation;
         let task = self.runtime.spawn(async move {
@@ -1070,7 +1250,12 @@ impl DbxApp {
                     serde_json::to_value(engine.relational_schema().await.map_err(|_| "Could not load schema metadata for this database".to_string())?).map_err(|e| e.to_string())?
                 } else { metadata };
                 let context = serde_json::json!({ "database": database, "kind": kind, "dialect": kind.dialect(), "native_query_example": kind.default_query(), "schema": schema });
-                crate::agents::generate(cli, config, crate::agents::build_prompt(&context, &request)?).await
+                let prompt = crate::agents::build_prompt(&context, &request)?;
+                if cli.is_direct() {
+                    crate::agents::generate_direct(cli, config, api_key, prompt).await
+                } else {
+                    crate::agents::generate(cli, config, prompt).await
+                }
             };
             tokio::time::timeout(Duration::from_secs(200), work).await.map_err(|_| "Schema loading or generation timed out.".to_string())?
         });
@@ -1110,65 +1295,53 @@ mod tests {
     use super::*;
 
     #[gpui::test]
-    fn choosing_an_agent_makes_it_the_default_and_edits_save_per_cli(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn api_keys_use_the_vault_and_clear_on_lock(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let directory = tempfile::tempdir().unwrap();
-        let store = SettingsStore::at(directory.path().join("settings.json"));
-        let saved = store.clone();
+        let profiles = ProfileStore::at(directory.path().join("profiles.json"));
+        let vault = profiles.vault().unwrap();
+        vault.create("test vault passphrase").unwrap();
+        let settings = SettingsStore::at(directory.path().join("settings.json"));
+        let saved = settings.clone();
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = DbxApp::new(window, cx);
+            app.profile_store = Some(profiles);
+            app.settings_store = Some(settings);
             app.vault_state = Some(VaultState::Unlocked);
-            app.settings_store = Some(store);
-            app.select_agent(AgentCli::OpenCode, cx);
-            app.agent_setup.executable.set("/opt/opencode".into(), cx);
-            app.agent_setup.model.set("test-model".into(), cx);
-            app.agent_setup.provider.set("test-provider".into(), cx);
+            app.select_agent(AgentCli::OpenAiApi, cx);
+            app.agent_setup.model.set("fixture-model".into(), cx);
+            app.agent_setup
+                .api_key
+                .set("fixture-secret-value".into(), cx);
             app.commit_agent_fields(cx);
-            app.open_agent_settings(window, cx);
+            app.save_assistant_api_key(false, cx);
             app
         });
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-        assert!(cx.debug_bounds("agents-settings").is_some());
-        let advanced = cx.debug_bounds("agent-advanced-settings").unwrap();
-        cx.simulate_click(advanced.center(), gpui::Modifiers::default());
-        assert!(app.read_with(cx, |app, _| app.agent_setup.advanced_open));
-        cx.simulate_resize(gpui::size(px(720.), px(640.)));
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-        assert!(cx.debug_bounds("agents-settings").is_some());
-        let appearance = cx.debug_bounds("settings-section-Appearance").unwrap();
-        cx.simulate_click(appearance.center(), gpui::Modifiers::default());
-        assert!(app.read_with(cx, |app, _| app.settings_section
-            == SettingsSection::Appearance));
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-        assert!(cx.debug_bounds("agents-settings").is_none());
-        let assistant = cx.debug_bounds("settings-section-Query assistant").unwrap();
-        cx.simulate_click(assistant.center(), gpui::Modifiers::default());
-        let preferences = saved.load().unwrap().agents;
-        assert_eq!(preferences.default_cli, AgentCli::OpenCode);
-        let config = &preferences.configurations[&AgentCli::OpenCode];
-        assert_eq!(config.executable, "/opt/opencode");
-        assert_eq!(config.model, "test-model");
-        assert_eq!(config.provider, "test-provider");
-
-        // Switching shows the other CLI's own configuration and leaves OpenCode's intact.
+        assert_eq!(
+            vault
+                .get(AgentCli::OpenAiApi.secret_key())
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "fixture-secret-value"
+        );
+        assert!(
+            !serde_json::to_string(&saved.load().unwrap())
+                .unwrap()
+                .contains("fixture-secret-value")
+        );
         app.update(cx, |app, cx| {
-            app.agent_setup.model.set("edited-before-switch".into(), cx);
-            app.select_agent(AgentCli::Claude, cx);
-            assert_eq!(app.agent_setup.executable.text(cx), "claude");
-            assert_eq!(app.agent_setup.model.text(cx), "");
-            app.select_agent(AgentCli::OpenCode, cx);
-            assert_eq!(app.agent_setup.model.text(cx), "edited-before-switch");
+            assert!(app.agent_setup.api_key.text(cx).is_empty());
+            app.agent_setup.api_key.set("unsaved-secret".into(), cx);
+            app.lock_vault(cx);
+            assert!(app.agent_setup.api_key.text(cx).is_empty());
+            app.agent_setup
+                .api_key
+                .editor
+                .update(cx, |editor, cx| editor.undo(cx));
+            assert!(app.agent_setup.api_key.text(cx).is_empty());
         });
-        cx.update(|window, cx| app.update(cx, |app, cx| app.close_settings(window, cx)));
-        assert_eq!(saved.load().unwrap().agents.default_cli, AgentCli::OpenCode);
+        assert!(vault.get(AgentCli::OpenAiApi.secret_key()).is_err());
     }
 
     #[gpui::test]
@@ -1233,102 +1406,6 @@ mod tests {
             assert!(query.agent.generation != generation);
             assert!(query.agent.result.is_none());
             assert!(!query.agent.busy);
-        });
-    }
-
-    #[gpui::test]
-    fn escape_closes_the_prompt_and_use_query_replaces_the_editor(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        cx.update(|cx| {
-            cx.bind_keys(editor::default_key_bindings());
-            cx.bind_keys([
-                gpui::KeyBinding::new("escape", DismissQueryAgent, Some("DbxQueryAgent")),
-                gpui::KeyBinding::new("enter", SubmitQueryAgent, Some("DbxQueryAgent")),
-                gpui::KeyBinding::new("shift-enter", editor::Enter, Some("DbxQueryAgent")),
-            ]);
-        });
-        let session_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Agent test".into(),
-                DatabaseKind::SQLite,
-                None,
-                window,
-                cx,
-            );
-            session.secondary_tabs.push(SecondaryTab {
-                id: tab_id,
-                kind: SecondaryTabKind::Query(Box::new(QueryTab::new(
-                    DatabaseKind::SQLite,
-                    session_id,
-                    tab_id,
-                    window,
-                    cx,
-                ))),
-            });
-            app.sessions = vec![session];
-            app.active_session_id = Some(session_id);
-            app.connection_picker_open = false;
-            app.activate_secondary_tab_for(session_id, tab_id, window, cx);
-            app.toggle_agent_panel(session_id, tab_id, window, cx);
-            app
-        });
-        cx.update(|window, cx| {
-            window.draw(cx).clear(cx);
-        });
-        assert!(cx.debug_bounds("query-agent-panel").is_some());
-        cx.simulate_keystrokes("shift-enter");
-        assert_eq!(
-            app.read_with(cx, |app, cx| app
-                .agent_query(session_id, tab_id)
-                .unwrap()
-                .prompt
-                .value
-                .read(cx)
-                .clone()),
-            "\n"
-        );
-        cx.simulate_input("Count active projects");
-        assert!(app.read_with(cx, |app, cx| {
-            app.agent_query(session_id, tab_id)
-                .unwrap()
-                .prompt
-                .value
-                .read(cx)
-                .contains("Count active projects")
-        }));
-        cx.simulate_keystrokes("escape");
-        assert!(!app.read_with(cx, |app, _| app.agent_panel_open(session_id, tab_id)));
-
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.toggle_agent_panel(session_id, tab_id, window, cx);
-                app.agent_query_mut(session_id, tab_id).unwrap().result = Some(GeneratedQuery {
-                    query: "SELECT count(*) FROM users".into(),
-                    explanation: "Count users".into(),
-                });
-                app.agent_query_mut(session_id, tab_id).unwrap().error =
-                    Some("Previous attempt failed".into());
-                app.use_generated_query(session_id, tab_id, false, window, cx);
-            });
-        });
-        app.read_with(cx, |app, cx| {
-            let session = app.session(session_id).unwrap();
-            let SecondaryTabKind::Query(query) = &session.secondary_tabs[0].kind else {
-                panic!("query tab");
-            };
-            assert_eq!(
-                query.query_editor.read(cx).text(cx),
-                "SELECT count(*) FROM users"
-            );
-            assert!(!query.agent.open);
-            assert!(query.agent.result.is_none());
-            assert!(query.agent.error.is_none());
         });
     }
 }

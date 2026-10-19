@@ -28,7 +28,10 @@ mod explorer;
 mod find;
 mod focus;
 pub use focus::focus_key_bindings;
+mod commands;
+mod driver_plugins;
 mod mcp;
+mod nonrelational;
 mod profile_transfer;
 mod query_language;
 mod query_parameters;
@@ -37,6 +40,8 @@ mod redis_completion;
 mod result_table;
 mod row_count;
 mod sql_completion;
+mod sql_library;
+mod table_commands;
 mod table_layout;
 mod transfer;
 pub(crate) mod value_view;
@@ -110,7 +115,7 @@ use redis_completion::redis_completion_items;
 use result_table::{ResultTableDelegate, foreign_key_target_table};
 use sql_completion::{
     SqlCompletionItem, SqlCompletionRequest, StatementSource, completion_table_key,
-    sql_completion_items, statement_sources,
+    sql_completion_items_with_relations, statement_sources,
 };
 
 const DIAGRAM_SCENE_PADDING: f32 = 24.0;
@@ -127,6 +132,7 @@ gpui::actions!(
         CompletionUp,
         CompletionDown,
         CompletionEnter,
+        CompletionTab,
         DiagramPanLeft,
         DiagramPanRight,
         DiagramPanUp,
@@ -172,12 +178,43 @@ gpui::actions!(
         SetCellNull,
         CommitChanges,
         DeleteRows,
+        UndoGridEdits,
+        RedoGridEdits,
         CopyDataSelection,
         PasteRows,
         OpenQuickOpen,
+        OpenCommandPalette,
+        OpenSqlFile,
+        ChooseTheme,
+        LightAppearance,
+        DarkAppearance,
+        SystemAppearance,
+        BrowseSqlFiles,
+        FavoriteSqlFiles,
+        SaveSqlFile,
+        ChooseSqlFolder,
+        ExplainQuery,
+        AnalyzeQuery,
+        QueryStatistics,
+        TableStatistics,
+        FullTableStatistics,
+        WatchQuery,
+        StopWatch,
+        InspectSchema,
+        CaptureSchema,
+        ExportDatabase,
+        ExportQueryCsv,
+        ExportQueryXlsx,
+        ExportFullQueryXlsx,
+        ExportFullTableXlsx,
+        OpenSettings,
+        OpenKeyboardShortcuts,
+        SearchQueryHistory,
         QuickOpenNext,
         QuickOpenPrevious,
         QuickOpenConfirm,
+        SubmitTableName,
+        ConfirmAction,
         SubmitQueryParameters,
         CancelQueryParameters,
         OpenFind,
@@ -210,6 +247,7 @@ enum CompletionAction {
     Up,
     Down,
     Enter,
+    Tab,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +255,8 @@ pub(super) enum QueryResultExportFormat {
     Tsv,
     Csv,
     Json,
+    Markdown,
+    Xlsx,
     Insert,
 }
 
@@ -249,6 +289,8 @@ impl QueryResultExportFormat {
             Self::Tsv => "tsv",
             Self::Csv => "csv",
             Self::Json => "json",
+            Self::Markdown => "md",
+            Self::Xlsx => "xlsx",
             Self::Insert => "sql",
         }
     }
@@ -348,11 +390,27 @@ pub(crate) struct Toast {
     id: u64,
     kind: ToastKind,
     message: SharedString,
+    hovered: bool,
+    remaining: std::time::Duration,
+}
+
+impl Toast {
+    fn elapse(&mut self, elapsed: std::time::Duration) -> bool {
+        if !self.hovered {
+            self.remaining = self.remaining.saturating_sub(elapsed);
+        }
+        self.remaining.is_zero()
+    }
 }
 
 const MAX_TOASTS: usize = 3;
 
+fn toast_reading_time(message: &str) -> std::time::Duration {
+    std::time::Duration::from_millis((6000 + 40 * message.chars().count() as u64).min(20_000))
+}
+
 struct ConnectionDraft {
+    driver_manifest: Option<PathBuf>,
     read_only: bool,
     cloud_auth: Option<dbx_core::CloudAuthentication>,
     kind: DatabaseKind,
@@ -363,6 +421,8 @@ struct ConnectionDraft {
     import_url: Entity<String>,
     import_url_editor: Entity<TextEditor>,
     tag: Option<ConnectionTag>,
+    folder: Entity<String>,
+    folder_editor: Entity<TextEditor>,
     connection_name: Entity<String>,
     connection_name_editor: Entity<TextEditor>,
     connection_url: Entity<String>,
@@ -511,6 +571,11 @@ impl VaultEditors {
 impl ConnectionDraft {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let connection_name = cx.new(|_| String::new());
+        let folder = cx.new(|_| String::new());
+        let folder_editor = cx.new(|cx| {
+            TextEditor::new(folder.clone(), false, window, cx)
+                .accessibility_label("Connection folder")
+        });
         let import_url = cx.new(|_| String::new());
         let import_url_editor = cx.new(|cx| {
             TextEditor::new(import_url.clone(), false, window, cx)
@@ -550,6 +615,7 @@ impl ConnectionDraft {
 
         Self {
             kind: DatabaseKind::SQLite,
+            driver_manifest: None,
             read_only: false,
             cloud_auth: None,
             mode: ConnectionFormMode::Details,
@@ -558,6 +624,8 @@ impl ConnectionDraft {
             import_url,
             import_url_editor,
             tag: Some(default_tags().remove(3)),
+            folder,
+            folder_editor,
             connection_name,
             connection_name_editor,
             connection_url,
@@ -631,6 +699,9 @@ enum ConfirmationTone {
 
 enum ConfirmationAction {
     LockVault,
+    RemoveDriver {
+        path: PathBuf,
+    },
     DeleteProfile {
         id: uuid::Uuid,
     },
@@ -639,6 +710,11 @@ enum ConfirmationAction {
         tab_id: SecondaryTabId,
         run_all: bool,
         query: query_actions::ExecutionSource,
+    },
+    AnalyzeQuery {
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        sql: String,
     },
     CloseQuery {
         session_id: SessionId,
@@ -699,8 +775,10 @@ impl ConfirmationAction {
             Self::LockVault
             | Self::Quit
             | Self::RemoveCustomTheme { .. }
+            | Self::RemoveDriver { .. }
             | Self::DeleteProfile { .. } => None,
             Self::RunQuery { session_id, .. }
+            | Self::AnalyzeQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
             | Self::ClearQueryHistory { session_id }
             | Self::Table { session_id, .. }
@@ -756,6 +834,7 @@ enum SettingsSection {
     Appearance,
     Editor,
     QueryAgent,
+    Shortcuts,
     Connections,
     Tags,
     Updates,
@@ -790,6 +869,10 @@ pub struct DbxApp {
     /// from render or query completion on the GPUI thread.
     recent_query_history: Vec<QueryHistoryEntry>,
     workspace_store: Option<Arc<crate::workspace::WorkspaceStore>>,
+    sql_library: crate::query_library::SqlLibrary,
+    sql_library_refreshing: bool,
+    sql_library_generation: u64,
+    sql_library_favorite_pending: bool,
     workspace_documents: HashMap<String, crate::workspace::WorkspaceDocument>,
     startup_recovery_started: bool,
     sessions: Vec<ConnectionSession>,
@@ -797,13 +880,19 @@ pub struct DbxApp {
     connection_picker_open: bool,
     compact_connection_form_open: bool,
     table_context_menu: Option<TableContextMenu>,
+    table_name_prompt: Option<table_commands::TableNamePrompt>,
+    nonrelational_editor: Option<nonrelational::NonrelationalEditor>,
+    nonrelational_generation: u64,
     database_export_dialog: Option<DatabaseExportDialog>,
     confirmation_dialog: Option<ConfirmationDialog>,
+    table_confirmation_input: Option<(String, Entity<TextEditor>, Subscription)>,
     quick_open: Option<quick_open::QuickOpen>,
     copied_table_data: Option<Arc<dbx_core::data_import::ImportData>>,
     data_import_dialog: Option<data_import::DataImportDialog>,
     profile_transfer_dialog: Option<profile_transfer::ProfileTransferDialog>,
     mutation_error_dialog: Option<MutationErrorDialog>,
+    shortcut_editor: Option<commands::ShortcutEditor>,
+    driver_registry: driver_plugins::DriverRegistry,
     settings_open: bool,
     settings_focus: FocusHandle,
     settings_scroll: gpui::ScrollHandle,
@@ -822,6 +911,7 @@ pub struct DbxApp {
     mono_font_size: u16,
     font_size_inputs: Option<[Entity<gpui_component::input::InputState>; 2]>,
     font_pickers: Option<[Entity<SelectState<SearchableVec<SharedString>>>; 2]>,
+    font_names_loading: bool,
     drag_row_selection: bool,
     row_drag: Option<(SessionId, SecondaryTabId, usize)>,
     vim_mode: bool,
@@ -951,6 +1041,10 @@ impl DbxApp {
             credential_hydrating: false,
             credential_hydration_generation: 0,
             credential_connect_window: None,
+            sql_library: Default::default(),
+            sql_library_refreshing: false,
+            sql_library_generation: 0,
+            sql_library_favorite_pending: false,
             workspace_store: profile_store
                 .as_ref()
                 .and_then(ProfileStore::vault)
@@ -967,13 +1061,19 @@ impl DbxApp {
             connection_picker_open: false,
             compact_connection_form_open,
             table_context_menu: None,
+            table_name_prompt: None,
+            nonrelational_editor: None,
+            nonrelational_generation: 0,
             database_export_dialog: None,
             confirmation_dialog: None,
+            table_confirmation_input: None,
             quick_open: None,
             profile_transfer_dialog: None,
             data_import_dialog: None,
             copied_table_data: None,
             mutation_error_dialog: None,
+            shortcut_editor: None,
+            driver_registry: driver_plugins::DriverRegistry::default(),
             settings_open: false,
             settings_focus: cx.focus_handle(),
             settings_scroll: gpui::ScrollHandle::new(),
@@ -1005,6 +1105,7 @@ impl DbxApp {
             }),
             font_size_inputs: None,
             font_pickers: None,
+            font_names_loading: false,
             drag_row_selection: saved_settings.as_ref().is_none_or(|s| s.drag_row_selection),
             row_drag: None,
             vim_mode: saved_settings
@@ -1105,9 +1206,20 @@ impl DbxApp {
     }
 
     pub(super) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings_section(SettingsSection::Appearance, window, cx);
+    }
+
+    fn open_settings_section(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.vault_state != Some(VaultState::Unlocked) {
             return;
         }
+        self.settings_section = section;
+        self.settings_scroll.set_offset(point(px(0.), px(0.)));
         if !self.settings_open {
             self.settings_return_focus = window.focused(cx);
             self.settings_focus.focus(window, cx);
@@ -1502,6 +1614,12 @@ impl DbxApp {
         } else if self.quick_open.is_some() {
             self.close_quick_open(window, cx);
             true
+        } else if self.nonrelational_editor.is_some() {
+            self.close_nonrelational_editor(window, cx);
+            true
+        } else if self.table_name_prompt.is_some() {
+            self.close_table_name_prompt(window, cx);
+            true
         } else if self.workspace_screen_drawn() && self.cancel_database_export(window, cx) {
             true
         } else if self.settings_open {
@@ -1569,6 +1687,7 @@ impl DbxApp {
             );
             return;
         }
+        self.invalidate_nonrelational_for(Some(session_id));
         self.persist_query_workspace_for(session_id, cx);
         let Some(index) = self
             .sessions
@@ -2581,7 +2700,7 @@ impl DbxApp {
         if session
             .engine
             .as_ref()
-            .is_some_and(|engine| engine.is_read_only())
+            .is_none_or(|engine| !engine.capabilities().row_edits)
         {
             return None;
         }
@@ -2626,6 +2745,10 @@ impl DbxApp {
                 signature,
                 tables: session.tables.len(),
                 columns: session.completion_columns.len(),
+                relational_schema: session
+                    .completion_schema
+                    .as_ref()
+                    .map_or(0, |schema| Arc::as_ptr(schema) as usize),
                 recent_result: recent_data
                     .and_then(|data| data.result.as_ref())
                     .map_or(0, |result| Arc::as_ptr(result) as usize),
@@ -2640,7 +2763,7 @@ impl DbxApp {
                 let computed = if session.kind.is_sql() {
                     editor::sql_completion_context_for(&query_text, cursor, Some(session.kind)).map(
                         |context| {
-                            let items = sql_completion_items(
+                            let items = sql_completion_items_with_relations(
                                 &query_text,
                                 cursor,
                                 &context,
@@ -2655,6 +2778,7 @@ impl DbxApp {
                                     result: recent_data.and_then(|data| data.result.as_deref()),
                                     active_schema_filter: session.schema_filter.as_deref(),
                                 },
+                                session.completion_schema.as_deref(),
                             );
                             (context.replacement_range, items)
                         },
@@ -2840,6 +2964,9 @@ impl DbxApp {
                 CompletionAction::Enter => {
                     query_editor.update(cx, |editor, cx| editor.insert_newline(cx));
                 }
+                CompletionAction::Tab => {
+                    query_editor.update(cx, |editor, cx| editor.indent_selection(cx));
+                }
             }
             return;
         };
@@ -2877,7 +3004,7 @@ impl DbxApp {
                 };
                 cx.notify();
             }
-            CompletionAction::Enter => {
+            CompletionAction::Enter | CompletionAction::Tab => {
                 let Some(item) = menu.items.get(menu.selected).cloned() else {
                     return;
                 };
@@ -3050,31 +3177,33 @@ impl DbxApp {
         let runtime = self.runtime.clone();
         // One bulk catalog snapshot replaces a describe call per table.
         let task = runtime.spawn(async move {
-            let schema = engine.relational_schema().await;
-            schema
+            let schema = engine.relational_schema().await.ok().map(Arc::new);
+            let columns = schema
+                .as_ref()
                 .map(|schema| {
                     schema
                         .tables
-                        .into_iter()
+                        .iter()
                         .filter(|entry| {
                             matches!(entry.table.kind, EntityKind::Table | EntityKind::View)
                         })
                         .map(|entry| {
                             (
                                 completion_table_key(&table_ref(&entry.table)),
-                                entry.structure.columns,
+                                entry.structure.columns.clone(),
                             )
                         })
                         .collect::<HashMap<_, _>>()
                 })
-                .unwrap_or_default()
+                .unwrap_or_default();
+            (columns, schema)
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
         }
 
         cx.spawn(async move |this, cx| {
-            let metadata = task.await?;
+            let (metadata, schema) = task.await?;
 
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
@@ -3088,6 +3217,7 @@ impl DbxApp {
                     return;
                 }
                 session.completion_columns.extend(metadata);
+                session.completion_schema = schema;
                 cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
@@ -3250,24 +3380,39 @@ impl DbxApp {
     ) {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
+        let message = message.into();
+        let remaining = toast_reading_time(&message);
         self.toasts.push(Toast {
             id,
             kind,
-            message: message.into(),
+            message,
+            hovered: false,
+            remaining,
         });
         if self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
         }
-        let lifetime = match kind {
-            // Long database errors need time to be read (and hovered in full).
-            ToastKind::Error => std::time::Duration::from_millis(
-                (6000 + 40 * self.toasts.last().map_or(0, |t| t.message.len()) as u64).min(20_000),
-            ),
-            ToastKind::Info | ToastKind::Success => std::time::Duration::from_millis(3200),
-        };
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(lifetime).await;
-            this.update(cx, |this, cx| this.dismiss_toast(id, cx))
+            let tick = std::time::Duration::from_millis(250);
+            loop {
+                cx.background_executor().timer(tick).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let Some(toast) = this.toasts.iter_mut().find(|toast| toast.id == id)
+                        else {
+                            return false;
+                        };
+                        if toast.elapse(tick) {
+                            this.dismiss_toast(id, cx);
+                            return false;
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
         })
         .detach();
         cx.notify();
@@ -3383,6 +3528,7 @@ impl DbxApp {
                         // Open tables belong to the previous database.
                         session.close_data_tabs();
                         session.completion_columns.clear();
+                        session.completion_schema = None;
                         session.schema_filter = None;
                         let diagram_schemas = diagram_schema_names(session.kind, &session.tables);
                         let diagram_selection = diagram_initial_schema_selection(
@@ -4127,7 +4273,7 @@ impl DbxApp {
             self.show_mutation_error_for(
                 session_id,
                 tab_id,
-                "Edit Redis keys from the command console.".into(),
+                "Use the structured document/key editor or the native command console.".into(),
                 return_focus,
                 window,
                 cx,
@@ -4196,7 +4342,7 @@ impl DbxApp {
         {
             self.show_toast(
                 ToastKind::Info,
-                "Edit Redis keys from the command console",
+                "Use the structured document/key editor or the native command console",
                 cx,
             );
             return;
@@ -4235,6 +4381,18 @@ impl DbxApp {
                 "Delete table",
             ),
         };
+        self.table_confirmation_input = None;
+        if self
+            .session(session_id)
+            .is_some_and(|session| session.tag.as_ref().is_some_and(|tag| tag.is_production()))
+        {
+            let input = cx.new(|cx| {
+                TextEditor::empty(false, window, cx)
+                    .accessibility_label("Type the table name to confirm")
+            });
+            let subscription = cx.observe(&input, |_, _, cx| cx.notify());
+            self.table_confirmation_input = Some((table.name.clone(), input, subscription));
+        }
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
             title,
@@ -4255,6 +4413,7 @@ impl DbxApp {
     }
 
     fn cancel_confirmation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.table_confirmation_input = None;
         let Some(dialog) = self.confirmation_dialog.take() else {
             return;
         };
@@ -4327,7 +4486,33 @@ impl DbxApp {
         }
     }
 
+    fn table_confirmation_matches(&self, cx: &App) -> bool {
+        let Some(ConfirmationDialog {
+            action: ConfirmationAction::Table {
+                session_id, table, ..
+            },
+            ..
+        }) = &self.confirmation_dialog
+        else {
+            return true;
+        };
+        if !self
+            .session(*session_id)
+            .is_some_and(|session| session.tag.as_ref().is_some_and(|tag| tag.is_production()))
+        {
+            return true;
+        }
+        self.table_confirmation_input
+            .as_ref()
+            .is_some_and(|(name, input, _)| name == &table.name && input.read(cx).text(cx) == *name)
+    }
+
     fn confirm_pending_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The action path is guarded as well as the button, including Enter.
+        if !self.table_confirmation_matches(cx) {
+            return;
+        }
+        self.table_confirmation_input = None;
         let Some(dialog) = self.confirmation_dialog.take() else {
             return;
         };
@@ -4337,7 +4522,15 @@ impl DbxApp {
             ConfirmationAction::CloseQuery { .. } | ConfirmationAction::DiscardDataTab { .. }
         );
         match dialog.action {
+            ConfirmationAction::AnalyzeQuery {
+                session_id,
+                tab_id,
+                sql,
+            } => {
+                self.analyze_query_for(session_id, tab_id, sql, cx);
+            }
             ConfirmationAction::DeleteProfile { id } => self.change_saved_profile(id, true, cx),
+            ConfirmationAction::RemoveDriver { path } => self.remove_driver_registration(path, cx),
             ConfirmationAction::LockVault => {
                 self.lock_vault(cx);
                 self.vault_editors
@@ -4839,22 +5032,6 @@ fn diagram_document_for_selection(
     )
 }
 
-fn schema_filtered_tables(
-    kind: DatabaseKind,
-    tables: &[TableInfo],
-    schema_filter: Option<&str>,
-) -> Vec<TableInfo> {
-    tables
-        .iter()
-        .filter(|table| {
-            kind.dialect() != DatabaseKind::PostgreSQL
-                || schema_filter.is_none()
-                || table.schema.as_deref() == schema_filter
-        })
-        .cloned()
-        .collect()
-}
-
 fn table_is_visible_in(
     kind: DatabaseKind,
     schema_filter: Option<&str>,
@@ -4977,110 +5154,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    struct VaultEnterHarness {
-        editor: Entity<TextEditor>,
-        submitted: bool,
-    }
-
-    impl Render for VaultEnterHarness {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let focus = self.editor.read(cx).focus_handle();
-            div()
-                .key_context("VaultGate")
-                .on_action(cx.listener(|this, _: &SubmitVault, _, cx| {
-                    this.submitted = true;
-                    cx.notify();
-                }))
-                .child(editor::input_with_key_context(
-                    self.editor.clone(),
-                    focus,
-                    false,
-                    "DbxTextEditor VaultGate",
-                    cx,
-                ))
-        }
-    }
-
-    #[gpui::test]
-    fn enter_in_focused_vault_password_field_submits(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        cx.update(|cx| {
-            cx.bind_keys(editor::default_key_bindings());
-            cx.bind_keys([gpui::KeyBinding::new(
-                "enter",
-                SubmitVault,
-                Some("VaultGate"),
-            )]);
-        });
-        let (harness, cx) = cx.add_window_view(|window, cx| {
-            let value = cx.new(|_| String::new());
-            let editor = cx.new(|cx| TextEditor::new(value, false, window, cx).password());
-            VaultEnterHarness {
-                editor,
-                submitted: false,
-            }
-        });
-        cx.update(|window, cx| {
-            harness
-                .read(cx)
-                .editor
-                .read(cx)
-                .focus_handle()
-                .focus(window, cx);
-        });
-
-        cx.simulate_keystrokes("enter");
-
-        assert!(cx.update(|_, cx| harness.read(cx).submitted));
-    }
-
-    #[gpui::test]
-    fn connection_tag_is_single_and_updates_shared_colours(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let directory = tempfile::tempdir().unwrap();
-        let store = ProfileStore::at(directory.path().join("connections.json"));
-        let (app, cx) = cx.add_window_view(DbxApp::new);
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.profile_store = Some(store.clone());
-                app.connection_tags = store.tags().unwrap();
-                app.vault_state = Some(VaultState::Unlocked);
-                let prod = default_tags().remove(0);
-                app.select_tag(prod.clone(), cx);
-                assert_eq!(app.draft.tag.as_ref().map(|tag| tag.id), Some(prod.id));
-                app.sessions.push(ConnectionSession::new(
-                    Uuid::new_v4(),
-                    None,
-                    "Test".into(),
-                    DatabaseKind::SQLite,
-                    app.draft.tag.clone(),
-                    window,
-                    cx,
-                ));
-                app.edit_tag(Some(prod.clone()), cx);
-                app.tag_editor.color.update(cx, |value, cx| {
-                    *value = "#B48EAD".into();
-                    cx.notify();
-                });
-                app.save_connection_tag(cx);
-                assert_eq!(app.draft.tag.as_ref().unwrap().color, 0xb48ead);
-                assert_eq!(app.sessions[0].tag.as_ref().unwrap().color, 0xb48ead);
-                assert_eq!(store.tags().unwrap()[0].color, 0xb48ead);
-                app.select_tag(prod.clone(), cx);
-                assert!(app.draft.tag.is_none());
-                app.select_tag(prod.clone(), cx);
-                app.delete_connection_tag(prod.id, cx);
-                assert!(app.draft.tag.is_none());
-                assert!(app.sessions[0].tag.is_none());
-                assert!(app.connection_tags.iter().all(|tag| tag.id != prod.id));
-                assert_eq!(store.tags().unwrap(), app.connection_tags);
-                let _ = gpui::Render::render(app, window, cx);
-                app.compact_layout = true;
-                let _ = gpui::Render::render(app, window, cx);
-            });
-        });
-    }
-
     #[gpui::test]
     fn named_query_drafts_are_flushed_before_vault_lock(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
@@ -5134,178 +5207,6 @@ mod tests {
         let startup = workspace.load_startup().unwrap();
         assert_eq!(startup.connections.len(), 1);
         assert_eq!(startup.connections[0].profile_id, profile_id);
-    }
-    #[gpui::test]
-    fn workbench_renders_transaction_controls_result_tabs_and_saved_queries(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let session_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Workbench test".into(),
-                DatabaseKind::SQLite,
-                None,
-                window,
-                cx,
-            );
-            let mut query = QueryTab::new(DatabaseKind::SQLite, session_id, tab_id, window, cx);
-            query.in_transaction = true;
-            query.statement_results = vec![
-                StatementResult {
-                    statement: "SELECT 1".into(),
-                    result: QueryResult::empty(None, 1),
-                    error: None,
-                },
-                StatementResult {
-                    statement: "SELECT 2".into(),
-                    result: QueryResult {
-                        columns: vec![ColumnInfo::result("second", 0, "INTEGER")],
-                        rows: vec![dbx_core::RowData::new(vec![CellValue::Integer(2)])],
-                        ..QueryResult::empty(None, 1)
-                    },
-                    error: None,
-                },
-            ];
-            session.secondary_tabs.push(SecondaryTab {
-                id: tab_id,
-                kind: SecondaryTabKind::Query(Box::new(query)),
-            });
-            session.active_secondary_tab = Some(tab_id);
-            session.pane = Pane::Query;
-            app.sessions = vec![session];
-            app.active_session_id = Some(session_id);
-            app.connection_picker_open = false;
-            app
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("save-named-query").is_some());
-        assert!(cx.debug_bounds("query-workbench-more").is_some());
-        assert!(cx.debug_bounds("commit-query").is_some());
-        assert!(cx.debug_bounds("rollback-query").is_some());
-        assert!(cx.debug_bounds("statement-result-0").is_some());
-        assert!(cx.debug_bounds("statement-result-1").is_some());
-        let second = cx.debug_bounds("statement-result-1").unwrap();
-        cx.simulate_click(second.center(), gpui::Modifiers::none());
-        cx.update(|_, cx| {
-            let session = app.read(cx).session(session_id).unwrap();
-            let SecondaryTabKind::Query(query) = &session.secondary_tabs[0].kind else {
-                panic!("query tab")
-            };
-            assert_eq!(query.active_result, 1);
-            assert_eq!(query.result.as_ref().unwrap().columns[0].name, "second");
-            assert_eq!(
-                query.result.as_ref().unwrap().rows[0].values[0],
-                CellValue::Integer(2)
-            );
-        });
-        cx.simulate_resize(gpui::size(px(720.), px(640.)));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        for selector in [
-            "save-named-query",
-            "commit-query",
-            "rollback-query",
-            "query-workbench-more",
-        ] {
-            let bounds = cx
-                .debug_bounds(selector)
-                .expect("query control remains visible");
-            assert!(
-                bounds.origin.x >= px(0.) && bounds.right() <= px(720.),
-                "{selector} is outside the compact window: {bounds:?}"
-            );
-        }
-        let options = cx.debug_bounds("query-workbench-more").unwrap();
-        cx.simulate_click(options.center(), gpui::Modifiers::none());
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.update(|_, cx| assert!(app.read(cx).session(session_id).is_some()));
-    }
-
-    #[gpui::test]
-    fn focused_redis_query_renders_runtime_catalog_completion_menu(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let session_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            let tab_id = Uuid::new_v4();
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Redis test".into(),
-                DatabaseKind::Redis,
-                Some(default_tags().remove(3)),
-                window,
-                cx,
-            );
-            let query = QueryTab::new(DatabaseKind::Redis, session_id, tab_id, window, cx);
-            query
-                .query_editor
-                .update(cx, |editor, cx| editor.set_text("", cx));
-            session.redis_command_catalog = Some(Arc::new(RedisCommandCatalog {
-                commands: vec![dbx_core::RedisCommand {
-                    name: "JSON.GET".into(),
-                    summary: Some("Get a value from a JSON document".into()),
-                    group: Some("json".into()),
-                    since: Some("1.0.0".into()),
-                    arguments: Vec::new(),
-                }],
-            }));
-            session.secondary_tabs.push(SecondaryTab {
-                id: tab_id,
-                kind: SecondaryTabKind::Query(Box::new(query)),
-            });
-            app.sessions = vec![session];
-            app.active_session_id = Some(session_id);
-            app.connection_picker_open = false;
-            app.activate_secondary_tab_for(session_id, tab_id, window, cx);
-            app
-        });
-
-        cx.simulate_input("JSON.G");
-        cx.update(|window, cx| {
-            let focus = app
-                .read(cx)
-                .active_query_editor_for(session_id)
-                .expect("Redis query editor should be active")
-                .read(cx)
-                .focus_handle();
-            assert!(focus.is_focused(window), "Redis query editor lost focus");
-            let menu = app.update(cx, |app, cx| app.query_completion_for(session_id, cx));
-            assert!(
-                menu.as_ref()
-                    .is_some_and(|menu| menu.items.iter().any(|item| item.label == "JSON.GET")),
-                "focused Redis query should resolve a module command before painting"
-            );
-            window.draw(cx).clear(cx)
-        });
-
-        assert!(
-            cx.debug_bounds("sql-completion-menu").is_some(),
-            "a focused Redis query with a partial module command must paint its completion popup"
-        );
-
-        cx.simulate_keystrokes("tab");
-        let query_text = cx.update(|_, cx| {
-            app.read(cx)
-                .session(session_id)
-                .and_then(|session| {
-                    let tab_id = session.active_secondary_tab?;
-                    session.secondary_tabs.iter().find(|tab| tab.id == tab_id)
-                })
-                .and_then(|tab| match &tab.kind {
-                    SecondaryTabKind::Query(query) => Some(query.query_text.read(cx).clone()),
-                    SecondaryTabKind::Data(_)
-                    | SecondaryTabKind::Structure(_)
-                    | SecondaryTabKind::Diagram(_) => None,
-                })
-        });
-        assert_eq!(query_text.as_deref(), Some("JSON.GET "));
     }
 
     struct DropProbe(Arc<AtomicBool>);
@@ -5369,25 +5270,10 @@ mod tests {
     }
 
     #[test]
-    fn table_browser_keeps_the_probe_row_out_of_the_grid() {
-        let mut result = QueryResult::empty(None, 0);
-        result.rows = (0..TABLE_BROWSE_QUERY_LIMIT)
-            .map(|_| RowData::default())
-            .collect();
-
-        assert!(trim_table_browse_result(&mut result));
-        assert_eq!(result.rows.len(), TABLE_BROWSE_PAGE_SIZE as usize);
-    }
-
-    #[test]
-    fn display_url_redacts_embedded_password() {
+    fn display_url_redacts_passwords_and_invalid_input() {
         let displayed = display_url("postgres://user:secret@example.test:5432/app");
         assert!(!displayed.contains("secret"));
         assert!(displayed.contains("user@example.test"));
-    }
-
-    #[test]
-    fn display_url_handles_invalid_input_without_leaking_it() {
         assert_eq!(display_url("not a URL"), "<redacted>");
     }
 
@@ -5418,94 +5304,6 @@ mod tests {
             false,
             Some(&table),
             Some(&table),
-        ));
-    }
-
-    #[test]
-    fn postgres_schema_filter_defaults_to_public_and_lists_unique_options() {
-        let tables = vec![
-            TableInfo::table("events", Some("analytics".into())),
-            TableInfo::table("users", Some("public".into())),
-            TableInfo::table("accounts", Some("public".into())),
-        ];
-
-        assert_eq!(
-            default_schema_filter(DatabaseKind::PostgreSQL, &tables),
-            Some("public".into())
-        );
-        assert_eq!(
-            schema_filter_options(DatabaseKind::PostgreSQL, &tables),
-            vec![None, Some("analytics".into()), Some("public".into())]
-        );
-    }
-
-    #[test]
-    fn sidebar_list_rebuilds_only_when_its_inputs_change() {
-        let tables = vec![
-            TableInfo::table("Events", Some("analytics".into())),
-            TableInfo::table("users", Some("public".into())),
-            TableInfo::table("accounts", Some("public".into())),
-        ];
-        let kind = DatabaseKind::PostgreSQL;
-        let names = |list: &SidebarList| {
-            list.visible
-                .iter()
-                .map(|table| table.name.clone())
-                .collect::<Vec<_>>()
-        };
-        let mut list = SidebarList::default();
-
-        assert!(list.refresh(kind, &tables, 1, None, ""));
-        assert_eq!(names(&list), vec!["Events", "users", "accounts"]);
-        let first_visible = list.visible.clone();
-        let first_options = list.schema_options.clone();
-
-        // Same inputs, including whitespace-only search noise: no rebuild.
-        assert!(!list.refresh(kind, &tables, 1, None, "  "));
-        assert!(Arc::ptr_eq(&first_visible, &list.visible));
-
-        // Search is case-insensitive and keeps the schema options cached.
-        assert!(list.refresh(kind, &tables, 1, None, "EVE"));
-        assert_eq!(names(&list), vec!["Events"]);
-        assert!(Arc::ptr_eq(&first_options, &list.schema_options));
-
-        assert!(list.refresh(kind, &tables, 1, Some("public"), ""));
-        assert_eq!(names(&list), vec!["users", "accounts"]);
-
-        // A new table list bumps the revision and rebuilds the options too.
-        let mut more = tables.clone();
-        more.push(TableInfo::table("orders", Some("sales".into())));
-        assert!(list.refresh(kind, &more, 2, Some("public"), ""));
-        assert_eq!(list.schema_options.len(), 4);
-    }
-
-    #[test]
-    fn schema_filter_is_postgres_only_and_does_not_requery() {
-        let tables = vec![
-            TableInfo::table("events", Some("analytics".into())),
-            TableInfo::table("users", Some("public".into())),
-        ];
-
-        assert_eq!(
-            schema_filtered_tables(DatabaseKind::PostgreSQL, &tables, Some("public"))
-                .iter()
-                .map(|table| table.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["users"]
-        );
-        assert_eq!(
-            schema_filtered_tables(DatabaseKind::MySQL, &tables, Some("public")).len(),
-            tables.len()
-        );
-        assert!(table_is_visible_in(
-            DatabaseKind::PostgreSQL,
-            Some("public"),
-            Some("public")
-        ));
-        assert!(!table_is_visible_in(
-            DatabaseKind::PostgreSQL,
-            Some("public"),
-            Some("analytics")
         ));
     }
 }

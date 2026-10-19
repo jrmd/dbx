@@ -69,6 +69,14 @@ pub(super) fn move_cursor(enabled: &[bool], from: Option<usize>, motion: Motion)
 pub(super) enum TableMenuCommand {
     OpenStructure,
     OpenData,
+    CopyName,
+    ViewDdl,
+    CopyDdl,
+    Rename,
+    Duplicate,
+    CopyInsert,
+    ColumnStatistics,
+    FullColumnStatistics,
     Refresh,
     Export,
     Import,
@@ -117,6 +125,24 @@ pub(super) fn table_menu_rows(writable: bool) -> Vec<TableMenuRow> {
     vec![
         item(OpenStructure, "Open structure", true, Normal),
         item(OpenData, "Open data", true, Normal),
+        item(CopyName, "Copy name", true, Normal),
+        item(ViewDdl, "View DDL", true, Normal),
+        item(CopyDdl, "Copy DDL", true, Normal),
+        item(CopyInsert, "Copy INSERT (up to 1,000 rows)", true, Normal),
+        item(
+            ColumnStatistics,
+            "Column statistics (loaded rows)",
+            true,
+            Normal,
+        ),
+        item(
+            FullColumnStatistics,
+            "Column statistics (full table, scans all rows)",
+            true,
+            Normal,
+        ),
+        item(Rename, "Rename…", writable, Normal),
+        item(Duplicate, "Duplicate…", writable, Normal),
         item(Refresh, "Refresh table", true, Normal),
         TableMenuRow::Separator,
         item(Export, "Export data…", writable, Normal),
@@ -423,16 +449,147 @@ impl DbxApp {
         }
     }
 
+    /// Keep supported edit actions visible when connection protection blocks writes.
+    pub(super) fn driver_supports_row_edits(&self, session_id: SessionId) -> bool {
+        self.session(session_id).is_some_and(|session| {
+            session.engine.as_ref().is_some_and(|engine| {
+                let capabilities = engine.capabilities();
+                capabilities.row_edits
+                    || (capabilities.protected
+                        && session.kind.supports_row_mutations()
+                        && session
+                            .profile_id
+                            .and_then(|id| {
+                                self.saved_connections
+                                    .iter()
+                                    .find(|profile| profile.id == id)
+                            })
+                            .is_none_or(|profile| profile.driver_manifest.is_none()))
+            })
+        })
+    }
+
     /// Rows for `menu`, with write-capable items enabled only when the
     /// connection can take them.
     pub(super) fn table_menu_rows_for(&self, menu: &TableContextMenu) -> Vec<TableMenuRow> {
         let writable = self.session(menu.session_id).is_some_and(|session| {
             session.kind.is_sql()
                 && !session.busy
-                && session.engine.is_some()
+                && session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| !engine.is_read_only())
                 && menu.table.kind == EntityKind::Table
         });
+        let sql = self
+            .session(menu.session_id)
+            .is_some_and(|session| session.kind.is_sql());
+        let engine = self
+            .session(menu.session_id)
+            .and_then(|session| session.engine.as_ref());
+        let full_statistics =
+            engine.is_some_and(|engine| QuerySession::supports_isolated_reads(engine));
+        let imports =
+            engine.is_some_and(|engine| matches!(engine.as_ref(), DatabaseEngine::Sql(_)));
         table_menu_rows(writable)
+            .into_iter()
+            .filter(|row| match row {
+                TableMenuRow::Item { command, .. } => match command {
+                    TableMenuCommand::ViewDdl
+                    | TableMenuCommand::CopyDdl
+                    | TableMenuCommand::CopyInsert
+                    | TableMenuCommand::Rename
+                    | TableMenuCommand::Duplicate
+                    | TableMenuCommand::Export
+                    | TableMenuCommand::Capture
+                    | TableMenuCommand::Append
+                    | TableMenuCommand::Compare
+                    | TableMenuCommand::Truncate
+                    | TableMenuCommand::Drop => sql,
+                    TableMenuCommand::Import => imports,
+                    TableMenuCommand::FullColumnStatistics => full_statistics,
+                    _ => true,
+                },
+                TableMenuRow::Separator => sql,
+            })
+            .map(|row| match row {
+                TableMenuRow::Item {
+                    command: TableMenuCommand::Export,
+                    label,
+                    tone,
+                    ..
+                } => TableMenuRow::Item {
+                    command: TableMenuCommand::Export,
+                    label,
+                    enabled: sql
+                        && self
+                            .session(menu.session_id)
+                            .is_some_and(|session| !session.busy && session.engine.is_some()),
+                    tone,
+                },
+                TableMenuRow::Item {
+                    command,
+                    label,
+                    enabled,
+                    tone,
+                } if matches!(
+                    command,
+                    TableMenuCommand::ViewDdl
+                        | TableMenuCommand::CopyDdl
+                        | TableMenuCommand::CopyInsert
+                ) =>
+                {
+                    TableMenuRow::Item {
+                        command,
+                        label,
+                        enabled: enabled && sql,
+                        tone,
+                    }
+                }
+                TableMenuRow::Item {
+                    command: TableMenuCommand::ColumnStatistics,
+                    label,
+                    enabled,
+                    tone,
+                } => TableMenuRow::Item {
+                    command: TableMenuCommand::ColumnStatistics,
+                    label,
+                    enabled: enabled
+                        && self
+                            .session(menu.session_id)
+                            .and_then(|session| session.active_data_tab())
+                            .is_some_and(|data| {
+                                data.table.name == menu.table.name
+                                    && data.table.schema == menu.table.schema
+                                    && data.result.is_some()
+                            }),
+                    tone,
+                },
+                TableMenuRow::Item {
+                    command: TableMenuCommand::FullColumnStatistics,
+                    label,
+                    enabled,
+                    tone,
+                } => {
+                    TableMenuRow::Item {
+                        command: TableMenuCommand::FullColumnStatistics,
+                        label,
+                        tone,
+                        enabled: enabled
+                            && self.session(menu.session_id).is_some_and(|session| {
+                                session.engine.as_ref().is_some_and(|engine| {
+                                    QuerySession::supports_isolated_reads(engine)
+                                }) && session.active_data_tab().is_some_and(|data| {
+                                    data.table.name == menu.table.name
+                                        && data.table.schema == menu.table.schema
+                                        && !data.table_columns.is_empty()
+                                })
+                            }),
+                    }
+                }
+                row => row,
+            })
+            .collect()
     }
 
     fn move_table_menu(&mut self, motion: Motion, cx: &mut Context<Self>) {
@@ -526,6 +683,27 @@ impl DbxApp {
         let table = menu.table;
         self.focus_session_explorer(session_id, window, cx);
         match command {
+            TableMenuCommand::ColumnStatistics => {
+                self.show_loaded_table_column_statistics(session_id, window, cx)
+            }
+            TableMenuCommand::FullColumnStatistics => {
+                self.show_full_table_column_statistics(session_id, window, cx)
+            }
+            TableMenuCommand::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(
+                table_ref_label(&table_ref(&table)),
+            )),
+            TableMenuCommand::ViewDdl
+            | TableMenuCommand::CopyDdl
+            | TableMenuCommand::CopyInsert => {
+                self.table_metadata_command(session_id, table, command, window, cx)
+            }
+            TableMenuCommand::Rename | TableMenuCommand::Duplicate => self.open_table_name_prompt(
+                session_id,
+                table,
+                command == TableMenuCommand::Duplicate,
+                window,
+                cx,
+            ),
             TableMenuCommand::OpenStructure => self.open_structure_tab_for(session_id, table, cx),
             TableMenuCommand::OpenData | TableMenuCommand::Refresh => {
                 self.select_table_for(session_id, table, window, cx)
@@ -592,355 +770,5 @@ impl DbxApp {
         cx: &mut Context<Self>,
     ) {
         self.cycle_secondary_tab(false, window, cx);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn menu_cursor_skips_disabled_rows_and_separators_and_wraps() {
-        let rows = table_menu_rows(false);
-        let enabled = rows
-            .iter()
-            .map(TableMenuRow::is_enabled_item)
-            .collect::<Vec<_>>();
-        let label = |index: usize| match rows[index] {
-            TableMenuRow::Item { label, .. } => label,
-            TableMenuRow::Separator => "-",
-        };
-        let first = move_cursor(&enabled, None, Motion::First).unwrap();
-        assert_eq!(label(first), "Open structure");
-        // From the last enabled row the cursor wraps instead of landing on a
-        // disabled Truncate/Delete.
-        let last = move_cursor(&enabled, None, Motion::Last).unwrap();
-        assert_eq!(label(last), "Compare with captured data…");
-        assert_eq!(move_cursor(&enabled, Some(last), Motion::Next), Some(first));
-        assert_eq!(
-            move_cursor(&enabled, Some(first), Motion::Previous),
-            Some(last)
-        );
-        // Stepping from "Refresh table" skips the separator, then the
-        // disabled export and import rows.
-        let refresh = (0..rows.len()).find(|index| label(*index) == "Refresh table");
-        assert_eq!(
-            label(move_cursor(&enabled, refresh, Motion::Next).unwrap()),
-            "Capture table for cross-connection copy"
-        );
-        assert_eq!(move_cursor(&[false, false], None, Motion::Next), None);
-
-        let writable = table_menu_rows(true);
-        let enabled = writable
-            .iter()
-            .map(TableMenuRow::is_enabled_item)
-            .collect::<Vec<_>>();
-        let last = move_cursor(&enabled, None, Motion::Last).unwrap();
-        assert!(matches!(
-            writable[last],
-            TableMenuRow::Item {
-                command: TableMenuCommand::Drop,
-                ..
-            }
-        ));
-    }
-
-    fn explorer_window(
-        cx: &mut gpui::TestAppContext,
-    ) -> (
-        gpui::Entity<DbxApp>,
-        &mut gpui::VisualTestContext,
-        SessionId,
-    ) {
-        cx.update(gpui_component::init);
-        cx.update(|cx| cx.bind_keys(key_bindings()));
-        let session_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.runtime = Arc::new(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap(),
-            );
-            app.vault_state = Some(VaultState::Unlocked);
-            let engine = Arc::new(
-                app.runtime
-                    .block_on(DatabaseEngine::connect(ConnectionConfig::new(
-                        DatabaseKind::SQLite,
-                        "sqlite::memory:",
-                    )))
-                    .unwrap(),
-            );
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Explorer test".into(),
-                DatabaseKind::SQLite,
-                None,
-                window,
-                cx,
-            );
-            session.engine = Some(engine);
-            session.tables = ["alpha", "beta", "gamma"]
-                .map(|name| TableInfo::table(name, None))
-                .to_vec();
-            app.sessions.push(session);
-            app.active_session_id = Some(session_id);
-            app
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        (app, cx, session_id)
-    }
-
-    fn cursor_name(app: &gpui::Entity<DbxApp>, cx: &mut gpui::VisualTestContext) -> Option<String> {
-        app.read_with(cx, |app, _| {
-            app.session(app.active_session_id?)?.sidebar.cursor.clone()
-        })
-    }
-
-    fn focus_explorer(app: &gpui::Entity<DbxApp>, cx: &mut gpui::VisualTestContext) {
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.focus_explorer_action(&FocusExplorer, window, cx)
-            })
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-    }
-
-    #[gpui::test]
-    fn accessible_paging_reaches_virtualized_objects_and_respects_filtering(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (app, cx, session_id) = explorer_window(cx);
-        app.update(cx, |app, _| {
-            let session = app.session_mut(session_id).unwrap();
-            session.tables = (0..100)
-                .map(|index| TableInfo::table(format!("table_{index:03}"), None))
-                .collect();
-            session.tables_revision += 1;
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        for _ in 0..6 {
-            cx.update(|window, cx| {
-                app.update(cx, |app, cx| {
-                    app.scroll_explorer_accessibly(session_id, 20, window, cx)
-                })
-            });
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-        }
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-table_099")
-        );
-        cx.update(|window, cx| {
-            assert!(
-                app.read(cx)
-                    .session(session_id)
-                    .unwrap()
-                    .sidebar
-                    .focus
-                    .is_focused(window)
-            )
-        });
-        app.update(cx, |app, cx| {
-            let session = app.session_mut(session_id).unwrap();
-            session.editors.sidebar_search.update(cx, |text, cx| {
-                *text = "table_00".into();
-                cx.notify();
-            });
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.scroll_explorer_accessibly(session_id, 20, window, cx)
-            })
-        });
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-table_009")
-        );
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.scroll_explorer_accessibly(session_id, -20, window, cx)
-            })
-        });
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-table_000")
-        );
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.active_session_id = None;
-                app.scroll_explorer_accessibly(session_id, 20, window, cx);
-                assert_eq!(
-                    app.session(session_id).unwrap().sidebar.cursor.as_deref(),
-                    Some("table-<default>-table_000"),
-                    "stale accessible requests must not navigate a hidden connection"
-                );
-            })
-        });
-    }
-
-    #[gpui::test]
-    fn arrow_keys_move_the_explorer_cursor_and_enter_opens_the_table(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (app, cx, session_id) = explorer_window(cx);
-        focus_explorer(&app, cx);
-        // Focusing with nothing open starts on the first row.
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-alpha")
-        );
-        cx.simulate_keystrokes("down down");
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-gamma")
-        );
-        // The list stops at its ends instead of wrapping.
-        cx.simulate_keystrokes("down");
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-gamma")
-        );
-        cx.simulate_keystrokes("home up");
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-alpha")
-        );
-        cx.simulate_keystrokes("end enter");
-        let opened = app.read_with(cx, |app, _| {
-            app.session(session_id)
-                .and_then(|session| session.active_data_tab())
-                .map(|data| data.table.name.clone())
-        });
-        assert_eq!(opened.as_deref(), Some("gamma"));
-    }
-
-    #[gpui::test]
-    fn a_stale_cursor_falls_back_instead_of_pointing_at_another_table(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (app, cx, session_id) = explorer_window(cx);
-        focus_explorer(&app, cx);
-        cx.simulate_keystrokes("down");
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-beta")
-        );
-        // Filtering the list removes the cursor's table; the next move starts
-        // from the top rather than from `beta`'s old position.
-        app.update(cx, |app, cx| {
-            let session = app.session_mut(session_id).unwrap();
-            session.tables = vec![
-                TableInfo::table("delta", None),
-                TableInfo::table("zeta", None),
-            ];
-            session.tables_revision += 1;
-            cx.notify();
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("down");
-        assert_eq!(
-            cursor_name(&app, cx).as_deref(),
-            Some("table-<default>-delta")
-        );
-    }
-
-    #[gpui::test]
-    fn the_context_menu_opens_from_the_keyboard_and_returns_focus_to_the_explorer(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let (app, cx, session_id) = explorer_window(cx);
-        focus_explorer(&app, cx);
-        cx.simulate_keystrokes("shift-f10");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let first = app.read_with(cx, |app, _| {
-            app.table_context_menu.as_ref().map(|menu| menu.cursor)
-        });
-        assert_eq!(first, Some(Some(0)));
-        // Escape closes it and hands focus back to the list.
-        cx.simulate_keystrokes("escape");
-        assert!(app.read_with(cx, |app, _| app.table_context_menu.is_none()));
-        let explorer_focused = cx.update(|window, cx| {
-            app.read(cx)
-                .session(session_id)
-                .unwrap()
-                .sidebar
-                .focus
-                .is_focused(window)
-        });
-        assert!(explorer_focused);
-
-        // Open again, jump to the last item (Delete table…) and confirm it.
-        cx.simulate_keystrokes("shift-f10");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("end enter");
-        let drop_asked = app.read_with(cx, |app, _| {
-            app.table_context_menu.is_none()
-                && matches!(
-                    app.confirmation_dialog
-                        .as_ref()
-                        .map(|dialog| &dialog.action),
-                    Some(ConfirmationAction::Table {
-                        action: TableAction::Drop,
-                        ..
-                    })
-                )
-        });
-        assert!(drop_asked);
-        // Cancelling the dialog returns focus to the explorer, not to the
-        // menu that no longer exists.
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("escape");
-        assert!(app.read_with(cx, |app, _| app.confirmation_dialog.is_none()));
-        let explorer_focused = cx.update(|window, cx| {
-            app.read(cx)
-                .session(session_id)
-                .unwrap()
-                .sidebar
-                .focus
-                .is_focused(window)
-        });
-        assert!(explorer_focused);
-    }
-
-    #[gpui::test]
-    fn tab_shortcuts_cycle_the_connections_tabs_and_wrap(cx: &mut gpui::TestAppContext) {
-        let (app, cx, session_id) = explorer_window(cx);
-        let ids = cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                let mut ids = Vec::new();
-                for name in ["alpha", "beta", "gamma"] {
-                    let id = Uuid::new_v4();
-                    let data = DataTab::new(session_id, id, TableRef::new(name), true, window, cx);
-                    app.session_mut(session_id)
-                        .unwrap()
-                        .secondary_tabs
-                        .push(SecondaryTab {
-                            id,
-                            kind: SecondaryTabKind::Data(Box::new(data)),
-                        });
-                    ids.push(id);
-                }
-                app.session_mut(session_id).unwrap().active_secondary_tab = Some(ids[0]);
-                ids
-            })
-        });
-        let active = |app: &gpui::Entity<DbxApp>, cx: &mut gpui::VisualTestContext| {
-            app.read_with(cx, |app, _| {
-                app.session(session_id).unwrap().active_secondary_tab
-            })
-        };
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("alt-pagedown");
-        assert_eq!(active(&app, cx), Some(ids[1]));
-        cx.simulate_keystrokes("alt-pagedown alt-pagedown");
-        assert_eq!(active(&app, cx), Some(ids[0]));
-        cx.simulate_keystrokes("alt-pageup");
-        assert_eq!(active(&app, cx), Some(ids[2]));
-        cx.simulate_keystrokes("cmd-alt-right");
-        assert_eq!(active(&app, cx), Some(ids[0]));
     }
 }

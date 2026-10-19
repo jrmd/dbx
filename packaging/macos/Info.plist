@@ -21,5 +21,42 @@
 	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
 	<string>0.2.0</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>SQLite database</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>sqlite</string>
+				<string>sqlite3</string>
+				<string>db</string>
+				<string>db3</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Database connection</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>postgres</string>
+				<string>postgresql</string>
+				<string>mysql</string>
+				<string>redis</string>
+				<string>rediss</string>
+				<string>mongodb</string>
+				<string>mongodb+srv</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

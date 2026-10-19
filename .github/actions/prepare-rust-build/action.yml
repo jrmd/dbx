@@ -1,5 +1,10 @@
 name: Prepare Rust build
-description: Install platform tools and restore release dependency artifacts
+description: Install platform tools and restore dependency artifacts
+inputs:
+  cache-profile:
+    description: Cargo profile used to separate dependency caches
+    required: false
+    default: release
 runs:
   using: composite
   steps:
@@ -29,7 +34,7 @@ runs:
     - name: Restore Rust dependencies
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
-        shared-key: release-${{ runner.os }}-${{ runner.arch }}
+        shared-key: ${{ inputs.cache-profile }}-${{ runner.os }}-${{ runner.arch }}
         # rust-cache prunes workspace binaries and non-Cargo output (including
         # bundles and notarization output) before saving dependency artifacts.
         workspaces: '. -> target'

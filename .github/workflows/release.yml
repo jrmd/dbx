@@ -57,6 +57,7 @@ jobs:
           cargo test --locked --release --workspace
           cargo clippy --locked --release --workspace --all-targets -- -D warnings
           python3 scripts/test-macos-release.py
+          python3 scripts/test-release-notes.py
       - name: Linux package
         if: runner.os == 'Linux'
         run: bash scripts/build-linux-app.sh appimage
@@ -92,6 +93,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -108,5 +112,6 @@ jobs:
           find release -mindepth 1 -type d -empty -delete
           (cd release && sha256sum -c ./*.sha256)
           # Keep partially uploaded assets out of /releases/latest.
-          gh release create "$RELEASE_TAG" release/* --verify-tag --generate-notes --draft
+          python3 scripts/release-notes.py "$RELEASE_TAG" --output release-notes.md
+          gh release create "$RELEASE_TAG" release/* --verify-tag --notes-file release-notes.md --draft
           gh release edit "$RELEASE_TAG" --draft=false --latest

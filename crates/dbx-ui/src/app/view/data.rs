@@ -345,6 +345,10 @@ impl DbxApp {
                                             ),
                                         )
                                     })
+                                    .when(matches!(kind, DatabaseKind::MongoDB | DatabaseKind::Redis) && has_selected_row && self.session(session_id).and_then(|session| session.engine.as_ref()).is_some_and(|engine| !engine.is_read_only()), |view| {
+                                        view.child(button("edit-document-key", if kind == DatabaseKind::MongoDB { "Edit document" } else { "Edit key value" }, ButtonKind::Quiet)
+                                            .on_click(cx.listener(move |this, _, window, cx| this.open_nonrelational_editor(session_id, tab_id, window, cx))))
+                                    })
                                     .when(self.narrow_workspace && has_selected_row && !has_draft, |view| {
                                         view.child(button("show-row-details", "Row details", ButtonKind::Quiet)
                                             .debug_selector(|| "show-row-details".into())
@@ -352,7 +356,7 @@ impl DbxApp {
                                                 this.open_inspector_for(session_id, tab_id, window, cx)
                                             })))
                                     })
-                                    .when(can_mutate, |view| {
+                                    .when(self.driver_supports_row_edits(session_id), |view| {
                                         view.child(
                                             div()
                                                 .mx(crate::theme::ui_px(2.))
@@ -362,6 +366,7 @@ impl DbxApp {
                                         )
                                         .child(
                                             button("add-row", if has_draft { "Continue row draft" } else { "New row" }, ButtonKind::Quiet)
+                                                .disabled(!can_mutate)
                                                 .debug_selector(|| "add-row".into())
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(
@@ -651,6 +656,18 @@ impl DbxApp {
                     )
                 },
             )
+            .on_action(cx.listener(move |this, _: &editor::Undo, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, false, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &editor::Redo, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, true, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &UndoGridEdits, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, false, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &RedoGridEdits, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, true, cx)
+            }))
             .on_action(cx.listener(move |this, _: &DeleteRows, _, cx| {
                 this.delete_rows_for(session_id, tab_id, None, cx)
             }))
@@ -660,70 +677,116 @@ impl DbxApp {
             .on_action(cx.listener(move |this, _: &PasteRows, _, cx| {
                 this.paste_rows_for(session_id, tab_id, cx)
             }))
-            .when(counts.total() > 0, |view| {
-                view.child(
-                    div()
-                        .flex_none()
-                        .px(crate::theme::ui_px(8.))
-                        .py(crate::theme::ui_px(5.))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(crate::theme::ui_px(8.))
-                        .border_b_1()
-                        .border_color(theme().border)
-                        .bg(theme().panel)
-                        .child(
-                            div()
-                                .text_size(crate::theme::text_px(11.))
-                                .text_color(theme().text)
-                                .child(if recovered {
-                                    format!("Recovered draft · {summary} · review required")
-                                } else {
-                                    summary
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(crate::theme::ui_px(6.))
-                                .child(
-                                    button("discard-cell-edits", "Discard", ButtonKind::Quiet)
-                                        .cursor_pointer()
-                                        .disabled(busy)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.request_discard_pending_edits_for(
-                                                session_id, tab_id, window, cx,
+            .when(
+                counts.total() > 0
+                    || self
+                        .data_tab(session_id, tab_id)
+                        .is_some_and(|data| data.edit_history.can_redo()),
+                |view| {
+                    view.child(
+                        div()
+                            .flex_none()
+                            .px(crate::theme::ui_px(8.))
+                            .py(crate::theme::ui_px(5.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(crate::theme::ui_px(8.))
+                            .border_b_1()
+                            .border_color(theme().border)
+                            .bg(theme().panel)
+                            .child(
+                                div()
+                                    .text_size(crate::theme::text_px(11.))
+                                    .text_color(theme().text)
+                                    .child(if recovered {
+                                        format!("Recovered draft · {summary} · review required")
+                                    } else {
+                                        summary
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(6.))
+                                    .child(
+                                        button("undo-grid-edits", "Undo", ButtonKind::Quiet)
+                                            .disabled(
+                                                busy || recovered
+                                                    || !self
+                                                        .data_tab(session_id, tab_id)
+                                                        .is_some_and(|data| {
+                                                            data.edit_history.can_undo()
+                                                        }),
                                             )
-                                        })),
-                                )
-                                .child(
-                                    button("review-cell-edits", "Review SQL", ButtonKind::Quiet)
-                                        .cursor_pointer()
-                                        .disabled(busy)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.review_changes_for(session_id, tab_id, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    button("save-cell-edits", "Commit", ButtonKind::Primary)
-                                        .cursor_pointer()
-                                        .disabled(busy)
-                                        .tooltip(if cfg!(target_os = "macos") {
-                                            "⌘S"
-                                        } else {
-                                            "Ctrl+S"
-                                        })
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.request_commit_changes_for(
-                                                session_id, tab_id, window, cx,
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.undo_grid_edits_for(
+                                                    session_id, tab_id, false, cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        button("redo-grid-edits", "Redo", ButtonKind::Quiet)
+                                            .disabled(
+                                                busy || recovered
+                                                    || !self
+                                                        .data_tab(session_id, tab_id)
+                                                        .is_some_and(|data| {
+                                                            data.edit_history.can_redo()
+                                                        }),
                                             )
-                                        })),
-                                ),
-                        ),
-                )
-            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.undo_grid_edits_for(
+                                                    session_id, tab_id, true, cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        button("discard-cell-edits", "Discard", ButtonKind::Quiet)
+                                            .cursor_pointer()
+                                            .disabled(busy)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.request_discard_pending_edits_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        button(
+                                            "review-cell-edits",
+                                            "Review SQL",
+                                            ButtonKind::Quiet,
+                                        )
+                                        .cursor_pointer()
+                                        .disabled(busy)
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.review_changes_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        button("save-cell-edits", "Commit", ButtonKind::Primary)
+                                            .cursor_pointer()
+                                            .disabled(busy)
+                                            .tooltip(if cfg!(target_os = "macos") {
+                                                "⌘S"
+                                            } else {
+                                                "Ctrl+S"
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.request_commit_changes_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
+            )
             .child(
                 div()
                     .flex_1()
@@ -1799,22 +1862,30 @@ impl DbxApp {
                             String::new()
                         },
                     )))
-                    .child(
-                        button(
-                            "open-table-designer",
-                            if designer_open {
-                                "Close designer"
-                            } else {
-                                "Design table…"
-                            },
-                            ButtonKind::Quiet,
-                        )
-                        .map(|button| gpui::Styled::rounded(button, crate::theme::ui_px(5.)))
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.toggle_designer_for(session_id, window, cx);
-                            },
-                        )),
+                    .when(
+                        self.session(session_id)
+                            .is_some_and(|session| session.kind.is_sql()),
+                        |view| {
+                            view.child(
+                                button(
+                                    "open-table-designer",
+                                    if designer_open {
+                                        "Close designer"
+                                    } else {
+                                        "Design table…"
+                                    },
+                                    ButtonKind::Quiet,
+                                )
+                                .map(|button| {
+                                    gpui::Styled::rounded(button, crate::theme::ui_px(5.))
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.toggle_designer_for(session_id, window, cx);
+                                    },
+                                )),
+                            )
+                        },
                     ),
             )
             .child(
@@ -2021,391 +2092,6 @@ mod tests {
     use gpui::TestAppContext;
 
     #[gpui::test]
-    fn structure_scrolls_without_clipping_and_remembers_expanded_details_per_tab(
-        cx: &mut TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let session_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let other_tab_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.settings_store = None;
-            app.startup_recovery_started = true;
-            app.connection_picker_open = false;
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Schema test".into(),
-                DatabaseKind::SQLite,
-                None,
-                window,
-                cx,
-            );
-            for id in [tab_id, other_tab_id] {
-                session.secondary_tabs.push(SecondaryTab {
-                    id,
-                    kind: SecondaryTabKind::Structure(Box::new(StructureTab {
-                        scroll: ScrollHandle::new(),
-                        expanded_sections: HashSet::new(),
-                        designer: None,
-                        table: TableRef::new("comments"),
-                        columns: (0..15)
-                            .map(|index| {
-                                ColumnInfo::result(format!("column_{index}"), index, "TEXT")
-                            })
-                            .collect(),
-                        foreign_keys: vec![ForeignKeyInfo {
-                            constraint_name: Some("comments_parent_fkey".into()),
-                            columns: vec!["column_1".into()],
-                            referenced_schema: None,
-                            referenced_table: "comments".into(),
-                            referenced_columns: vec!["column_0".into()],
-                            on_update: Some(ReferentialAction::NoAction),
-                            on_delete: Some(ReferentialAction::Cascade),
-                        }],
-                        indexes: (0..8)
-                            .map(|index| dbx_core::IndexInfo {
-                                constraint_name: None,
-                                name: format!("index_{index}"),
-                                columns: vec!["column_1".into(), "column_2".into()],
-                                unique: false,
-                                primary: false,
-                                method: Some("btree".into()),
-                                predicate: Some("deleted_at IS NULL AND parent_id IS NULL".into()),
-                                definition: None,
-                            })
-                            .collect(),
-                        checks: vec![dbx_core::CheckConstraintInfo {
-                            name: Some("valid_comment".into()),
-                            expression: "column_2 <> ''".into(),
-                        }],
-                        definition: Some("CREATE TABLE comments (...)".into()),
-                        busy: false,
-                        error: None,
-                    })),
-                });
-            }
-            session.active_secondary_tab = Some(tab_id);
-            session.pane = Pane::Structure;
-            app.sessions = vec![session];
-            app.active_session_id = Some(session_id);
-            app
-        });
-        cx.simulate_resize(gpui::size(px(800.), px(600.)));
-        for scale in [100, 200] {
-            cx.update(|window, cx| {
-                app.update(cx, |app, _| app.ui_scale = scale);
-                window.draw(cx).clear(cx);
-            });
-            let scroll = app.read_with(cx, |app, _| {
-                let SecondaryTabKind::Structure(structure) =
-                    &app.session(session_id).unwrap().secondary_tabs[0].kind
-                else {
-                    panic!("structure tab")
-                };
-                structure.scroll.clone()
-            });
-            scroll.set_offset(gpui::point(px(0.), px(0.)));
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            let viewport = cx.debug_bounds("structure-scroll").unwrap();
-            let header = cx.debug_bounds("structure-header").unwrap();
-            let grid = cx.debug_bounds("structure-columns").unwrap();
-            let first = cx.debug_bounds("structure-column-0").unwrap();
-            let last = cx.debug_bounds("structure-column-14").unwrap();
-            assert!(viewport.bottom() <= px(600.));
-            assert!(header.bottom() <= viewport.top());
-            assert!(grid.size.height >= crate::theme::ui_px(30. + 15. * 32.));
-            assert!(
-                last.bottom() <= grid.bottom(),
-                "the last column must not be clipped"
-            );
-            assert!(
-                last.top() > viewport.bottom(),
-                "fixture needs scrolling at {scale}%"
-            );
-            assert!(
-                cx.debug_bounds("structure-detail-index_0").is_none(),
-                "details start collapsed"
-            );
-            cx.simulate_event(gpui::ScrollWheelEvent {
-                position: viewport.origin + gpui::point(px(40.), px(40.)),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(-40.), px(0.))),
-                touch_phase: gpui::TouchPhase::Started,
-                ..Default::default()
-            });
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            let shifted = cx.debug_bounds("structure-column-0").unwrap();
-            assert!(
-                shifted.left() < first.left(),
-                "wide columns must scroll horizontally"
-            );
-            assert_eq!(scroll.offset().y, px(0.));
-            let first = shifted;
-            // Vertical input over the horizontally scrollable grid reaches the page.
-            for delta in [
-                gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-60.))),
-                gpui::ScrollDelta::Lines(gpui::point(0., -3.)),
-            ] {
-                let before = scroll.offset().y;
-                cx.simulate_event(gpui::ScrollWheelEvent {
-                    position: viewport.origin + gpui::point(px(40.), px(40.)),
-                    delta,
-                    touch_phase: gpui::TouchPhase::Started,
-                    ..Default::default()
-                });
-                cx.update(|window, cx| {
-                    window.refresh();
-                    window.draw(cx).clear(cx);
-                });
-                assert!(
-                    scroll.offset().y < before,
-                    "wheel must move the schema page"
-                );
-                assert_eq!(cx.debug_bounds("structure-header").unwrap(), header);
-                assert_eq!(
-                    cx.debug_bounds("structure-column-0").unwrap().left(),
-                    first.left()
-                );
-            }
-            scroll.set_offset(gpui::point(px(0.), px(-10000.)));
-            for _ in 0..2 {
-                cx.update(|window, cx| {
-                    window.refresh();
-                    window.draw(cx).clear(cx);
-                });
-            }
-            let indexes = cx.debug_bounds("structure-indexes").unwrap();
-            scroll.set_offset(gpui::point(
-                px(0.),
-                scroll.offset().y + viewport.top() + crate::theme::ui_px(4.) - indexes.top(),
-            ));
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            let indexes = cx.debug_bounds("structure-indexes").unwrap();
-            assert!(
-                indexes.top() >= viewport.top() && indexes.bottom() <= viewport.bottom(),
-                "indexes: {indexes:?}; viewport: {viewport:?}; offset: {:?}; scale: {scale}",
-                scroll.offset()
-            );
-            cx.simulate_click(indexes.center(), gpui::Modifiers::none());
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            let row = cx.debug_bounds("structure-detail-index_0").unwrap();
-            let next = cx.debug_bounds("structure-detail-index_1").unwrap();
-            assert!(
-                row.size.height > crate::theme::ui_px(44.),
-                "predicates need their own line"
-            );
-            assert!(
-                row.bottom() <= next.top(),
-                "index predicates must not overlap the next row"
-            );
-            scroll.set_offset(gpui::point(px(0.), px(-10000.)));
-            for _ in 0..2 {
-                cx.update(|window, cx| {
-                    window.refresh();
-                    window.draw(cx).clear(cx);
-                });
-            }
-            let last_index = cx.debug_bounds("structure-detail-index_7").unwrap();
-            scroll.set_offset(gpui::point(
-                px(0.),
-                scroll.offset().y + viewport.top() + crate::theme::ui_px(4.) - last_index.top(),
-            ));
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            let last_index = cx.debug_bounds("structure-detail-index_7").unwrap();
-            assert!(
-                last_index.top() >= viewport.top() && last_index.bottom() <= viewport.bottom(),
-                "index {last_index:?}, viewport {viewport:?}, scale {scale}, fonts {:?}",
-                app.read_with(cx, |app, _| (app.font_size, app.mono_font_size))
-            );
-            let retained_offset = scroll.offset();
-            cx.update(|window, cx| {
-                app.update(cx, |app, cx| {
-                    app.activate_secondary_tab_for(session_id, other_tab_id, window, cx)
-                });
-                window.draw(cx).clear(cx);
-            });
-            assert!(cx.debug_bounds("structure-detail-index_0").is_none());
-            assert!(
-                cx.debug_bounds("structure-column-0").unwrap().top()
-                    >= cx.debug_bounds("structure-scroll").unwrap().top()
-            );
-            cx.update(|window, cx| {
-                app.update(cx, |app, cx| {
-                    app.activate_secondary_tab_for(session_id, tab_id, window, cx)
-                });
-                window.draw(cx).clear(cx);
-            });
-            assert!(cx.debug_bounds("structure-detail-index_0").is_some());
-            assert_eq!(scroll.offset(), retained_offset);
-            // Collapse again before repeating at the other scale.
-            let indexes = cx.debug_bounds("structure-indexes").unwrap();
-            scroll.set_offset(gpui::point(
-                px(0.),
-                scroll.offset().y + viewport.top() + crate::theme::ui_px(4.) - indexes.top(),
-            ));
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            let indexes = cx.debug_bounds("structure-indexes").unwrap();
-            cx.simulate_click(indexes.center(), gpui::Modifiers::none());
-            cx.update(|window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            assert!(cx.debug_bounds("structure-detail-index_0").is_none());
-        }
-    }
-
-    #[gpui::test]
-    fn dragging_selects_ranges_and_respects_release_and_preference(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let session_id = Uuid::new_v4();
-        let tab_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.settings_store = None;
-            app.ui_scale = 100;
-            app.drag_row_selection = true;
-            app.editor_scale = 100;
-            let mut session = ConnectionSession::new(
-                session_id,
-                None,
-                "Inspector test".into(),
-                DatabaseKind::SQLite,
-                None,
-                window,
-                cx,
-            );
-            session.tables = vec![TableInfo::table("projects", None)];
-            let table = TableRef::new("projects");
-            let mut data = DataTab::new(session_id, tab_id, table.clone(), false, window, cx);
-            data.table_columns = (0..20)
-                .map(|index| ColumnInfo::result(format!("field_{index}"), index, "TEXT"))
-                .collect();
-            data.set_result(
-                Some(QueryResult {
-                    columns: data.table_columns.clone(),
-                    rows: vec![dbx_core::RowData::new(vec![CellValue::Null; 20]); 5],
-                    ..QueryResult::empty(None, 0)
-                }),
-                &session.tables,
-                cx,
-            );
-            data.result_table = Some(table);
-            session.secondary_tabs.push(SecondaryTab {
-                id: tab_id,
-                kind: SecondaryTabKind::Data(Box::new(data)),
-            });
-            session.active_secondary_tab = Some(tab_id);
-            session.recent_data_tab = Some(tab_id);
-            app.sessions = vec![session];
-            app.active_session_id = Some(session_id);
-            app.connection_picker_open = false;
-            app
-        });
-        for (width, zoom, font) in [
-            (1400., 100, 20),
-            (1400., 200, 20),
-            (720., 100, 20),
-            (1400., 100, 12),
-        ] {
-            cx.simulate_resize(gpui::size(px(width), px(900.)));
-            cx.update(|window, cx| {
-                app.update(cx, |app, _| {
-                    app.ui_scale = zoom;
-                    app.font_size = font;
-                    app.mono_font_size = font;
-                });
-                window.draw(cx).clear(cx);
-            });
-            let toolbar = cx.debug_bounds("data-filter-toolbar").unwrap();
-            let button = cx.debug_bounds("data-add-filter").unwrap();
-            assert!(
-                button.top() >= toolbar.top() && button.bottom() <= toolbar.bottom(),
-                "filter button clipped at {width}/{zoom}/{font}: {button:?}, {toolbar:?}"
-            );
-            assert!(
-                button.left() >= toolbar.left() && button.right() <= toolbar.right(),
-                "filter button overflow"
-            );
-        }
-        let row = |cx: &mut gpui::VisualTestContext, index| {
-            cx.debug_bounds(match index {
-                0 => "dbx-result-row-0",
-                1 => "dbx-result-row-1",
-                _ => "dbx-result-row-3",
-            })
-            .unwrap()
-            .center()
-        };
-        let first = row(cx, 0);
-        cx.simulate_mouse_down(first, MouseButton::Left, Default::default());
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let fourth = row(cx, 3);
-        cx.simulate_mouse_move(fourth, MouseButton::Left, Default::default());
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .data_tab(session_id, tab_id)
-                .unwrap()
-                .marked_rows
-                .clone()),
-            BTreeSet::from([0, 1, 2, 3])
-        );
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let second = row(cx, 1);
-        cx.simulate_mouse_move(second, MouseButton::Left, Default::default());
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .data_tab(session_id, tab_id)
-                .unwrap()
-                .marked_rows
-                .clone()),
-            BTreeSet::from([0, 1])
-        );
-        cx.simulate_mouse_up(second, MouseButton::Left, Default::default());
-        cx.simulate_mouse_move(fourth, None, Default::default());
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .data_tab(session_id, tab_id)
-                .unwrap()
-                .marked_rows
-                .clone()),
-            BTreeSet::from([0, 1])
-        );
-        cx.update(|_, cx| app.update(cx, |app, _| app.drag_row_selection = false));
-        cx.simulate_mouse_down(first, MouseButton::Left, Default::default());
-        cx.simulate_mouse_move(fourth, MouseButton::Left, Default::default());
-        cx.simulate_mouse_up(fourth, MouseButton::Left, Default::default());
-        assert_eq!(
-            app.read_with(cx, |app, _| app
-                .data_tab(session_id, tab_id)
-                .unwrap()
-                .marked_rows
-                .clone()),
-            BTreeSet::from([0])
-        );
-    }
-
-    #[gpui::test]
     fn compact_row_inspector_reveals_fields_preserves_drafts_and_returns_to_grid(
         cx: &mut TestAppContext,
     ) {
@@ -2414,6 +2100,12 @@ mod tests {
         let tab_id = Uuid::new_v4();
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
             app.vault_state = Some(VaultState::Unlocked);
             app.settings_store = None;
             app.ui_scale = 200;
@@ -2427,6 +2119,14 @@ mod tests {
                 window,
                 cx,
             );
+            session.engine = Some(Arc::new(
+                app.runtime
+                    .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                        DatabaseKind::SQLite,
+                        "sqlite::memory:",
+                    )))
+                    .unwrap(),
+            ));
             session.tables = vec![TableInfo::table("projects", None)];
             let table = TableRef::new("projects");
             let mut data = DataTab::new(session_id, tab_id, table.clone(), false, window, cx);

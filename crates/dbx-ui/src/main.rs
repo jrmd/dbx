@@ -3,18 +3,22 @@ mod agents;
 mod app;
 mod assets;
 mod binary_values;
+mod config;
 mod connection_fields;
 mod device_unlock;
 mod diagram;
 mod editor;
 #[allow(dead_code)]
 mod filters;
+mod keybindings;
 mod motion;
 mod popups;
 mod profile_transfer;
 mod profiles;
 #[allow(dead_code)]
 mod query_history;
+mod query_library;
+mod result_export;
 #[allow(dead_code)]
 mod row_drafts;
 mod settings;
@@ -77,6 +81,7 @@ fn app_menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("New Connection", app::NewConnection),
                 MenuItem::action("New Query", app::NewQuery),
+                MenuItem::action("Open SQL File…", app::OpenSqlFile),
                 MenuItem::separator(),
                 MenuItem::action("Close Tab", app::CloseTab),
             ],
@@ -138,201 +143,236 @@ fn main() {
         return;
     }
 
-    gpui_platform::application()
-        .with_assets(assets::Assets)
-        .run(|cx: &mut App| {
-            gpui_component::init(cx);
-            let settings = settings::SettingsStore::new()
-                .and_then(|store| store.load())
-                .unwrap_or_else(|error| {
-                    eprintln!("DBX could not load appearance settings: {error}");
-                    settings::Settings::default()
+    let open_targets = std::sync::Arc::new(std::sync::Mutex::new(
+        std::env::args()
+            .skip(1)
+            .filter(|argument| !argument.starts_with('-'))
+            .collect::<std::collections::VecDeque<_>>(),
+    ));
+    let application = gpui_platform::application().with_assets(assets::Assets);
+    application.on_open_urls({
+        let targets = open_targets.clone();
+        move |urls| {
+            if let Ok(mut targets) = targets.lock() {
+                targets.extend(urls);
+            }
+        }
+    });
+    application.run(move |cx: &mut App| {
+        gpui_component::init(cx);
+        let settings = settings::SettingsStore::new()
+            .and_then(|store| store.load())
+            .unwrap_or_else(|error| {
+                eprintln!("DBX could not load appearance settings: {error}");
+                settings::Settings::default()
+            });
+        motion::init(settings.motion, cx);
+        theme::set_appearance(settings.appearance);
+        theme::catalog::set_preferences(&settings.theme);
+        theme::set_reduce_transparency(settings.reduce_transparency);
+        theme::set_text_scales(settings.ui_scale, settings.editor_scale);
+        theme::set_system_appearance(cx.window_appearance());
+        theme::sync_component_theme(None, cx);
+        // First, so editor and grid bindings win ties with it: GPUI ranks a
+        // binding without a context as deepest and breaks ties by order.
+        cx.bind_keys(app::focus_key_bindings());
+        cx.bind_keys(editor::default_key_bindings());
+        cx.bind_keys(app::explorer_key_bindings());
+        cx.bind_keys([
+            KeyBinding::new("enter", app::SubmitVault, Some("VaultGate")),
+            KeyBinding::new("enter", app::SubmitTableName, Some("DbxTableName")),
+            KeyBinding::new("enter", app::ConfirmAction, Some("DbxConfirmation")),
+            KeyBinding::new("enter", app::ConfirmAction, Some("DbxTableConfirmation")),
+            KeyBinding::new("cmd-z", app::UndoGridEdits, Some("DbxDataGrid")),
+            KeyBinding::new("ctrl-z", app::UndoGridEdits, Some("DbxDataGrid")),
+            KeyBinding::new("cmd-shift-z", app::RedoGridEdits, Some("DbxDataGrid")),
+            KeyBinding::new("ctrl-shift-z", app::RedoGridEdits, Some("DbxDataGrid")),
+            KeyBinding::new("enter", app::ApplyFilters, Some("DbxFilters")),
+            KeyBinding::new("enter", app::CommitCellEdit, Some("DbxCellEditor")),
+            KeyBinding::new(
+                "enter",
+                app::SubmitQueryParameters,
+                Some("DbxQueryParameters"),
+            ),
+            KeyBinding::new(
+                "escape",
+                app::CancelQueryParameters,
+                Some("DbxQueryParameters"),
+            ),
+            KeyBinding::new("tab", app::CommitCellEditNext, Some("DbxCellEditor")),
+            KeyBinding::new(
+                "shift-tab",
+                app::CommitCellEditPrevious,
+                Some("DbxCellEditor"),
+            ),
+            KeyBinding::new("escape", app::CancelCellEdit, Some("DbxCellEditor")),
+            KeyBinding::new(
+                "cmd-shift-backspace",
+                app::SetCellNull,
+                Some("DbxCellEditor"),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-backspace",
+                app::SetCellNull,
+                Some("DbxCellEditor"),
+            ),
+            KeyBinding::new("cmd-s", app::CommitChanges, Some("DbxDataTab")),
+            KeyBinding::new("ctrl-s", app::CommitChanges, Some("DbxDataTab")),
+            KeyBinding::new("delete", app::DeleteRows, Some("DbxDataGrid")),
+            KeyBinding::new("cmd-backspace", app::DeleteRows, Some("DbxDataGrid")),
+            KeyBinding::new("ctrl-backspace", app::DeleteRows, Some("DbxDataGrid")),
+            KeyBinding::new("cmd-c", app::CopyDataSelection, Some("DbxDataGrid")),
+            KeyBinding::new("ctrl-c", app::CopyDataSelection, Some("DbxDataGrid")),
+            KeyBinding::new("cmd-v", app::PasteRows, Some("DbxDataGrid")),
+            KeyBinding::new("ctrl-v", app::PasteRows, Some("DbxDataGrid")),
+            KeyBinding::new("cmd-shift-p", app::OpenCommandPalette, None),
+            KeyBinding::new("ctrl-shift-p", app::OpenCommandPalette, None),
+            KeyBinding::new("cmd-,", app::OpenSettings, None),
+            KeyBinding::new("ctrl-,", app::OpenSettings, None),
+            KeyBinding::new("cmd-alt-,", app::OpenKeyboardShortcuts, None),
+            KeyBinding::new("ctrl-alt-,", app::OpenKeyboardShortcuts, None),
+            KeyBinding::new("cmd-o", app::OpenSqlFile, None),
+            KeyBinding::new("ctrl-o", app::OpenSqlFile, None),
+            KeyBinding::new("cmd-p", app::OpenQuickOpen, None),
+            KeyBinding::new("ctrl-p", app::OpenQuickOpen, None),
+            KeyBinding::new("cmd-enter", app::RunQuery, Some(editor::SQL_EDITOR_CONTEXT)),
+            KeyBinding::new(
+                "ctrl-enter",
+                app::RunQuery,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new(
+                "shift-cmd-enter",
+                app::RunQueryAll,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-enter",
+                app::RunQueryAll,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new("escape", app::CancelQuery, Some(editor::SQL_EDITOR_CONTEXT)),
+            KeyBinding::new("escape", app::CancelQuery, Some("QueryWorkbench")),
+            KeyBinding::new("cmd-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
+            KeyBinding::new("cmd-f", app::OpenFind, Some("QueryWorkbench")),
+            KeyBinding::new("ctrl-f", app::OpenFind, Some("QueryWorkbench")),
+            KeyBinding::new("cmd-alt-f", app::OpenReplace, Some("QueryWorkbench")),
+            KeyBinding::new("ctrl-h", app::OpenReplace, Some("QueryWorkbench")),
+            KeyBinding::new("enter", app::FindNext, Some("DbxFind")),
+            KeyBinding::new("shift-enter", app::FindPrevious, Some("DbxFind")),
+            KeyBinding::new("escape", app::CloseFind, Some("DbxFind")),
+            KeyBinding::new("down", app::QuickOpenNext, Some("DbxQuickOpen")),
+            KeyBinding::new("up", app::QuickOpenPrevious, Some("DbxQuickOpen")),
+            KeyBinding::new("ctrl-n", app::QuickOpenNext, Some("DbxQuickOpen")),
+            KeyBinding::new("ctrl-p", app::QuickOpenPrevious, Some("DbxQuickOpen")),
+            KeyBinding::new("enter", app::QuickOpenConfirm, Some("DbxQuickOpen")),
+            KeyBinding::new("ctrl-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
+            KeyBinding::new("enter", app::SubmitQueryAgent, Some("DbxQueryAgent")),
+            KeyBinding::new("shift-enter", editor::Enter, Some("DbxQueryAgent")),
+            KeyBinding::new("escape", app::DismissQueryAgent, Some("DbxQueryAgent")),
+            KeyBinding::new("cmd-c", app::CopyQuerySelection, Some("QueryResult")),
+            KeyBinding::new("ctrl-c", app::CopyQuerySelection, Some("QueryResult")),
+            KeyBinding::new("left", app::DiagramPanLeft, Some("DbxDiagram")),
+            KeyBinding::new("right", app::DiagramPanRight, Some("DbxDiagram")),
+            KeyBinding::new("up", app::DiagramPanUp, Some("DbxDiagram")),
+            KeyBinding::new("down", app::DiagramPanDown, Some("DbxDiagram")),
+            KeyBinding::new("shift-left", app::DiagramPanLeftLarge, Some("DbxDiagram")),
+            KeyBinding::new("shift-right", app::DiagramPanRightLarge, Some("DbxDiagram")),
+            KeyBinding::new("shift-up", app::DiagramPanUpLarge, Some("DbxDiagram")),
+            KeyBinding::new("shift-down", app::DiagramPanDownLarge, Some("DbxDiagram")),
+            KeyBinding::new("=", app::DiagramZoomIn, Some("DbxDiagram")),
+            KeyBinding::new("shift-=", app::DiagramZoomIn, Some("DbxDiagram")),
+            KeyBinding::new("-", app::DiagramZoomOut, Some("DbxDiagram")),
+            KeyBinding::new("0", app::DiagramResetView, Some("DbxDiagram")),
+            KeyBinding::new("f", app::DiagramFit, Some("DbxDiagram")),
+            KeyBinding::new("r", app::DiagramRefresh, Some("DbxDiagram")),
+            KeyBinding::new("cmd-r", app::RefreshData, None),
+            KeyBinding::new("ctrl-r", app::RefreshData, None),
+            KeyBinding::new(
+                "shift-cmd-f",
+                app::FormatQuery,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-f",
+                app::FormatQuery,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new("up", app::CompletionUp, Some(editor::SQL_EDITOR_CONTEXT)),
+            KeyBinding::new(
+                "down",
+                app::CompletionDown,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new(
+                "enter",
+                app::CompletionEnter,
+                Some(editor::SQL_EDITOR_CONTEXT),
+            ),
+            KeyBinding::new("tab", app::CompletionTab, Some(editor::SQL_EDITOR_CONTEXT)),
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("ctrl-q", Quit, None),
+            // Workspace navigation follows each platform's conventions:
+            // ⌘ on macOS, Ctrl elsewhere.
+            KeyBinding::new("cmd-n", app::NewConnection, None),
+            KeyBinding::new("ctrl-n", app::NewConnection, None),
+            KeyBinding::new("cmd-t", app::NewQuery, None),
+            KeyBinding::new("ctrl-t", app::NewQuery, None),
+            KeyBinding::new("cmd-w", app::CloseTab, None),
+            KeyBinding::new("ctrl-w", app::CloseTab, None),
+            KeyBinding::new("ctrl-tab", app::NextConnection, None),
+            KeyBinding::new("ctrl-shift-tab", app::PreviousConnection, None),
+            KeyBinding::new("cmd-shift-]", app::NextConnection, None),
+            KeyBinding::new("cmd-shift-[", app::PreviousConnection, None),
+            KeyBinding::new("ctrl-pagedown", app::NextConnection, None),
+            KeyBinding::new("ctrl-pageup", app::PreviousConnection, None),
+            KeyBinding::new("cmd-b", app::ToggleSidebar, None),
+            KeyBinding::new("ctrl-b", app::ToggleSidebar, None),
+            KeyBinding::new("f5", app::RefreshData, None),
+            KeyBinding::new("cmd-m", Minimize, None),
+            KeyBinding::new("ctrl-cmd-f", Zoom, None),
+        ]);
+        keybindings::init(cx);
+        cx.on_action(|_: &Quit, cx| {
+            let confirmed = cx
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<DbxApp>())
+                .all(|window| {
+                    window
+                        .update(cx, |app, window, cx| app.confirm_quit(window, cx))
+                        .unwrap_or(true)
                 });
-            motion::init(settings.motion, cx);
-            theme::set_appearance(settings.appearance);
-            theme::catalog::set_preferences(&settings.theme);
-            theme::set_reduce_transparency(settings.reduce_transparency);
-            theme::set_text_scales(settings.ui_scale, settings.editor_scale);
-            theme::set_system_appearance(cx.window_appearance());
-            theme::sync_component_theme(None, cx);
-            // First, so editor and grid bindings win ties with it: GPUI ranks a
-            // binding without a context as deepest and breaks ties by order.
-            cx.bind_keys(app::focus_key_bindings());
-            cx.bind_keys(editor::default_key_bindings());
-            cx.bind_keys(app::explorer_key_bindings());
-            cx.bind_keys([
-                KeyBinding::new("enter", app::SubmitVault, Some("VaultGate")),
-                KeyBinding::new("enter", app::ApplyFilters, Some("DbxFilters")),
-                KeyBinding::new("enter", app::CommitCellEdit, Some("DbxCellEditor")),
-                KeyBinding::new(
-                    "enter",
-                    app::SubmitQueryParameters,
-                    Some("DbxQueryParameters"),
-                ),
-                KeyBinding::new(
-                    "escape",
-                    app::CancelQueryParameters,
-                    Some("DbxQueryParameters"),
-                ),
-                KeyBinding::new("tab", app::CommitCellEditNext, Some("DbxCellEditor")),
-                KeyBinding::new(
-                    "shift-tab",
-                    app::CommitCellEditPrevious,
-                    Some("DbxCellEditor"),
-                ),
-                KeyBinding::new("escape", app::CancelCellEdit, Some("DbxCellEditor")),
-                KeyBinding::new(
-                    "cmd-shift-backspace",
-                    app::SetCellNull,
-                    Some("DbxCellEditor"),
-                ),
-                KeyBinding::new(
-                    "ctrl-shift-backspace",
-                    app::SetCellNull,
-                    Some("DbxCellEditor"),
-                ),
-                KeyBinding::new("cmd-s", app::CommitChanges, Some("DbxDataTab")),
-                KeyBinding::new("ctrl-s", app::CommitChanges, Some("DbxDataTab")),
-                KeyBinding::new("delete", app::DeleteRows, Some("DbxDataGrid")),
-                KeyBinding::new("cmd-backspace", app::DeleteRows, Some("DbxDataGrid")),
-                KeyBinding::new("ctrl-backspace", app::DeleteRows, Some("DbxDataGrid")),
-                KeyBinding::new("cmd-c", app::CopyDataSelection, Some("DbxDataGrid")),
-                KeyBinding::new("ctrl-c", app::CopyDataSelection, Some("DbxDataGrid")),
-                KeyBinding::new("cmd-v", app::PasteRows, Some("DbxDataGrid")),
-                KeyBinding::new("ctrl-v", app::PasteRows, Some("DbxDataGrid")),
-                KeyBinding::new("cmd-p", app::OpenQuickOpen, None),
-                KeyBinding::new("ctrl-p", app::OpenQuickOpen, None),
-                KeyBinding::new("cmd-enter", app::RunQuery, Some(editor::SQL_EDITOR_CONTEXT)),
-                KeyBinding::new(
-                    "ctrl-enter",
-                    app::RunQuery,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new(
-                    "shift-cmd-enter",
-                    app::RunQueryAll,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new(
-                    "ctrl-shift-enter",
-                    app::RunQueryAll,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new("escape", app::CancelQuery, Some(editor::SQL_EDITOR_CONTEXT)),
-                KeyBinding::new("escape", app::CancelQuery, Some("QueryWorkbench")),
-                KeyBinding::new("cmd-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
-                KeyBinding::new("cmd-f", app::OpenFind, Some("QueryWorkbench")),
-                KeyBinding::new("ctrl-f", app::OpenFind, Some("QueryWorkbench")),
-                KeyBinding::new("cmd-alt-f", app::OpenReplace, Some("QueryWorkbench")),
-                KeyBinding::new("ctrl-h", app::OpenReplace, Some("QueryWorkbench")),
-                KeyBinding::new("enter", app::FindNext, Some("DbxFind")),
-                KeyBinding::new("shift-enter", app::FindPrevious, Some("DbxFind")),
-                KeyBinding::new("escape", app::CloseFind, Some("DbxFind")),
-                KeyBinding::new("down", app::QuickOpenNext, Some("DbxQuickOpen")),
-                KeyBinding::new("up", app::QuickOpenPrevious, Some("DbxQuickOpen")),
-                KeyBinding::new("ctrl-n", app::QuickOpenNext, Some("DbxQuickOpen")),
-                KeyBinding::new("ctrl-p", app::QuickOpenPrevious, Some("DbxQuickOpen")),
-                KeyBinding::new("enter", app::QuickOpenConfirm, Some("DbxQuickOpen")),
-                KeyBinding::new("ctrl-k", app::ToggleQueryAgent, Some("QueryWorkbench")),
-                KeyBinding::new("enter", app::SubmitQueryAgent, Some("DbxQueryAgent")),
-                KeyBinding::new("shift-enter", editor::Enter, Some("DbxQueryAgent")),
-                KeyBinding::new("escape", app::DismissQueryAgent, Some("DbxQueryAgent")),
-                KeyBinding::new("cmd-c", app::CopyQuerySelection, Some("QueryResult")),
-                KeyBinding::new("ctrl-c", app::CopyQuerySelection, Some("QueryResult")),
-                KeyBinding::new("left", app::DiagramPanLeft, Some("DbxDiagram")),
-                KeyBinding::new("right", app::DiagramPanRight, Some("DbxDiagram")),
-                KeyBinding::new("up", app::DiagramPanUp, Some("DbxDiagram")),
-                KeyBinding::new("down", app::DiagramPanDown, Some("DbxDiagram")),
-                KeyBinding::new("shift-left", app::DiagramPanLeftLarge, Some("DbxDiagram")),
-                KeyBinding::new("shift-right", app::DiagramPanRightLarge, Some("DbxDiagram")),
-                KeyBinding::new("shift-up", app::DiagramPanUpLarge, Some("DbxDiagram")),
-                KeyBinding::new("shift-down", app::DiagramPanDownLarge, Some("DbxDiagram")),
-                KeyBinding::new("=", app::DiagramZoomIn, Some("DbxDiagram")),
-                KeyBinding::new("shift-=", app::DiagramZoomIn, Some("DbxDiagram")),
-                KeyBinding::new("-", app::DiagramZoomOut, Some("DbxDiagram")),
-                KeyBinding::new("0", app::DiagramResetView, Some("DbxDiagram")),
-                KeyBinding::new("f", app::DiagramFit, Some("DbxDiagram")),
-                KeyBinding::new("r", app::DiagramRefresh, Some("DbxDiagram")),
-                KeyBinding::new("cmd-r", app::RefreshData, None),
-                KeyBinding::new("ctrl-r", app::RefreshData, None),
-                KeyBinding::new(
-                    "shift-cmd-f",
-                    app::FormatQuery,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new(
-                    "ctrl-shift-f",
-                    app::FormatQuery,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new("up", app::CompletionUp, Some(editor::SQL_EDITOR_CONTEXT)),
-                KeyBinding::new(
-                    "down",
-                    app::CompletionDown,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new(
-                    "enter",
-                    app::CompletionEnter,
-                    Some(editor::SQL_EDITOR_CONTEXT),
-                ),
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("ctrl-q", Quit, None),
-                // Workspace navigation follows each platform's conventions:
-                // ⌘ on macOS, Ctrl elsewhere.
-                KeyBinding::new("cmd-n", app::NewConnection, None),
-                KeyBinding::new("ctrl-n", app::NewConnection, None),
-                KeyBinding::new("cmd-t", app::NewQuery, None),
-                KeyBinding::new("ctrl-t", app::NewQuery, None),
-                KeyBinding::new("cmd-w", app::CloseTab, None),
-                KeyBinding::new("ctrl-w", app::CloseTab, None),
-                KeyBinding::new("ctrl-tab", app::NextConnection, None),
-                KeyBinding::new("ctrl-shift-tab", app::PreviousConnection, None),
-                KeyBinding::new("cmd-shift-]", app::NextConnection, None),
-                KeyBinding::new("cmd-shift-[", app::PreviousConnection, None),
-                KeyBinding::new("ctrl-pagedown", app::NextConnection, None),
-                KeyBinding::new("ctrl-pageup", app::PreviousConnection, None),
-                KeyBinding::new("cmd-b", app::ToggleSidebar, None),
-                KeyBinding::new("ctrl-b", app::ToggleSidebar, None),
-                KeyBinding::new("f5", app::RefreshData, None),
-                KeyBinding::new("cmd-m", Minimize, None),
-                KeyBinding::new("ctrl-cmd-f", Zoom, None),
-            ]);
-            cx.on_action(|_: &Quit, cx| {
-                let confirmed = cx
-                    .windows()
-                    .into_iter()
-                    .filter_map(|window| window.downcast::<DbxApp>())
-                    .all(|window| {
-                        window
-                            .update(cx, |app, window, cx| app.confirm_quit(window, cx))
-                            .unwrap_or(true)
-                    });
-                if confirmed {
-                    cx.quit();
-                }
-            });
-            cx.on_action(|_: &Minimize, cx| {
-                if let Some(window) = cx.active_window() {
-                    let _ = window.update(cx, |_, window, _| window.minimize_window());
-                }
-            });
-            cx.on_action(|_: &Zoom, cx| {
-                if let Some(window) = cx.active_window() {
-                    let _ = window.update(cx, |_, window, _| window.zoom_window());
-                }
-            });
-            // DBX is a single-window app: closing it (titlebar, compositor, or
-            // ⌘W-style window close) ends the process, as the old control did.
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            cx.set_menus(app_menus());
-            cx.open_window(dbx_window_options(), |window, cx| {
-                window.set_window_title(APP_NAME);
+            if confirmed {
+                cx.quit();
+            }
+        });
+        cx.on_action(|_: &Minimize, cx| {
+            if let Some(window) = cx.active_window() {
+                let _ = window.update(cx, |_, window, _| window.minimize_window());
+            }
+        });
+        cx.on_action(|_: &Zoom, cx| {
+            if let Some(window) = cx.active_window() {
+                let _ = window.update(cx, |_, window, _| window.zoom_window());
+            }
+        });
+        // DBX is a single-window app: closing it (titlebar, compositor, or
+        // ⌘W-style window close) ends the process, as the old control did.
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        cx.set_menus(app_menus());
+        let main_window = cx
+            .open_window(dbx_window_options(), |window, cx| {
+                window.set_window_title(if config::override_directory().is_some() {
+                    "DBX — isolated profile"
+                } else {
+                    APP_NAME
+                });
                 let app = cx.new(|cx| DbxApp::new(window, cx));
                 let closing = app.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
@@ -343,6 +383,29 @@ fn main() {
                 app
             })
             .expect("open DBX window");
-            cx.activate(true);
-        });
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                if main_window
+                    .update(cx, |app, window, cx| {
+                        if app.can_open_connection_targets()
+                            && let Some(target) = open_targets
+                                .lock()
+                                .ok()
+                                .and_then(|mut targets| targets.pop_front())
+                        {
+                            app.open_connection_target(target, window, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.activate(true);
+    });
 }

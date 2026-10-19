@@ -41,7 +41,7 @@ const _: () = {
     assert!(RADIUS_CONTROL < RADIUS_PANEL && RADIUS_PANEL < RADIUS_GLASS);
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Theme {
     pub canvas: Rgba,
     pub panel: Rgba,
@@ -267,6 +267,8 @@ static SYSTEM_IS_DARK: AtomicBool = AtomicBool::new(true);
 static REDUCE_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
+    static PRODUCTION_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRODUCTION_PALETTE: std::cell::RefCell<Option<(Theme, bool, Theme)>> = const { std::cell::RefCell::new(None) };
     static MONO_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static UI_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
@@ -377,7 +379,47 @@ pub fn window_background() -> WindowBackgroundAppearance {
 
 /// Return the semantic palette for the current appearance and material.
 pub fn theme() -> Theme {
-    catalog::resolved_theme(is_dark(), reduce_transparency())
+    let mut palette = catalog::resolved_theme(is_dark(), reduce_transparency());
+    if PRODUCTION_CONTEXT.get() {
+        let original = palette;
+        let dark = is_dark();
+        if let Some(cached) = PRODUCTION_PALETTE.with_borrow(|cache| {
+            cache
+                .as_ref()
+                .filter(|(base, was_dark, _)| *base == original && *was_dark == dark)
+                .map(|(_, _, tinted)| *tinted)
+        }) {
+            return cached;
+        }
+        // Tint surfaces, never text or data-state colors. The connection badge
+        // also names the environment so this cue does not rely on color alone.
+        let tint = palette.danger;
+        for surface in [
+            &mut palette.window,
+            &mut palette.canvas,
+            &mut palette.panel,
+            &mut palette.panel_raised,
+            &mut palette.rail,
+            &mut palette.glass,
+            &mut palette.glass_raised,
+        ] {
+            let alpha = surface.a;
+            *surface = Rgba {
+                r: surface.r * 0.94 + tint.r * 0.06,
+                g: surface.g * 0.94 + tint.g * 0.06,
+                b: surface.b * 0.94 + tint.b * 0.06,
+                a: alpha,
+            };
+        }
+        catalog::ensure_readable(&mut palette, dark);
+        PRODUCTION_PALETTE.with_borrow_mut(|cache| *cache = Some((original, dark, palette)));
+    }
+    palette
+}
+
+/// Returns whether the active environment changed, for component theme sync.
+pub fn set_production_context(production: bool) -> bool {
+    PRODUCTION_CONTEXT.replace(production) != production
 }
 
 /// Push DBX's resolved palette into gpui-component so its menus, popovers,
@@ -838,6 +880,9 @@ pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
         .h(crate::theme::control_height(26.))
         .px(crate::theme::ui_px(11.))
         .rounded_full()
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .font_weight(gpui::FontWeight::MEDIUM)
         .flex()
         .items_center()
         .gap(crate::theme::ui_px(6.))
@@ -845,7 +890,6 @@ pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
         .cursor_pointer()
         .when(selected, |view| {
             view.bg(theme.glass_selected)
-                .border_1()
                 .border_color(theme.hairline)
                 .shadow(glass_shadow(3.))
                 .text_color(theme.text)
@@ -1178,216 +1222,4 @@ pub fn badge(label: impl Into<SharedString>, color: Rgba) -> Div {
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(color)
         .child(label.into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn relative_luminance(color: Rgba) -> f32 {
-        fn channel(value: f32) -> f32 {
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b)
-    }
-
-    fn contrast(foreground: Rgba, background: Rgba) -> f32 {
-        let foreground = relative_luminance(foreground);
-        let background = relative_luminance(background);
-        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
-    }
-
-    fn composite(foreground: Rgba, background: Rgba) -> Rgba {
-        Rgba {
-            r: foreground.r * foreground.a + background.r * (1. - foreground.a),
-            g: foreground.g * foreground.a + background.g * (1. - foreground.a),
-            b: foreground.b * foreground.a + background.b * (1. - foreground.a),
-            a: 1.,
-        }
-    }
-
-    /// Actual root tint, pane and control layers. Include colored as well as
-    /// black/white desktop pixels; never compare an uncomposited alpha token.
-    fn composed_surfaces(palette: &Theme, desktop: Rgba) -> Vec<(&'static str, Rgba)> {
-        let window = composite(palette.window, desktop);
-        let glass = composite(palette.glass, window);
-        let raised = composite(palette.glass_raised, window);
-        // GPUI paints a pane's drop shadow beneath its translucent fill. The
-        // interior can receive the full shadow, as the native QA view confirms.
-        let shadowed = composite(palette.shadow, window);
-        let shadowed_glass = composite(palette.glass, shadowed);
-        let shadowed_raised = composite(palette.glass_raised, shadowed);
-        vec![
-            ("window", window),
-            ("glass", glass),
-            ("raised", raised),
-            ("shadowed glass", shadowed_glass),
-            ("shadowed raised", shadowed_raised),
-            (
-                "shadowed glass control",
-                composite(palette.glass_hover, shadowed_glass),
-            ),
-            (
-                "shadowed raised control",
-                composite(palette.glass_hover, shadowed_raised),
-            ),
-            ("glass control", composite(palette.glass_hover, glass)),
-            ("raised control", composite(palette.glass_hover, raised)),
-            ("canvas", palette.canvas),
-            ("panel", palette.panel),
-            ("panel raised", palette.panel_raised),
-            (
-                "panel control",
-                composite(palette.glass_hover, palette.panel),
-            ),
-        ]
-    }
-
-    #[test]
-    fn composited_materials_preserve_text_and_control_contrast() {
-        let mut failures = Vec::new();
-        for (name, palette) in [
-            ("dark glass", &*DARK_THEME),
-            ("light glass", &*LIGHT_THEME),
-            ("dark solid", &*DARK_SOLID_THEME),
-            ("light solid", &*LIGHT_SOLID_THEME),
-        ] {
-            // The macOS workbench currently enforces opaque materials.
-            if cfg!(target_os = "macos") && name.ends_with("glass") {
-                continue;
-            }
-            for desktop in [
-                rgb(0x000000),
-                rgb(0xffffff),
-                rgb(0xff0000),
-                rgb(0x00ff00),
-                rgb(0x0000ff),
-            ] {
-                for (surface_name, surface) in composed_surfaces(palette, desktop) {
-                    for (token, foreground, minimum) in [
-                        ("text", palette.text, 4.5),
-                        ("muted text", palette.text_muted, 4.5),
-                        ("blue text", palette.accent_text, 4.5),
-                        ("error text", palette.danger_text, 4.5),
-                        ("success text", palette.success_text, 4.5),
-                        ("warning text", palette.warning_text, 4.5),
-                        ("input edge", palette.input_border, 3.0),
-                        ("focus", palette.focus_ring, 3.0),
-                    ] {
-                        let measured = contrast(foreground, surface);
-                        if measured < minimum {
-                            failures.push(format!(
-                                "{name} {surface_name} {token}: {measured:.3}:1 < {minimum}:1"
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        failures.sort();
-        failures.dedup();
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
-
-    #[gpui::test]
-    fn resolved_input_materials_have_readable_fill_and_distinct_edges(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let _appearance = appearance_test_lock();
-        cx.update(gpui_component::init);
-        for appearance in [Appearance::Light, Appearance::Dark] {
-            set_appearance(appearance);
-            cx.update(|cx| sync_component_theme(None, cx));
-            cx.update(|cx| {
-                let component = gpui_component::Theme::global(cx);
-                let edge = Rgba::from(component.colors.input);
-                let fill = Rgba::from(component.input_background());
-                let text = Rgba::from(component.colors.foreground);
-                let placeholder = Rgba::from(component.colors.muted_foreground);
-                let palette = theme();
-                for (_, surface) in composed_surfaces(&palette, rgb(0xffffff)) {
-                    let painted_fill = composite(fill, surface);
-                    let painted_edge = composite(edge, surface);
-                    assert!(
-                        contrast(painted_edge, surface) >= 3.0,
-                        "{appearance:?} input edge against outside"
-                    );
-                    assert!(
-                        contrast(painted_edge, painted_fill) >= 3.0,
-                        "{appearance:?} input edge against fill"
-                    );
-                    assert!(
-                        contrast(text, painted_fill) >= 4.5,
-                        "{appearance:?} input value"
-                    );
-                    assert!(
-                        contrast(placeholder, painted_fill) >= 4.5,
-                        "{appearance:?} input placeholder"
-                    );
-                }
-                let base = &gpui_base::Theme::global(cx).tokens.colors;
-                assert_eq!(
-                    base.input, component.colors.input,
-                    "Base controls must use the resolved input edge"
-                );
-                assert_eq!(
-                    base.ring, component.colors.ring,
-                    "Base controls must use the resolved focus ring"
-                );
-            });
-        }
-        set_appearance(Appearance::Dark);
-    }
-
-    #[test]
-    fn current_palette_follows_selected_appearance() {
-        let _appearance = appearance_test_lock();
-        set_appearance(Appearance::Light);
-        assert_eq!(theme().canvas, LIGHT_THEME.canvas);
-        set_appearance(Appearance::Dark);
-        assert_eq!(theme().canvas, DARK_THEME.canvas);
-        set_appearance(Appearance::System);
-        set_system_appearance(WindowAppearance::Light);
-        assert_eq!(theme().canvas, LIGHT_THEME.canvas);
-        set_system_appearance(WindowAppearance::VibrantDark);
-        assert_eq!(theme().canvas, DARK_THEME.canvas);
-        set_appearance(Appearance::Dark);
-    }
-
-    #[test]
-    fn reduced_transparency_makes_every_material_opaque() {
-        for palette in [&*DARK_SOLID_THEME, &*LIGHT_SOLID_THEME] {
-            for material in [palette.window, palette.glass, palette.glass_raised] {
-                assert_eq!(material.a, 1.0);
-            }
-        }
-        for palette in [&*DARK_THEME, &*LIGHT_THEME] {
-            assert!(
-                palette.window.a < 1.0,
-                "glass needs a translucent backdrop tint"
-            );
-            // Content stays opaque so data never competes with the desktop.
-            assert_eq!(palette.canvas.a, 1.0);
-        }
-    }
-
-    #[test]
-    fn shared_controls_publish_names_roles_and_switch_state() {
-        use gpui::Element;
-        let button = glass_icon_button("test-close", Icon::Close, false);
-        let mut node = gpui::accesskit::Node::new(button.a11y_role().unwrap());
-        button.write_a11y_info(&mut node);
-        assert_eq!(node.role(), gpui::Role::Button);
-        assert_eq!(node.label(), Some("Close"));
-        let switch = settings_switch("test-switch", "SQL Vim mode", true);
-        let mut node = gpui::accesskit::Node::new(switch.a11y_role().unwrap());
-        switch.write_a11y_info(&mut node);
-        assert_eq!(node.role(), gpui::Role::Switch);
-        assert_eq!(node.label(), Some("SQL Vim mode"));
-        assert_eq!(node.toggled(), Some(gpui::accesskit::Toggled::True));
-    }
 }

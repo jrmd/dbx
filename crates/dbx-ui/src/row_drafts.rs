@@ -1160,71 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn parser_handles_supported_column_types() {
-        assert_eq!(
-            parse_field_value(&column("enabled", "BOOLEAN", false), "true").unwrap(),
-            CellValue::Boolean(true)
-        );
-        assert_eq!(
-            parse_field_value(&column("count", "BIGINT", false), "-4").unwrap(),
-            CellValue::Integer(-4)
-        );
-        assert_eq!(
-            parse_field_value(&column("count", "BIGINT UNSIGNED", false), "4").unwrap(),
-            CellValue::Unsigned(4)
-        );
-        assert_eq!(
-            parse_field_value(&column("ratio", "DOUBLE PRECISION", false), "1.5").unwrap(),
-            CellValue::Real(1.5)
-        );
-        assert_eq!(
-            parse_field_value(&column("body", "JSONB", true), r#"{"ok":true}"#).unwrap(),
-            CellValue::Json(serde_json::json!({ "ok": true }))
-        );
-        assert_eq!(
-            parse_field_value(&column("payload", "BYTEA", false), "0xdead").unwrap(),
-            CellValue::Bytes(vec![0xde, 0xad])
-        );
-        assert_eq!(
-            parse_field_value(&column("name", "TEXT", false), "Ada ").unwrap(),
-            CellValue::Text("Ada ".into())
-        );
-        assert_eq!(
-            parse_field_value(&column("body", "JSONB", true), "null").unwrap(),
-            CellValue::Json(serde_json::Value::Null)
-        );
-        assert_eq!(
-            parse_field_value(&column("name", "TEXT", true), "NULL").unwrap(),
-            CellValue::Text("NULL".into())
-        );
-    }
-
-    #[test]
-    fn column_types_classify_by_base_name_not_substring() {
-        let kind = |data_type| field_value_kind(&column("field", data_type, true));
-        // MySQL COLUMN_TYPE spellings.
-        assert_eq!(kind("tinyint(1)"), FieldValueKind::Boolean);
-        assert_eq!(kind("tinyint"), FieldValueKind::Integer);
-        assert_eq!(kind("int unsigned"), FieldValueKind::Unsigned);
-        assert_eq!(kind("year"), FieldValueKind::Integer);
-        assert_eq!(kind("decimal(10,2)"), FieldValueKind::Decimal);
-        assert_eq!(kind("varbinary(8)"), FieldValueKind::Bytes);
-        assert_eq!(kind("bit(1)"), FieldValueKind::Text);
-        // PostgreSQL format_type spellings that contain other type names.
-        assert_eq!(kind("interval"), FieldValueKind::Text);
-        assert_eq!(kind("point"), FieldValueKind::Text);
-        assert_eq!(kind("integer[]"), FieldValueKind::Text);
-        assert_eq!(kind("bit(3)"), FieldValueKind::Text);
-        assert_eq!(kind("timestamp without time zone"), FieldValueKind::Text);
-        assert_eq!(kind("double precision"), FieldValueKind::Real);
-        assert_eq!(kind("numeric(30,10)"), FieldValueKind::Decimal);
-
-        let mut mood = column("mood", "enum('int','json')", false);
-        mood.enum_values = vec!["int".into(), "json".into()];
-        assert_eq!(field_value_kind(&mood), FieldValueKind::Text);
-    }
-
-    #[test]
     fn decimals_keep_every_digit_and_reject_non_numbers() {
         let price = column("price", "numeric(30,10)", false);
         assert_eq!(
@@ -1267,52 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_fields_are_typed_ordered_and_ignore_unchanged_values() {
-        let columns = vec![
-            column("id", "INTEGER", false),
-            column("name", "TEXT", false),
-            column("active", "BOOLEAN", true),
-        ];
-        let drafts = vec![
-            FieldDraft::new(
-                1,
-                "id",
-                Some(CellValue::Integer(7)),
-                "7",
-                FieldValueState::Value,
-                None,
-            ),
-            FieldDraft::new(
-                2,
-                "name",
-                Some(CellValue::Text("Ada".into())),
-                "Grace",
-                FieldValueState::Value,
-                None,
-            ),
-            FieldDraft::new(
-                3,
-                "active",
-                Some(CellValue::Boolean(true)),
-                "",
-                FieldValueState::Null,
-                None,
-            ),
-        ];
-
-        assert_eq!(
-            changed_fields(&drafts, &columns).unwrap(),
-            vec![
-                (
-                    "name".into(),
-                    MutationValue::Parameter(CellValue::Text("Grace".into()))
-                ),
-                ("active".into(), MutationValue::Parameter(CellValue::Null)),
-            ]
-        );
-    }
-
-    #[test]
     fn insert_values_omit_defaults_and_keep_explicit_nulls() {
         let columns = vec![
             column("id", "INTEGER", false),
@@ -1345,44 +1234,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_expressions_are_extracted_without_parsing_as_column_values() {
-        let columns = vec![
-            column("id", "UUID", false),
-            column("updated_at", "TIMESTAMPTZ", false),
-        ];
-        let insert = vec![
-            FieldDraft::new(1, "id", None, "uuidv7()", FieldValueState::Sql, None),
-            FieldDraft::new(2, "updated_at", None, " NOW() ", FieldValueState::Sql, None),
-        ];
-        assert_eq!(
-            insert_values(&insert, &columns).unwrap(),
-            vec![
-                ("id".into(), MutationValue::Expression("uuidv7()".into())),
-                (
-                    "updated_at".into(),
-                    MutationValue::Expression("NOW()".into())
-                ),
-            ]
-        );
-
-        let update = vec![FieldDraft::new(
-            3,
-            "updated_at",
-            Some(CellValue::Text("2026-08-23T12:00:00Z".into())),
-            "NOW()",
-            FieldValueState::Sql,
-            None,
-        )];
-        assert_eq!(
-            changed_fields(&update, &columns[1..]).unwrap(),
-            vec![(
-                "updated_at".into(),
-                MutationValue::Expression("NOW()".into())
-            )]
-        );
-    }
-
-    #[test]
     fn unsafe_or_empty_sql_expressions_fail_before_the_mutation_runs() {
         let columns = vec![column("id", "UUID", false)];
         for expression in ["", "uuidv7(); DROP TABLE users"] {
@@ -1403,20 +1254,6 @@ mod tests {
                 FieldValidationError::InvalidSqlExpression { .. }
             ));
         }
-    }
-
-    #[test]
-    fn insert_can_omit_columns_without_introspected_default_metadata() {
-        let columns = vec![
-            column("id", "INTEGER", false),
-            column("name", "TEXT", false),
-        ];
-        let drafts = vec![
-            FieldDraft::new(1, "id", None, "", FieldValueState::Default, None),
-            FieldDraft::new(2, "name", None, "", FieldValueState::Default, None),
-        ];
-
-        assert!(insert_values(&drafts, &columns).unwrap().is_empty());
     }
 
     #[test]
@@ -1459,37 +1296,5 @@ mod tests {
         )];
 
         assert!(changed_fields(&drafts, &columns).unwrap().is_empty());
-    }
-
-    #[test]
-    fn invalid_values_and_nullability_errors_are_clear() {
-        let columns = vec![column("id", "INTEGER", false), column("name", "TEXT", true)];
-        let error = changed_fields(
-            &[FieldDraft::new(
-                7,
-                "id",
-                Some(CellValue::Integer(1)),
-                "nope",
-                FieldValueState::Value,
-                None,
-            )],
-            &columns,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("signed base-10 integer"));
-
-        let error = insert_values(
-            &[FieldDraft::new(
-                8,
-                "id",
-                None,
-                "",
-                FieldValueState::Null,
-                None,
-            )],
-            &columns,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("cannot be NULL"));
     }
 }

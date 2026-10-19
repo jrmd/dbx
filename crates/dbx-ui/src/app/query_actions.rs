@@ -90,6 +90,25 @@ fn editor_execution_source(
     )
 }
 
+/// Database positions are relative to the failed statement, even in Run all.
+/// Walk statements in execution order so repeated SQL maps to the right copy.
+fn statement_error_range(
+    source: &str,
+    statements: &[dbx_core::StatementResult],
+) -> Option<Range<usize>> {
+    let mut offset = 0;
+    for statement in statements {
+        let text = statement.statement.trim();
+        let start = offset + source.get(offset..)?.find(text)?;
+        if let Some(error) = &statement.error {
+            return editor::sql_error_range(error, text)
+                .map(|range| start + range.start..start + range.end);
+        }
+        offset = start + text.len();
+    }
+    None
+}
+
 impl DbxApp {
     pub(super) fn request_run_query_for(
         &mut self,
@@ -133,10 +152,24 @@ impl DbxApp {
         else {
             return;
         };
+        let guarded = self.session(session_id).is_some_and(|session| {
+            session.tag.as_ref().is_some_and(|tag| tag.is_production())
+                || session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.is_read_only())
+        });
+        let unfiltered = guarded && dbx_core::language::has_unfiltered_mutation(kind, &source.text);
         let (title, detail, confirm_label, tone) = match editor::sql_execution_kind(
             &source.text,
             dialect,
         ) {
+            _ if unfiltered => (
+                "Run UPDATE or DELETE without WHERE?",
+                "This query contains an UPDATE or DELETE without a WHERE filter. Every row may be changed or deleted on this production or protected connection. Protected connections still reject writes.",
+                "Run query",
+                ConfirmationTone::Danger,
+            ),
             editor::SqlExecutionKind::Destructive => (
                 "Run destructive query?",
                 "This statement can permanently change or delete data.",
@@ -157,6 +190,7 @@ impl DbxApp {
                 return;
             }
         };
+        let review_sql = unfiltered.then(|| source.text.clone());
         let return_focus = Some(query_editor.read(cx).focus_handle());
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
@@ -172,7 +206,7 @@ impl DbxApp {
             },
             focus: focus.clone(),
             return_focus,
-            sql: None,
+            sql: review_sql,
         });
         focus.focus(window, cx);
         cx.notify();
@@ -254,7 +288,12 @@ impl DbxApp {
         let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
             return;
         };
+        let watched = std::mem::take(&mut query_tab.watch_read_only_pending);
+        if !watched && query_tab.watch_interval.take().is_some() {
+            query_tab.watch_generation = query_tab.watch_generation.wrapping_add(1);
+        }
         query_tab.busy = true;
+        query_tab.plan_tree = false;
         query_tab.export_prompt = None;
         query_tab.results_stale = query_tab.result.is_some();
         query_tab.error = None;
@@ -267,6 +306,10 @@ impl DbxApp {
         // The executed statement moves into the blocking task; the original
         // stays behind so failures can locate the offending token in it.
         let executed_query = query.clone();
+        let analyzing = std::mem::take(&mut query_tab.plan_analyze_pending);
+        let statistics_columns = query_tab.full_table_statistics_pending.take();
+        let in_transaction = query_tab.in_transaction;
+        let analyze_engine = engine.clone();
         let console = query_tab
             .console
             .get_or_insert_with(|| Arc::new(QuerySession::new(engine)))
@@ -275,7 +318,41 @@ impl DbxApp {
         query_tab.cancellation = Some(cancellation.clone());
         let timeout_secs = query_tab.timeout_secs;
         let task = runtime.spawn(async move {
-            if let Some(statements) = prepared_parameters {
+            if analyzing || watched {
+                let result = if analyzing {
+                    QuerySession::explain_analyze(
+                        analyze_engine,
+                        &executed_query,
+                        QueryOptions::default(),
+                        std::time::Duration::from_secs(timeout_secs),
+                        cancellation,
+                    )
+                    .await
+                } else {
+                    QuerySession::read_only_query(
+                        analyze_engine,
+                        &executed_query,
+                        QueryOptions::default(),
+                        std::time::Duration::from_secs(timeout_secs),
+                        cancellation,
+                    )
+                    .await
+                };
+                let result = result.and_then(|result| match &statistics_columns {
+                    Some(columns) => {
+                        dbx_core::format_table_column_statistics(kind, columns, &result)
+                    }
+                    None => Ok(result),
+                });
+                result.map(|result| dbx_core::ScriptResult {
+                    statements: vec![StatementResult {
+                        statement: executed_query,
+                        result,
+                        error: None,
+                    }],
+                    in_transaction,
+                })
+            } else if let Some(statements) = prepared_parameters {
                 console
                     .run_prepared(
                         statements,
@@ -328,6 +405,7 @@ impl DbxApp {
                             let mut result = query_tab
                                 .statement_results
                                 .last()
+                                .filter(|item| item.error.is_none())
                                 .map(|item| item.result.clone());
                             let error = query_tab
                                 .statement_results
@@ -339,6 +417,7 @@ impl DbxApp {
                             {
                                 let plan = dbx_core::format_execution_plan(kind, raw);
                                 query_tab.plan = Some(plan.clone());
+                                query_tab.plan_tree = true;
                                 result = Some(plan);
                             }
                             query_tab.status =
@@ -350,13 +429,23 @@ impl DbxApp {
                             };
                             query_tab.set_result(result, cx);
                             query_tab.results_stale = false;
+                            query_tab.error_highlight = (query_tab.query_revision
+                                == query_revision)
+                                .then(|| {
+                                    statement_error_range(&query, &query_tab.statement_results)
+                                })
+                                .flatten()
+                                .and_then(|range| source.editor_range(range));
                             query_tab.error = error;
-                            query_tab.error_highlight = None;
                             (outcome, may_change_schema && !query_tab.in_transaction)
                         }
                         Ok(Err(error)) => {
                             query_tab.plan_pending = false;
-                            query_tab.in_transaction = false;
+                            if !analyzing && !watched {
+                                query_tab.in_transaction = false;
+                            }
+                            query_tab.watch_interval = None;
+                            query_tab.watch_generation = query_tab.watch_generation.wrapping_add(1);
                             let message = error.to_string();
                             query_tab.error_highlight =
                                 if query_tab.query_revision == query_revision {
@@ -371,18 +460,22 @@ impl DbxApp {
                         }
                         Err(error) => {
                             let message = format!("Query task stopped unexpectedly: {error}");
+                            query_tab.watch_interval = None;
+                            query_tab.watch_generation = query_tab.watch_generation.wrapping_add(1);
                             query_tab.error = Some(message.clone());
                             query_tab.results_stale = query_tab.result.is_some();
                             (QueryHistoryOutcome::failure(message), false)
                         }
                     }
                 };
-                this.record_query_history(
-                    history_connection.clone(),
-                    query.clone(),
-                    history_outcome,
-                    cx,
-                );
+                if !watched {
+                    this.record_query_history(
+                        history_connection.clone(),
+                        query.clone(),
+                        history_outcome,
+                        cx,
+                    );
+                }
                 if refresh_schema {
                     if let Some(session) = this.session_mut(session_id) {
                         for tab in &mut session.secondary_tabs {
@@ -439,8 +532,8 @@ impl DbxApp {
         {
             query.active_result = index;
             query.status = query_result_status(&item.result);
+            query.set_result(item.error.is_none().then_some(item.result), cx);
             query.error = item.error;
-            query.set_result(Some(item.result), cx);
             cx.notify();
         }
     }
@@ -489,6 +582,10 @@ impl DbxApp {
         let SecondaryTabKind::Query(query_tab) = &mut tab.kind else {
             return;
         };
+        if query_tab.watch_interval.take().is_some() {
+            query_tab.watch_generation = query_tab.watch_generation.wrapping_add(1);
+            cx.notify();
+        }
         // Then to extra carets, while nothing is running.
         if !query_tab.busy {
             query_tab
@@ -593,6 +690,8 @@ impl DbxApp {
             QueryResultExportFormat::Tsv => delegate.result_as_tsv(),
             QueryResultExportFormat::Csv => delegate.result_as_csv(),
             QueryResultExportFormat::Json => delegate.result_as_json(),
+            QueryResultExportFormat::Markdown => delegate.result_as_markdown(),
+            QueryResultExportFormat::Xlsx => None,
             QueryResultExportFormat::Insert => {
                 let target = query.export_target.read(cx).text(cx);
                 if target.trim().is_empty() {
@@ -783,6 +882,15 @@ impl DbxApp {
         format: QueryResultExportFormat,
         cx: &mut Context<Self>,
     ) {
+        if matches!(format, QueryResultExportFormat::Xlsx) {
+            if let Some(result) = self
+                .active_query_tab(session_id)
+                .and_then(|query| query.result.clone())
+            {
+                self.export_loaded_xlsx(result, "query-result.xlsx".into(), cx);
+            }
+            return;
+        }
         let Some(text) = self.query_result_text_for(session_id, format, cx) else {
             return;
         };
@@ -952,5 +1060,37 @@ impl DbxApp {
         }
         focus_handle.focus(window, cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn failed_script_statement_maps_position_to_its_own_occurrence() {
+        let text = "SELECT 'é';\nSELECT missing;\nSELECT missing;";
+        let statements = vec![
+            dbx_core::StatementResult {
+                statement: "SELECT 'é'".into(),
+                result: QueryResult::empty(None, 0),
+                error: None,
+            },
+            dbx_core::StatementResult {
+                statement: "SELECT missing".into(),
+                result: QueryResult::empty(None, 0),
+                error: None,
+            },
+            dbx_core::StatementResult {
+                statement: "SELECT missing".into(),
+                result: QueryResult::empty(None, 0),
+                error: Some("column does not exist\nOriginal position: 8".into()),
+            },
+        ];
+        let start = text.rfind("missing").unwrap();
+        assert_eq!(
+            statement_error_range(text, &statements),
+            Some(start..start + "missing".len())
+        );
     }
 }

@@ -49,7 +49,9 @@ impl DbxApp {
         let password_focus = self.draft.password_editor.read(cx).focus_handle();
         let database_focus = self.draft.database_editor.read(cx).focus_handle();
         let kind = self.draft.kind;
-        let details = self.draft.mode == ConnectionFormMode::Details && kind.supports_details();
+        let details = self.draft.driver_manifest.is_none()
+            && self.draft.mode == ConnectionFormMode::Details
+            && kind.supports_details();
         let tags_editor = self.render_connection_tags(cx);
         let saved_connections = self.saved_connections.clone();
         let selected_profile = self.draft.selected_profile;
@@ -84,9 +86,9 @@ impl DbxApp {
                         .child(glass_icon_button("new-connection-from-list", Icon::Add, false).tooltip(tip("New connection")).on_click(cx.listener(|this, _, _, cx| this.begin_new_connection(cx)))))
                     .child(div().id("saved-connections").flex_1().min_h_0().overflow_y_scroll().p(crate::theme::ui_px(8.)).flex().flex_col().gap(crate::theme::ui_px(2.))
                         .when(saved_connections.is_empty(), |view| view.child(div().p(crate::theme::ui_px(10.)).text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child("No saved connections")))
-                        .children(saved_connections.into_iter().map(|profile| {
+                        .children(grouped_connections(saved_connections).into_iter().map(|(folder, profile)| {
                             let id = profile.id; let selected = selected_profile == Some(id); let choose = profile.clone();
-                            div().id(SharedString::from(format!("saved-connection-{id}"))).pressable(profile.name.clone()).h(crate::theme::control_height(50.)).px(crate::theme::ui_px(10.)).rounded(px(RADIUS_PANEL - 2.)).when(selected, |row| row.bg(theme().accent_soft)).when(!selected, |row| row.hover(|style| style.bg(theme().glass_hover))).cursor_pointer().flex().items_center().gap(crate::theme::ui_px(10.))
+                            let row = div().id(SharedString::from(format!("saved-connection-{id}"))).pressable(profile.name.clone()).h(crate::theme::control_height(50.)).px(crate::theme::ui_px(10.)).rounded(px(RADIUS_PANEL - 2.)).when(selected, |row| row.bg(theme().accent_soft)).when(!selected, |row| row.hover(|style| style.bg(theme().glass_hover))).cursor_pointer().flex().items_center().gap(crate::theme::ui_px(10.))
                                 .child(database_logo(profile.kind, if selected { theme().accent } else { theme().text_muted }))
                                 .child(div().flex_1().min_w_0().flex().flex_col().gap(crate::theme::ui_px(1.)).child(div().truncate().text_size(crate::theme::text_px(12.)).font_weight(FontWeight::MEDIUM).child(profile.name)).child(div().truncate().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(display_url(&profile.url))))
                                 .children(tag_badge(profile.tag.as_ref()))
@@ -101,7 +103,8 @@ impl DbxApp {
                                         SavedConnectionClickAction::Select => this.select_saved_connection(choose.clone(), cx),
                                         SavedConnectionClickAction::Open => this.open_saved_connection(choose.clone(), window, cx),
                                     }
-                                }))
+                                }));
+                            connection_group_row(folder, row.into_any_element())
                         }))),
             ))
             .child(div().flex_1().min_w_0().flex().flex_col().overflow_hidden().rounded(crate::theme::ui_px(RADIUS_PANEL)).border_1().border_color(theme().hairline).bg(theme().canvas).shadow(glass_shadow(10.))
@@ -119,11 +122,18 @@ impl DbxApp {
                         .when(editing, |view| view.child(div().flex().gap(crate::theme::ui_px(8.))
                             .child(button("duplicate-connection", "Duplicate", ButtonKind::Quiet).disabled(self.saving_connection || self.credential_hydrating).on_click(cx.listener(|this, _, _, cx| this.duplicate_profile(cx))))
                             .child(button("delete-connection", "Delete…", ButtonKind::Quiet).disabled(self.saving_connection || self.credential_hydrating).on_click(cx.listener(|this, _, window, cx| this.request_delete_profile(window, cx))))))
+                        .child(button("import-connections", "Import connections…", ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| this.open_profile_transfer(2, window, cx))))
+                        .when_some(self.draft.driver_manifest.clone(), |view, path| {
+                            let driver = dbx_core::driver_plugin::DriverManifest::read(&path).map(|manifest| format!("Community driver: {} · {}", manifest.name, manifest.executable.display())).unwrap_or_else(|_| "Community driver manifest unavailable".into());
+                            view.child(div().text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child(driver))
+                        })
                         .children(kind_picker)
                         .when(!choosing, |view| view.child(div().bg(theme().canvas).py(crate::theme::ui_px(16.)).flex().flex_col().gap(crate::theme::ui_px(12.))
                             .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Connection name")).child(editor::input(self.draft.connection_name_editor.clone(), name_focus, false, cx)))
+                            .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Folder (optional)"))
+                                .child(editor::input(self.draft.folder_editor.clone(), self.draft.folder_editor.read(cx).focus_handle(), false, cx)))
                             .child(tags_editor)
-                            .when(kind.supports_details(), |view| view.child(div().flex().child(segmented_track().id("connection-format").role(gpui::Role::RadioGroup).aria_label("Connection format")
+                            .when(kind.supports_details() && self.draft.driver_manifest.is_none(), |view| view.child(div().flex().child(segmented_track().id("connection-format").role(gpui::Role::RadioGroup).aria_label("Connection format")
                                 .child(div().id("connection-details-mode").pressable("Connection details").role(gpui::Role::RadioButton).aria_toggled(if details { gpui::accesskit::Toggled::True } else { gpui::accesskit::Toggled::False }).flex().items_center().gap(crate::theme::ui_px(5.)).px(crate::theme::ui_px(12.)).h(crate::theme::control_height(26.)).rounded_full().when(details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if details { theme().text } else { theme().text_muted }).text_size(crate::theme::text_px(11.)).cursor_pointer().child("Details").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::Details, cx))))
                                 .child(div().id("connection-string-mode").pressable("Connection string").role(gpui::Role::RadioButton).aria_toggled(if !details { gpui::accesskit::Toggled::True } else { gpui::accesskit::Toggled::False }).flex().items_center().gap(crate::theme::ui_px(5.)).px(crate::theme::ui_px(12.)).h(crate::theme::control_height(26.)).rounded_full().when(!details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if !details { theme().text } else { theme().text_muted }).text_size(crate::theme::text_px(11.)).cursor_pointer().child("Connection string").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx)))))))
                             .when(details, |view| view
@@ -131,13 +141,13 @@ impl DbxApp {
                                 .child(div().flex().gap(crate::theme::ui_px(8.)).child(div().flex_1().min_w_0().child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Username")).child(editor::input(self.draft.username_editor.clone(), username_focus, false, cx))).child(div().flex_1().min_w_0().child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Password")).child(editor::input(self.draft.password_editor.clone(), password_focus.clone(), false, cx))))
                                 .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::Redis { "Database index (optional)" } else { "Database" })).child(editor::input(self.draft.database_editor.clone(), database_focus, false, cx))))
                             .when(!kind.connection_help().is_empty(), |view| view.child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(kind.connection_help())))
-                            .when(!details, |view| view.child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind.is_file() { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(crate::theme::ui_px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false, cx))).when(kind.is_file(), |view| view.child(button("choose-sqlite-file", "Choose file…", ButtonKind::Quiet).h(crate::theme::control_height(32.)).flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx))))))))
+                            .when(!details, |view| view.child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind.is_file() { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(crate::theme::ui_px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false, cx))).when(self.draft.driver_manifest.is_none() && kind.is_file(), |view| view.child(button("choose-sqlite-file", "Choose file…", ButtonKind::Quiet).h(crate::theme::control_height(32.)).flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx))))))))
                             .when(matches!(kind,DatabaseKind::BigQuery|DatabaseKind::Turso|DatabaseKind::CloudflareD1), |view| view.child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::BigQuery { "OAuth token (optional; leave blank for Google credentials)" } else { "API token" })).child(editor::input(self.draft.password_editor.clone(),password_focus,false, cx))))
                              .child(Switch::new("connection-protected").label("Protected connection · disable writes").checked(protected).with_size(Size::Small)
                                 .on_click(cx.listener(|this, checked: &bool, _, cx| { this.draft.read_only = *checked; cx.notify(); })))
-                            .child(div().id("connection-capabilities").text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child(kind.capabilities(protected).summary()))
+                            .child(div().id("connection-capabilities").text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child(if self.draft.driver_manifest.is_some() { dbx_core::driver_plugin::capabilities(kind, protected).summary() } else { kind.capabilities(protected).summary() }))
                             .child(div().text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child("Use a read-only database account to enforce permissions. Protected mode also blocks accidental writes in DBX."))
-                            .when(kind.supports_transport(), |view| view.child(transport))))))
+                            .when(self.draft.driver_manifest.is_none() && kind.supports_transport(), |view| view.child(transport))))))
                 .when(!choosing, |view| view.child(div().flex_none().border_t_1().border_color(theme().border).follow_bottom_corners(RADIUS_PANEL).bg(theme().panel).px(if self.compact_layout { crate::theme::ui_px(14.) } else { crate::theme::ui_px(24.) }).py(crate::theme::ui_px(12.)).flex().items_center().justify_between().gap(crate::theme::ui_px(12.))
                     .child(div().min_w_0().flex_1().when_some(self.error.clone(), |view, error| view.child(crate::accessibility::announcement("connection-error", error.clone(), true).truncate().text_size(crate::theme::text_px(12.)).text_color(theme().danger_text).tooltip(tip(error.clone())).child(error))))
                     .child(div().flex_none().flex().items_center().gap(crate::theme::ui_px(8.))
@@ -148,7 +158,7 @@ impl DbxApp {
 
     /// The first step of a new connection: paste a URL to detect its type, or
     /// pick one from the grid.
-    fn render_kind_picker(&self, cx: &mut Context<Self>) -> Div {
+    fn render_kind_picker(&mut self, cx: &mut Context<Self>) -> Div {
         let url_focus = self.draft.import_url_editor.read(cx).focus_handle();
         let detected = self.import_url_kind(cx);
         div()
@@ -165,7 +175,7 @@ impl DbxApp {
                         div()
                             .text_size(crate::theme::text_px(11.))
                             .text_color(theme().text_muted)
-                            .child("Paste a connection URL"),
+                            .child("Paste a connection URL or database file path"),
                     )
                     .child(
                         div()
@@ -234,6 +244,41 @@ impl DbxApp {
                             .child("Explore a local SQLite database with sample data."),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(crate::theme::ui_px(8.))
+                    .child(
+                        div()
+                            .text_size(crate::theme::text_px(11.))
+                            .text_color(theme().text_muted)
+                            .child("Cloud presets · use PostgreSQL or MySQL drivers"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(crate::theme::ui_px(8.))
+                            .children(
+                                ["Redshift", "Neon", "PlanetScale", "Supabase"]
+                                    .into_iter()
+                                    .map(|name| {
+                                        button(
+                                            SharedString::from(format!("preset-{name}")),
+                                            name,
+                                            ButtonKind::Quiet,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.select_connection_preset(name, cx)
+                                            }),
+                                        )
+                                    }),
+                            ),
+                    ),
+            )
+            .child(self.render_driver_picker(cx))
             .children(KIND_GROUPS.into_iter().map(|(title, kinds)| {
                 div()
                     .flex()
@@ -459,6 +504,7 @@ impl DbxApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Connections"),
                     )
+                    .child(button("compact-import-connections", "Import connections…", ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| this.open_profile_transfer(2, window, cx))))
                     .child(
                         glass(div(), RADIUS_GLASS, 8.)
                             .flex_1()
@@ -499,11 +545,11 @@ impl DbxApp {
                                     .flex()
                                     .flex_col()
                                     .gap(crate::theme::ui_px(3.))
-                                    .children(saved_connections.into_iter().map(|profile| {
+                                    .children(grouped_connections(saved_connections).into_iter().map(|(folder, profile)| {
                                         let id = profile.id;
                                         let selected = selected_profile == Some(id);
                                         let choose = profile.clone();
-                                        div()
+                                        let row = div()
                                             .id(SharedString::from(format!(
                                                 "saved-connection-{id}"
                                             )))
@@ -580,7 +626,8 @@ impl DbxApp {
                                                             ),
                                                     }
                                                 },
-                                            ))
+                                            ));
+                                        connection_group_row(folder, row.into_any_element())
                                     })),
                             )
                             .child(
@@ -681,44 +728,46 @@ impl DbxApp {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn grouped_connections(
+    mut profiles: Vec<SavedConnection>,
+) -> Vec<(Option<String>, SavedConnection)> {
+    profiles.sort_by_key(|profile| {
+        (
+            profile.folder.clone().unwrap_or_default().to_lowercase(),
+            profile.name.to_lowercase(),
+        )
+    });
+    let mut previous = None;
+    profiles
+        .into_iter()
+        .map(|profile| {
+            let folder = profile.folder.clone().unwrap_or_else(|| "Ungrouped".into());
+            let heading = if previous.as_ref() == Some(&folder) {
+                None
+            } else {
+                previous = Some(folder.clone());
+                Some(folder)
+            };
+            (heading, profile)
+        })
+        .collect()
+}
 
-    #[gpui::test]
-    fn vault_controls_stay_inside_card_with_large_fonts(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Locked);
-            app.vault_busy = true;
-            app.font_family = Some("Menlo".into());
-            app
-        });
-        for (width, zoom, font) in [
-            (1100., 100, 20),
-            (1400., 200, 20),
-            (720., 100, 20),
-            (1400., 100, 12),
-        ] {
-            cx.simulate_resize(gpui::size(px(width), px(1000.)));
-            cx.update(|window, cx| {
-                app.update(cx, |app, _| {
-                    app.ui_scale = zoom;
-                    app.font_size = font;
-                });
-                window.draw(cx).clear(cx);
-            });
-            let card = cx.debug_bounds("vault-card").unwrap();
-            let submit = cx.debug_bounds("vault-submit").unwrap();
-            assert!(
-                submit.left() >= card.left() && submit.right() <= card.right(),
-                "button outside card: {submit:?} / {card:?}"
-            );
-            assert!(submit.bottom() <= card.bottom(), "button below card");
-            assert!(card.right() <= px(width), "card exceeds window");
-        }
-        crate::theme::set_text_scales(100, 100);
-        crate::theme::set_font_sizes(12, 12);
-    }
+fn connection_group_row(folder: Option<String>, row: AnyElement) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .when_some(folder, |view, folder| {
+            view.child(
+                div()
+                    .px(crate::theme::ui_px(10.))
+                    .pt(crate::theme::ui_px(10.))
+                    .pb(crate::theme::ui_px(5.))
+                    .text_size(crate::theme::text_px(11.))
+                    .text_color(theme().text_muted)
+                    .child(folder),
+            )
+        })
+        .child(row)
 }

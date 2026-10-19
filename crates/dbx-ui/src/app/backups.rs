@@ -24,6 +24,18 @@ impl DbxApp {
         if session.busy {
             return;
         }
+        if session
+            .engine
+            .as_ref()
+            .is_none_or(|engine| !engine.capabilities().native_backup)
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Native backup and restore are unavailable for this connection",
+                cx,
+            );
+            return;
+        }
         if session.profile_id.is_none() {
             self.show_toast(
                 ToastKind::Info,
@@ -118,7 +130,13 @@ impl DbxApp {
         let Some(session) = self.session(session_id) else {
             return;
         };
-        if session.busy || self.vault_state != Some(VaultState::Unlocked) {
+        if session.busy
+            || self.vault_state != Some(VaultState::Unlocked)
+            || session
+                .engine
+                .as_ref()
+                .is_none_or(|engine| !engine.capabilities().native_backup)
+        {
             return;
         }
         let Some(profile_id) = session.profile_id else {

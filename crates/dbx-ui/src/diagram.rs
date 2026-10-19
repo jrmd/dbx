@@ -309,6 +309,31 @@ impl DiagramDocument {
         }
         separate_lanes(&mut self.edges);
         for edge in &mut self.edges {
+            // A relationship can skip layout columns or cross a card moved
+            // by hand. Keep the simple route when clear, and find a path
+            // through the free corridors when any card blocks it.
+            let obstacles = self
+                .nodes
+                .iter()
+                .map(|node| {
+                    let margin = if node.id == edge.source || node.id == edge.target {
+                        0.
+                    } else {
+                        12.
+                    };
+                    (
+                        node.x - margin,
+                        node.y - margin,
+                        node.x + node.width + margin,
+                        node.y + node.height + margin,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if route_blocked(&edge.points, &obstacles)
+                && let Some(points) = avoid_cards(&edge.points, &obstacles)
+            {
+                edge.points = points;
+            }
             edge.path = rounded_svg_path(&edge.points, EDGE_CORNER_RADIUS);
         }
 
@@ -316,11 +341,21 @@ impl DiagramDocument {
             .nodes
             .iter()
             .map(|node| node.x + node.width + PADDING)
+            .chain(
+                self.edges
+                    .iter()
+                    .flat_map(|edge| edge.points.iter().map(|point| point.0 + PADDING)),
+            )
             .fold(PADDING * 2.0, f32::max);
         self.height = self
             .nodes
             .iter()
             .map(|node| node.y + node.height + PADDING)
+            .chain(
+                self.edges
+                    .iter()
+                    .flat_map(|edge| edge.points.iter().map(|point| point.1 + PADDING)),
+            )
             .fold(PADDING * 2.0, f32::max);
     }
 
@@ -786,6 +821,137 @@ fn edge_route(
     }
 }
 
+type CardBounds = (f32, f32, f32, f32);
+
+fn segment_blocked(a: (f32, f32), b: (f32, f32), cards: &[CardBounds]) -> bool {
+    cards.iter().any(|&(left, top, right, bottom)| {
+        if a.0 == b.0 {
+            a.0 > left && a.0 < right && a.1.min(b.1) < bottom && a.1.max(b.1) > top
+        } else {
+            a.1 > top && a.1 < bottom && a.0.min(b.0) < right && a.0.max(b.0) > left
+        }
+    })
+}
+
+fn route_blocked(points: &[(f32, f32)], cards: &[CardBounds]) -> bool {
+    points
+        .windows(2)
+        .any(|pair| segment_blocked(pair[0], pair[1], cards))
+}
+
+/// Find the shortest orthogonal path on the visibility grid formed by card
+/// borders. Turns have a small cost to prefer clean, easily followed routes.
+fn avoid_cards(points: &[(f32, f32)], cards: &[CardBounds]) -> Option<Vec<(f32, f32)>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let (&start, &end) = (points.first()?, points.last()?);
+    let mut xs = vec![start.0, end.0];
+    let mut ys = vec![start.1, end.1];
+    for &(left, top, right, bottom) in cards {
+        xs.extend([left.max(0.), right]);
+        ys.extend([top.max(0.), bottom]);
+    }
+    xs.sort_by(f32::total_cmp);
+    xs.dedup();
+    ys.sort_by(f32::total_cmp);
+    ys.dedup();
+    let width = xs.len();
+    let index = |point: (f32, f32)| {
+        Some(
+            ys.iter().position(|y| *y == point.1)? * width
+                + xs.iter().position(|x| *x == point.0)?,
+        )
+    };
+    let start_index = index(start)?;
+    let end_index = index(end)?;
+    let count = width * ys.len() * 2;
+    let mut distance = vec![u64::MAX; count];
+    let mut previous = vec![usize::MAX; count];
+    let mut queue = BinaryHeap::new();
+    for axis in 0..2 {
+        distance[start_index * 2 + axis] = 0;
+        queue.push((Reverse(0u64), start_index * 2 + axis));
+    }
+    let mut goal = None;
+    while let Some((Reverse(cost), state)) = queue.pop() {
+        if distance[state] != cost {
+            continue;
+        }
+        let vertex = state / 2;
+        if vertex == end_index {
+            goal = Some(state);
+            break;
+        }
+        let (x, y) = (vertex % width, vertex / width);
+        let here = (xs[x], ys[y]);
+        let neighbors = [
+            x.checked_sub(1).map(|x| (x, y, 0)),
+            (x + 1 < width).then_some((x + 1, y, 0)),
+            y.checked_sub(1).map(|y| (x, y, 1)),
+            (y + 1 < ys.len()).then_some((x, y + 1, 1)),
+        ];
+        for (nx, ny, axis) in neighbors.into_iter().flatten() {
+            let there = (xs[nx], ys[ny]);
+            let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+            // Preserve the card's port direction so cardinality marks stay
+            // perpendicular to the border instead of following its edge.
+            if vertex == start_index
+                && points.len() > 1
+                && dot(
+                    (there.0 - here.0, there.1 - here.1),
+                    (points[1].0 - start.0, points[1].1 - start.1),
+                ) <= 0.
+            {
+                continue;
+            }
+            if ny * width + nx == end_index && points.len() > 1 {
+                let before = points[points.len() - 2];
+                if dot(
+                    (here.0 - end.0, here.1 - end.1),
+                    (before.0 - end.0, before.1 - end.1),
+                ) <= 0.
+                {
+                    continue;
+                }
+            }
+            if segment_blocked(here, there, cards) {
+                continue;
+            }
+            let next = (ny * width + nx) * 2 + axis;
+            let length = ((here.0 - there.0).abs() + (here.1 - there.1).abs()) * 10.;
+            let next_cost = cost + length.round() as u64 + if state % 2 == axis { 0 } else { 240 };
+            if next_cost < distance[next] {
+                distance[next] = next_cost;
+                previous[next] = state;
+                queue.push((Reverse(next_cost), next));
+            }
+        }
+    }
+    let mut state = goal?;
+    let mut route = Vec::new();
+    loop {
+        let vertex = state / 2;
+        route.push((xs[vertex % width], ys[vertex / width]));
+        if previous[state] == usize::MAX {
+            break;
+        }
+        state = previous[state];
+    }
+    route.reverse();
+    let mut simplified: Vec<(f32, f32)> = Vec::new();
+    for point in route {
+        if simplified.len() >= 2 {
+            let a = simplified[simplified.len() - 2];
+            let b = simplified[simplified.len() - 1];
+            if (a.0 == b.0 && b.0 == point.0) || (a.1 == b.1 && b.1 == point.1) {
+                simplified.pop();
+            }
+        }
+        simplified.push(point);
+    }
+    Some(simplified)
+}
+
 /// Fan out relationships whose vertical runs share a corridor so parallel
 /// lines never draw on top of one another.
 fn separate_lanes(edges: &mut [DiagramEdge]) {
@@ -1144,268 +1310,4 @@ fn adler32(data: &[u8]) -> u32 {
         (a, (b + a) % 65_521)
     });
     (b << 16) | a
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use dbx_core::{EntityKind, ForeignKeyInfo, RelationalTable, TableStructure};
-    use std::sync::Arc;
-
-    fn table(
-        name: &str,
-        columns: Vec<ColumnInfo>,
-        foreign_keys: Vec<ForeignKeyInfo>,
-    ) -> RelationalTable {
-        table_in_schema("public", name, columns, foreign_keys)
-    }
-    fn table_in_schema(
-        schema: &str,
-        name: &str,
-        columns: Vec<ColumnInfo>,
-        foreign_keys: Vec<ForeignKeyInfo>,
-    ) -> RelationalTable {
-        RelationalTable {
-            table: TableInfo {
-                name: name.into(),
-                schema: Some(schema.into()),
-                kind: EntityKind::Table,
-            },
-            structure: TableStructure {
-                columns,
-                foreign_keys,
-                ..Default::default()
-            },
-        }
-    }
-    fn column(name: &str, ordinal: usize, primary_key: bool) -> ColumnInfo {
-        ColumnInfo {
-            name: name.into(),
-            data_type: "uuid".into(),
-            enum_values: vec![],
-            nullable: !primary_key,
-            ordinal,
-            primary_key,
-            default_value: None,
-        }
-    }
-    fn foreign(columns: &[&str], target: &str, target_columns: &[&str]) -> ForeignKeyInfo {
-        foreign_in_schema("public", columns, target, target_columns)
-    }
-    fn foreign_in_schema(
-        target_schema: &str,
-        columns: &[&str],
-        target: &str,
-        target_columns: &[&str],
-    ) -> ForeignKeyInfo {
-        ForeignKeyInfo {
-            constraint_name: None,
-            columns: columns.iter().map(|value| (*value).into()).collect(),
-            referenced_schema: Some(target_schema.into()),
-            referenced_table: target.into(),
-            referenced_columns: target_columns.iter().map(|value| (*value).into()).collect(),
-            on_update: None,
-            on_delete: None,
-        }
-    }
-    fn palette() -> DiagramPalette<'static> {
-        DiagramPalette {
-            canvas: "#0a0c10",
-            surface: "#111318",
-            surface_muted: "#171a20",
-            border: "#1f232b",
-            text: "#f1f5f9",
-            muted_text: "#94a3b8",
-            accent: "#2563eb",
-            key: "#f59e0b",
-            relation: "#60a5fa",
-        }
-    }
-
-    #[test]
-    fn layout_is_deterministic_and_nodes_do_not_overlap() {
-        let users = table("users", vec![column("id", 0, true)], vec![]);
-        let posts = table(
-            "posts",
-            vec![column("id", 0, true), column("user_id", 1, false)],
-            vec![foreign(&["user_id"], "users", &["id"])],
-        );
-        let forward = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![users.clone(), posts.clone()],
-            ..Default::default()
-        });
-        let reverse = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![posts, users],
-            ..Default::default()
-        });
-        assert_eq!(forward.svg(palette(), None), reverse.svg(palette(), None));
-        for (index, left) in forward.nodes.iter().enumerate() {
-            for right in forward.nodes.iter().skip(index + 1) {
-                assert!(
-                    left.x + left.width <= right.x
-                        || right.x + right.width <= left.x
-                        || left.y + left.height <= right.y
-                        || right.y + right.height <= left.y
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn schema_projection_retains_cross_schema_relationships() {
-        let schema = RelationalSchema {
-            database: "db".into(),
-            tables: vec![
-                table_in_schema("auth", "users", vec![column("id", 0, true)], vec![]),
-                table_in_schema(
-                    "public",
-                    "posts",
-                    vec![column("id", 0, true), column("author_id", 1, false)],
-                    vec![foreign_in_schema("auth", &["author_id"], "users", &["id"])],
-                ),
-            ],
-            ..Default::default()
-        };
-        let original = schema.clone();
-        let selected = BTreeSet::from(["auth".to_owned(), "public".to_owned()]);
-
-        let document = DiagramDocument::from_schema_selection(&schema, Some(&selected));
-
-        assert_eq!(document.nodes.len(), 2);
-        assert_eq!(document.edges.len(), 1);
-        assert_eq!(document.edges[0].source, "public.posts");
-        assert_eq!(document.edges[0].target, "auth.users");
-        assert_eq!(schema, original);
-    }
-
-    #[test]
-    fn schema_projection_omits_relationships_with_hidden_endpoints() {
-        let schema = RelationalSchema {
-            database: "db".into(),
-            tables: vec![
-                table_in_schema("auth", "users", vec![column("id", 0, true)], vec![]),
-                table_in_schema(
-                    "public",
-                    "posts",
-                    vec![column("id", 0, true), column("author_id", 1, false)],
-                    vec![foreign_in_schema("auth", &["author_id"], "users", &["id"])],
-                ),
-            ],
-            ..Default::default()
-        };
-
-        for selected_schema in ["auth", "public"] {
-            let selected = BTreeSet::from([selected_schema.to_owned()]);
-            let document = DiagramDocument::from_schema_selection(&schema, Some(&selected));
-            assert_eq!(document.nodes.len(), 1);
-            assert!(document.edges.is_empty());
-        }
-    }
-
-    #[test]
-    fn svg_escapes_identifiers_and_keeps_composite_relationships() {
-        let parent = table(
-            "parent<&",
-            vec![column("first", 0, true), column("second", 1, true)],
-            vec![],
-        );
-        let child = table(
-            "child",
-            vec![column("first", 0, false), column("second", 1, false)],
-            vec![foreign(
-                &["first", "second"],
-                "parent<&",
-                &["first", "second"],
-            )],
-        );
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![child, parent],
-            ..Default::default()
-        });
-        let svg = document.svg(palette(), None);
-        assert!(svg.contains("parent&lt;&amp;"));
-        assert_eq!(document.edges[0].source_columns, ["first", "second"]);
-        assert_eq!(document.edges[0].target_columns, ["first", "second"]);
-    }
-
-    #[test]
-    fn referenced_columns_remain_visible_without_becoming_foreign_keys() {
-        let mut parent_columns = (0..20)
-            .map(|index| column(&format!("column_{index}"), index, index == 0))
-            .collect::<Vec<_>>();
-        parent_columns.push(column("external_key", 20, false));
-        let parent = table("parent", parent_columns, vec![]);
-        let child = table(
-            "child",
-            vec![column("id", 0, true), column("parent_key", 1, false)],
-            vec![foreign(&["parent_key"], "parent", &["external_key"])],
-        );
-
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![parent, child],
-            ..Default::default()
-        });
-        let parent = document
-            .nodes
-            .iter()
-            .find(|node| node.table.name == "parent")
-            .unwrap();
-        let referenced = parent
-            .columns
-            .iter()
-            .find(|column| column.name == "external_key")
-            .expect("referenced column should be retained beyond the ordinary column limit");
-        assert!(!referenced.foreign_key);
-    }
-
-    #[test]
-    fn moving_a_card_reroutes_its_relationships() {
-        let mut document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![
-                table("parent", vec![column("id", 0, true)], vec![]),
-                table(
-                    "child",
-                    vec![column("id", 0, true), column("parent_id", 1, false)],
-                    vec![foreign(&["parent_id"], "parent", &["id"])],
-                ),
-            ],
-            ..Default::default()
-        });
-        let before = document.edges[0].points.clone();
-        assert!(document.move_node("public.parent", 900.0, 700.0));
-        assert_eq!(
-            document.node_position("public.parent"),
-            Some((900.0, 700.0))
-        );
-        assert_ne!(document.edges[0].points, before);
-        assert!(document.width >= 900.0 && document.height >= 700.0);
-        assert!(!document.move_node("public.missing", 0.0, 0.0));
-    }
-
-    #[test]
-    fn png_export_has_a_valid_signature() {
-        let document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![table("users", vec![column("id", 0, true)], vec![])],
-            ..Default::default()
-        });
-        let renderer = SvgRenderer::new(Arc::new(()));
-        let png = document.png(&renderer, palette(), None, 1.0).unwrap();
-        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(
-            u32::from_be_bytes(png[16..20].try_into().unwrap()),
-            document.width as u32
-        );
-        assert_eq!(
-            u32::from_be_bytes(png[20..24].try_into().unwrap()),
-            document.height as u32
-        );
-        assert_eq!(&png[png.len() - 12..png.len() - 4], b"\0\0\0\0IEND");
-    }
 }

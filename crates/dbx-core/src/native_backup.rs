@@ -86,6 +86,11 @@ pub async fn native_backup(
     restore: bool,
     control: TransferControl,
 ) -> Result<String> {
+    if config.driver_manifest.is_some() {
+        return Err(invalid(
+            "Native backup and restore are unavailable for community drivers",
+        ));
+    }
     config.validate()?;
     if restore && config.read_only {
         return Err(invalid("Protected connection: restore is disabled"));

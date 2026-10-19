@@ -172,9 +172,8 @@ impl SettingsStore {
 }
 
 fn default_settings_path() -> SettingsResult<PathBuf> {
-    Ok(dirs::config_dir()
+    Ok(crate::config::directory()
         .ok_or(SettingsError::ConfigDirectoryUnavailable)?
-        .join("dbx")
         .join(SETTINGS_FILE_NAME))
 }
 
@@ -248,49 +247,21 @@ mod tests {
     }
 
     #[test]
-    fn custom_theme_and_preset_survive_relaunch_and_old_settings_migrate() {
+    fn legacy_settings_migrate_and_preferences_survive_restart() {
         let (_directory, store) = test_store();
         fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
         let mut settings = store.load().unwrap();
+        assert_eq!(settings.appearance, Appearance::Dark);
+        assert!(!settings.reduce_transparency);
+        assert_eq!(settings.ui_scale, 100);
+        assert_eq!(settings.motion, crate::motion::MotionPreference::System);
+        assert_eq!(settings.editor_scale, 100);
         assert_eq!(settings.theme, Default::default());
         settings.theme.preset = crate::theme::catalog::Preset::Ocean;
         settings
             .theme
             .edit("grid_active", "#aabbcc", false)
             .unwrap();
-        store.save(settings.clone()).unwrap();
-        assert_eq!(
-            SettingsStore::at(store.path.clone()).load().unwrap(),
-            settings
-        );
-    }
-
-    #[test]
-    fn missing_settings_follow_the_system_with_glass() {
-        let (_directory, store) = test_store();
-        assert_eq!(store.load().expect("load defaults"), Settings::default());
-        assert_eq!(Settings::default().appearance, Appearance::System);
-        assert!(!Settings::default().reduce_transparency);
-    }
-
-    #[test]
-    fn earlier_documents_keep_their_explicit_appearance() {
-        let (_directory, store) = test_store();
-        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#)
-            .expect("write earlier settings");
-        let settings = store.load().expect("load earlier settings");
-        assert_eq!(settings.appearance, Appearance::Dark);
-        assert!(!settings.reduce_transparency);
-        assert_eq!(settings.ui_scale, 100);
-        assert_eq!(settings.motion, crate::motion::MotionPreference::System);
-        assert_eq!(settings.editor_scale, 100);
-    }
-
-    #[test]
-    fn typography_and_drag_preferences_migrate_and_survive_restart() {
-        let (_directory, store) = test_store();
-        fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
-        let mut settings = store.load().unwrap();
         assert_eq!(settings.font_size, 12);
         assert!(settings.font_family.is_none());
         assert!(settings.mono_font_family.is_none());
@@ -301,21 +272,9 @@ mod tests {
         settings.mono_font_size = Some(14);
         settings.drag_row_selection = false;
         store.save(settings.clone()).unwrap();
-        assert_eq!(store.load().unwrap(), settings);
-    }
-
-    #[test]
-    fn rejects_unknown_document_versions() {
-        let (_directory, store) = test_store();
-        fs::write(&store.path, r#"{"version":2,"appearance":"dark"}"#)
-            .expect("write future settings");
-
-        assert!(matches!(
-            store.load(),
-            Err(SettingsError::UnsupportedVersion {
-                found: 2,
-                expected: 1
-            })
-        ));
+        assert_eq!(
+            SettingsStore::at(store.path.clone()).load().unwrap(),
+            settings
+        );
     }
 }

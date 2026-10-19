@@ -109,7 +109,11 @@ docker compose -f docker-compose.test.yml stop clickhouse
 ```
 
 MongoDB and Elasticsearch collection schemas are sampled from documents;
-their grids are read-only. Use their native commands for writes. Kafka has a
+their grids are read-only. MongoDB also offers a separate Extended JSON document
+editor with review, immutable `_id`, and an original-document conflict check.
+Redis has structured editors for strings, hashes, lists, sets, sorted sets and
+streams. Native commands remain available for both engines; Elasticsearch
+writes use its command console. Kafka has a
 topic/message surface rather than relational row editing. BigQuery's grid is
 read-only, with writes available through SQL. BigQuery uses refreshing Google
 Application Default Credentials when its optional token field is blank. This

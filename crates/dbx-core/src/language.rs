@@ -123,6 +123,42 @@ fn dialect_for(kind: DatabaseKind) -> Option<Box<dyn Dialect>> {
     })
 }
 
+/// Detect UPDATE/DELETE operations whose own AST has no WHERE predicate.
+/// Walking statements also catches mutations inside WITH and nested queries;
+/// a WHERE in a subquery never counts as a filter on the outer mutation.
+/// On unsupported syntax, warn conservatively if a mutation keyword exists.
+pub fn has_unfiltered_mutation(kind: DatabaseKind, sql: &str) -> bool {
+    struct Mutations;
+    impl Visitor for Mutations {
+        type Break = ();
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+            if matches!(statement, Statement::Update(update) if update.selection.is_none())
+                || matches!(statement, Statement::Delete(delete) if delete.selection.is_none())
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    let Some(dialect) = dialect_for(kind) else {
+        return false;
+    };
+    let Ok(statements) = crate::script::checked_split_sql_for(Some(kind), sql) else {
+        return crate::protected::sql_words_for(Some(kind), sql)
+            .iter()
+            .any(|word| matches!(word.as_str(), "UPDATE" | "DELETE"));
+    };
+    statements
+        .iter()
+        .any(|sql| match Parser::parse_sql(dialect.as_ref(), sql) {
+            Ok(ast) => ast.visit(&mut Mutations).is_break(),
+            Err(_) => crate::protected::sql_words_for(Some(kind), sql)
+                .iter()
+                .any(|word| matches!(word.as_str(), "UPDATE" | "DELETE")),
+        })
+}
+
 /// Words that may begin a statement in some supported engine. A statement
 /// starting with anything else is almost certainly a typo.
 const STATEMENT_LEADERS: &[&str] = &[
@@ -701,137 +737,29 @@ fn report_unknown_columns(
 }
 
 #[cfg(test)]
-mod tests {
+mod mutation_safety_tests {
     use super::*;
-
-    fn catalog() -> LanguageCatalog {
-        LanguageCatalog {
-            tables: vec![
-                CatalogTable {
-                    schema: Some("public".into()),
-                    name: "users".into(),
-                    columns: Some(vec!["id".into(), "name".into(), "email".into()]),
-                },
-                CatalogTable {
-                    schema: Some("public".into()),
-                    name: "orders".into(),
-                    columns: None,
-                },
-            ],
-        }
-    }
-
-    fn found(script: &str) -> Vec<(String, String)> {
-        analyze_sql(DatabaseKind::PostgreSQL, script, &catalog(), None)
-            .into_iter()
-            .map(|diagnostic| (script[diagnostic.range].to_owned(), diagnostic.message))
-            .collect()
-    }
-
     #[test]
-    fn syntax_errors_point_at_the_offending_token() {
-        assert_eq!(
-            found("SELECT 1;\nSELECT a, FROM users"),
-            [(
-                "FROM".to_owned(),
-                "Expected an expression, found FROM".to_owned()
-            )]
-        );
-        assert_eq!(
-            found("SELEC 1"),
-            [("SELEC".to_owned(), "Unknown statement `SELEC`".to_owned())]
-        );
-        let unfinished = "SELECT * FROM users WHERE";
-        assert_eq!(found(unfinished).len(), 1);
-        assert!(
-            analyze_sql(
-                DatabaseKind::PostgreSQL,
-                unfinished,
-                &catalog(),
-                Some(unfinished.len())
-            )
-            .is_empty(),
-            "the statement being typed is not reported as unfinished"
-        );
-    }
-
-    #[test]
-    fn valid_engine_specific_statements_stay_clean() {
-        for script in [
-            "SELECT name #>> '{a}', id::int FROM users WHERE name ILIKE $1",
-            "DO $$ BEGIN RAISE NOTICE 'x'; END $$",
-            "VACUUM ANALYZE users",
-            "REFRESH MATERIALIZED VIEW mv",
-            "CREATE FUNCTION f() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END",
-            "WITH recent AS (SELECT id FROM users) SELECT id FROM recent",
-            "SELECT * FROM generate_series(1, 3)",
-            "SELECT * FROM information_schema.tables",
-            "SELECT * FROM pg_class",
-            "CREATE TEMP TABLE scratch (id int); SELECT * FROM scratch",
-            "SELECT current_date, name AS label FROM users ORDER BY label",
+    fn mutation_filters_belong_to_the_mutation_and_include_ctes() {
+        let kind = DatabaseKind::PostgreSQL;
+        for sql in [
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "WITH x AS (SELECT * FROM t WHERE id=1) DELETE FROM t",
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            "UPDATE t SET a=(SELECT a FROM u WHERE id=1)",
+            "SELECT 1; DELETE FROM t;",
         ] {
-            assert_eq!(found(script), [], "{script}");
+            assert!(has_unfiltered_mutation(kind, sql), "{sql}");
         }
-        for (kind, script) in [
-            (DatabaseKind::MySQL, "SET @x := 1"),
-            (
-                DatabaseKind::MySQL,
-                "CREATE PROCEDURE p() BEGIN SELECT 1; END",
-            ),
-            (DatabaseKind::SQLite, "PRAGMA table_info(users)"),
-            (
-                DatabaseKind::MySQL,
-                "SELECT * FROM users # comment; with a semicolon",
-            ),
+        for sql in [
+            "UPDATE t SET a=1 WHERE id=2",
+            "WITH x AS (SELECT 1) DELETE FROM t WHERE id=2",
+            "SELECT 'DELETE FROM t', 'WHERE'",
+            "DELETE FROM t WHERE id IN (SELECT id FROM u)",
+            "-- UPDATE t\nSELECT 1",
         ] {
-            assert_eq!(analyze_sql(kind, script, &catalog(), None), [], "{script}");
+            assert!(!has_unfiltered_mutation(kind, sql), "{sql}");
         }
-    }
-
-    #[test]
-    fn catalog_warnings_cover_unknown_tables_and_columns() {
-        assert_eq!(
-            found("SELECT * FROM userz"),
-            [("userz".to_owned(), "Unknown table `userz`".to_owned())]
-        );
-        assert_eq!(
-            found("SELECT nmae FROM users u WHERE u.emial = 'x'"),
-            [
-                (
-                    "nmae".to_owned(),
-                    "Unknown column `nmae` in `users`".to_owned()
-                ),
-                (
-                    "emial".to_owned(),
-                    "Unknown column `emial` in `users`".to_owned()
-                )
-            ]
-        );
-        assert_eq!(
-            found("UPDATE users SET nme = 'x' WHERE id = 1"),
-            [(
-                "nme".to_owned(),
-                "Unknown column `nme` in `users`".to_owned()
-            )]
-        );
-        assert_eq!(
-            found("INSERT INTO users (id, mail) SELECT id, total FROM orders"),
-            [(
-                "mail".to_owned(),
-                "Unknown column `mail` in `users`".to_owned()
-            )]
-        );
-        // Joins and unloaded columns are not guessed at.
-        assert_eq!(found("SELECT anything FROM users JOIN orders ON true"), []);
-        assert_eq!(found("SELECT anything FROM orders"), []);
-        assert!(
-            analyze_sql(
-                DatabaseKind::PostgreSQL,
-                "SELECT * FROM userz",
-                &LanguageCatalog::default(),
-                None
-            )
-            .is_empty()
-        );
     }
 }

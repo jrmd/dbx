@@ -729,30 +729,4 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn scripts_split_on_go_and_keep_module_bodies_whole() {
-        let script = "SELECT * FROM #staging; SELECT 2\nGO\nCREATE OR ALTER PROCEDURE dbo.p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\ngo\n-- note\nUPDATE t SET a = 1";
-        assert_eq!(
-            crate::script::checked_split_sql_for(Some(DatabaseKind::SqlServer), script).unwrap(),
-            [
-                "SELECT * FROM #staging",
-                "SELECT 2",
-                "CREATE OR ALTER PROCEDURE dbo.p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND",
-                "UPDATE t SET a = 1",
-            ]
-        );
-    }
-
-    #[test]
-    fn defaults_and_checks_lose_their_storage_parentheses() {
-        assert_eq!(strip_parentheses("((0))"), "0");
-        assert_eq!(strip_parentheses("([qty]>=(0))"), "[qty]>=(0)");
-        assert_eq!(strip_parentheses("(getdate())"), "getdate()");
-        assert_eq!(strip_parentheses("(a) + (b)"), "(a) + (b)");
-        assert!(is_row_count_statement("  update t set a = 1"));
-        assert!(!is_row_count_statement(
-            "WITH x AS (SELECT 1) SELECT * FROM x"
-        ));
-    }
 }

@@ -8,6 +8,332 @@ use super::*;
 use crate::row_drafts::parse_field_value;
 
 impl DbxApp {
+    pub(super) fn copy_data_markdown_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(result) = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.result.clone())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(crate::result_export::markdown(
+            &result,
+        )));
+        self.show_toast(
+            ToastKind::Success,
+            format!(
+                "Copied {} loaded rows as Markdown; staged edits excluded",
+                result.rows.len()
+            ),
+            cx,
+        );
+    }
+
+    pub(super) fn export_data_xlsx_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(result) = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.result.clone())
+        {
+            self.export_loaded_xlsx(result, "table-loaded-rows.xlsx".into(), cx);
+        }
+    }
+
+    pub(super) fn export_loaded_xlsx(
+        &mut self,
+        result: Arc<QueryResult>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some(&name));
+        let runtime = self.runtime.clone();
+        let rows = result.rows.len();
+        let partial = result.truncated;
+        cx.spawn(async move |this, cx| {
+            let outcome = match receiver.await {
+                Ok(Ok(Some(path))) => runtime
+                    .spawn_blocking(move || {
+                        let bytes = crate::result_export::xlsx(&result)?;
+                        dbx_core::write_atomic_export(&path, &bytes)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result),
+                Ok(Ok(None)) => return Ok::<(), anyhow::Error>(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            this.update(cx, |this, cx| match outcome {
+                Ok(()) => this.show_toast(
+                    ToastKind::Success,
+                    format!(
+                        "Exported {rows} loaded rows to XLSX{}; staged edits excluded",
+                        if partial { " (partial result)" } else { "" }
+                    ),
+                    cx,
+                ),
+                Err(error) => {
+                    this.show_toast(ToastKind::Error, format!("XLSX export: {error}"), cx)
+                }
+            })?;
+            Ok(())
+        })
+        .detach();
+    }
+
+    pub(super) fn export_full_query_xlsx_for(
+        &mut self,
+        session_id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, sql, tab_id, busy, transaction, watching)) =
+            self.session(session_id).and_then(|session| {
+                let query = self.active_query_tab(session_id)?;
+                Some((
+                    session.engine.clone()?,
+                    query.query_text.read(cx).clone(),
+                    session.active_secondary_tab?,
+                    session.busy || query.busy,
+                    query.in_transaction,
+                    query.watch_interval.is_some(),
+                ))
+            })
+        else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        if watching {
+            self.show_toast(
+                ToastKind::Info,
+                "Pause Watch before exporting a fresh read-only XLSX result",
+                cx,
+            );
+            return;
+        }
+        if transaction {
+            self.show_toast(
+                ToastKind::Info,
+                "Commit or roll back the query transaction before a fresh read-only export",
+                cx,
+            );
+            return;
+        }
+        if editor::lex_sql_for(&sql, Some(engine.kind()))
+            .iter()
+            .any(|token| token.kind == editor::SqlTokenKind::Parameter)
+        {
+            self.show_toast(ToastKind::Info, "Full XLSX export requires a standalone read statement without parameter placeholders", cx);
+            return;
+        }
+        self.export_full_xlsx(session_id, tab_id, engine, sql, false, cx);
+    }
+
+    pub(super) fn export_full_table_xlsx_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((engine, table, busy)) = self.session(session_id).and_then(|session| {
+            Some((
+                session.engine.clone()?,
+                self.data_tab(session_id, tab_id)?.table.clone(),
+                session.busy,
+            ))
+        }) else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        let quoted = (|| -> dbx_core::Result<String> {
+            let name = dbx_core::quote_identifier(engine.kind(), &table.name)?;
+            Ok(if let Some(schema) = &table.schema {
+                format!(
+                    "{}.{name}",
+                    dbx_core::quote_identifier(engine.kind(), schema)?
+                )
+            } else {
+                name
+            })
+        })();
+        let name = match quoted {
+            Ok(name) => name,
+            Err(error) => {
+                self.show_toast(ToastKind::Error, error.to_string(), cx);
+                return;
+            }
+        };
+        self.export_full_xlsx(
+            session_id,
+            tab_id,
+            engine,
+            format!("SELECT * FROM {name}"),
+            true,
+            cx,
+        );
+    }
+
+    fn export_full_xlsx(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        engine: Arc<DatabaseEngine>,
+        sql: String,
+        table: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !engine.capabilities().streaming_query_export {
+            self.show_toast(
+                ToastKind::Info,
+                "Full XLSX export is unavailable for this driver; export loaded rows instead",
+                cx,
+            );
+            return;
+        }
+        if let Err(error) = dbx_core::validate_query_export(engine.kind(), &sql) {
+            self.show_toast(ToastKind::Error, error.to_string(), cx);
+            return;
+        }
+        let Some(session) = self.session(session_id) else {
+            return;
+        };
+        let database = session.current_database.clone();
+        let target_table = if table {
+            let Some(data) = self.data_tab(session_id, tab_id) else {
+                return;
+            };
+            Some(data.table.clone())
+        } else {
+            None
+        };
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let name = if table {
+            "full-table.xlsx"
+        } else {
+            "full-query.xlsx"
+        };
+        let receiver = cx.prompt_for_new_path(&directory, Some(name));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return Ok::<(), anyhow::Error>(());
+            };
+            let task = this.update(cx, |this, cx| {
+                // Native save dialogs can outlive a database switch, tab close, or new transaction.
+                let session = this.session(session_id)?;
+                if session.busy
+                    || session.current_database != database
+                    || !session
+                        .engine
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &engine))
+                {
+                    return None;
+                }
+                let tab = session.secondary_tabs.iter().find(|tab| tab.id == tab_id)?;
+                match &tab.kind {
+                    SecondaryTabKind::Query(query) if !table => {
+                        if query.busy
+                            || query.in_transaction
+                            || query.watch_interval.is_some()
+                            || *query.query_text.read(cx) != sql
+                        {
+                            return None;
+                        }
+                    }
+                    SecondaryTabKind::Data(data)
+                        if table && target_table.as_ref() == Some(&data.table) => {}
+                    _ => return None,
+                }
+                let session = this.session_mut(session_id)?;
+                session.busy = true;
+                session.request_generation += 1;
+                let generation = session.request_generation;
+                session.status = if table {
+                    "Exporting full table to XLSX · filters and staged edits excluded…"
+                } else {
+                    "Rerunning full query as a fresh read-only XLSX export…"
+                }
+                .into();
+                let scope = if table {
+                    "Full table; UI filters excluded"
+                } else {
+                    "Full query rerun; grid row limit excluded"
+                }
+                .to_owned();
+                let control = this.start_transfer_progress(session_id, generation, cx);
+                let task = this.runtime.spawn(async move {
+                    dbx_core::with_transfer_control(
+                        control.clone(),
+                        crate::result_export::full_xlsx(&engine, &sql, path, scope, control),
+                    )
+                    .await
+                });
+                if let Some(session) = this.session_mut(session_id) {
+                    session.track_background_task(&task);
+                }
+                Some((task, generation))
+            })?;
+            if let Some((task, generation)) = task {
+                // Join failures also release the busy state instead of leaving the session wedged.
+                let result = task
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                this.update(cx, |this, cx| {
+                    let Some(session) = this.session_mut(session_id) else {
+                        return;
+                    };
+                    if session.request_generation != generation {
+                        return;
+                    }
+                    session.busy = false;
+                    session.transfer_control = None;
+                    session.status = match &result {
+                        Ok(rows) => format!("Exported {rows} rows to XLSX"),
+                        Err(error) => format!("XLSX export: {error}"),
+                    };
+                    match result {
+                        Ok(rows) => this.show_toast(
+                            ToastKind::Success,
+                            format!(
+                                "Exported all {rows} {} rows to XLSX; staged edits excluded",
+                                if table {
+                                    "table (filters excluded)"
+                                } else {
+                                    "query"
+                                }
+                            ),
+                            cx,
+                        ),
+                        Err(error) => {
+                            this.show_toast(ToastKind::Error, format!("XLSX export: {error}"), cx)
+                        }
+                    }
+                    cx.notify();
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     /// Copy the marked rows, else the selected cell, row or column, as TSV.
     pub(super) fn copy_data_selection_for(
         &mut self,

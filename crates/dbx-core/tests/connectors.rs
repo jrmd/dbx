@@ -792,3 +792,252 @@ async fn sqlserver_live_sql_metadata_browsing_and_checked_edits() {
         CellValue::Integer(42)
     );
 }
+
+#[tokio::test]
+#[ignore = "requires disposable MongoDB from scripts/test-integration.sh"]
+async fn mongo_structured_edit_preserves_bson_and_rejects_conflicts_and_protected_writes() {
+    use mongodb::bson::{self, Bson, doc};
+    use serde_json::json;
+    let url = std::env::var("DBX_TEST_MONGO_URL")
+        .unwrap_or_else(|_| "mongodb://localhost:57017/dbx_qa".into());
+    let client = mongodb::Client::with_uri_str(&url).await.unwrap();
+    let database = client.default_database().unwrap();
+    let name = format!(
+        "dbx_edit_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let collection = database.collection::<bson::Document>(&name);
+    let id = bson::oid::ObjectId::new();
+    let original = doc! {"_id":id,"z":Bson::Int64(4),"a":doc!{"z":Bson::Decimal128("12.34".parse().unwrap()),"a":Bson::DateTime(bson::DateTime::from_millis(1234))},"bytes":Bson::Binary(bson::Binary { subtype:bson::spec::BinarySubtype::Generic, bytes:vec![0,255,1] })};
+    collection.insert_one(original.clone()).await.unwrap();
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::MongoDB, &url))
+        .await
+        .unwrap();
+    let identity = json!({"$oid":id.to_hex()});
+    let fetched = engine
+        .document_for_edit(&TableRef::new(&name), &identity)
+        .await
+        .unwrap();
+    assert_eq!(
+        bson::Document::try_from(fetched.as_object().unwrap().clone()).unwrap(),
+        original
+    );
+    assert!(fetched.get("absent").is_none());
+    let mut replacement = fetched.clone();
+    replacement["new"] = json!("saved");
+    engine
+        .replace_mongo_document(&name, &fetched, &replacement)
+        .await
+        .unwrap();
+    let saved = collection.find_one(doc! {"_id":id}).await.unwrap().unwrap();
+    assert!(matches!(saved.get("z"), Some(Bson::Int64(4))));
+    assert_eq!(
+        saved.get_document("a").unwrap(),
+        original.get_document("a").unwrap()
+    );
+    assert_eq!(saved.get("bytes"), original.get("bytes"));
+    let fresh = engine
+        .document_for_edit(&TableRef::new(&name), &identity)
+        .await
+        .unwrap();
+    collection
+        .update_one(doc! {"_id":id}, doc! {"$set":{"concurrent":"keep me"}})
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .replace_mongo_document(&name, &fresh, &fresh)
+            .await
+            .is_err(),
+        "new concurrent fields must prevent replacement"
+    );
+    assert_eq!(
+        collection
+            .find_one(doc! {"_id":id})
+            .await
+            .unwrap()
+            .unwrap()
+            .get_str("concurrent")
+            .unwrap(),
+        "keep me"
+    );
+    let mut changed_id = replacement.clone();
+    changed_id["_id"] = json!("different");
+    assert!(
+        engine
+            .replace_mongo_document(&name, &replacement, &changed_id)
+            .await
+            .is_err()
+    );
+    let protected = DatabaseEngine::connect(
+        ConnectionConfig::new(DatabaseKind::MongoDB, &url).with_read_only(true),
+    )
+    .await
+    .unwrap();
+    let protected_doc = protected
+        .document_for_edit(&TableRef::new(&name), &identity)
+        .await
+        .unwrap();
+    assert!(
+        protected
+            .replace_mongo_document(&name, &protected_doc, &protected_doc)
+            .await
+            .is_err()
+    );
+    collection.drop().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis from scripts/test-integration.sh"]
+async fn redis_structured_edit_types_ttl_conflicts_streams_and_protection() {
+    use serde_json::json;
+    let url =
+        std::env::var("DBX_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:56379/0".into());
+    let engine = RedisEngine::connect(ConnectionConfig::new(DatabaseKind::Redis, &url))
+        .await
+        .unwrap();
+    let prefix = format!(
+        "dbx_edit_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let cases = [
+        ("string", vec!["SET", "old"], json!("new")),
+        (
+            "hash",
+            vec!["HSET", "field", "old"],
+            json!([["field", "new"], ["other", "2"]]),
+        ),
+        ("list", vec!["RPUSH", "old"], json!(["new", "next"])),
+        ("set", vec!["SADD", "old"], json!(["new", "next"])),
+        ("zset", vec!["ZADD", "1", "old"], json!([["new", "2.5"]])),
+    ];
+    for (kind, args, value) in cases {
+        let key = format!("{prefix}:{kind}");
+        let mut command = redis::cmd(args[0]);
+        command.arg(&key);
+        for argument in &args[1..] {
+            command.arg(argument);
+        }
+        command
+            .query_async::<redis::Value>(&mut connection)
+            .await
+            .unwrap();
+        redis::cmd("PEXPIRE")
+            .arg(&key)
+            .arg(60000)
+            .query_async::<i64>(&mut connection)
+            .await
+            .unwrap();
+        let snapshot = engine.read_structured(&key).await.unwrap();
+        assert_eq!(snapshot.document["type"], kind);
+        let edit = json!({"type":kind,"value":value});
+        engine.save_structured(&snapshot, &edit).await.unwrap();
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(ttl > 0 && ttl <= 60000, "{kind}: {ttl}");
+        let fresh = engine.read_structured(&key).await.unwrap();
+        let mut malformed = fresh.document.clone();
+        malformed["value"] = json!({"invalid":true});
+        assert!(engine.save_structured(&fresh, &malformed).await.is_err());
+        assert_eq!(
+            engine.read_structured(&key).await.unwrap().document,
+            fresh.document,
+            "malformed edits must not partially mutate {kind}"
+        );
+        redis::cmd("DEL")
+            .arg(&key)
+            .query_async::<i64>(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            engine.save_structured(&fresh, &edit).await.is_err(),
+            "missing keys must not be resurrected"
+        );
+    }
+    let key = format!("{prefix}:conflict");
+    redis::cmd("SET")
+        .arg(&key)
+        .arg("old")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    let snapshot = engine.read_structured(&key).await.unwrap();
+    redis::cmd("SET")
+        .arg(&key)
+        .arg("concurrent")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .save_structured(&snapshot, &json!({"type":"string","value":"new"}))
+            .await
+            .is_err()
+    );
+    let value: String = redis::cmd("GET")
+        .arg(&key)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(value, "concurrent");
+    let protected =
+        RedisEngine::connect(ConnectionConfig::new(DatabaseKind::Redis, &url).with_read_only(true))
+            .await
+            .unwrap();
+    let snapshot = protected.read_structured(&key).await.unwrap();
+    assert!(
+        protected
+            .save_structured(&snapshot, &snapshot.document)
+            .await
+            .is_err()
+    );
+    redis::cmd("DEL")
+        .arg(&key)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap();
+    let stream = format!("{prefix}:stream");
+    let id: String = redis::cmd("XADD")
+        .arg(&stream)
+        .arg("*")
+        .arg("field")
+        .arg("old")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let snapshot = engine.read_structured(&stream).await.unwrap();
+    let mut oversized = snapshot.document.clone();
+    oversized["append"] = json!([[["valid", "first"]], vec![json!(["field", "value"]); 1001]]);
+    assert!(engine.save_structured(&snapshot, &oversized).await.is_err());
+    assert_eq!(
+        engine.read_structured(&stream).await.unwrap().document,
+        snapshot.document,
+        "a malformed second append must not apply the first append"
+    );
+    let mut edit = snapshot.document.clone();
+    edit["append"] = json!([[["field", "new"]]]);
+    edit["delete"] = json!([id]);
+    engine.save_structured(&snapshot, &edit).await.unwrap();
+    let saved = engine.read_structured(&stream).await.unwrap();
+    assert_eq!(saved.document["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        saved.document["entries"][0]["fields"],
+        json!([["field", "new"]])
+    );
+    redis::cmd("DEL")
+        .arg(&stream)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap();
+}

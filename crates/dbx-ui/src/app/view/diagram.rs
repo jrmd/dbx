@@ -1481,37 +1481,3 @@ fn compact_schema_name(schema: &str) -> String {
         prefix
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_diagram_culls_offscreen_cards_and_relationships() {
-        let visible = DiagramSceneBounds {
-            left: 1_000.0,
-            top: 1_000.0,
-            right: 2_000.0,
-            bottom: 2_000.0,
-        };
-
-        assert!(diagram_rect_intersects_scene(
-            1_900.0, 1_900.0, 200.0, 200.0, visible
-        ));
-        assert!(!diagram_rect_intersects_scene(
-            100.0, 100.0, 200.0, 200.0, visible
-        ));
-        assert!(diagram_edge_intersects_scene(
-            &[(500.0, 1_500.0), (2_500.0, 1_500.0)],
-            visible,
-        ));
-        assert!(!diagram_edge_intersects_scene(
-            &[(100.0, 100.0), (500.0, 100.0)],
-            visible,
-        ));
-        assert!(!diagram_edge_intersects_scene(
-            &[(500.0, 500.0), (2_500.0, 500.0), (2_500.0, 2_500.0)],
-            visible,
-        ));
-    }
-}

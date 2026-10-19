@@ -31,6 +31,9 @@ impl QueryCancellation {
         self.flag.store(true, Ordering::SeqCst);
         self.wake.notify_one();
     }
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
     pub(crate) async fn cancelled(&self) {
         while !self.flag.load(Ordering::SeqCst) {
             self.wake.notified().await;
@@ -61,6 +64,7 @@ enum SqlConnection {
 enum CancelTarget {
     Postgres(Arc<sqlx::postgres::PgConnectOptions>, i32),
     MySql(Arc<sqlx::mysql::MySqlConnectOptions>, u64),
+    Cockroach(Arc<sqlx::postgres::PgConnectOptions>, String),
     Local,
 }
 impl CancelTarget {
@@ -74,6 +78,12 @@ impl CancelTarget {
                         .fetch_one(&mut control)
                         .await?;
                     Ok(stopped)
+                }
+                Self::Cockroach(options, id) => {
+                    let mut control = sqlx::PgConnection::connect_with(options).await?;
+                    sqlx::query("CANCEL QUERIES SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE session_id = $1")
+                        .bind(id).execute(&mut control).await?;
+                    Ok(true)
                 }
                 Self::MySql(options, id) => {
                     let mut control = sqlx::MySqlConnection::connect_with(options).await?;
@@ -112,6 +122,158 @@ pub struct QuerySession {
     state: Mutex<SessionState>,
 }
 impl QuerySession {
+    /// Whether this native driver provides an isolated read-only session.
+    /// Private in-memory SQLite databases are rejected when opening the session.
+    pub fn supports_isolated_reads(engine: &DatabaseEngine) -> bool {
+        matches!(engine, DatabaseEngine::Sql(_))
+            && matches!(
+                engine.kind(),
+                DatabaseKind::PostgreSQL
+                    | DatabaseKind::MySQL
+                    | DatabaseKind::SQLite
+                    | DatabaseKind::CockroachDB
+            )
+    }
+
+    /// Execute a read plan on a separate connection in a read-only transaction
+    /// followed by ROLLBACK. Error/cancel closes that connection, never the tab's.
+    pub async fn explain_analyze(
+        engine: Arc<DatabaseEngine>,
+        sql: &str,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryResult> {
+        let command = crate::diagnostics::execution_plan_analyze_query(engine.kind(), sql)?;
+        Self::run_isolated_read(engine, &command, options, timeout, cancellation).await
+    }
+
+    /// Repeated watches use a fresh server-enforced read-only transaction for
+    /// each sample, independently of query-tab transaction state.
+    pub async fn read_only_query(
+        engine: Arc<DatabaseEngine>,
+        sql: &str,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryResult> {
+        crate::diagnostics::execution_plan_query(engine.kind(), sql)?;
+        Self::run_isolated_read(engine, sql, options, timeout, cancellation).await
+    }
+
+    async fn run_isolated_read(
+        engine: Arc<DatabaseEngine>,
+        command: &str,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryResult> {
+        if !Self::supports_isolated_reads(&engine) {
+            return Err(DbxError::Unsupported {
+                operation: "isolated native read-only transaction".into(),
+                kind: engine.kind(),
+            });
+        }
+        let started = Instant::now();
+        let kind = engine.kind();
+        let mut isolated = Self::new(engine.clone());
+        let mut command = command.to_string();
+        if kind == DatabaseKind::MySQL && command.starts_with("EXPLAIN ANALYZE FORMAT=TREE ") {
+            // MariaDB uses ANALYZE FORMAT=JSON instead of MySQL's EXPLAIN
+            // ANALYZE. Detect on this isolated socket, inside the same deadline;
+            // never probe by executing the user's query or relaxing READ ONLY.
+            let open = async {
+                let DatabaseEngine::Sql(native) = &*engine else {
+                    unreachable!()
+                };
+                let SqlxPool::MySql(pool) = native.pool_snapshot().await? else {
+                    unreachable!()
+                };
+                let mut connection =
+                    sqlx::MySqlConnection::connect_with(&pool.connect_options()).await?;
+                let version: String = sqlx::query_scalar("SELECT VERSION()")
+                    .fetch_one(&mut connection)
+                    .await?;
+                Ok::<_, DbxError>((connection, version.to_ascii_lowercase().contains("mariadb")))
+            };
+            let (connection, mariadb) = tokio::select! {
+                result = tokio::time::timeout(timeout, open) => result.map_err(|_| DbxError::Interrupted("Analysis initialization timed out".into()))??,
+                _ = cancellation.cancelled() => return Err(DbxError::Interrupted("Analysis initialization cancelled".into())),
+            };
+            if mariadb {
+                command = format!(
+                    "ANALYZE FORMAT=JSON {}",
+                    command
+                        .strip_prefix("EXPLAIN ANALYZE FORMAT=TREE ")
+                        .unwrap()
+                );
+            }
+            isolated.state.get_mut().connection = Some(SqlConnection::MySql(connection));
+        }
+        if kind == DatabaseKind::SQLite {
+            // Do not acquire/detach a pooled handle: a tab may own it and its
+            // PRAGMAs/transaction must survive cancellation. A private :memory:
+            // database cannot be reopened as an independent committed snapshot.
+            let open = async {
+                let DatabaseEngine::Sql(native) = &*engine else {
+                    unreachable!()
+                };
+                let SqlxPool::SQLite(pool) = native.pool_snapshot().await? else {
+                    unreachable!()
+                };
+                let options = (*pool.connect_options())
+                    .clone()
+                    .read_only(true)
+                    .create_if_missing(false)
+                    .pragma("query_only", "ON");
+                let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+                let databases: Vec<(i64, String, String)> = sqlx::query_as("PRAGMA database_list")
+                    .fetch_all(&mut connection)
+                    .await?;
+                if databases.first().is_none_or(|(_, _, path)| path.is_empty()) {
+                    return Err(DbxError::Unsupported {
+                        operation: "isolated reads require a file-backed SQLite database".into(),
+                        kind,
+                    });
+                }
+                Ok::<_, DbxError>(connection)
+            };
+            let connection = tokio::select! {
+                result = tokio::time::timeout(timeout, open) => result.map_err(|_| DbxError::Interrupted("Isolated read initialization timed out".into()))??,
+                _ = cancellation.cancelled() => return Err(DbxError::Interrupted("Isolated read initialization cancelled".into())),
+            };
+            isolated.state.get_mut().connection = Some(SqlConnection::SQLite(connection));
+        }
+        let begin = if kind == DatabaseKind::MySQL {
+            "START TRANSACTION READ ONLY"
+        } else if kind == DatabaseKind::SQLite {
+            "BEGIN"
+        } else {
+            "BEGIN READ ONLY"
+        };
+        let script = isolated
+            .run(
+                &format!("{begin};\n{command}\n;\nROLLBACK;"),
+                options,
+                timeout.saturating_sub(started.elapsed()),
+                cancellation,
+            )
+            .await?;
+        if let Some(error) = script
+            .statements
+            .iter()
+            .find_map(|statement| statement.error.as_ref())
+        {
+            return Err(DbxError::Query(error.clone()));
+        }
+        script
+            .statements
+            .into_iter()
+            .nth(1)
+            .map(|statement| statement.result)
+            .ok_or_else(|| DbxError::Query("Isolated read returned no result".into()))
+    }
+
     pub fn new(engine: Arc<DatabaseEngine>) -> Self {
         Self {
             engine,
@@ -334,6 +496,7 @@ async fn prepare_session(
         cancel_target(
             state.connection.as_mut().unwrap(),
             engine.pool_snapshot().await?,
+            engine.kind(),
         )
         .await?
     } else {
@@ -373,8 +536,22 @@ async fn open_connection(pool: SqlxPool) -> Result<SqlConnection> {
         }
     })
 }
-async fn cancel_target(connection: &mut SqlConnection, pool: SqlxPool) -> Result<CancelTarget> {
+async fn cancel_target(
+    connection: &mut SqlConnection,
+    pool: SqlxPool,
+    kind: DatabaseKind,
+) -> Result<CancelTarget> {
     Ok(match (connection, pool) {
+        (SqlConnection::Postgres(connection), SqlxPool::Postgres(pool))
+            if kind == DatabaseKind::CockroachDB =>
+        {
+            CancelTarget::Cockroach(
+                pool.connect_options(),
+                sqlx::query_scalar("SHOW session_id")
+                    .fetch_one(connection)
+                    .await?,
+            )
+        }
         (SqlConnection::Postgres(connection), SqlxPool::Postgres(pool)) => CancelTarget::Postgres(
             pool.connect_options(),
             sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -975,5 +1152,53 @@ impl SqlTransaction {
         self.query(&SqlStatement::new("COMMIT", Vec::new())).await?;
         self.connection.take();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod isolated_read_tests {
+    use super::*;
+    #[tokio::test]
+    async fn sqlite_enforces_readonly_beyond_statement_classifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            DatabaseEngine::connect(crate::ConnectionConfig::new(
+                DatabaseKind::SQLite,
+                format!(
+                    "sqlite://{}?mode=rwc",
+                    directory.path().join("readonly.sqlite").display()
+                ),
+            ))
+            .await
+            .unwrap(),
+        );
+        engine
+            .execute_sql("CREATE TABLE guarded(id INTEGER)")
+            .await
+            .unwrap();
+        let error = QuerySession::run_isolated_read(
+            engine.clone(),
+            "INSERT INTO guarded VALUES(1)",
+            QueryOptions::default(),
+            Duration::from_secs(10),
+            QueryCancellation::default(),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .to_ascii_lowercase();
+        assert!(
+            error.contains("readonly") || error.contains("read-only"),
+            "{error}"
+        );
+        engine
+            .execute_sql("INSERT INTO guarded VALUES(2)")
+            .await
+            .unwrap();
+        let rows = engine
+            .query("SELECT id FROM guarded", QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0].values[0], CellValue::Integer(2));
     }
 }

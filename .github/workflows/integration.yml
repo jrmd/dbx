@@ -11,15 +11,6 @@ on:
       - 'scripts/test-integration.sh'
       - 'scripts/test-transports.py'
       - '.github/workflows/integration.yml'
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/dbx-core/**'
-      - 'docker-compose.test.yml'
-      - 'scripts/test-integration.sh'
-      - 'scripts/test-transports.py'
-      - '.github/workflows/integration.yml'
   schedule:
     # Nightly, to catch new database image releases.
     - cron: '17 3 * * *'

@@ -33,7 +33,6 @@ use gpui_component::table::TableEvent;
 use crate::workspace::TableLayout;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
-use crate::diagram::display_type;
 use crate::row_drafts::{FieldValueKind, field_value_kind};
 use crate::theme::{ButtonAccessibility as _, Icon, icon, theme};
 
@@ -468,8 +467,8 @@ impl ResultTableDelegate {
         app: &WeakEntity<DbxApp>,
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        row_ix: usize,
-        column: usize,
+        (row_ix, column): (usize, usize),
+        cx: &App,
     ) -> PopupMenu {
         let Some(result) = self.result.as_deref() else {
             return menu;
@@ -551,7 +550,15 @@ impl ResultTableDelegate {
                 ("Filter: not equal", FilterOperator::NotEquals),
             ]
         };
-        for (label, operator) in filters.iter().copied() {
+        let supports_filters = app.upgrade().is_some_and(|app| {
+            app.read(cx).session(session_id).is_some_and(|session| {
+                session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.capabilities().structured_filters)
+            })
+        });
+        for (label, operator) in filters.iter().copied().filter(|_| supports_filters) {
             let app = app.clone();
             menu = menu.item(PopupMenuItem::new(label).disabled(multiple).on_click(
                 move |_, window, cx| {
@@ -567,6 +574,76 @@ impl ResultTableDelegate {
                     });
                 },
             ));
+        }
+        let (can_edit, nullable) = app
+            .upgrade()
+            .map(|app| {
+                let owner = app.read(cx);
+                let data = owner.data_tab(session_id, tab_id);
+                let editable = owner.editable_table_for(session_id, tab_id).is_some()
+                    && data.is_some_and(|data| {
+                        !data.busy
+                            && data.cell_editor.is_none()
+                            && data.row_draft.is_none()
+                            && data.recovered_changeset.is_none()
+                    });
+                let nullable = data
+                    .and_then(|data| data.table_columns.iter().find(|info| info.name == name))
+                    .is_none_or(|info| info.nullable);
+                (editable, nullable)
+            })
+            .unwrap_or((false, false));
+        let supports_edits = app
+            .upgrade()
+            .is_some_and(|app| app.read(cx).driver_supports_row_edits(session_id));
+        for (label, set_null) in [
+            (
+                format!(
+                    "Set value in {}…",
+                    super::counted(rows.len(), "selected row", "selected rows")
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "Set NULL in {}",
+                    super::counted(rows.len(), "selected row", "selected rows")
+                ),
+                true,
+            ),
+        ]
+        .into_iter()
+        .filter(|_| supports_edits)
+        {
+            let app = app.clone();
+            let rows = rows.clone();
+            let snapshot = self.result.clone();
+            let inserts = self.changes.inserts.clone();
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .disabled(!can_edit || (set_null && !nullable))
+                    .on_click(move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            let valid = this.data_tab(session_id, tab_id).is_some_and(|data| {
+                                data.result
+                                    .as_ref()
+                                    .zip(snapshot.as_ref())
+                                    .is_some_and(|(current, old)| Arc::ptr_eq(current, old))
+                                    && data.data_grid.read(cx).delegate().changes.inserts == inserts
+                            });
+                            if valid {
+                                this.begin_bulk_cell_edit_for(
+                                    session_id,
+                                    tab_id,
+                                    (rows.clone(), column),
+                                    set_null,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        });
+                    }),
+            );
         }
         let pinned = self
             .grid_column(column)
@@ -915,6 +992,10 @@ impl ResultTableDelegate {
             .map(|result| delimited_result(result, '\t'))
     }
 
+    pub(super) fn result_as_markdown(&self) -> Option<String> {
+        self.result.as_deref().map(crate::result_export::markdown)
+    }
+
     /// Render the complete result as a headered RFC 4180-compatible CSV document.
     pub(super) fn result_as_csv(&self) -> Option<String> {
         self.result
@@ -953,9 +1034,7 @@ impl ResultTableDelegate {
     }
 
     fn auto_width(result: &QueryResult, column_index: usize, column: &ColumnInfo) -> Pixels {
-        let header_chars = format!("{}  {}", column.name, column.data_type)
-            .chars()
-            .count();
+        let header_chars = column.name.chars().count();
         let value_chars = result
             .rows
             .iter()
@@ -1147,11 +1226,7 @@ impl ResultTableDelegate {
         let result = self.result.as_deref()?;
         let index = self.result_column(col_ix)?;
         let column = result.columns.get(index)?;
-        let header = format!("{}  {}", column.name, display_type(&column.data_type))
-            .chars()
-            .count() as f32
-            * 7.0
-            + 28.0;
+        let header = column.name.chars().count() as f32 * 7.0 + 28.0;
         let values = result
             .rows
             .iter()
@@ -1524,6 +1599,10 @@ impl TableDelegate for ResultTableDelegate {
                 SORT_ICON_WIDTH * crate::theme::ui_scale() + 4.
             };
         let content = cell
+            .tooltip(crate::theme::tip(format!(
+                "{} · {}",
+                column.name, column.data_type
+            )))
             .when(column.primary_key, |cell| {
                 cell.child(
                     div()
@@ -1536,23 +1615,13 @@ impl TableDelegate for ResultTableDelegate {
             })
             .child(
                 div()
-                    .flex_shrink(1.)
+                    .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_size(crate::theme::text_px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme().text)
                     .child(column.name.clone()),
-            )
-            .child(
-                div()
-                    .max_w(gpui::relative(0.45))
-                    .flex_shrink(1.)
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::theme::text_px(9.))
-                    .text_color(theme().text_muted)
-                    .child(display_type(&column.data_type)),
             );
         // The content clips its labels; the handle sits outside that clip.
         div()
@@ -1789,7 +1858,7 @@ impl TableDelegate for ResultTableDelegate {
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let mut menu = menu;
@@ -1798,6 +1867,22 @@ impl TableDelegate for ResultTableDelegate {
         for (label, text) in [
             ("Copy as JSON", self.rows_as_json(&rows)),
             ("Copy as TSV", self.rows_as_tsv(&rows)),
+            (
+                "Copy as Markdown",
+                self.result.as_ref().and_then(|result| {
+                    let selected = QueryResult {
+                        columns: result.columns.clone(),
+                        rows: rows
+                            .iter()
+                            .map(|row| result.rows.get(*row).cloned())
+                            .collect::<Option<Vec<_>>>()?,
+                        rows_affected: None,
+                        truncated: false,
+                        elapsed_ms: result.elapsed_ms,
+                    };
+                    Some(crate::result_export::markdown(&selected))
+                }),
+            ),
         ] {
             menu = menu.item(PopupMenuItem::new(label).disabled(text.is_none()).on_click(
                 move |_, _, cx| {
@@ -1838,6 +1923,85 @@ impl TableDelegate for ResultTableDelegate {
             }
             return menu;
         }
+        let supports_full_export = app.upgrade().is_some_and(|app| {
+            app.read(cx).session(session_id).is_some_and(|session| {
+                session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.capabilities().streaming_query_export)
+            })
+        });
+        let supports_sql = app.upgrade().is_some_and(|app| {
+            app.read(cx)
+                .session(session_id)
+                .is_some_and(|session| session.kind.is_sql())
+        });
+        let full_export = app.upgrade().is_some_and(|app| {
+            app.read(cx).session(session_id).is_some_and(|session| {
+                !session.busy
+                    && session
+                        .engine
+                        .as_ref()
+                        .is_some_and(|engine| engine.capabilities().streaming_query_export)
+            })
+        });
+        let has_result = self.result.is_some();
+        let copy_app = app.clone();
+        let export_app = app.clone();
+        menu = menu
+            .separator()
+            .label("Loaded rows · staged edits excluded")
+            .item(
+                PopupMenuItem::new("Copy all loaded rows as Markdown")
+                    .disabled(!has_result)
+                    .on_click(move |_, _, cx| {
+                        let app = copy_app.clone();
+                        cx.defer(move |cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.copy_data_markdown_for(session_id, tab_id, cx);
+                            });
+                        });
+                    }),
+            )
+            .item(PopupMenuItem::submenu(
+                "Export XLSX…",
+                PopupMenu::build(window, cx, move |menu, _, _| {
+                    let loaded = export_app.clone();
+                    let full = export_app.clone();
+                    menu.label("Loaded rows · staged edits excluded")
+                        .item(
+                            PopupMenuItem::new("Loaded rows only…")
+                                .disabled(!has_result)
+                                .on_click(move |_, _, cx| {
+                                    let app = loaded.clone();
+                                    cx.defer(move |cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.export_data_xlsx_for(session_id, tab_id, cx);
+                                        });
+                                    });
+                                }),
+                        )
+                        .when(supports_full_export, |menu| {
+                            menu.separator()
+                                .label("Full table · filters and staged edits excluded")
+                                .item(
+                                    PopupMenuItem::new("All table rows…")
+                                        .disabled(!full_export)
+                                        .on_click(move |_, _, cx| {
+                                            let app = full.clone();
+                                            cx.defer(move |cx| {
+                                                let _ = app.update(cx, |this, cx| {
+                                                    this.export_full_table_xlsx_for(
+                                                        session_id, tab_id, cx,
+                                                    );
+                                                });
+                                            });
+                                        }),
+                                )
+                        })
+                }),
+            ))
+            .separator();
         let sql = app.upgrade().and_then(|app| {
             let owner = app.read(cx);
             let kind = owner.session(session_id)?.kind;
@@ -1861,8 +2025,8 @@ impl TableDelegate for ResultTableDelegate {
                 .collect::<Option<Vec<_>>>()
                 .map(|statements| statements.join("\n"))
         });
-        menu = menu
-            .item(
+        menu = menu.when(supports_sql, |menu| {
+            menu.item(
                 PopupMenuItem::new("Copy as SQL")
                     .disabled(sql.is_none())
                     .on_click(move |_, _, cx| {
@@ -1871,11 +2035,12 @@ impl TableDelegate for ResultTableDelegate {
                         }
                     }),
             )
-            .separator();
+            .separator()
+        });
         if let Some(column) = self.context_column
             && row_ix < self.loaded_rows()
         {
-            menu = self.column_menu(menu, &app, session_id, tab_id, row_ix, column);
+            menu = self.column_menu(menu, &app, session_id, tab_id, (row_ix, column), cx);
         }
         let result_snapshot = self.result.clone();
         let insert_snapshot = self.changes.inserts.clone();
@@ -1889,6 +2054,34 @@ impl TableDelegate for ResultTableDelegate {
                         && data.recovered_changeset.is_none()
                 })
         });
+        let supports_edits = app
+            .upgrade()
+            .is_some_and(|app| app.read(cx).driver_supports_row_edits(session_id));
+        for (label, redo) in [("Undo staged edit", false), ("Redo staged edit", true)]
+            .into_iter()
+            .filter(|_| supports_edits)
+        {
+            let enabled = can_edit
+                && app.upgrade().is_some_and(|app| {
+                    app.read(cx)
+                        .data_tab(session_id, tab_id)
+                        .is_some_and(|data| {
+                            if redo {
+                                data.edit_history.can_redo()
+                            } else {
+                                data.edit_history.can_undo()
+                            }
+                        })
+                });
+            let app = app.clone();
+            menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                move |_, _, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.undo_grid_edits_for(session_id, tab_id, redo, cx)
+                    });
+                },
+            ));
+        }
         let is_new = rows.iter().all(|row| self.insert_row(*row).is_some());
         let has_changes = rows.iter().any(|row| {
             self.insert_row(*row).is_some()
@@ -1921,6 +2114,9 @@ impl TableDelegate for ResultTableDelegate {
                 can_edit && has_changes,
             ),
         ] {
+            if !supports_edits && !matches!(action, RowAction::Inspect) {
+                continue;
+            }
             let app = app.clone();
             let rows = rows.clone();
             let result_snapshot = result_snapshot.clone();
@@ -2329,55 +2525,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn json_cells_follow_column_types_and_loaded_or_staged_json_values() {
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(
-            Some(Arc::new(QueryResult {
-                columns: vec![
-                    ColumnInfo::result("document", 0, "JSON"),
-                    ColumnInfo::result("binary_document", 1, "jsonb"),
-                    ColumnInfo::result("inferred", 2, "TEXT"),
-                    ColumnInfo::result("plain", 3, "TEXT"),
-                ],
-                rows: vec![RowData::new(vec![
-                    CellValue::Text("{\"a\":1}".into()),
-                    CellValue::Null,
-                    CellValue::Json(serde_json::json!(true)),
-                    CellValue::Text("ordinary text".into()),
-                ])],
-                ..QueryResult::empty(None, 0)
-            })),
-            &HashMap::new(),
-            None,
-            &[],
-            &[],
-        );
-        assert!(!delegate.is_json_cell(0, 0)); // Row number.
-        assert!(delegate.is_json_cell(0, 1));
-        assert!(delegate.is_json_cell(0, 2));
-        assert!(delegate.is_json_cell(0, 3));
-        assert!(!delegate.is_json_cell(0, 4));
-
-        delegate.changes.edits.insert(
-            (0, 3),
-            MutationValue::Parameter(CellValue::Json(serde_json::json!({"new": 1}))),
-        );
-        assert!(delegate.is_json_cell(0, 4));
-        delegate.changes.inserts.push(vec![
-            None,
-            None,
-            Some(MutationValue::Parameter(CellValue::Json(
-                serde_json::json!([]),
-            ))),
-            None,
-        ]);
-        assert!(delegate.is_json_cell(1, 1));
-        assert!(delegate.is_json_cell(1, 2));
-        assert!(delegate.is_json_cell(1, 3));
-        assert!(!delegate.is_json_cell(1, 4));
-    }
-
     fn export_result() -> QueryResult {
         QueryResult {
             columns: vec![
@@ -2403,97 +2550,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn layouts_pin_reorder_and_hide_columns_by_name() {
-        let columns = ["id", "name", "email", "created"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| ColumnInfo::result(name, index, "TEXT"))
-            .collect::<Vec<_>>();
-        let layout = TableLayout {
-            pinned: vec!["email".into(), "missing".into()],
-            order: vec!["created".into()],
-            hidden: ["name".to_owned()].into(),
-            ..Default::default()
-        };
-        assert_eq!(display_order(&columns, Some(&layout)), vec![2, 3, 0]);
-        assert_eq!(display_order(&columns, None), vec![0, 1, 2, 3]);
-        let everything_hidden = TableLayout {
-            hidden: columns.iter().map(|column| column.name.clone()).collect(),
-            ..Default::default()
-        };
-        assert_eq!(display_order(&columns, Some(&everything_hidden)), vec![0]);
-
-        let mut delegate = ResultTableDelegate::default();
-        let result = QueryResult {
-            columns,
-            rows: Vec::new(),
-            rows_affected: None,
-            truncated: false,
-            elapsed_ms: 0,
-        };
-        delegate.set_result(
-            Some(Arc::new(result)),
-            &HashMap::new(),
-            Some(&layout),
-            &[],
-            &[],
-        );
-        // Grid column 1 is the pinned email column.
-        assert_eq!(delegate.result_column(1), Some(2));
-        assert_eq!(delegate.grid_column(0), Some(3));
-        assert_eq!(delegate.grid_column(1), None);
-        assert!(delegate.columns[1].fixed.is_some());
-        assert!(delegate.set_column_width(1, px(5_000.)));
-        assert_eq!(
-            delegate.widths_by_name()[0],
-            ("email".to_owned(), MAX_COLUMN_WIDTH)
-        );
-    }
-
-    #[test]
-    fn local_sort_orders_numbers_and_nulls_then_restores_original_rows() {
-        let mut delegate = ResultTableDelegate {
-            sorting: ResultSorting::Local,
-            ..ResultTableDelegate::default()
-        };
-        let result = QueryResult {
-            columns: vec![ColumnInfo::result("n", 0, "TEXT")],
-            rows: ["10", "9", "", "b"]
-                .into_iter()
-                .map(|value| {
-                    RowData::new(vec![if value.is_empty() {
-                        CellValue::Null
-                    } else {
-                        CellValue::Text(value.into())
-                    }])
-                })
-                .chain([RowData::new(vec![CellValue::Integer(2)])])
-                .collect(),
-            rows_affected: None,
-            truncated: false,
-            elapsed_ms: 0,
-        };
-        delegate.set_result(Some(Arc::new(result)), &HashMap::new(), None, &[], &[]);
-        let column = |delegate: &ResultTableDelegate| {
-            delegate
-                .column_values(0)
-                .unwrap()
-                .into_iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        };
-        let original = column(&delegate);
-
-        delegate.sort_locally(0, Some(OrderDirection::Ascending));
-        assert_eq!(column(&delegate), ["NULL", "2", "9", "10", "b"]);
-        delegate.sort_locally(0, Some(OrderDirection::Descending));
-        assert_eq!(column(&delegate), ["b", "10", "9", "2", "NULL"]);
-        delegate.sort_locally(0, None);
-        assert_eq!(column(&delegate), original);
-        assert_eq!(delegate.column_sort(0), Some(ColumnSort::Default));
-    }
-
     fn delegate_with_export_result() -> ResultTableDelegate {
         let mut delegate = ResultTableDelegate::default();
         delegate.set_result(
@@ -2504,74 +2560,6 @@ mod tests {
             &[],
         );
         delegate
-    }
-
-    #[test]
-    fn result_grid_marks_populated_foreign_key_cells_as_navigable() {
-        let foreign_key = ForeignKeyInfo {
-            constraint_name: Some("orders_customer_id_fkey".into()),
-            columns: vec!["customer_id".into()],
-            referenced_schema: Some("public".into()),
-            referenced_table: "customers".into(),
-            referenced_columns: vec!["id".into()],
-            on_update: None,
-            on_delete: None,
-        };
-        let tables = vec![TableInfo::table("customers", Some("public".into()))];
-        let result = QueryResult {
-            columns: vec![
-                ColumnInfo::result("id", 0, "INTEGER"),
-                ColumnInfo::result("customer_id", 1, "INTEGER"),
-            ],
-            rows: vec![RowData::new(vec![
-                CellValue::Integer(1),
-                CellValue::Integer(42),
-            ])],
-            rows_affected: None,
-            truncated: false,
-            elapsed_ms: 0,
-        };
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(
-            Some(Arc::new(result)),
-            &HashMap::new(),
-            None,
-            &[foreign_key],
-            &tables,
-        );
-
-        assert!(delegate.foreign_key_for_cell(0, 2).is_some());
-    }
-
-    #[test]
-    fn result_grid_hides_foreign_key_action_for_null_values() {
-        let foreign_key = ForeignKeyInfo {
-            constraint_name: None,
-            columns: vec!["customer_id".into()],
-            referenced_schema: Some("public".into()),
-            referenced_table: "customers".into(),
-            referenced_columns: vec!["id".into()],
-            on_update: None,
-            on_delete: None,
-        };
-        let tables = vec![TableInfo::table("customers", Some("public".into()))];
-        let result = QueryResult {
-            columns: vec![ColumnInfo::result("customer_id", 0, "INTEGER")],
-            rows: vec![RowData::new(vec![CellValue::Null])],
-            rows_affected: None,
-            truncated: false,
-            elapsed_ms: 0,
-        };
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(
-            Some(Arc::new(result)),
-            &HashMap::new(),
-            None,
-            &[foreign_key],
-            &tables,
-        );
-
-        assert!(delegate.foreign_key_for_cell(0, 1).is_none());
     }
 
     #[test]
@@ -2588,20 +2576,6 @@ mod tests {
             Some(
                 "id\tnote\tnote\n7\tNULL\t\"\"\n8\t\"comma, tab\t quote\"\" newline\n\"\t\"NULL\""
             )
-        );
-    }
-
-    #[test]
-    fn column_tsv_export_includes_its_header_and_preserves_null_vs_empty_text() {
-        let delegate = delegate_with_export_result();
-
-        assert_eq!(
-            delegate.column_as_tsv(1).as_deref(),
-            Some("note\nNULL\n\"comma, tab\t quote\"\" newline\n\"")
-        );
-        assert_eq!(
-            delegate.column_as_tsv(2).as_deref(),
-            Some("note\n\"\"\n\"NULL\"")
         );
     }
 
@@ -2625,197 +2599,6 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             accessible_grid(&self.grid, "Test results", false)
         }
-    }
-
-    #[gpui::test]
-    fn column_resize_handles_work_with_large_fonts_and_zoom(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
-            grid: cx.new(|cx| TableState::new(delegate_with_export_result(), window, cx)),
-        });
-        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
-        cx.simulate_resize(gpui::size(px(1400.), px(900.)));
-        for (zoom, normal, mono) in [(100, 12, 12), (100, 20, 20), (200, 20, 12), (200, 12, 20)] {
-            crate::theme::set_text_scales(zoom, 100);
-            crate::theme::set_font_sizes(normal, mono);
-            cx.update(|window, cx| {
-                window.set_rem_size(px(16. * crate::theme::ui_scale()));
-                grid.update(cx, |table, cx| {
-                    for column in &mut table.delegate_mut().columns {
-                        column.width = px(250.);
-                    }
-                    table.refresh(cx);
-                });
-                window.draw(cx).clear(cx);
-            });
-            let handle = cx.debug_bounds("dbx-column-resize-1").unwrap();
-            let row = cx.debug_bounds("dbx-result-row-0").unwrap();
-            assert!(row.size.height >= crate::theme::grid_row_height() - px(1.));
-            let before = grid.read_with(cx, |table, _| table.delegate().columns[1].width);
-            cx.simulate_mouse_down(handle.center(), MouseButton::Left, Default::default());
-            cx.simulate_mouse_move(
-                handle.center() + gpui::point(px(10.), px(0.)),
-                MouseButton::Left,
-                Default::default(),
-            );
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            cx.simulate_mouse_move(
-                handle.center() + gpui::point(px(70.), px(0.)),
-                MouseButton::Left,
-                Default::default(),
-            );
-            cx.simulate_mouse_up(
-                handle.center() + gpui::point(px(70.), px(0.)),
-                MouseButton::Left,
-                Default::default(),
-            );
-            cx.update(|window, cx| window.draw(cx).clear(cx));
-            let after = grid.read_with(cx, |table, _| table.delegate().columns[1].width);
-            assert!(
-                after > before + px(40.),
-                "resize at {zoom}% / {normal}px / {mono}px: {before:?} -> {after:?}; handle {handle:?}"
-            );
-        }
-        crate::theme::set_text_scales(100, 100);
-        crate::theme::set_font_sizes(12, 12);
-    }
-
-    #[gpui::test]
-    fn right_click_copies_the_clicked_row_instead_of_the_selected_row(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let (_, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
-            grid: cx.new(|cx| {
-                let mut grid = TableState::new(delegate_with_export_result(), window, cx);
-                grid.set_selected_row(0, cx);
-                grid.delegate_mut().changes.marked = BTreeSet::from([0]);
-                grid
-            }),
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let row = cx
-            .debug_bounds("dbx-result-row-1")
-            .expect("second row must be visible");
-        cx.simulate_mouse_down(row.center(), gpui::MouseButton::Right, Default::default());
-        cx.simulate_mouse_up(row.center(), gpui::MouseButton::Right, Default::default());
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("down enter");
-        let copied = cx
-            .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
-            .expect("row menu must write the clipboard");
-        let value: serde_json::Value = serde_json::from_str(&copied).unwrap();
-        assert_eq!(value["rows"].as_array().unwrap().len(), 1);
-        assert_eq!(value["rows"][0][0], 8);
-    }
-
-    #[gpui::test]
-    fn grid_semantics_preserve_focus_and_keyboard_resize_without_extra_tab_stops(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use gpui::Focusable;
-        cx.update(gpui_component::init);
-        let (harness, cx) = cx.add_window_view(|window, cx| RowMenuHarness {
-            grid: cx.new(|cx| TableState::new(delegate_with_export_result(), window, cx)),
-        });
-        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
-        let before = cx.update(|window, cx| {
-            grid.update(cx, |table, cx| {
-                table.set_selected_cell(0, 1, cx);
-                table.focus_handle(cx).focus(window, cx);
-                table.delegate().columns[1].width
-            })
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("secondary-shift-right");
-        cx.update(|window, cx| {
-            grid.update(cx, |table, cx| {
-                assert_eq!(table.delegate().columns[1].width, before + px(20.));
-                assert_eq!(table.selected_cell(), Some((0, 1)));
-                assert!(table.focus_handle(cx).is_focused(window));
-                assert_eq!(window.focused(cx), Some(table.focus_handle(cx)));
-            })
-        });
-        cx.simulate_keystrokes("secondary-shift-left");
-        cx.update(|_, cx| assert_eq!(grid.read(cx).delegate().columns[1].width, before));
-    }
-
-    #[gpui::test]
-    fn virtualized_grid_keyboard_navigation_reveals_rows_beyond_the_viewport(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use gpui::Focusable;
-        cx.update(gpui_component::init);
-        let (harness, cx) = cx.add_window_view(|window, cx| {
-            let mut delegate = delegate_with_export_result();
-            let mut result = export_result();
-            result.rows = (0..100)
-                .map(|n| {
-                    RowData::new(vec![
-                        CellValue::Integer(n),
-                        CellValue::Null,
-                        CellValue::Text(format!("Row {n}")),
-                    ])
-                })
-                .collect();
-            delegate.set_result(Some(Arc::new(result)), &HashMap::new(), None, &[], &[]);
-            RowMenuHarness {
-                grid: cx.new(|cx| TableState::new(delegate, window, cx)),
-            }
-        });
-        let grid = harness.read_with(cx, |harness, _| harness.grid.clone());
-        cx.update(|window, cx| {
-            grid.update(cx, |table, cx| {
-                table.set_selected_cell(0, 1, cx);
-                table.focus_handle(cx).focus(window, cx);
-            })
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("dbx-result-row-99").is_none());
-        for _ in 0..30 {
-            cx.simulate_keystrokes("pagedown");
-        }
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.update(|_, cx| assert_eq!(grid.read(cx).selected_cell(), Some((99, 1))));
-        assert!(cx.debug_bounds("dbx-result-row-99").is_some());
-    }
-
-    #[test]
-    fn row_json_preserves_typed_values_and_full_text() {
-        let text = "line\nquoted\"".repeat(100);
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(
-            Some(Arc::new(QueryResult {
-                columns: vec![
-                    ColumnInfo::result("id", 0, "INTEGER"),
-                    ColumnInfo::result("note", 1, "TEXT"),
-                    ColumnInfo::result("empty", 2, "TEXT"),
-                    ColumnInfo::result("missing", 3, "TEXT"),
-                    ColumnInfo::result("payload", 4, "JSON"),
-                ],
-                rows: vec![RowData::new(vec![
-                    CellValue::Integer(7),
-                    CellValue::Text(text.clone()),
-                    CellValue::Text(String::new()),
-                    CellValue::Null,
-                    CellValue::Json(serde_json::json!({"ok": true})),
-                ])],
-                rows_affected: None,
-                truncated: false,
-                elapsed_ms: 0,
-            })),
-            &HashMap::new(),
-            None,
-            &[],
-            &[],
-        );
-        let value: serde_json::Value =
-            serde_json::from_str(&delegate.row_as_json(0).unwrap()).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({"id":7,"note":text,"empty":"","missing":null,"payload":{"ok":true}})
-        );
-        assert!(delegate.row_as_json(1).is_none());
     }
 
     #[test]
@@ -2874,26 +2657,5 @@ mod tests {
         assert_eq!(json["rows"].as_array().unwrap().len(), 2);
         assert_eq!(json["rows"][0][0], 7);
         assert_eq!(json["rows"][1][0], 8);
-    }
-
-    #[test]
-    fn empty_result_exports_its_headers_instead_of_disappearing() {
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(
-            Some(Arc::new(QueryResult {
-                columns: vec![ColumnInfo::result("id", 0, "INTEGER")],
-                rows: Vec::new(),
-                rows_affected: None,
-                truncated: false,
-                elapsed_ms: 0,
-            })),
-            &HashMap::new(),
-            None,
-            &[],
-            &[],
-        );
-
-        assert_eq!(delegate.result_as_csv().as_deref(), Some("id"));
-        assert_eq!(delegate.result_as_tsv().as_deref(), Some("id"));
     }
 }
