@@ -386,61 +386,7 @@ impl DbxApp {
                 }
                 match loaded {
                     Ok((key, document)) => {
-                        if !this
-                            .session(session_id)
-                            .and_then(query_history_connection)
-                            .is_some_and(|identity| connection_key(&identity) == key)
-                        {
-                            return;
-                        }
-                        // Never replace a document the user started while recovery loaded.
-                        let has_queries = this
-                            .session(session_id)
-                            .is_some_and(|session| !session.secondary_tabs.is_empty());
-                        let startup = this
-                            .session_mut(session_id)
-                            .and_then(|session| session.startup_layout.take());
-                        let startup_tabs = startup
-                            .as_ref()
-                            .and_then(|connection| connection.tabs.clone());
-                        let has_startup_layout = startup_tabs.is_some();
-                        let tabs = if let Some(tabs) = startup_tabs {
-                            tabs
-                        } else if document.tabs.is_empty() {
-                            document
-                                .drafts
-                                .iter()
-                                .cloned()
-                                .map(SavedTab::Query)
-                                .chain(document.open_tables.iter().cloned().map(SavedTab::Data))
-                                .collect()
-                        } else {
-                            document.tabs.clone()
-                        };
-                        let active_tab = startup
-                            .as_ref()
-                            .and_then(|connection| connection.active_tab)
-                            .or(document.active_tab);
-                        if let Some(session) = this.session_mut(session_id) {
-                            session.closed_queries = document.closed.clone();
-                            session.schema_baseline = document.schema_baseline.clone();
-                        }
-                        this.workspace_documents.insert(key, document);
-                        if !has_queries && tabs.is_empty() && !has_startup_layout {
-                            if let Some(table) = this
-                                .session(session_id)
-                                .and_then(|session| session.tables.first())
-                                .cloned()
-                            {
-                                this.select_table_for(session_id, table, window, cx);
-                            }
-                        } else if !has_queries {
-                            this.restore_workspace_tabs_for(
-                                session_id, tabs, active_tab, window, cx,
-                            );
-                        } else {
-                            this.persist_query_workspace_for(session_id, cx);
-                        }
+                        this.apply_query_workspace_recovery(session_id, key, document, window, cx);
                     }
                     Err(error) => {
                         this.show_toast(ToastKind::Error, format!("Draft recovery: {error}"), cx)
@@ -685,6 +631,60 @@ impl DbxApp {
 
     /// Restore ordered documents after discovery, without replacing work the
     /// user opened while recovery was loading.
+    fn apply_query_workspace_recovery(
+        &mut self,
+        session_id: SessionId,
+        key: String,
+        document: crate::workspace::WorkspaceDocument,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .session(session_id)
+            .and_then(query_history_connection)
+            .is_some_and(|identity| connection_key(&identity) == key)
+        {
+            return;
+        }
+        // Never replace a document the user started while recovery loaded.
+        let has_queries = self
+            .session(session_id)
+            .is_some_and(|session| !session.secondary_tabs.is_empty());
+        let startup = self
+            .session_mut(session_id)
+            .and_then(|session| session.startup_layout.take());
+        let startup_tabs = startup
+            .as_ref()
+            .and_then(|connection| connection.tabs.clone());
+        let tabs = if let Some(tabs) = startup_tabs {
+            tabs
+        } else if document.tabs.is_empty() {
+            document
+                .drafts
+                .iter()
+                .cloned()
+                .map(SavedTab::Query)
+                .chain(document.open_tables.iter().cloned().map(SavedTab::Data))
+                .collect()
+        } else {
+            document.tabs.clone()
+        };
+        let active_tab = startup
+            .as_ref()
+            .and_then(|connection| connection.active_tab)
+            .or(document.active_tab);
+        if let Some(session) = self.session_mut(session_id) {
+            session.closed_queries = document.closed.clone();
+            session.schema_baseline = document.schema_baseline.clone();
+        }
+        self.workspace_documents.insert(key, document);
+        if !has_queries {
+            self.restore_workspace_tabs_for(session_id, tabs, active_tab, window, cx);
+        } else {
+            self.persist_query_workspace_for(session_id, cx);
+        }
+    }
+
     fn restore_workspace_tabs_for(
         &mut self,
         session_id: SessionId,
@@ -847,6 +847,72 @@ impl DbxApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn empty_recovery_does_not_open_the_first_discovered_table(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("connections.json"));
+        store
+            .vault()
+            .unwrap()
+            .create("workspace test passphrase")
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let profile_id = Uuid::new_v4();
+        let key = connection_key(&QueryHistoryConnection::profile(profile_id));
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            app.profile_store = Some(store);
+            app.vault_state = Some(VaultState::Unlocked);
+            let engine = app
+                .runtime
+                .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                    DatabaseKind::SQLite,
+                    "sqlite::memory:",
+                )))
+                .unwrap();
+            app.runtime
+                .block_on(engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY)"))
+                .unwrap();
+            let mut session = ConnectionSession::new(
+                session_id,
+                Some(profile_id),
+                "Empty workspace".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            session.engine = Some(Arc::new(engine));
+            session.tables = vec![TableInfo::table("items", None)];
+            session.tables_revision = 1;
+            app.sessions.push(session);
+            app.active_session_id = Some(session_id);
+            app.apply_query_workspace_recovery(
+                session_id,
+                key.clone(),
+                Default::default(),
+                window,
+                cx,
+            );
+            app
+        });
+        app.read_with(cx, |app, _| {
+            let session = app.session(session_id).unwrap();
+            assert!(
+                session.secondary_tabs.is_empty(),
+                "Connecting must leave table choice to the user"
+            );
+            assert!(session.active_secondary_tab.is_none());
+        });
+    }
 
     #[gpui::test]
     fn workspace_restores_mixed_tab_order_and_selection_and_skips_missing_tables(

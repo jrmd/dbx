@@ -11,6 +11,88 @@ fn hydration_matches_current_draft(
 }
 
 impl DbxApp {
+    pub(crate) fn can_open_connection_targets(&self) -> bool {
+        self.vault_state == Some(VaultState::Unlocked)
+    }
+
+    /// A launch argument or native file drop is an explicit request to open a database.
+    pub(crate) fn open_connection_target(
+        &mut self,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = if target.starts_with("file:") {
+            match url::Url::parse(&target)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+            {
+                Some(path) => path.to_string_lossy().into_owned(),
+                None => {
+                    self.set_error("Invalid database file URL".into());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            target
+        };
+        let fields = match ConnectionFields::from_url(&target) {
+            Ok(fields) => fields,
+            Err(_) => {
+                self.set_error("Open requires a database path or supported connection URL".into());
+                cx.notify();
+                return;
+            }
+        };
+        self.begin_new_connection(cx);
+        self.draft.choosing_kind = false;
+        let name = if fields.kind.is_file() {
+            std::path::Path::new(&target)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| fields.kind.to_string())
+        } else {
+            format!("{} · {}", fields.kind, fields.host)
+        };
+        self.draft.connection_name.update(cx, |value, cx| {
+            *value = name;
+            cx.notify();
+        });
+        self.hydrate_connection_fields(fields.kind, fields.url().unwrap_or(target), cx);
+        if self.can_open_connection_targets() {
+            self.connect(window, cx);
+        }
+    }
+
+    pub(super) fn select_connection_preset(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        let (kind, address) = match name {
+            "Redshift" => (
+                DatabaseKind::PostgreSQL,
+                "postgres://awsuser@cluster.example.redshift.amazonaws.com:5439/dev?sslmode=require",
+            ),
+            "Neon" => (
+                DatabaseKind::PostgreSQL,
+                "postgres://user@ep-example.neon.tech/neondb?sslmode=require",
+            ),
+            "Supabase" => (
+                DatabaseKind::PostgreSQL,
+                "postgres://postgres@db.project.supabase.co/postgres?sslmode=require",
+            ),
+            "PlanetScale" => (
+                DatabaseKind::MySQL,
+                "mysql://user@aws.connect.psdb.cloud:3306/database?ssl-mode=VERIFY_IDENTITY",
+            ),
+            _ => return,
+        };
+        self.select_kind(kind, cx);
+        self.hydrate_connection_fields(kind, address.into(), cx);
+        self.draft.connection_name.update(cx, |value, cx| {
+            *value = name.into();
+            cx.notify();
+        });
+    }
+
     fn hydrate_transport(
         &mut self,
         socket: Option<std::path::PathBuf>,
@@ -119,6 +201,7 @@ impl DbxApp {
 
     fn connection_fields(&self, cx: &App) -> ConnectionFields {
         let mut fields = ConnectionFields::new(self.draft.kind);
+        fields.driver_manifest = self.draft.driver_manifest.clone();
         fields.read_only = self.draft.read_only;
         fields.cloud_auth = self.draft.cloud_auth;
         fields.host = self.draft.host.read(cx).clone();
@@ -451,6 +534,9 @@ impl DbxApp {
             cx.notify();
             return;
         }
+        self.invalidate_nonrelational_for(None);
+        self.table_name_prompt = None;
+        self.table_confirmation_input = None;
         self.vault_state = Some(VaultState::Locked);
         self.workspace_documents.clear();
         // Use the normal teardown so queries, connection attempts, and tab
@@ -486,6 +572,7 @@ impl DbxApp {
             cx.notify();
         });
         self.clear_vault_inputs(cx);
+        self.clear_assistant_secret(cx);
         self.error = recovery_error;
         cx.notify();
     }
@@ -503,7 +590,7 @@ impl DbxApp {
         mode: ConnectionFormMode,
         cx: &mut Context<Self>,
     ) {
-        if mode == self.draft.mode {
+        if self.draft.driver_manifest.is_some() || mode == self.draft.mode {
             return;
         }
 
@@ -592,6 +679,7 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.driver_manifest = None;
         self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
         self.connection_form_focus_pending = true;
@@ -619,6 +707,7 @@ impl DbxApp {
         self.cancel_credential_hydration();
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.driver_manifest = None;
         self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
         self.hydrate_connection_fields(kind, url.trim().to_owned(), cx);
@@ -766,6 +855,10 @@ impl DbxApp {
         let profile_id = profile.id;
         self.draft.selected_profile = Some(profile.id);
         self.draft.choosing_kind = false;
+        self.draft.folder.update(cx, |value, cx| {
+            *value = profile.folder.clone().unwrap_or_default();
+            cx.notify();
+        });
         self.draft.tag = profile.tag;
         self.draft.connection_name.update(cx, |name, cx| {
             *name = profile.name;
@@ -773,6 +866,7 @@ impl DbxApp {
         });
         self.hydrate_connection_fields(profile.kind, profile.url.clone(), cx);
         self.draft.read_only = profile.read_only;
+        self.draft.driver_manifest = profile.driver_manifest;
         self.draft.cloud_auth = profile.cloud_auth;
         self.hydrate_transport(profile.socket, profile.ssh, cx);
         self.error = None;
@@ -873,8 +967,23 @@ impl DbxApp {
                             *value = loaded.config.ssh_password.clone().unwrap_or_default();
                             cx.notify();
                         });
+                        let plugin_password = loaded
+                            .config
+                            .driver_manifest
+                            .as_ref()
+                            .and_then(|_| url::Url::parse(&loaded.config.url).ok())
+                            .and_then(|url| {
+                                url.password().map(|password| {
+                                    percent_encoding::percent_decode_str(password)
+                                        .decode_utf8_lossy()
+                                        .into_owned()
+                                })
+                            });
                         let mut fields = ConnectionFields::from_url(loaded.config.url)
                             .unwrap_or_else(|_| ConnectionFields::new(loaded.config.kind));
+                        if let Some(password) = plugin_password {
+                            fields.password = password;
+                        }
                         this.draft.password.update(cx, |value, cx| {
                             value.zeroize();
                             *value = std::mem::take(&mut fields.password);
@@ -915,6 +1024,7 @@ impl DbxApp {
             fields.config()?,
         )
         .with_tag(self.draft.tag.clone());
+        draft.folder = Some(self.draft.folder.read(cx).clone());
         if let Some(id) = self.draft.selected_profile {
             draft = draft.with_id(id);
         }
@@ -1268,16 +1378,13 @@ impl DbxApp {
             let databases = engine.list_databases().await.unwrap_or_default();
             let current_database = engine.current_database().await.ok();
             let schema_filter = default_schema_filter(kind, &tables);
-            let initial_table = schema_filtered_tables(kind, &tables, schema_filter.as_deref())
-                .into_iter()
-                .next();
+
             Ok::<_, dbx_core::DbxError>((
                 engine,
                 tables,
                 databases,
                 current_database,
                 schema_filter,
-                initial_table,
             ))
         });
         if let Some(session) = self.session_mut(session_id) {
@@ -1295,26 +1402,23 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
-                let mut initial_table = None;
                 match result {
-                    Ok((engine, tables, databases, current_database, schema_filter, initial)) => {
+                    Ok((engine, tables, databases, current_database, schema_filter)) => {
                         session.engine = Some(engine);
                         session.set_tables(tables);
                         session.databases = databases;
                         session.current_database = current_database;
                         session.schema_filter = schema_filter;
                         session.completion_columns.clear();
+                        session.completion_schema = None;
                         session.error = None;
                         session.pane = Pane::Data;
-                        initial_table = initial;
                     }
                     Err(error) => {
                         session.error = Some(error.to_string());
                     }
                 }
-                // Open the first table the same way a navigator click would,
-                // so it arrives in its own data tab.
-                let _ = initial_table;
+                // Connecting only loads metadata; table tabs require an explicit choice.
                 cx.notify();
                 this.prefetch_completion_columns_for(session_id, cx);
                 if connected {
@@ -1422,8 +1526,13 @@ impl DbxApp {
         self.compact_connection_form_open = true;
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.driver_manifest = None;
         self.draft.cloud_auth = None;
         self.draft.tag = Some(default_tags().remove(3));
+        self.draft.folder.update(cx, |value, cx| {
+            value.clear();
+            cx.notify();
+        });
         self.draft.choosing_kind = true;
         self.connection_form_focus_pending = true;
         self.settings_open = false;
@@ -1446,6 +1555,7 @@ impl DbxApp {
         self.compact_connection_form_open = false;
         self.draft.selected_profile = None;
         self.draft.read_only = false;
+        self.draft.driver_manifest = None;
         self.draft.cloud_auth = None;
         self.draft.password.update(cx, |value, cx| {
             value.zeroize();

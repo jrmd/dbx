@@ -7,9 +7,14 @@ const TAG_PALETTE: [u32; 8] = [
     0xef6b73, 0xe5b567, 0x8fcf9c, 0x82aaff, 0xb48ead, 0x56b6c2, 0xe89bb5, 0xaab2bf,
 ];
 
-const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 6] = [
+const SETTINGS_SECTIONS: [(SettingsSection, &str, Icon); 7] = [
     (SettingsSection::Appearance, "Appearance", Icon::Appearance),
     (SettingsSection::Editor, "Editor", Icon::Query),
+    (
+        SettingsSection::Shortcuts,
+        "Keyboard shortcuts",
+        Icon::Query,
+    ),
     (
         SettingsSection::QueryAgent,
         "Query assistant",
@@ -46,6 +51,7 @@ impl DbxApp {
                 .render_settings_appearance(window, cx)
                 .into_any_element(),
             SettingsSection::Editor => self.render_settings_editor(cx).into_any_element(),
+            SettingsSection::Shortcuts => self.render_settings_shortcuts(window, cx),
             SettingsSection::QueryAgent => self.render_agent_settings(cx).into_any_element(),
             SettingsSection::Connections => self.render_settings_connections(cx).into_any_element(),
             SettingsSection::Tags => self.render_settings_tags(cx).into_any_element(),
@@ -227,9 +233,12 @@ impl DbxApp {
     }
 
     /// Jump straight to tag management, e.g. from the connection form.
-    pub(super) fn open_tag_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.settings_section = SettingsSection::Tags;
-        self.open_settings(window, cx);
+    pub(in crate::app) fn open_tag_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings_section(SettingsSection::Tags, window, cx);
     }
 
     pub(in crate::app) fn scrolling_settings_group(
@@ -462,6 +471,7 @@ impl DbxApp {
                     option.label()
                 )))
                 .pressable(option.label())
+                .debug_selector(move || format!("settings-appearance-{}", option.label()))
                 .role(gpui::Role::RadioButton)
                 .aria_toggled(if option == current {
                     gpui::accesskit::Toggled::True

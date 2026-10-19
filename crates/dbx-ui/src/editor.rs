@@ -593,6 +593,32 @@ impl TextEditor {
         cx.notify();
     }
 
+    /// Forget a secret field without leaving its value in undo/redo history.
+    pub(crate) fn clear_secret(&mut self, cx: &mut Context<Self>) {
+        use zeroize::Zeroize;
+        self.value.update(cx, |value, cx| {
+            value.zeroize();
+            cx.notify();
+        });
+        for snapshot in self
+            .undo_history
+            .iter_mut()
+            .chain(self.redo_history.iter_mut())
+        {
+            snapshot.text.zeroize();
+        }
+        self.undo_history.clear();
+        self.redo_history.clear();
+        self.fold_basis.zeroize();
+        self.paint_cache.borrow_mut().text.zeroize();
+        *self.paint_cache.borrow_mut() = PaintCache::default();
+        self.selected_range = 0..0;
+        self.extra_selections.clear();
+        self.marked_range = None;
+        self.typing_run = None;
+        cx.notify();
+    }
+
     /// The current selection as UTF-8 byte offsets.
     #[allow(dead_code)]
     pub fn selected_range(&self) -> Range<usize> {
@@ -1562,6 +1588,10 @@ impl TextEditor {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        self.indent_selection(cx);
+    }
+
+    pub(crate) fn indent_selection(&mut self, cx: &mut Context<Self>) {
         if !self.is_code() {
             cx.propagate();
             return;
@@ -4707,6 +4737,22 @@ mod tests {
         let sqlite_query = "SELEC * FROM t";
         let sqlite_message = "near \"SELEC\": syntax error";
         assert_eq!(sql_error_range(sqlite_message, sqlite_query), Some(0..5));
+    }
+
+    #[test]
+    fn error_range_prefers_original_position_and_ignores_internal_query_positions() {
+        let query = "SELECT missing FROM users";
+        assert_eq!(
+            sql_error_range(
+                "failure\nInternal query position: 1\nOriginal position: 8",
+                query
+            ),
+            Some(7..14)
+        );
+        assert_eq!(
+            sql_error_range("failure\nInternal query position: 8", query),
+            None
+        );
     }
 
     #[test]

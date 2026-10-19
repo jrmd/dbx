@@ -68,6 +68,17 @@ pub trait Engine: Send + Sync {
     }
 
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>>;
+    /// Retrieve a complete canonical Extended JSON document for editing.
+    async fn document_for_edit(
+        &self,
+        _table: &TableRef,
+        _identity: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Err(DbxError::Unsupported {
+            operation: "document_for_edit".into(),
+            kind: self.kind(),
+        })
+    }
 
     async fn table_structure(&self, table: &TableRef) -> Result<TableStructure> {
         Ok(TableStructure {
@@ -141,8 +152,8 @@ pub trait Engine: Send + Sync {
 /// A connected database. The enum keeps backend-specific dependencies behind
 /// a single object while still allowing each backend to optimize internally.
 pub enum DatabaseEngine {
-    Sql(SqlxEngine),
-    Redis(RedisEngine),
+    Sql(Box<SqlxEngine>),
+    Redis(Box<RedisEngine>),
     Other(Box<dyn Engine>),
 }
 
@@ -158,6 +169,11 @@ impl std::fmt::Debug for DatabaseEngine {
 impl DatabaseEngine {
     pub async fn connect(config: ConnectionConfig) -> Result<Self> {
         config.validate()?;
+        if config.driver_manifest.is_some() {
+            return Ok(Self::Other(Box::new(
+                crate::driver_plugin::PluginEngine::connect(config).await?,
+            )));
+        }
         if matches!(
             config.kind,
             DatabaseKind::PostgreSQL
@@ -165,9 +181,9 @@ impl DatabaseEngine {
                 | DatabaseKind::SQLite
                 | DatabaseKind::CockroachDB
         ) {
-            Ok(Self::Sql(SqlxEngine::connect(config).await?))
+            Ok(Self::Sql(Box::new(SqlxEngine::connect(config).await?)))
         } else if config.kind == DatabaseKind::Redis {
-            Ok(Self::Redis(RedisEngine::connect(config).await?))
+            Ok(Self::Redis(Box::new(RedisEngine::connect(config).await?)))
         } else {
             let protected = config.read_only;
             let engine = crate::connectors::connect(config).await?;
@@ -195,7 +211,11 @@ impl DatabaseEngine {
         }
     }
     pub fn capabilities(&self) -> crate::Capabilities {
-        self.kind().capabilities(self.is_read_only())
+        match self {
+            Self::Sql(engine) => engine.capabilities(),
+            Self::Redis(engine) => crate::Engine::capabilities(engine.as_ref()),
+            Self::Other(engine) => engine.capabilities(),
+        }
     }
     pub(crate) fn ensure_writable(&self) -> Result<()> {
         if self.is_read_only() {
@@ -248,6 +268,14 @@ impl DatabaseEngine {
 
     pub async fn use_database(&self, name: &str) -> Result<()> {
         Engine::use_database(self, name).await
+    }
+
+    pub async fn document_for_edit(
+        &self,
+        table: &TableRef,
+        identity: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Engine::document_for_edit(self, table, identity).await
     }
 
     pub async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
@@ -722,6 +750,9 @@ fn ensure_primary_key_filters(columns: &[ColumnInfo], filters: &[Filter]) -> Res
 
 #[async_trait]
 impl Engine for DatabaseEngine {
+    fn capabilities(&self) -> crate::Capabilities {
+        DatabaseEngine::capabilities(self)
+    }
     fn kind(&self) -> DatabaseKind {
         self.kind()
     }
@@ -758,6 +789,20 @@ impl Engine for DatabaseEngine {
             Self::Sql(engine) => engine.use_database(name).await,
             Self::Redis(engine) => engine.use_database(name).await,
             Self::Other(engine) => engine.use_database(name).await,
+        }
+    }
+
+    async fn document_for_edit(
+        &self,
+        table: &TableRef,
+        identity: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::Other(engine) => engine.document_for_edit(table, identity).await,
+            _ => Err(DbxError::Unsupported {
+                operation: "document_for_edit".into(),
+                kind: self.kind(),
+            }),
         }
     }
 

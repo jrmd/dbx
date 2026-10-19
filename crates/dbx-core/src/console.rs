@@ -31,6 +31,9 @@ impl QueryCancellation {
         self.flag.store(true, Ordering::SeqCst);
         self.wake.notify_one();
     }
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
     pub(crate) async fn cancelled(&self) {
         while !self.flag.load(Ordering::SeqCst) {
             self.wake.notified().await;
@@ -112,6 +115,78 @@ pub struct QuerySession {
     state: Mutex<SessionState>,
 }
 impl QuerySession {
+    /// Execute a read plan on a separate connection in BEGIN READ ONLY and
+    /// ROLLBACK. The query tab's connection and transaction are never reused.
+    /// Dropping the isolated session after an error/cancel closes its direct
+    /// PostgreSQL connection, rolling back any remaining transaction.
+    pub async fn explain_analyze(
+        engine: Arc<DatabaseEngine>,
+        sql: &str,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryResult> {
+        let command = crate::diagnostics::execution_plan_analyze_query(engine.kind(), sql)?;
+        Self::run_isolated_read(engine, &command, options, timeout, cancellation).await
+    }
+
+    /// Repeated watches use a fresh server-enforced read-only transaction for
+    /// each sample, independently of query-tab transaction state.
+    pub async fn read_only_query(
+        engine: Arc<DatabaseEngine>,
+        sql: &str,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryResult> {
+        if engine.kind() != DatabaseKind::PostgreSQL {
+            return Err(DbxError::Unsupported {
+                operation: "isolated read-only query watch".into(),
+                kind: engine.kind(),
+            });
+        }
+        crate::diagnostics::execution_plan_query(engine.kind(), sql)?;
+        Self::run_isolated_read(engine, sql, options, timeout, cancellation).await
+    }
+
+    async fn run_isolated_read(
+        engine: Arc<DatabaseEngine>,
+        command: &str,
+        options: QueryOptions,
+        timeout: Duration,
+        cancellation: QueryCancellation,
+    ) -> Result<QueryResult> {
+        if engine.kind() != DatabaseKind::PostgreSQL || !matches!(&*engine, DatabaseEngine::Sql(_))
+        {
+            return Err(DbxError::Unsupported {
+                operation: "isolated PostgreSQL read-only transaction".into(),
+                kind: engine.kind(),
+            });
+        }
+        let isolated = Self::new(engine);
+        let script = isolated
+            .run(
+                &format!("BEGIN READ ONLY;\n{command}\n;\nROLLBACK;"),
+                options,
+                timeout,
+                cancellation,
+            )
+            .await?;
+        if let Some(error) = script
+            .statements
+            .iter()
+            .find_map(|statement| statement.error.as_ref())
+        {
+            return Err(DbxError::Query(error.clone()));
+        }
+        script
+            .statements
+            .into_iter()
+            .nth(1)
+            .map(|statement| statement.result)
+            .ok_or_else(|| DbxError::Query("Isolated read returned no result".into()))
+    }
+
     pub fn new(engine: Arc<DatabaseEngine>) -> Self {
         Self {
             engine,

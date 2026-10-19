@@ -309,6 +309,31 @@ impl DiagramDocument {
         }
         separate_lanes(&mut self.edges);
         for edge in &mut self.edges {
+            // A relationship can skip layout columns or cross a card moved
+            // by hand. Keep the simple route when clear, and find a path
+            // through the free corridors when any card blocks it.
+            let obstacles = self
+                .nodes
+                .iter()
+                .map(|node| {
+                    let margin = if node.id == edge.source || node.id == edge.target {
+                        0.
+                    } else {
+                        12.
+                    };
+                    (
+                        node.x - margin,
+                        node.y - margin,
+                        node.x + node.width + margin,
+                        node.y + node.height + margin,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if route_blocked(&edge.points, &obstacles)
+                && let Some(points) = avoid_cards(&edge.points, &obstacles)
+            {
+                edge.points = points;
+            }
             edge.path = rounded_svg_path(&edge.points, EDGE_CORNER_RADIUS);
         }
 
@@ -316,11 +341,21 @@ impl DiagramDocument {
             .nodes
             .iter()
             .map(|node| node.x + node.width + PADDING)
+            .chain(
+                self.edges
+                    .iter()
+                    .flat_map(|edge| edge.points.iter().map(|point| point.0 + PADDING)),
+            )
             .fold(PADDING * 2.0, f32::max);
         self.height = self
             .nodes
             .iter()
             .map(|node| node.y + node.height + PADDING)
+            .chain(
+                self.edges
+                    .iter()
+                    .flat_map(|edge| edge.points.iter().map(|point| point.1 + PADDING)),
+            )
             .fold(PADDING * 2.0, f32::max);
     }
 
@@ -784,6 +819,137 @@ fn edge_route(
             target.x + target.width
         )
     }
+}
+
+type CardBounds = (f32, f32, f32, f32);
+
+fn segment_blocked(a: (f32, f32), b: (f32, f32), cards: &[CardBounds]) -> bool {
+    cards.iter().any(|&(left, top, right, bottom)| {
+        if a.0 == b.0 {
+            a.0 > left && a.0 < right && a.1.min(b.1) < bottom && a.1.max(b.1) > top
+        } else {
+            a.1 > top && a.1 < bottom && a.0.min(b.0) < right && a.0.max(b.0) > left
+        }
+    })
+}
+
+fn route_blocked(points: &[(f32, f32)], cards: &[CardBounds]) -> bool {
+    points
+        .windows(2)
+        .any(|pair| segment_blocked(pair[0], pair[1], cards))
+}
+
+/// Find the shortest orthogonal path on the visibility grid formed by card
+/// borders. Turns have a small cost to prefer clean, easily followed routes.
+fn avoid_cards(points: &[(f32, f32)], cards: &[CardBounds]) -> Option<Vec<(f32, f32)>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let (&start, &end) = (points.first()?, points.last()?);
+    let mut xs = vec![start.0, end.0];
+    let mut ys = vec![start.1, end.1];
+    for &(left, top, right, bottom) in cards {
+        xs.extend([left.max(0.), right]);
+        ys.extend([top.max(0.), bottom]);
+    }
+    xs.sort_by(f32::total_cmp);
+    xs.dedup();
+    ys.sort_by(f32::total_cmp);
+    ys.dedup();
+    let width = xs.len();
+    let index = |point: (f32, f32)| {
+        Some(
+            ys.iter().position(|y| *y == point.1)? * width
+                + xs.iter().position(|x| *x == point.0)?,
+        )
+    };
+    let start_index = index(start)?;
+    let end_index = index(end)?;
+    let count = width * ys.len() * 2;
+    let mut distance = vec![u64::MAX; count];
+    let mut previous = vec![usize::MAX; count];
+    let mut queue = BinaryHeap::new();
+    for axis in 0..2 {
+        distance[start_index * 2 + axis] = 0;
+        queue.push((Reverse(0u64), start_index * 2 + axis));
+    }
+    let mut goal = None;
+    while let Some((Reverse(cost), state)) = queue.pop() {
+        if distance[state] != cost {
+            continue;
+        }
+        let vertex = state / 2;
+        if vertex == end_index {
+            goal = Some(state);
+            break;
+        }
+        let (x, y) = (vertex % width, vertex / width);
+        let here = (xs[x], ys[y]);
+        let neighbors = [
+            x.checked_sub(1).map(|x| (x, y, 0)),
+            (x + 1 < width).then_some((x + 1, y, 0)),
+            y.checked_sub(1).map(|y| (x, y, 1)),
+            (y + 1 < ys.len()).then_some((x, y + 1, 1)),
+        ];
+        for (nx, ny, axis) in neighbors.into_iter().flatten() {
+            let there = (xs[nx], ys[ny]);
+            let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+            // Preserve the card's port direction so cardinality marks stay
+            // perpendicular to the border instead of following its edge.
+            if vertex == start_index
+                && points.len() > 1
+                && dot(
+                    (there.0 - here.0, there.1 - here.1),
+                    (points[1].0 - start.0, points[1].1 - start.1),
+                ) <= 0.
+            {
+                continue;
+            }
+            if ny * width + nx == end_index && points.len() > 1 {
+                let before = points[points.len() - 2];
+                if dot(
+                    (here.0 - end.0, here.1 - end.1),
+                    (before.0 - end.0, before.1 - end.1),
+                ) <= 0.
+                {
+                    continue;
+                }
+            }
+            if segment_blocked(here, there, cards) {
+                continue;
+            }
+            let next = (ny * width + nx) * 2 + axis;
+            let length = ((here.0 - there.0).abs() + (here.1 - there.1).abs()) * 10.;
+            let next_cost = cost + length.round() as u64 + if state % 2 == axis { 0 } else { 240 };
+            if next_cost < distance[next] {
+                distance[next] = next_cost;
+                previous[next] = state;
+                queue.push((Reverse(next_cost), next));
+            }
+        }
+    }
+    let mut state = goal?;
+    let mut route = Vec::new();
+    loop {
+        let vertex = state / 2;
+        route.push((xs[vertex % width], ys[vertex / width]));
+        if previous[state] == usize::MAX {
+            break;
+        }
+        state = previous[state];
+    }
+    route.reverse();
+    let mut simplified: Vec<(f32, f32)> = Vec::new();
+    for point in route {
+        if simplified.len() >= 2 {
+            let a = simplified[simplified.len() - 2];
+            let b = simplified[simplified.len() - 1];
+            if (a.0 == b.0 && b.0 == point.0) || (a.1 == b.1 && b.1 == point.1) {
+                simplified.pop();
+            }
+        }
+        simplified.push(point);
+    }
+    Some(simplified)
 }
 
 /// Fan out relationships whose vertical runs share a corridor so parallel
@@ -1252,6 +1418,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn relationships_route_around_intermediate_and_manually_moved_cards() {
+        let mut document = DiagramDocument::from_schema(&RelationalSchema {
+            database: "db".into(),
+            tables: vec![
+                table("parent", vec![column("id", 0, true)], vec![]),
+                table("blocker", vec![column("id", 0, true)], vec![]),
+                table(
+                    "child",
+                    vec![column("id", 0, true)],
+                    vec![foreign(&["id"], "parent", &["id"])],
+                ),
+            ],
+            ..Default::default()
+        });
+        document.move_node("public.child", 44., 100.);
+        document.move_node("public.parent", 900., 100.);
+        document.move_node("public.blocker", 450., 80.);
+        let edge = &document.edges[0];
+        let cards = document
+            .nodes
+            .iter()
+            .map(|node| (node.x, node.y, node.x + node.width, node.y + node.height))
+            .collect::<Vec<_>>();
+        assert!(!route_blocked(&edge.points, &cards), "{:?}", edge.points);
+        assert!(edge.points.len() >= 4);
+        assert!(
+            edge.points
+                .windows(2)
+                .all(|pair| pair[0].0 == pair[1].0 || pair[0].1 == pair[1].1)
+        );
+        let before = edge.path.clone();
+        document.route();
+        assert_eq!(
+            document.edges[0].path, before,
+            "routing stays deterministic"
+        );
+        let svg = document.svg(palette(), None);
+        assert!(svg.contains(&document.edges[0].path));
     }
 
     #[test]

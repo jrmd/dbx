@@ -1,0 +1,9 @@
+{
+  "protocol": 1,
+  "id": "example-sqlite",
+  "name": "Example community SQLite",
+  "family": "sqlite",
+  "executable": "/usr/bin/python3",
+  "arguments": ["/absolute/path/to/dbx/examples/drivers/sqlite-driver.py"],
+  "schemes": ["example-sqlite"]
+}

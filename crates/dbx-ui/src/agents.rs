@@ -10,6 +10,10 @@ const MAX_OUTPUT: usize = 1024 * 1024;
 const MAX_PROMPT: usize = 96 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(180);
 
+#[path = "agents/direct.rs"]
+mod direct;
+pub use direct::generate_direct;
+
 /// Resolve the CLI's version line. Errors are short enough to sit under the field.
 pub async fn check_cli(cli: AgentCli, executable: String) -> Result<String, String> {
     let executable = if executable.trim().is_empty() {
@@ -65,16 +69,32 @@ pub enum AgentCli {
     Codex,
     OpenCode,
     Copilot,
+    OpenAiApi,
+    AnthropicApi,
+    Ollama,
 }
 
 impl AgentCli {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Claude,
         Self::Cursor,
         Self::Codex,
         Self::OpenCode,
         Self::Copilot,
+        Self::OpenAiApi,
+        Self::AnthropicApi,
+        Self::Ollama,
     ];
+    pub fn is_direct(self) -> bool {
+        matches!(self, Self::OpenAiApi | Self::AnthropicApi | Self::Ollama)
+    }
+    pub fn secret_key(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "query-assistant-openai-api-key",
+            Self::AnthropicApi => "query-assistant-anthropic-api-key",
+            _ => "query-assistant-unused",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
@@ -82,6 +102,9 @@ impl AgentCli {
             Self::Codex => "Codex",
             Self::OpenCode => "OpenCode",
             Self::Copilot => "Copilot",
+            Self::OpenAiApi => "OpenAI API",
+            Self::AnthropicApi => "Anthropic API",
+            Self::Ollama => "Ollama",
         }
     }
     pub fn executable(self) -> &'static str {
@@ -91,6 +114,9 @@ impl AgentCli {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Copilot => "copilot",
+            Self::OpenAiApi => "https://api.openai.com/v1/responses",
+            Self::AnthropicApi => "https://api.anthropic.com/v1/messages",
+            Self::Ollama => "http://127.0.0.1:11434",
         }
     }
 }
@@ -140,6 +166,7 @@ pub fn build_prompt(context: &serde_json::Value, request: &str) -> Result<String
 
 fn arguments(cli: AgentCli, config: &AgentConfig, prompt: &str, output: &Path) -> Vec<String> {
     let mut args: Vec<String> = match cli {
+        AgentCli::OpenAiApi | AgentCli::AnthropicApi | AgentCli::Ollama => return Vec::new(),
         AgentCli::Claude => vec![
             "--print",
             "--output-format",
@@ -281,6 +308,9 @@ pub async fn generate(
     config: AgentConfig,
     prompt: String,
 ) -> Result<GeneratedQuery, String> {
+    if cli.is_direct() {
+        return Err("Direct providers use the API adapter, not a CLI executable.".into());
+    }
     let workspace = tempfile::tempdir().map_err(|e| e.to_string())?;
     let output = workspace.path().join("response.json");
     if cli == AgentCli::Cursor {
@@ -463,7 +493,7 @@ else:
             "Count users",
         )
         .unwrap();
-        for cli in AgentCli::ALL {
+        for cli in AgentCli::ALL.into_iter().filter(|cli| !cli.is_direct()) {
             let config = AgentConfig {
                 executable: executable.clone(),
                 ..Default::default()
@@ -594,7 +624,7 @@ else:
             executable: String::new(),
         };
         let prompt = "$(touch /tmp/should-never-exist) \"; select 1";
-        for cli in AgentCli::ALL {
+        for cli in AgentCli::ALL.into_iter().filter(|cli| !cli.is_direct()) {
             let args = arguments(cli, &config, prompt, Path::new("/tmp/output"));
             assert!(
                 !args

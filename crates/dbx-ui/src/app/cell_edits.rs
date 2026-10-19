@@ -26,11 +26,98 @@ pub(super) struct PendingInsert {
     pub(super) values: BTreeMap<usize, MutationValue>,
 }
 
+const MAX_EDIT_HISTORY: usize = 50;
+const MAX_EDIT_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct EditSnapshot {
+    edits: PendingEdits,
+    inserts: Vec<PendingInsert>,
+    deletes: BTreeSet<usize>,
+}
+
+impl EditSnapshot {
+    fn weight(&self) -> usize {
+        fn value_bytes(value: &MutationValue) -> usize {
+            std::mem::size_of::<MutationValue>()
+                + match value {
+                    MutationValue::Expression(value)
+                    | MutationValue::Parameter(CellValue::Text(value)) => value.len(),
+                    MutationValue::Parameter(CellValue::Bytes(value)) => value.len(),
+                    MutationValue::Parameter(CellValue::Json(value)) => value.to_string().len(),
+                    _ => 0,
+                }
+        }
+        self.edits.values().map(value_bytes).sum::<usize>()
+            + self
+                .inserts
+                .iter()
+                .flat_map(|insert| insert.values.values())
+                .map(value_bytes)
+                .sum::<usize>()
+            + (self.edits.len() + self.deletes.len() + self.inserts.len()) * 64
+    }
+}
+
+/// History belongs to one loaded table page. Snapshots never survive a reload or commit.
+#[derive(Default)]
+pub(super) struct EditHistory {
+    current: EditSnapshot,
+    undo: Vec<EditSnapshot>,
+    redo: Vec<EditSnapshot>,
+    suspended: bool,
+}
+
+impl EditHistory {
+    fn trim(stack: &mut Vec<EditSnapshot>) {
+        let mut bytes = stack.iter().map(EditSnapshot::weight).sum::<usize>();
+        while stack.len() > MAX_EDIT_HISTORY || bytes > MAX_EDIT_HISTORY_BYTES {
+            bytes = bytes.saturating_sub(stack.remove(0).weight());
+        }
+    }
+    fn record(&mut self, next: EditSnapshot) {
+        if self.suspended {
+            return;
+        }
+        if next.weight() > MAX_EDIT_HISTORY_BYTES {
+            self.undo.clear();
+            self.redo.clear();
+            self.current = Default::default();
+            self.suspended = true;
+            return;
+        }
+        if next == self.current {
+            return;
+        }
+        self.redo.clear();
+        self.undo.push(std::mem::replace(&mut self.current, next));
+        Self::trim(&mut self.undo);
+    }
+    fn step(&mut self, redo: bool) -> Option<EditSnapshot> {
+        let (source, target) = if redo {
+            (&mut self.redo, &mut self.undo)
+        } else {
+            (&mut self.undo, &mut self.redo)
+        };
+        let next = source.pop()?;
+        target.push(std::mem::replace(&mut self.current, next));
+        Self::trim(target);
+        Some(self.current.clone())
+    }
+    pub(super) fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+    pub(super) fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+}
+
 pub(super) struct CellEditor {
     pub(super) row: usize,
     pub(super) column: usize,
     pub(super) editor: Entity<TextEditor>,
     pub(super) structured: bool,
+    pub(super) bulk_rows: Vec<usize>,
     binary_format: Option<value_view::BinaryFormat>,
     _blur: Subscription,
 }
@@ -106,7 +193,14 @@ impl DataTab {
     }
 
     /// Mirror the changeset, marks and open editor into the grid delegate.
-    pub(super) fn sync_cell_edits(&self, cx: &mut Context<DbxApp>) {
+    pub(super) fn sync_cell_edits(&mut self, cx: &mut Context<DbxApp>) {
+        if !self.edit_history.suspended {
+            self.edit_history.record(EditSnapshot {
+                edits: self.pending_edits.clone(),
+                inserts: self.pending_inserts.clone(),
+                deletes: self.pending_deletes.clone(),
+            });
+        }
         let columns = self
             .result
             .as_ref()
@@ -218,6 +312,37 @@ enum StagedCell {
 }
 
 impl DbxApp {
+    pub(super) fn undo_grid_edits_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        redo: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
+            return;
+        };
+        if data.busy
+            || data.cell_editor.is_some()
+            || data.row_draft.is_some()
+            || data.recovered_changeset.is_some()
+        {
+            return;
+        }
+        let Some(snapshot) = data.edit_history.step(redo) else {
+            return;
+        };
+        data.pending_edits = snapshot.edits;
+        data.pending_inserts = snapshot.inserts;
+        data.pending_deletes = snapshot.deletes;
+        data.marked_rows.clear();
+        data.mark_anchor = None;
+        data.selected_row = None;
+        data.clear_grid_selection(cx);
+        data.sync_cell_edits(cx);
+        cx.notify();
+    }
+
     /// Describe why a data tab cannot reload, for a blocking toast.
     pub(super) fn pending_edits_block(
         &mut self,
@@ -381,6 +506,7 @@ impl DbxApp {
             column,
             editor: editor.clone(),
             structured,
+            bulk_rows: Vec::new(),
             binary_format,
             _blur: blur,
         });
@@ -407,6 +533,7 @@ impl DbxApp {
             return;
         };
         let (row, column) = (cell.row, cell.column);
+        let bulk_rows = cell.bulk_rows.clone();
         let structured = cell.structured;
         let binary_format = cell.binary_format;
         let text = cell.editor.read(cx).text(cx);
@@ -429,7 +556,7 @@ impl DbxApp {
         };
         // An emptied cell that showed NULL (or a new row's default) keeps it
         // instead of becoming an empty string the user never typed.
-        let unchanged_empty = text.is_empty() && was_null;
+        let unchanged_empty = bulk_rows.is_empty() && text.is_empty() && was_null;
         if structured
             && !unchanged_empty
             && let Err(error) = serde_json::from_str::<serde_json::Value>(&text)
@@ -455,7 +582,13 @@ impl DbxApp {
             return;
         };
         if let Some(value) = staged {
-            data.stage_cell(row, column, value);
+            for row in if bulk_rows.is_empty() {
+                vec![row]
+            } else {
+                bulk_rows
+            } {
+                data.stage_cell(row, column, value.clone());
+            }
         }
         data.cell_editor = None;
         data.sync_cell_edits(cx);
@@ -498,6 +631,53 @@ impl DbxApp {
         cx.notify();
     }
 
+    pub(super) fn begin_bulk_cell_edit_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        (rows, column): (Vec<usize>, usize),
+        set_null: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(&first) = rows.first() else {
+            return;
+        };
+        let valid = self.data_tab(session_id, tab_id).is_some_and(|data| {
+            !data.busy
+                && data.cell_editor.is_none()
+                && data.row_draft.is_none()
+                && data.recovered_changeset.is_none()
+                && rows.iter().all(|row| {
+                    *row < data.loaded_rows_with_inserts() && !data.pending_deletes.contains(row)
+                })
+        });
+        if !valid {
+            return;
+        }
+        self.begin_cell_edit_for(session_id, tab_id, first, column, window, cx);
+        if let Some(data) = self.data_tab_mut(session_id, tab_id)
+            && let Some(cell) = &mut data.cell_editor
+        {
+            cell.bulk_rows = rows.clone();
+        } else {
+            return;
+        }
+        if set_null {
+            self.set_cell_null_for(session_id, tab_id, window, cx);
+        } else {
+            self.show_toast(
+                ToastKind::Info,
+                format!(
+                    "Enter a value for {} selected rows; changes remain staged for review",
+                    rows.len()
+                ),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
     /// Stage NULL for the open editor's cell when its column allows it.
     pub(super) fn set_cell_null_for(
         &mut self,
@@ -525,6 +705,11 @@ impl DbxApp {
             return;
         };
         let (row, column) = (cell.row, cell.column);
+        let rows = if cell.bulk_rows.is_empty() {
+            vec![row]
+        } else {
+            cell.bulk_rows.clone()
+        };
         let Some(nullable) = data.result.as_ref().and_then(|result| {
             let name = &result.columns.get(column)?.name;
             Some(
@@ -543,7 +728,9 @@ impl DbxApp {
         let Some(data) = self.data_tab_mut(session_id, tab_id) else {
             return;
         };
-        data.stage_cell(row, column, Some(MutationValue::Parameter(CellValue::Null)));
+        for row in rows {
+            data.stage_cell(row, column, Some(MutationValue::Parameter(CellValue::Null)));
+        }
         data.cell_editor = None;
         data.sync_cell_edits(cx);
         let grid = data.data_grid.read(cx).focus_handle(cx);
@@ -602,6 +789,7 @@ impl DbxApp {
         data.pending_inserts.clear();
         data.pending_deletes.clear();
         data.cell_editor = None;
+        data.edit_history = Default::default();
         if had_inserts
             && data
                 .selected_row
@@ -765,8 +953,19 @@ impl DbxApp {
         rows: &[usize],
         cx: &mut Context<Self>,
     ) {
+        let history = self.data_tab_mut(session_id, tab_id).map(|data| {
+            let history = std::mem::take(&mut data.edit_history);
+            data.edit_history.suspended = true;
+            history
+        });
         for &row in rows {
             self.duplicate_row_for(session_id, tab_id, row, cx);
+        }
+        if let Some(history) = history
+            && let Some(data) = self.data_tab_mut(session_id, tab_id)
+        {
+            data.edit_history = history;
+            data.sync_cell_edits(cx);
         }
     }
 
@@ -777,6 +976,11 @@ impl DbxApp {
         rows: &[usize],
         cx: &mut Context<Self>,
     ) {
+        let history = self.data_tab_mut(session_id, tab_id).map(|data| {
+            let history = std::mem::take(&mut data.edit_history);
+            data.edit_history.suspended = true;
+            history
+        });
         let mut rows = rows.to_vec();
         rows.sort_unstable();
         rows.dedup();
@@ -785,6 +989,9 @@ impl DbxApp {
             self.revert_row_for(session_id, tab_id, row, cx);
         }
         if let Some(data) = self.data_tab_mut(session_id, tab_id) {
+            if let Some(history) = history {
+                data.edit_history = history;
+            }
             data.marked_rows.clear();
             data.mark_anchor = None;
             if data
@@ -1245,6 +1452,7 @@ impl DbxApp {
                         data.pending_inserts.clear();
                         data.pending_deletes.clear();
                         data.cell_editor = None;
+                        data.edit_history = Default::default();
                         data.sync_cell_edits(cx);
                         this.show_toast(
                             ToastKind::Success,
@@ -1268,6 +1476,149 @@ impl DbxApp {
 mod tests {
     use super::*;
     use dbx_core::OrderDirection;
+
+    #[test]
+    fn edit_history_branches_and_bounds_snapshots() {
+        let mut history = EditHistory::default();
+        let mut first = EditSnapshot::default();
+        first.edits.insert(
+            (0, 1),
+            MutationValue::Parameter(CellValue::Text("edited".into())),
+        );
+        first.inserts.push(PendingInsert::default());
+        first.deletes.insert(2);
+        history.record(first.clone());
+        assert_eq!(history.step(false).unwrap(), EditSnapshot::default());
+        assert_eq!(history.step(true).unwrap(), first);
+        history.step(false).unwrap();
+        let mut branch = EditSnapshot::default();
+        branch.deletes.insert(3);
+        history.record(branch);
+        assert!(!history.can_redo());
+        for row in 0..100 {
+            let mut next = EditSnapshot::default();
+            next.deletes.insert(row);
+            history.record(next);
+        }
+        assert!(history.undo.len() <= MAX_EDIT_HISTORY);
+        let mut huge = EditSnapshot::default();
+        huge.edits.insert(
+            (0, 1),
+            MutationValue::Parameter(CellValue::Text("x".repeat(MAX_EDIT_HISTORY_BYTES + 1))),
+        );
+        history.record(huge);
+        assert!(!history.can_undo());
+        assert!(!history.can_redo());
+        assert!(history.suspended);
+    }
+
+    #[gpui::test]
+    fn bulk_grid_values_are_staged_atomic_and_undoable(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+            app.vault_state = Some(VaultState::Unlocked);
+            let engine = Arc::new(app.runtime.block_on(DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::SQLite, "sqlite::memory:"))).unwrap());
+            app.runtime.block_on(engine.execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT, count INTEGER NOT NULL); INSERT INTO items VALUES(1,'one',10),(2,'two',20)")).unwrap();
+            let result = app.runtime.block_on(engine.query("SELECT * FROM items", QueryOptions::default())).unwrap();
+            let mut session = ConnectionSession::new(session_id, None, "Bulk".into(), DatabaseKind::SQLite, None, window, cx);
+            session.tables = vec![TableInfo::table("items", None)];
+            let mut data = DataTab::new(session_id, tab_id, TableRef::new("items"), true, window, cx);
+            data.table_columns = app.runtime.block_on(engine.describe_table(&data.table)).unwrap();
+            data.result_table = Some(data.table.clone()); data.set_result(Some(result), &session.tables, cx);
+            session.engine = Some(engine); session.secondary_tabs.push(SecondaryTab { id: tab_id, kind: SecondaryTabKind::Data(Box::new(data)) }); session.active_secondary_tab = Some(tab_id);
+            app.sessions.push(session); app.active_session_id = Some(session_id); app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.begin_bulk_cell_edit_for(session_id, tab_id, (vec![0, 1], 1), true, window, cx);
+                let data = app.data_tab(session_id, tab_id).unwrap();
+                assert_eq!(data.pending_edits.len(), 2);
+                assert!(
+                    data.pending_edits
+                        .values()
+                        .all(|value| *value == MutationValue::Parameter(CellValue::Null))
+                );
+                app.undo_grid_edits_for(session_id, tab_id, false, cx);
+                assert!(
+                    !app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .has_pending_edits()
+                );
+                app.undo_grid_edits_for(session_id, tab_id, true, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .len(),
+                    2
+                );
+                app.begin_bulk_cell_edit_for(
+                    session_id,
+                    tab_id,
+                    (vec![0, 1], 2),
+                    false,
+                    window,
+                    cx,
+                );
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| editor.set_text("not a number", cx));
+                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .len(),
+                    2,
+                    "Invalid bulk input must stage nothing"
+                );
+                editor.update(cx, |editor, cx| editor.set_text("99", cx));
+                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .len(),
+                    4
+                );
+                app.undo_grid_edits_for(session_id, tab_id, false, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .len(),
+                    2,
+                    "Bulk changes undo together"
+                );
+                let engine = app.session(session_id).unwrap().engine.as_ref().unwrap();
+                let original = app
+                    .runtime
+                    .block_on(engine.query(
+                        "SELECT count FROM items ORDER BY id",
+                        QueryOptions::default(),
+                    ))
+                    .unwrap();
+                assert_eq!(original.rows[0].values[0], CellValue::Integer(10));
+                app.discard_pending_edits_for(session_id, tab_id, cx);
+                assert!(
+                    !app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .edit_history
+                        .can_undo()
+                );
+            })
+        });
+    }
 
     // Tokio database jobs use real threads; drain GPUI completions while
     // waiting for their notifications, with a bounded wall-clock deadline.
@@ -1478,11 +1829,12 @@ mod tests {
             });
             window.draw(cx).clear(cx);
         });
-        // Choose JSON, TSV and SQL through the actual right-click menu.
+        // Choose JSON, TSV, Markdown and SQL through the actual right-click menu.
         for (keys, format) in [
             ("down enter", "json"),
             ("down down enter", "tsv"),
-            ("down down down enter", "sql"),
+            ("down down down enter", "markdown"),
+            ("down down down down enter", "sql"),
         ] {
             let row = cx.debug_bounds("dbx-result-row-1").unwrap();
             let point = gpui::point(row.left() + px(8.), row.center().y);
@@ -1499,6 +1851,10 @@ mod tests {
                     assert_eq!(json[1]["name"], "two");
                 }
                 "tsv" => assert_eq!(text, "1\tone\n2\ttwo"),
+                "markdown" => {
+                    assert!(text.contains("| 1 | one |"));
+                    assert!(text.contains("| 2 | two |"));
+                }
                 _ => {
                     assert_eq!(text.matches("INSERT INTO").count(), 2);
                     assert!(text.contains("'one'") && text.contains("'two'"));
@@ -1510,7 +1866,7 @@ mod tests {
         cx.simulate_mouse_down(cell.center(), MouseButton::Right, Default::default());
         cx.simulate_mouse_up(cell.center(), MouseButton::Right, Default::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("down down down down enter");
+        cx.simulate_keystrokes("down down down down down enter");
         assert_eq!(
             cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
             "one\ntwo"
@@ -1522,7 +1878,7 @@ mod tests {
         cx.simulate_mouse_down(point, MouseButton::Right, Default::default());
         cx.simulate_mouse_up(point, MouseButton::Right, Default::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("down down down down enter");
+        cx.simulate_keystrokes("down down down down down enter");
         cx.update(|_, cx| {
             app.update(cx, |app, cx| {
                 let data = app.data_tab(session_id, tab_id).unwrap();
@@ -1828,6 +2184,14 @@ mod tests {
                 window,
                 cx,
             );
+            session.engine = Some(Arc::new(
+                app.runtime
+                    .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                        DatabaseKind::SQLite,
+                        "sqlite::memory:",
+                    )))
+                    .unwrap(),
+            ));
             session.tables = vec![TableInfo::table("items", None)];
             let mut id = ColumnInfo::result("id", 0, "INTEGER");
             id.primary_key = true;

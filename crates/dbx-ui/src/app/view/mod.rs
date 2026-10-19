@@ -15,6 +15,14 @@ use super::*;
 
 impl Render for DbxApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let production = self.workspace_screen_drawn()
+            && self
+                .active_session()
+                .and_then(|session| session.tag.as_ref())
+                .is_some_and(ConnectionTag::is_production);
+        if crate::theme::set_production_context(production) {
+            crate::theme::sync_component_theme(Some(window), cx);
+        }
         crate::theme::set_text_scales(self.ui_scale, self.editor_scale);
         crate::theme::set_font_sizes(self.font_size, self.mono_font_size);
         {
@@ -80,6 +88,7 @@ impl Render for DbxApp {
             self.startup_recovery_started = true;
             self.restore_startup_workspace(window, cx);
         }
+        self.validate_nonrelational_editor();
         let content = if !unlocked {
             self.render_connection(cx).into_any_element()
         } else if self.settings_open {
@@ -99,7 +108,16 @@ impl Render for DbxApp {
         div()
             .id("dbx-app")
             .role(gpui::Role::Application)
-            .aria_label("DBX")
+            .aria_label(if production {
+                format!(
+                    "DBX — production connection {}",
+                    self.active_session()
+                        .map(|session| session.name.as_str())
+                        .unwrap_or_default()
+                )
+            } else {
+                "DBX".to_owned()
+            })
             .size_full()
             .relative()
             .flex()
@@ -109,6 +127,17 @@ impl Render for DbxApp {
             .text_size(px(16. * self.font_size as f32 / 12.))
             .text_color(theme().text)
             .track_focus(&self.focus_handle)
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    if let Some(path) = paths.paths().first() {
+                        this.open_connection_target(
+                            path.to_string_lossy().into_owned(),
+                            window,
+                            cx,
+                        );
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|this, event, window, cx| {
                 this.dismiss_overlay_on_escape(event, window, cx)
             }))
@@ -137,6 +166,16 @@ impl Render for DbxApp {
             .on_action(cx.listener(Self::previous_connection_action))
             .on_action(cx.listener(Self::toggle_sidebar_action))
             .on_action(cx.listener(Self::open_quick_open_action))
+            .on_action(cx.listener(Self::open_command_palette_action))
+            .on_action(cx.listener(|this, _: &SubmitTableName, window, cx| {
+                this.submit_table_name_prompt(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ConfirmAction, window, cx| {
+                this.confirm_pending_action(window, cx)
+            }))
+            .on_action(cx.listener(Self::open_settings_action))
+            .on_action(cx.listener(Self::open_shortcuts_action))
+            .on_action(cx.listener(Self::search_history_action))
             .on_action(cx.listener(Self::focus_explorer_action))
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))
@@ -186,7 +225,9 @@ impl Render for DbxApp {
                     .child(self.render_mutation_error_dialog(cx))
             })
             .when(unlocked, |view| {
-                view.child(self.render_quick_open(cx))
+                view.child(self.render_nonrelational_editor(cx))
+                    .child(self.render_table_name_prompt(cx))
+                    .child(self.render_quick_open(cx))
                     .child(self.render_confirmation_dialog(cx))
                     .child(self.render_profile_transfer(cx))
                     .child(self.render_data_import(cx))
@@ -224,12 +265,15 @@ impl DbxApp {
                     ToastKind::Error => theme().danger,
                 };
                 glass_raised(
-                    div().id(SharedString::from(format!("toast-{id}"))),
+                    div()
+                        .id(SharedString::from(format!("toast-{id}")))
+                        .debug_selector(move || format!("toast-{id}")),
                     RADIUS_GLASS + 4.,
                 )
-                .rounded_full()
+                .rounded(crate::theme::ui_px(16.))
                 .max_w(crate::theme::ui_px(520.))
-                .h(crate::theme::control_height(36.))
+                .min_h(crate::theme::control_height(36.))
+                .py(crate::theme::ui_px(8.))
                 .pl(crate::theme::ui_px(14.))
                 .pr(crate::theme::ui_px(18.))
                 .flex()
@@ -256,7 +300,7 @@ impl DbxApp {
                         matches!(toast.kind, ToastKind::Error),
                     )
                     .min_w_0()
-                    .truncate()
+                    .whitespace_normal()
                     .child(toast.message.clone()),
                 )
                 .child(
@@ -265,6 +309,11 @@ impl DbxApp {
                         .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx))),
                 )
                 .tooltip(tip(toast.message.clone()))
+                .on_hover(cx.listener(move |this, hovered, _, _| {
+                    if let Some(toast) = this.toasts.iter_mut().find(|toast| toast.id == id) {
+                        toast.hovered = *hovered;
+                    }
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)))
             }))
     }

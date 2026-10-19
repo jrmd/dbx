@@ -56,6 +56,8 @@ impl DbxApp {
                 .map(|d| d.focus.clone()),
         );
         traps.extend(self.quick_open.as_ref().map(|d| d.focus.clone()));
+        traps.extend(self.nonrelational_editor.as_ref().map(|d| d.focus.clone()));
+        traps.extend(self.table_name_prompt.as_ref().map(|d| d.focus.clone()));
         if self.workspace_screen_drawn() {
             traps.extend(
                 self.database_export_dialog
@@ -405,8 +407,7 @@ mod tests {
             }
             app.active_session_id = Some(app.sessions[0].id);
             app.connection_picker_open = false;
-            app.settings_section = SettingsSection::Editor;
-            app.open_settings(window, cx);
+            app.open_settings_section(SettingsSection::Editor, window, cx);
             app
         });
         settle(cx);

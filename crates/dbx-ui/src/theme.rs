@@ -41,7 +41,7 @@ const _: () = {
     assert!(RADIUS_CONTROL < RADIUS_PANEL && RADIUS_PANEL < RADIUS_GLASS);
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Theme {
     pub canvas: Rgba,
     pub panel: Rgba,
@@ -267,6 +267,8 @@ static SYSTEM_IS_DARK: AtomicBool = AtomicBool::new(true);
 static REDUCE_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
+    static PRODUCTION_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRODUCTION_PALETTE: std::cell::RefCell<Option<(Theme, bool, Theme)>> = const { std::cell::RefCell::new(None) };
     static MONO_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static UI_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
@@ -377,7 +379,47 @@ pub fn window_background() -> WindowBackgroundAppearance {
 
 /// Return the semantic palette for the current appearance and material.
 pub fn theme() -> Theme {
-    catalog::resolved_theme(is_dark(), reduce_transparency())
+    let mut palette = catalog::resolved_theme(is_dark(), reduce_transparency());
+    if PRODUCTION_CONTEXT.get() {
+        let original = palette;
+        let dark = is_dark();
+        if let Some(cached) = PRODUCTION_PALETTE.with_borrow(|cache| {
+            cache
+                .as_ref()
+                .filter(|(base, was_dark, _)| *base == original && *was_dark == dark)
+                .map(|(_, _, tinted)| *tinted)
+        }) {
+            return cached;
+        }
+        // Tint surfaces, never text or data-state colors. The connection badge
+        // also names the environment so this cue does not rely on color alone.
+        let tint = palette.danger;
+        for surface in [
+            &mut palette.window,
+            &mut palette.canvas,
+            &mut palette.panel,
+            &mut palette.panel_raised,
+            &mut palette.rail,
+            &mut palette.glass,
+            &mut palette.glass_raised,
+        ] {
+            let alpha = surface.a;
+            *surface = Rgba {
+                r: surface.r * 0.94 + tint.r * 0.06,
+                g: surface.g * 0.94 + tint.g * 0.06,
+                b: surface.b * 0.94 + tint.b * 0.06,
+                a: alpha,
+            };
+        }
+        catalog::ensure_readable(&mut palette, dark);
+        PRODUCTION_PALETTE.with_borrow_mut(|cache| *cache = Some((original, dark, palette)));
+    }
+    palette
+}
+
+/// Returns whether the active environment changed, for component theme sync.
+pub fn set_production_context(production: bool) -> bool {
+    PRODUCTION_CONTEXT.replace(production) != production
 }
 
 /// Push DBX's resolved palette into gpui-component so its menus, popovers,
@@ -1183,6 +1225,22 @@ pub fn badge(label: impl Into<SharedString>, color: Rgba) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_tint_changes_surfaces_and_restores_the_selected_theme() {
+        set_production_context(false);
+        let base = theme();
+        assert!(set_production_context(true));
+        let production = theme();
+        assert!(production.canvas != base.canvas);
+        assert!(production.panel != base.panel);
+        assert!(production.window != base.window);
+        assert_eq!(production.window.a, base.window.a);
+        assert!(theme() == production);
+        assert!(!set_production_context(true));
+        assert!(set_production_context(false));
+        assert!(theme() == base);
+    }
 
     fn relative_luminance(color: Rgba) -> f32 {
         fn channel(value: f32) -> f32 {

@@ -57,6 +57,33 @@ impl From<sqlx::Error> for DbxError {
             {
                 Self::Connection(error.to_string())
             }
+            sqlx::Error::Database(database) => {
+                let mut message = database.message().to_owned();
+                if let Some(postgres) =
+                    database.try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                {
+                    if let Some(position) = postgres.position() {
+                        match position {
+                            sqlx::postgres::PgErrorPosition::Original(position) => {
+                                message.push_str(&format!("\nPosition: {position}"));
+                            }
+                            sqlx::postgres::PgErrorPosition::Internal { position, .. } => {
+                                message.push_str(&format!("\nInternal query position: {position}"));
+                            }
+                        }
+                    }
+                    if let Some(detail) = postgres.detail() {
+                        message.push_str(&format!("\nDetail: {detail}"));
+                    }
+                    if let Some(hint) = postgres.hint() {
+                        message.push_str(&format!("\nHint: {hint}"));
+                    }
+                }
+                if let Some(code) = database.code() {
+                    message.push_str(&format!("\nDatabase code: {code}"));
+                }
+                Self::Query(message)
+            }
             other => Self::Query(other.to_string()),
         }
     }

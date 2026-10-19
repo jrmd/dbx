@@ -123,6 +123,42 @@ fn dialect_for(kind: DatabaseKind) -> Option<Box<dyn Dialect>> {
     })
 }
 
+/// Detect UPDATE/DELETE operations whose own AST has no WHERE predicate.
+/// Walking statements also catches mutations inside WITH and nested queries;
+/// a WHERE in a subquery never counts as a filter on the outer mutation.
+/// On unsupported syntax, warn conservatively if a mutation keyword exists.
+pub fn has_unfiltered_mutation(kind: DatabaseKind, sql: &str) -> bool {
+    struct Mutations;
+    impl Visitor for Mutations {
+        type Break = ();
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+            if matches!(statement, Statement::Update(update) if update.selection.is_none())
+                || matches!(statement, Statement::Delete(delete) if delete.selection.is_none())
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    let Some(dialect) = dialect_for(kind) else {
+        return false;
+    };
+    let Ok(statements) = crate::script::checked_split_sql_for(Some(kind), sql) else {
+        return crate::protected::sql_words_for(Some(kind), sql)
+            .iter()
+            .any(|word| matches!(word.as_str(), "UPDATE" | "DELETE"));
+    };
+    statements
+        .iter()
+        .any(|sql| match Parser::parse_sql(dialect.as_ref(), sql) {
+            Ok(ast) => ast.visit(&mut Mutations).is_break(),
+            Err(_) => crate::protected::sql_words_for(Some(kind), sql)
+                .iter()
+                .any(|word| matches!(word.as_str(), "UPDATE" | "DELETE")),
+        })
+}
+
 /// Words that may begin a statement in some supported engine. A statement
 /// starting with anything else is almost certainly a typo.
 const STATEMENT_LEADERS: &[&str] = &[
@@ -833,5 +869,33 @@ mod tests {
             )
             .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod mutation_safety_tests {
+    use super::*;
+    #[test]
+    fn mutation_filters_belong_to_the_mutation_and_include_ctes() {
+        let kind = DatabaseKind::PostgreSQL;
+        for sql in [
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "WITH x AS (SELECT * FROM t WHERE id=1) DELETE FROM t",
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            "UPDATE t SET a=(SELECT a FROM u WHERE id=1)",
+            "SELECT 1; DELETE FROM t;",
+        ] {
+            assert!(has_unfiltered_mutation(kind, sql), "{sql}");
+        }
+        for sql in [
+            "UPDATE t SET a=1 WHERE id=2",
+            "WITH x AS (SELECT 1) DELETE FROM t WHERE id=2",
+            "SELECT 'DELETE FROM t', 'WHERE'",
+            "DELETE FROM t WHERE id IN (SELECT id FROM u)",
+            "-- UPDATE t\nSELECT 1",
+        ] {
+            assert!(!has_unfiltered_mutation(kind, sql), "{sql}");
+        }
     }
 }

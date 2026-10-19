@@ -18,10 +18,13 @@ pub use designer::{TableAlteration, draft_table_alteration, draft_table_alterati
 mod connectors;
 mod console;
 mod diagnostics;
+pub mod driver_plugin;
 mod engine;
 mod error;
 pub mod language;
 mod model;
+mod nonrelational;
+pub use nonrelational::mongo_replacement;
 mod parameters;
 mod protected;
 mod redis_catalog;
@@ -31,8 +34,9 @@ mod sql;
 mod sqlx_engine;
 mod transfer;
 pub use diagnostics::{
-    MigrationDraft, Monitor, compare_execution_plans, execution_plan_query, format_execution_plan,
-    monitor_query, schema_migration,
+    MigrationDraft, Monitor, compare_execution_plans, execution_plan_analyze_query,
+    execution_plan_query, format_execution_plan, loaded_column_statistics, monitor_query,
+    schema_migration,
 };
 mod transport;
 
@@ -49,7 +53,7 @@ pub use model::{
     UpdateRequest,
 };
 pub use redis_catalog::{RedisCommand, RedisCommandArgument, RedisCommandCatalog};
-pub use redis_engine::RedisEngine;
+pub use redis_engine::{RedisEditSnapshot, RedisEngine, validate_redis_edit};
 pub use script::{
     ScriptSpan, checked_split_sql_for, split_sql_statements, sql_backslash_escapes,
     sql_dollar_quotes, sql_hash_comments, sql_statement_spans,

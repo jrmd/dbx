@@ -138,6 +138,155 @@ enum SqlCompletionArea {
 
 const MAX_SQL_COMPLETIONS: usize = 14;
 
+pub(super) fn sql_completion_items_with_relations(
+    query_text: &str,
+    cursor: usize,
+    context: &editor::SqlCompletionContext,
+    sources: SqlCompletionRequest<'_>,
+    schema: Option<&dbx_core::RelationalSchema>,
+) -> Vec<SqlCompletionItem> {
+    let mut joins = schema.map_or_else(Vec::new, |schema| {
+        foreign_key_join_items(query_text, cursor, context, &sources, schema)
+    });
+    joins.extend(sql_completion_items(query_text, cursor, context, sources));
+    joins.truncate(MAX_SQL_COMPLETIONS);
+    joins
+}
+
+/// Complete the table immediately after JOIN with a complete FK predicate.
+/// Metadata comes from the existing background catalog snapshot, never typing.
+fn foreign_key_join_items(
+    text: &str,
+    cursor: usize,
+    context: &editor::SqlCompletionContext,
+    request: &SqlCompletionRequest<'_>,
+    schema: &dbx_core::RelationalSchema,
+) -> Vec<SqlCompletionItem> {
+    if context.quote.is_some() || context.qualifier.is_some() {
+        return Vec::new();
+    }
+    let (tokens, _) = sql_query_tokens(
+        &text[..context.replacement_range.start],
+        Some(request.database_kind),
+    );
+    if tokens.last().is_none_or(|token| token.text != "join") {
+        return Vec::new();
+    }
+    let index = infer_sql_query_index(text, cursor, request);
+    let same = |source: &SqlQuerySource, table: &TableRef| {
+        source.relation.eq_ignore_ascii_case(&table.name)
+            && source.schema.as_ref().is_none_or(|schema| {
+                table
+                    .schema
+                    .as_ref()
+                    .is_some_and(|known| known.eq_ignore_ascii_case(schema))
+            })
+    };
+    let identifier = |name: &str| completion_identifier(request.database_kind, name, None);
+    let mut output = Vec::new();
+    let mut seen = HashSet::new();
+    for source in index.sources.iter().filter(|source| {
+        source.depth == index.current_depth
+            && source.scope_start <= index.current_scope_start
+            && index.current_scope_end <= source.scope_end
+    }) {
+        if source.schema.is_none()
+            && index
+                .ctes
+                .iter()
+                .any(|cte| cte.relation.eq_ignore_ascii_case(&source.relation))
+        {
+            continue;
+        }
+        // An unqualified source with duplicate table names is ambiguous. Do
+        // not guess which schema's constraints the user meant.
+        if schema
+            .tables
+            .iter()
+            .filter(|entry| same(source, &table_ref(&entry.table)))
+            .count()
+            != 1
+        {
+            continue;
+        }
+        for entry in &schema.tables {
+            let child = table_ref(&entry.table);
+            for key in &entry.structure.foreign_keys {
+                if key.columns.is_empty() || key.columns.len() != key.referenced_columns.len() {
+                    continue;
+                }
+                let parent = TableRef {
+                    schema: key
+                        .referenced_schema
+                        .clone()
+                        .or_else(|| child.schema.clone()),
+                    name: key.referenced_table.clone(),
+                };
+                let outgoing = same(source, &child);
+                let incoming = same(source, &parent);
+                if !outgoing && !incoming {
+                    continue;
+                }
+                let target = if outgoing { &parent } else { &child };
+                if !schema
+                    .tables
+                    .iter()
+                    .any(|entry| table_ref(&entry.table) == *target)
+                {
+                    continue;
+                }
+                let search = table_ref_label(target);
+                if completion_match_score(&search, &context.prefix.to_lowercase()).is_none() {
+                    continue;
+                }
+                let duplicate = index.sources.iter().any(|source| same(source, target));
+                let alias = duplicate.then(|| format!("joined_{}", target.name));
+                let target_name = alias.as_deref().unwrap_or(&target.name);
+                let source_name = source.display_name();
+                let predicate = key
+                    .columns
+                    .iter()
+                    .zip(&key.referenced_columns)
+                    .map(|(child_column, parent_column)| {
+                        let (left, right) = if outgoing {
+                            (source_name, target_name)
+                        } else {
+                            (target_name, source_name)
+                        };
+                        format!(
+                            "{}.{} = {}.{}",
+                            identifier(left),
+                            identifier(child_column),
+                            identifier(right),
+                            identifier(parent_column)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let table_sql = target.schema.as_ref().map_or_else(
+                    || identifier(&target.name),
+                    |schema| format!("{}.{}", identifier(schema), identifier(&target.name)),
+                );
+                let alias_sql = alias
+                    .as_ref()
+                    .map_or_else(String::new, |alias| format!(" AS {}", identifier(alias)));
+                let insert_text = format!("{table_sql}{alias_sql} ON {predicate}");
+                if seen.insert(insert_text.clone()) {
+                    output.push(SqlCompletionItem::new(
+                        format!("{} · FK JOIN", target.name),
+                        insert_text,
+                        format!("foreign key · {predicate}"),
+                        search,
+                        CompletionItemKind::Table,
+                    ));
+                }
+            }
+        }
+    }
+    output.sort_by(|left, right| left.insert_text.cmp(&right.insert_text));
+    output
+}
+
 pub(super) fn sql_completion_items(
     query_text: &str,
     cursor: usize,
@@ -1472,6 +1621,77 @@ pub(super) fn completion_table_key(table: &TableRef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreign_key_join_completions_quote_aliases_and_all_composite_columns() {
+        let parent = dbx_core::RelationalTable {
+            table: TableInfo {
+                schema: Some("public".into()),
+                name: "parent".into(),
+                kind: EntityKind::Table,
+            },
+            structure: Default::default(),
+        };
+        let child = dbx_core::RelationalTable {
+            table: TableInfo {
+                schema: Some("public".into()),
+                name: "child".into(),
+                kind: EntityKind::Table,
+            },
+            structure: dbx_core::TableStructure {
+                foreign_keys: vec![dbx_core::ForeignKeyInfo {
+                    constraint_name: Some("child_parent".into()),
+                    columns: vec!["parent_id".into(), "tenant_id".into()],
+                    referenced_schema: Some("public".into()),
+                    referenced_table: "parent".into(),
+                    referenced_columns: vec!["id".into(), "tenant".into()],
+                    on_update: None,
+                    on_delete: None,
+                }],
+                ..Default::default()
+            },
+        };
+        let schema = dbx_core::RelationalSchema {
+            database: "test".into(),
+            tables: vec![parent, child],
+            ..Default::default()
+        };
+        let tables = schema
+            .tables
+            .iter()
+            .map(|entry| entry.table.clone())
+            .collect::<Vec<_>>();
+        let columns = HashMap::new();
+        for (text, expected) in [
+            (
+                "SELECT * FROM child AS c JOIN par",
+                "\"public\".\"parent\" ON \"c\".\"parent_id\" = \"parent\".\"id\" AND \"c\".\"tenant_id\" = \"parent\".\"tenant\"",
+            ),
+            (
+                "SELECT * FROM parent AS p JOIN chi",
+                "\"public\".\"child\" ON \"child\".\"parent_id\" = \"p\".\"id\" AND \"child\".\"tenant_id\" = \"p\".\"tenant\"",
+            ),
+        ] {
+            let context = editor::sql_completion_context(text, text.len()).unwrap();
+            let items = sql_completion_items_with_relations(
+                text,
+                text.len(),
+                &context,
+                SqlCompletionRequest {
+                    database_kind: DatabaseKind::PostgreSQL,
+                    tables: &tables,
+                    completion_columns: &columns,
+                    selected_table: None,
+                    active_columns: &[],
+                    result: None,
+                    active_schema_filter: None,
+                },
+                Some(&schema),
+            );
+            assert_eq!(items[0].insert_text, expected);
+            assert!(items[0].detail.contains("foreign key"));
+        }
+    }
     #[test]
     fn sql_completion_uses_schema_and_cached_columns() {
         let tables = vec![

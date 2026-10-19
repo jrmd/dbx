@@ -23,6 +23,7 @@ enum Target {
     History(SessionId, QueryHistoryEntry),
     Session(SessionId),
     Connection(Box<SavedConnection>),
+    Command(&'static str),
 }
 
 #[derive(Clone)]
@@ -95,14 +96,18 @@ impl DbxApp {
             return;
         }
         if let Some(open) = &self.quick_open {
-            open.query
-                .update(cx, |editor, cx| editor.select_all_text(cx));
+            open.query.update(cx, |editor, cx| {
+                if editor.text(cx).trim_start().starts_with('>') {
+                    editor.set_text("", cx);
+                }
+                editor.select_all_text(cx);
+            });
             open.query.read(cx).focus_handle().focus(window, cx);
             return;
         }
         let query = cx.new(|cx| {
             TextEditor::empty(false, window, cx)
-                .accessibility_label("Search connections, tables and queries")
+                .accessibility_label("Search destinations, or type > for commands")
         });
         let subscription = cx.observe(&query, |this, _, cx| {
             if let Some(open) = this.quick_open.as_mut() {
@@ -172,6 +177,29 @@ impl DbxApp {
             }
             Target::Session(session_id) => self.activate_session(session_id, cx),
             Target::Connection(profile) => self.open_saved_connection(*profile, window, cx),
+            Target::Command(name) => {
+                if let Some(session_id) = self.active_session_id() {
+                    match name {
+                        "dbx_ui::RunQuery" | "dbx_ui::RunQueryAll" => {
+                            self.request_run_query_for(
+                                session_id,
+                                name.ends_with("All"),
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                        "dbx_ui::FormatQuery" => {
+                            self.format_query_for(session_id, window, cx);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Ok(action) = cx.build_action(name, None) {
+                    window.dispatch_action(action, cx);
+                }
+            }
         }
     }
 
@@ -182,6 +210,28 @@ impl DbxApp {
             return Vec::new();
         };
         let query = open.query.read(cx).text(cx);
+        if let Some(search) = query.trim_start().strip_prefix('>') {
+            let mut commands = commands::palette_commands()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (name, label))| {
+                    fuzzy_score(search, label).map(|score| {
+                        (
+                            score,
+                            index,
+                            Item {
+                                label: (*label).to_owned(),
+                                detail: commands::shortcut_for(name, cx),
+                                icon: Icon::Query,
+                                target: Target::Command(name),
+                            },
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            commands.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+            return commands.into_iter().map(|(_, _, item)| item).collect();
+        }
         if let Some(search) = query.strip_prefix("history:") {
             return self.history_search_items(search);
         }
@@ -392,6 +442,7 @@ impl DbxApp {
         let editor = open.query.clone();
         let focus = editor.read(cx).focus_handle();
         let modal_focus = open.focus.clone();
+        let command_mode = editor.read(cx).text(cx).trim_start().starts_with('>');
         let items = self.quick_open_items(cx);
         let selected = open.selected.min(items.len().saturating_sub(1));
         let selected_label = items
@@ -408,7 +459,7 @@ impl DbxApp {
             .unwrap_or_else(|| "No matches".into());
         div()
             .id("quick-open-overlay")
-            .role(gpui::Role::Dialog).aria_label("Quick open").aria_description("Search connections, tables, and queries. Use Up and Down to select a result and Enter to open it.")
+            .role(gpui::Role::Dialog).aria_label(if command_mode { "Command palette" } else { "Quick open" }).aria_description("Search destinations, or type > for commands. Use Up and Down to select a result and Enter to open it.")
             .a11y_synthetic_children({ let background = self.modal_is_background(&modal_focus); move |builder| { let node = builder.parent_node(); node.set_modal(); if background { node.set_hidden(); } } })
             .track_focus(&modal_focus)
             .occlude()
@@ -544,5 +595,48 @@ mod tests {
         assert!(fuzzy_score("user", "users") > fuzzy_score("user", "audit_user_log"));
         assert!(fuzzy_score("users", "users") > fuzzy_score("users", "users_archive"));
         assert_eq!(fuzzy_score("", "anything"), Some(0));
+    }
+    #[gpui::test]
+    fn command_prefix_filters_commands_and_registry_actions_exist(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                for (name, _) in commands::palette_commands() {
+                    assert!(cx.build_action(name, None).is_ok(), "missing action {name}");
+                }
+                app.open_command_palette_action(&OpenCommandPalette, window, cx);
+                assert!(
+                    app.quick_open_items(cx)
+                        .iter()
+                        .all(|item| matches!(item.target, Target::Command(_)))
+                );
+                app.quick_open
+                    .as_ref()
+                    .unwrap()
+                    .query
+                    .update(cx, |editor, cx| editor.set_text(">new query", cx));
+                assert_eq!(app.quick_open_items(cx)[0].label, "New query");
+                app.open_quick_open_action(&OpenQuickOpen, window, cx);
+                assert_eq!(app.quick_open.as_ref().unwrap().query.read(cx).text(cx), "");
+                assert!(
+                    app.quick_open_items(cx)
+                        .iter()
+                        .all(|item| !matches!(item.target, Target::Command(_))),
+                    "Cmd-P must remain destination mode (saved destinations may exist)"
+                );
+            })
+        });
     }
 }

@@ -157,7 +157,7 @@ impl DbxApp {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Import a VS Code or DBX theme JSON".into()),
+            prompt: Some("Import a VS Code, Zed or DBX theme JSON".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let paths = match receiver.await {
@@ -187,7 +187,7 @@ impl DbxApp {
                     file.take(catalog::MAX_THEME_BYTES + 1)
                         .read_to_string(&mut source)
                         .map_err(|e| format!("Could not read theme: {e}"))?;
-                    catalog::import_theme(
+                    catalog::import_themes(
                         &source,
                         path.file_stem()
                             .and_then(|s| s.to_str())
@@ -197,11 +197,22 @@ impl DbxApp {
                 .await;
             this.update_in(cx, |this, window, cx| match imported {
                 Ok(imported) => {
-                    let name = imported.theme.name.clone();
+                    let count = imported.len();
+                    let name = imported[0].theme.name.clone();
                     this.theme_preferences.preset = Preset::Default;
-                    let index = this.theme_preferences.add(imported.theme);
+                    let mut first = None;
+                    for imported in imported {
+                        let index = this.theme_preferences.add(imported.theme);
+                        first.get_or_insert(index);
+                    }
+                    let index = first.expect("validated nonempty theme family");
                     this.select_custom_theme(index, window, cx);
-                    this.show_toast(ToastKind::Success, format!("Applied {name}"), cx);
+                    let message = if count > 1 {
+                        format!("Imported {count} themes · Applied {name}")
+                    } else {
+                        format!("Applied {name}")
+                    };
+                    this.show_toast(ToastKind::Success, message, cx);
                 }
                 Err(error) => this.show_toast(ToastKind::Error, error, cx),
             })?;
@@ -397,7 +408,7 @@ impl DbxApp {
             tile_row(
                 "Your themes",
                 (self.theme_preferences.custom_themes.is_empty())
-                    .then_some("Import a VS Code or DBX theme, or edit a preset’s colours."),
+                    .then_some("Import a VS Code, Zed or DBX theme, or edit a preset’s colours."),
                 "theme-custom",
                 yours,
             ),
@@ -806,6 +817,47 @@ fn theme_specimen(current: &crate::theme::Theme, mono: SharedString) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn one_click_applies_dark_theme_and_reopening_settings_starts_at_appearance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let _appearance = crate::theme::appearance_test_lock();
+        cx.update(gpui_component::init);
+        set_appearance(Appearance::Light);
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::at(directory.path().join("settings.json"));
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.appearance = Appearance::Light;
+            app.settings_store = Some(store.clone());
+            app.apply_material(window, cx);
+            app.open_settings(window, cx);
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let dark = cx.debug_bounds("settings-appearance-Dark").unwrap();
+        cx.simulate_click(dark.center(), Default::default());
+        app.read_with(cx, |app, cx| {
+            assert_eq!(app.appearance, Appearance::Dark);
+            assert!(crate::theme::is_dark());
+            assert!(gpui_component::Theme::global(cx).is_dark());
+            assert_eq!(store.load().unwrap().appearance, Appearance::Dark);
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.settings_section = SettingsSection::Editor;
+                app.close_settings(window, cx);
+                app.open_settings(window, cx);
+                assert!(app.settings_section == SettingsSection::Appearance);
+                app.open_tag_settings(window, cx);
+                assert!(app.settings_section == SettingsSection::Tags);
+            })
+        });
+        catalog::set_preferences(&Default::default());
+        set_appearance(Appearance::Dark);
+    }
 
     #[gpui::test]
     fn file_picker_import_export_and_cancellation_preserve_themes(cx: &mut gpui::TestAppContext) {

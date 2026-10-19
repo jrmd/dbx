@@ -8,6 +8,91 @@ use super::*;
 use crate::row_drafts::parse_field_value;
 
 impl DbxApp {
+    pub(super) fn copy_data_markdown_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(result) = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.result.clone())
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(crate::result_export::markdown(
+            &result,
+        )));
+        self.show_toast(
+            ToastKind::Success,
+            format!(
+                "Copied {} loaded rows as Markdown; staged edits excluded",
+                result.rows.len()
+            ),
+            cx,
+        );
+    }
+
+    pub(super) fn export_data_xlsx_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(result) = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.result.clone())
+        {
+            self.export_loaded_xlsx(result, "table-loaded-rows.xlsx".into(), cx);
+        }
+    }
+
+    pub(super) fn export_loaded_xlsx(
+        &mut self,
+        result: Arc<QueryResult>,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&directory, Some(&name));
+        let runtime = self.runtime.clone();
+        let rows = result.rows.len();
+        let partial = result.truncated;
+        cx.spawn(async move |this, cx| {
+            let outcome = match receiver.await {
+                Ok(Ok(Some(path))) => runtime
+                    .spawn_blocking(move || {
+                        let bytes = crate::result_export::xlsx(&result)?;
+                        dbx_core::write_atomic_export(&path, &bytes)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result),
+                Ok(Ok(None)) => return Ok::<(), anyhow::Error>(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            this.update(cx, |this, cx| match outcome {
+                Ok(()) => this.show_toast(
+                    ToastKind::Success,
+                    format!(
+                        "Exported {rows} loaded rows to XLSX{}; staged edits excluded",
+                        if partial { " (partial result)" } else { "" }
+                    ),
+                    cx,
+                ),
+                Err(error) => {
+                    this.show_toast(ToastKind::Error, format!("XLSX export: {error}"), cx)
+                }
+            })?;
+            Ok(())
+        })
+        .detach();
+    }
+
     /// Copy the marked rows, else the selected cell, row or column, as TSV.
     pub(super) fn copy_data_selection_for(
         &mut self,

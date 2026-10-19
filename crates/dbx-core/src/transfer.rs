@@ -325,7 +325,7 @@ struct ExportFile {
 }
 enum ExportWriter {
     Plain(BufWriter<fs::File>),
-    Gzip(GzEncoder<BufWriter<fs::File>>),
+    Gzip(Box<GzEncoder<BufWriter<fs::File>>>),
 }
 impl ExportFile {
     fn new(path: &Path, gzipped: bool) -> Result<Self> {
@@ -337,7 +337,7 @@ impl ExportFile {
         .map_err(io_error)?;
         let buffer = BufWriter::new(temporary.as_file().try_clone().map_err(io_error)?);
         let writer = if gzipped {
-            ExportWriter::Gzip(GzEncoder::new(buffer, Compression::default()))
+            ExportWriter::Gzip(Box::new(GzEncoder::new(buffer, Compression::default())))
         } else {
             ExportWriter::Plain(buffer)
         };

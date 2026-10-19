@@ -34,7 +34,7 @@ impl Pairing {
         let DatabaseEngine::Sql(sql) = source.as_ref() else {
             unreachable!("native engine checked")
         };
-        let engine = Arc::new(DatabaseEngine::Sql(sql.frozen_pool().await?));
+        let engine = Arc::new(DatabaseEngine::Sql(Box::new(sql.frozen_pool().await?)));
         let database = engine.current_database().await?;
         let mut entropy = [0u8; 32];
         getrandom::fill(&mut entropy)

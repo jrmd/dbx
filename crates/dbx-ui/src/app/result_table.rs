@@ -33,7 +33,6 @@ use gpui_component::table::TableEvent;
 use crate::workspace::TableLayout;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
-use crate::diagram::display_type;
 use crate::row_drafts::{FieldValueKind, field_value_kind};
 use crate::theme::{ButtonAccessibility as _, Icon, icon, theme};
 
@@ -468,8 +467,8 @@ impl ResultTableDelegate {
         app: &WeakEntity<DbxApp>,
         session_id: SessionId,
         tab_id: SecondaryTabId,
-        row_ix: usize,
-        column: usize,
+        (row_ix, column): (usize, usize),
+        cx: &App,
     ) -> PopupMenu {
         let Some(result) = self.result.as_deref() else {
             return menu;
@@ -567,6 +566,70 @@ impl ResultTableDelegate {
                     });
                 },
             ));
+        }
+        let (can_edit, nullable) = app
+            .upgrade()
+            .map(|app| {
+                let owner = app.read(cx);
+                let data = owner.data_tab(session_id, tab_id);
+                let editable = owner.editable_table_for(session_id, tab_id).is_some()
+                    && data.is_some_and(|data| {
+                        !data.busy
+                            && data.cell_editor.is_none()
+                            && data.row_draft.is_none()
+                            && data.recovered_changeset.is_none()
+                    });
+                let nullable = data
+                    .and_then(|data| data.table_columns.iter().find(|info| info.name == name))
+                    .is_none_or(|info| info.nullable);
+                (editable, nullable)
+            })
+            .unwrap_or((false, false));
+        for (label, set_null) in [
+            (
+                format!(
+                    "Set value in {}…",
+                    super::counted(rows.len(), "selected row", "selected rows")
+                ),
+                false,
+            ),
+            (
+                format!(
+                    "Set NULL in {}",
+                    super::counted(rows.len(), "selected row", "selected rows")
+                ),
+                true,
+            ),
+        ] {
+            let app = app.clone();
+            let rows = rows.clone();
+            let snapshot = self.result.clone();
+            let inserts = self.changes.inserts.clone();
+            menu = menu.item(
+                PopupMenuItem::new(label)
+                    .disabled(!can_edit || (set_null && !nullable))
+                    .on_click(move |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| {
+                            let valid = this.data_tab(session_id, tab_id).is_some_and(|data| {
+                                data.result
+                                    .as_ref()
+                                    .zip(snapshot.as_ref())
+                                    .is_some_and(|(current, old)| Arc::ptr_eq(current, old))
+                                    && data.data_grid.read(cx).delegate().changes.inserts == inserts
+                            });
+                            if valid {
+                                this.begin_bulk_cell_edit_for(
+                                    session_id,
+                                    tab_id,
+                                    (rows.clone(), column),
+                                    set_null,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        });
+                    }),
+            );
         }
         let pinned = self
             .grid_column(column)
@@ -915,6 +978,10 @@ impl ResultTableDelegate {
             .map(|result| delimited_result(result, '\t'))
     }
 
+    pub(super) fn result_as_markdown(&self) -> Option<String> {
+        self.result.as_deref().map(crate::result_export::markdown)
+    }
+
     /// Render the complete result as a headered RFC 4180-compatible CSV document.
     pub(super) fn result_as_csv(&self) -> Option<String> {
         self.result
@@ -953,9 +1020,7 @@ impl ResultTableDelegate {
     }
 
     fn auto_width(result: &QueryResult, column_index: usize, column: &ColumnInfo) -> Pixels {
-        let header_chars = format!("{}  {}", column.name, column.data_type)
-            .chars()
-            .count();
+        let header_chars = column.name.chars().count();
         let value_chars = result
             .rows
             .iter()
@@ -1147,11 +1212,7 @@ impl ResultTableDelegate {
         let result = self.result.as_deref()?;
         let index = self.result_column(col_ix)?;
         let column = result.columns.get(index)?;
-        let header = format!("{}  {}", column.name, display_type(&column.data_type))
-            .chars()
-            .count() as f32
-            * 7.0
-            + 28.0;
+        let header = column.name.chars().count() as f32 * 7.0 + 28.0;
         let values = result
             .rows
             .iter()
@@ -1524,6 +1585,10 @@ impl TableDelegate for ResultTableDelegate {
                 SORT_ICON_WIDTH * crate::theme::ui_scale() + 4.
             };
         let content = cell
+            .tooltip(crate::theme::tip(format!(
+                "{} · {}",
+                column.name, column.data_type
+            )))
             .when(column.primary_key, |cell| {
                 cell.child(
                     div()
@@ -1536,23 +1601,13 @@ impl TableDelegate for ResultTableDelegate {
             })
             .child(
                 div()
-                    .flex_shrink(1.)
+                    .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_size(crate::theme::text_px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme().text)
                     .child(column.name.clone()),
-            )
-            .child(
-                div()
-                    .max_w(gpui::relative(0.45))
-                    .flex_shrink(1.)
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::theme::text_px(9.))
-                    .text_color(theme().text_muted)
-                    .child(display_type(&column.data_type)),
             );
         // The content clips its labels; the handle sits outside that clip.
         div()
@@ -1798,6 +1853,22 @@ impl TableDelegate for ResultTableDelegate {
         for (label, text) in [
             ("Copy as JSON", self.rows_as_json(&rows)),
             ("Copy as TSV", self.rows_as_tsv(&rows)),
+            (
+                "Copy as Markdown",
+                self.result.as_ref().and_then(|result| {
+                    let selected = QueryResult {
+                        columns: result.columns.clone(),
+                        rows: rows
+                            .iter()
+                            .map(|row| result.rows.get(*row).cloned())
+                            .collect::<Option<Vec<_>>>()?,
+                        rows_affected: None,
+                        truncated: false,
+                        elapsed_ms: result.elapsed_ms,
+                    };
+                    Some(crate::result_export::markdown(&selected))
+                }),
+            ),
         ] {
             menu = menu.item(PopupMenuItem::new(label).disabled(text.is_none()).on_click(
                 move |_, _, cx| {
@@ -1875,7 +1946,7 @@ impl TableDelegate for ResultTableDelegate {
         if let Some(column) = self.context_column
             && row_ix < self.loaded_rows()
         {
-            menu = self.column_menu(menu, &app, session_id, tab_id, row_ix, column);
+            menu = self.column_menu(menu, &app, session_id, tab_id, (row_ix, column), cx);
         }
         let result_snapshot = self.result.clone();
         let insert_snapshot = self.changes.inserts.clone();
@@ -1889,6 +1960,28 @@ impl TableDelegate for ResultTableDelegate {
                         && data.recovered_changeset.is_none()
                 })
         });
+        for (label, redo) in [("Undo staged edit", false), ("Redo staged edit", true)] {
+            let enabled = can_edit
+                && app.upgrade().is_some_and(|app| {
+                    app.read(cx)
+                        .data_tab(session_id, tab_id)
+                        .is_some_and(|data| {
+                            if redo {
+                                data.edit_history.can_redo()
+                            } else {
+                                data.edit_history.can_undo()
+                            }
+                        })
+                });
+            let app = app.clone();
+            menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                move |_, _, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.undo_grid_edits_for(session_id, tab_id, redo, cx)
+                    });
+                },
+            ));
+        }
         let is_new = rows.iter().all(|row| self.insert_row(*row).is_some());
         let has_changes = rows.iter().any(|row| {
             self.insert_row(*row).is_some()

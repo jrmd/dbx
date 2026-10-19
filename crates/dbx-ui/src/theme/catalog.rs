@@ -19,16 +19,24 @@ pub enum Preset {
     Plum,
     Sand,
     Graphite,
+    Dracula,
+    Nord,
+    Solarized,
+    Catppuccin,
 }
 
 impl Preset {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 10] = [
         Self::Default,
         Self::Ocean,
         Self::Forest,
         Self::Plum,
         Self::Sand,
         Self::Graphite,
+        Self::Dracula,
+        Self::Nord,
+        Self::Solarized,
+        Self::Catppuccin,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -38,6 +46,10 @@ impl Preset {
             Self::Plum => "Plum",
             Self::Sand => "Sand",
             Self::Graphite => "Graphite",
+            Self::Dracula => "Dracula",
+            Self::Nord => "Nord",
+            Self::Solarized => "Solarized",
+            Self::Catppuccin => "Catppuccin",
         }
     }
 }
@@ -290,7 +302,7 @@ fn mix(a: Rgba, b: Rgba, amount: f32) -> Rgba {
 
 /// Text roles must stay legible whatever a custom or imported theme says;
 /// saved themes from older imports are corrected here when they load.
-fn ensure_readable(p: &mut Theme, dark: bool) {
+pub(super) fn ensure_readable(p: &mut Theme, dark: bool) {
     let surfaces = [
         p.canvas,
         composite(p.panel, p.canvas),
@@ -335,13 +347,19 @@ pub fn preset_theme(preset: Preset, dark: bool, solid: bool) -> Theme {
     if preset == Preset::Default {
         return p;
     }
+    if matches!(
+        preset,
+        Preset::Dracula | Preset::Nord | Preset::Solarized | Preset::Catppuccin
+    ) {
+        return familiar_palette(p, preset, dark);
+    }
     let (tint, accent, bright) = match preset {
         Preset::Ocean => (0x146c94, 0x086b87, 0x78d4ea),
         Preset::Forest => (0x37765b, 0x24734d, 0x92d9ac),
         Preset::Plum => (0x765386, 0x8147b3, 0xd7a7f4),
         Preset::Sand => (0xb08a50, 0x976121, 0xe7c38c),
         Preset::Graphite => (0x777777, 0x536176, 0xb9c9df),
-        Preset::Default => unreachable!(),
+        _ => unreachable!(),
     };
     for color in [
         &mut p.canvas,
@@ -375,6 +393,106 @@ pub fn preset_theme(preset: Preset, dark: bool, solid: bool) -> Theme {
     p.selection.a = 0.3;
     p.sql_keyword = p.accent_text;
     p.sql_identifier = p.accent_text;
+    p
+}
+
+/// Established palette colours adapted to DBX's semantic roles. See
+/// docs/themes.md for the original palette references and light variants.
+fn familiar_palette(mut p: Theme, preset: Preset, dark: bool) -> Theme {
+    let (background, foreground, muted, accent, keyword, string, number, comment) =
+        match (preset, dark) {
+            (Preset::Dracula, true) => (
+                0x282a36, 0xf8f8f2, 0xb3b8d5, 0xbd93f9, 0xff79c6, 0xf1fa8c, 0xbd93f9, 0x6272a4,
+            ),
+            (Preset::Dracula, false) => (
+                0xfffbeb, 0x1f1f1f, 0x6c664b, 0x644ac9, 0xa3144d, 0x6a6b09, 0x644ac9, 0x6c664b,
+            ),
+            (Preset::Nord, true) => (
+                0x2e3440, 0xeceff4, 0xb8c2d2, 0x88c0d0, 0x81a1c1, 0xa3be8c, 0xb48ead, 0x788ba8,
+            ),
+            (Preset::Nord, false) => (
+                0xeceff4, 0x2e3440, 0x4c566a, 0x3b6580, 0x5e81ac, 0x4f6c39, 0x825b7e, 0x616e88,
+            ),
+            (Preset::Solarized, true) => (
+                0x002b36, 0x93a1a1, 0x839496, 0x268bd2, 0x859900, 0x2aa198, 0xd33682, 0x657b83,
+            ),
+            (Preset::Solarized, false) => (
+                0xfdf6e3, 0x586e75, 0x657b83, 0x268bd2, 0x859900, 0x2aa198, 0xd33682, 0x839496,
+            ),
+            (Preset::Catppuccin, true) => (
+                0x1e1e2e, 0xcdd6f4, 0xa6adc8, 0xcba6f7, 0xcba6f7, 0xa6e3a1, 0xfab387, 0x7f849c,
+            ),
+            (Preset::Catppuccin, false) => (
+                0xeff1f5, 0x4c4f69, 0x5c5f77, 0x8839ef, 0x8839ef, 0x40a02b, 0xfe640b, 0x7c7f93,
+            ),
+            _ => unreachable!(),
+        };
+    let edge = if dark { rgb(0xffffff) } else { rgb(0) };
+    p.canvas = rgb(background);
+    p.text = rgb(foreground);
+    p.text_muted = rgb(muted);
+    p.panel = mix(p.canvas, edge, 0.025);
+    p.panel_raised = mix(p.canvas, edge, 0.05);
+    p.window = p.panel;
+    p.rail = p.panel;
+    p.glass = p.panel;
+    p.glass_raised = p.panel_raised;
+    p.border = mix(p.canvas, edge, 0.16);
+    p.hairline = p.border;
+    p.border_strong = mix(p.canvas, edge, 0.3);
+    p.input_border = mix(p.canvas, p.text, 0.6);
+    p.accent = rgb(accent);
+    p.accent_hover = mix(p.accent, edge, 0.12);
+    p.accent_active = mix(p.accent, edge, 0.24);
+    p.accent_text = readable(p.accent, p.text, &[p.canvas, p.panel, p.panel_raised], 4.5);
+    p.accent_foreground = if contrast(rgb(0), p.accent) >= contrast(rgb(0xffffff), p.accent) {
+        rgb(0)
+    } else {
+        rgb(0xffffff)
+    };
+    p.focus_ring = p.accent_text;
+    p.accent_soft = mix(p.canvas, p.accent_text, 0.12);
+    p.grid_alternate = mix(p.canvas, edge, 0.02);
+    p.grid_active = mix(p.canvas, p.accent_text, if dark { 0.22 } else { 0.28 });
+    p.grid_selected = mix(p.canvas, p.accent_text, 0.1);
+    p.grid_hover = mix(p.canvas, p.accent_text, 0.05);
+    p.glass_hover = p.grid_hover;
+    p.glass_selected = p.grid_selected;
+    p.selection = p.accent_text;
+    p.selection.a = 0.3;
+    p.sql_keyword = rgb(keyword);
+    p.sql_string = rgb(string);
+    p.sql_number = rgb(number);
+    p.sql_comment = rgb(comment);
+    p.sql_parameter = p.accent_text;
+    p.sql_identifier = p.text;
+    p.sql_type = p.accent_text;
+    ensure_readable(&mut p, dark);
+    // Grid washes must leave labels readable in both appearances.
+    p.text = readable(
+        p.text,
+        edge,
+        &[
+            p.canvas,
+            p.panel,
+            p.panel_raised,
+            p.grid_active,
+            p.grid_selected,
+        ],
+        4.5,
+    );
+    p.text_muted = readable(
+        p.text_muted,
+        p.text,
+        &[
+            p.canvas,
+            p.panel,
+            p.panel_raised,
+            p.grid_active,
+            p.grid_selected,
+        ],
+        4.5,
+    );
     p
 }
 
@@ -657,6 +775,15 @@ fn syntax_color(
 }
 
 pub fn import_theme(source: &str, fallback_name: &str) -> Result<ImportedTheme, String> {
+    import_themes(source, fallback_name)?
+        .into_iter()
+        .next()
+        .ok_or("The theme family is empty.".into())
+}
+
+/// Validate the whole file before changing preferences. Zed families can
+/// contain several independent variants; retain every one in Your themes.
+pub fn import_themes(source: &str, fallback_name: &str) -> Result<Vec<ImportedTheme>, String> {
     if source.len() as u64 > MAX_THEME_BYTES {
         return Err("Theme files must be smaller than 2 MB.".into());
     }
@@ -679,12 +806,115 @@ pub fn import_theme(source: &str, fallback_name: &str) -> Result<ImportedTheme, 
         if file.theme.light.is_empty() && file.theme.dark.is_empty() {
             return Err("The theme has no colours.".into());
         }
-        return Ok(ImportedTheme {
+        return Ok(vec![ImportedTheme {
             theme: file.theme,
             appearance: None,
-        });
+        }]);
     }
-    import_vscode(&value, fallback_name)
+    if let Some(themes) = value.get("themes") {
+        let themes = themes
+            .as_array()
+            .filter(|themes| !themes.is_empty())
+            .ok_or("A Zed theme family needs a nonempty ‘themes’ array.")?;
+        return themes
+            .iter()
+            .map(|theme| import_zed(theme, fallback_name))
+            .collect();
+    }
+    if value.get("style").is_some() {
+        return import_zed(&value, fallback_name).map(|theme| vec![theme]);
+    }
+    import_vscode(&value, fallback_name).map(|theme| vec![theme])
+}
+
+fn import_zed(value: &serde_json::Value, fallback_name: &str) -> Result<ImportedTheme, String> {
+    use serde_json::{Value, json};
+    let style = value
+        .get("style")
+        .and_then(Value::as_object)
+        .ok_or("A Zed theme needs a ‘style’ object.")?;
+    let appearance = value
+        .get("appearance")
+        .and_then(Value::as_str)
+        .ok_or("A Zed theme needs a light or dark ‘appearance’.")?;
+    if !matches!(appearance, "light" | "dark") {
+        return Err("Zed theme appearance must be light or dark.".into());
+    }
+    let mut colors = serde_json::Map::new();
+    // Reuse the material derivation, alpha handling and contrast correction
+    // of the VS Code adapter after mapping Zed's semantic field names.
+    for (from, to) in [
+        ("background", "editor.background"),
+        ("editor.background", "editor.background"),
+        ("text", "editor.foreground"),
+        ("editor.foreground", "editor.foreground"),
+        ("text.muted", "descriptionForeground"),
+        ("surface.background", "panel.background"),
+        ("panel.background", "sideBar.background"),
+        ("toolbar.background", "editorGroupHeader.tabsBackground"),
+        ("title_bar.background", "titleBar.activeBackground"),
+        ("elevated_surface.background", "editorWidget.background"),
+        ("border", "panel.border"),
+        ("border.variant", "sideBar.border"),
+        ("border.focused", "focusBorder"),
+        ("text.accent", "textLink.foreground"),
+        ("element.background", "button.background"),
+        ("element.hover", "button.hoverBackground"),
+        ("element.selected", "list.activeSelectionBackground"),
+        ("ghost_element.hover", "list.hoverBackground"),
+        ("ghost_element.selected", "list.inactiveSelectionBackground"),
+        ("editor.selection_background", "editor.selectionBackground"),
+        ("error", "editorError.foreground"),
+        ("warning", "editorWarning.foreground"),
+        ("success", "testing.iconPassed"),
+    ] {
+        if let Some(color) = style.get(from).filter(|value| !value.is_null()) {
+            colors.insert(to.into(), color.clone());
+        }
+    }
+    if let Some(cursor) = style
+        .get("players")
+        .and_then(Value::as_array)
+        .and_then(|players| players.first())
+        .and_then(|player| player.get("cursor"))
+    {
+        colors
+            .entry("editorCursor.foreground")
+            .or_insert_with(|| cursor.clone());
+    }
+    let mut rules = Vec::new();
+    if let Some(syntax) = style.get("syntax") {
+        let syntax = syntax.as_object().ok_or("Zed syntax must be an object.")?;
+        for (capture, scope) in [
+            ("keyword", "keyword"),
+            ("string", "string"),
+            ("comment", "comment"),
+            ("comment.doc", "comment.block.documentation"),
+            ("number", "constant.numeric"),
+            ("constant", "constant"),
+            ("type", "storage.type"),
+            ("variable", "variable"),
+            ("variable.special", "variable.parameter"),
+            ("property", "entity.name"),
+        ] {
+            if let Some(color) = syntax
+                .get(capture)
+                .and_then(|style| style.get("color"))
+                .filter(|color| !color.is_null())
+            {
+                rules.push(json!({"scope": scope, "settings": {"foreground": color}}));
+            }
+        }
+    }
+    import_vscode(
+        &json!({
+            "name": value.get("name").and_then(Value::as_str).unwrap_or(fallback_name),
+            "type": appearance,
+            "colors": colors,
+            "tokenColors": rules,
+        }),
+        fallback_name,
+    )
 }
 
 fn import_vscode(value: &serde_json::Value, fallback_name: &str) -> Result<ImportedTheme, String> {
@@ -875,6 +1105,38 @@ fn import_vscode(value: &serde_json::Value, fallback_name: &str) -> Result<Impor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zed_family_import_retains_variants_and_maps_surfaces_and_sql_syntax() {
+        let imported = import_themes(
+            r##"{
+            "name":"Example family", "themes":[
+                {"name":"Example Dark","appearance":"dark","style":{
+                    "editor.background":"#1e1e2e", "text":"#cdd6f4",
+                    "surface.background":"#181825", "text.accent":"#cba6f7",
+                    "syntax":{"keyword":{"color":"#cba6f7"},"string":{"color":"#a6e3a1"}},
+                    "players":[{"cursor":"#f5e0dc","selection":"#cdd6f444"}]
+                }},
+                {"name":"Example Light","appearance":"light","style":{
+                    "editor.background":"#eff1f5", "text":"#4c4f69"
+                }}
+            ]
+        }"##,
+            "fallback",
+        )
+        .unwrap();
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].appearance, Some(Appearance::Dark));
+        assert_eq!(imported[1].appearance, Some(Appearance::Light));
+        assert_eq!(imported[0].theme.dark["canvas"], "#1e1e2e");
+        assert_eq!(imported[0].theme.dark["panel"], "#181825");
+        assert_eq!(imported[0].theme.dark["sql_keyword"], "#cba6f7");
+        assert_eq!(imported[0].theme.dark["sql_string"], "#a6e3a1");
+        assert_eq!(imported[1].theme.light["canvas"], "#eff1f5");
+        assert!(imported[1].theme.dark.is_empty());
+        assert!(import_themes(r##"{"themes":[{"appearance":"dark","style":{"text":"#fff"}},{"appearance":"invalid","style":{}}]}"##, "bad").is_err());
+        assert!(import_themes(r#"{"themes":[]}"#, "empty").is_err());
+    }
 
     #[test]
     fn presets_have_readable_controls_and_distinct_active_rows() {

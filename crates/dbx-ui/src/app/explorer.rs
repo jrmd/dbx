@@ -69,6 +69,13 @@ pub(super) fn move_cursor(enabled: &[bool], from: Option<usize>, motion: Motion)
 pub(super) enum TableMenuCommand {
     OpenStructure,
     OpenData,
+    CopyName,
+    ViewDdl,
+    CopyDdl,
+    Rename,
+    Duplicate,
+    CopyInsert,
+    ColumnStatistics,
     Refresh,
     Export,
     Import,
@@ -117,6 +124,18 @@ pub(super) fn table_menu_rows(writable: bool) -> Vec<TableMenuRow> {
     vec![
         item(OpenStructure, "Open structure", true, Normal),
         item(OpenData, "Open data", true, Normal),
+        item(CopyName, "Copy name", true, Normal),
+        item(ViewDdl, "View DDL", true, Normal),
+        item(CopyDdl, "Copy DDL", true, Normal),
+        item(CopyInsert, "Copy INSERT (up to 1,000 rows)", true, Normal),
+        item(
+            ColumnStatistics,
+            "Column statistics (loaded rows)",
+            true,
+            Normal,
+        ),
+        item(Rename, "Rename…", writable, Normal),
+        item(Duplicate, "Duplicate…", writable, Normal),
         item(Refresh, "Refresh table", true, Normal),
         TableMenuRow::Separator,
         item(Export, "Export data…", writable, Normal),
@@ -429,10 +448,73 @@ impl DbxApp {
         let writable = self.session(menu.session_id).is_some_and(|session| {
             session.kind.is_sql()
                 && !session.busy
-                && session.engine.is_some()
+                && session
+                    .engine
+                    .as_ref()
+                    .is_some_and(|engine| !engine.is_read_only())
                 && menu.table.kind == EntityKind::Table
         });
+        let sql = self
+            .session(menu.session_id)
+            .is_some_and(|session| session.kind.is_sql());
         table_menu_rows(writable)
+            .into_iter()
+            .map(|row| match row {
+                TableMenuRow::Item {
+                    command: TableMenuCommand::Export,
+                    label,
+                    tone,
+                    ..
+                } => TableMenuRow::Item {
+                    command: TableMenuCommand::Export,
+                    label,
+                    enabled: sql
+                        && self
+                            .session(menu.session_id)
+                            .is_some_and(|session| !session.busy && session.engine.is_some()),
+                    tone,
+                },
+                TableMenuRow::Item {
+                    command,
+                    label,
+                    enabled,
+                    tone,
+                } if matches!(
+                    command,
+                    TableMenuCommand::ViewDdl
+                        | TableMenuCommand::CopyDdl
+                        | TableMenuCommand::CopyInsert
+                ) =>
+                {
+                    TableMenuRow::Item {
+                        command,
+                        label,
+                        enabled: enabled && sql,
+                        tone,
+                    }
+                }
+                TableMenuRow::Item {
+                    command: TableMenuCommand::ColumnStatistics,
+                    label,
+                    enabled,
+                    tone,
+                } => TableMenuRow::Item {
+                    command: TableMenuCommand::ColumnStatistics,
+                    label,
+                    enabled: enabled
+                        && self
+                            .session(menu.session_id)
+                            .and_then(|session| session.active_data_tab())
+                            .is_some_and(|data| {
+                                data.table.name == menu.table.name
+                                    && data.table.schema == menu.table.schema
+                                    && data.result.is_some()
+                            }),
+                    tone,
+                },
+                row => row,
+            })
+            .collect()
     }
 
     fn move_table_menu(&mut self, motion: Motion, cx: &mut Context<Self>) {
@@ -526,6 +608,24 @@ impl DbxApp {
         let table = menu.table;
         self.focus_session_explorer(session_id, window, cx);
         match command {
+            TableMenuCommand::ColumnStatistics => {
+                self.show_loaded_table_column_statistics(session_id, window, cx)
+            }
+            TableMenuCommand::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(
+                table_ref_label(&table_ref(&table)),
+            )),
+            TableMenuCommand::ViewDdl
+            | TableMenuCommand::CopyDdl
+            | TableMenuCommand::CopyInsert => {
+                self.table_metadata_command(session_id, table, command, window, cx)
+            }
+            TableMenuCommand::Rename | TableMenuCommand::Duplicate => self.open_table_name_prompt(
+                session_id,
+                table,
+                command == TableMenuCommand::Duplicate,
+                window,
+                cx,
+            ),
             TableMenuCommand::OpenStructure => self.open_structure_tab_for(session_id, table, cx),
             TableMenuCommand::OpenData | TableMenuCommand::Refresh => {
                 self.select_table_for(session_id, table, window, cx)

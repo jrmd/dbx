@@ -984,8 +984,24 @@ pub(super) fn quoted_snippets(lowered_message: &str) -> Vec<String> {
 }
 
 pub(super) fn sql_error_position_range(lowered_message: &str, query: &str) -> Option<Range<usize>> {
-    let marker = lowered_message.find("position")?;
-    let digits = lowered_message[marker + "position".len()..]
+    // Internal positions refer to server-side function SQL rather than the
+    // editor query. Prefer an explicitly original position when provided.
+    let position_text = lowered_message
+        .lines()
+        .find_map(|line| {
+            let marker = line.find("original position")?;
+            Some(&line[marker + "original position".len()..])
+        })
+        .or_else(|| {
+            lowered_message.lines().find_map(|line| {
+                if line.contains("internal") {
+                    return None;
+                }
+                let marker = line.find("position")?;
+                Some(&line[marker + "position".len()..])
+            })
+        })?;
+    let digits = position_text
         .chars()
         .skip_while(|character| !character.is_ascii_digit())
         .take_while(|character| character.is_ascii_digit())

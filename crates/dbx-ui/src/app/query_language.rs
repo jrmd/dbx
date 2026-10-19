@@ -85,7 +85,9 @@ impl DbxApp {
             return Vec::new();
         };
         let mut diagnostics = Vec::new();
-        if let Some(range) = query.error_highlight.clone() {
+        if query.error.is_some()
+            && let Some(range) = query.error_highlight.clone()
+        {
             diagnostics.push(EditorDiagnostic {
                 range,
                 severity: editor::DiagnosticSeverity::Error,
@@ -149,7 +151,7 @@ impl DbxApp {
         }
     }
 
-    fn query_tab_mut(
+    pub(super) fn query_tab_mut(
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,

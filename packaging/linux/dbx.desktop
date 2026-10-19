@@ -2,9 +2,10 @@
 Type=Application
 Name=DBX
 Comment=Native database workbench
-Exec=dbx
+Exec=dbx %U
 TryExec=dbx
 Icon=dbx
 Terminal=false
 Categories=Development;Database;
+MimeType=application/vnd.sqlite3;application/x-sqlite3;x-scheme-handler/postgres;x-scheme-handler/postgresql;x-scheme-handler/mysql;x-scheme-handler/redis;x-scheme-handler/rediss;x-scheme-handler/mongodb;x-scheme-handler/mongodb+srv;
 StartupWMClass=dbx

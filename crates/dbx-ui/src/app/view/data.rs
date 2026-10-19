@@ -144,6 +144,10 @@ impl DbxApp {
             .min_w_0()
             .flex()
             .flex_col()
+            .when(!inspector_page, |view| view.child(div().flex_none().px(crate::theme::ui_px(8.)).py(crate::theme::ui_px(4.)).flex().items_center().gap(crate::theme::ui_px(8.))
+                .child(div().flex_1().min_w_0().truncate().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(format!("{} loaded rows · staged edits excluded", self.data_tab(session_id, tab_id).and_then(|data| data.result.as_ref()).map_or(0, |result| result.rows.len()))))
+                .child(button("copy-loaded-markdown", "Copy Markdown", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.copy_data_markdown_for(session_id, tab_id, cx))))
+                .child(button("export-loaded-xlsx", "Export XLSX…", ButtonKind::Quiet).on_click(cx.listener(move |this, _, _, cx| this.export_data_xlsx_for(session_id, tab_id, cx))))))
             .when(!inspector_page, |view| view
             .child(
                 div()
@@ -344,6 +348,10 @@ impl DbxApp {
                                                 }),
                                             ),
                                         )
+                                    })
+                                    .when(matches!(kind, DatabaseKind::MongoDB | DatabaseKind::Redis) && has_selected_row && self.session(session_id).and_then(|session| session.engine.as_ref()).is_some_and(|engine| !engine.is_read_only()), |view| {
+                                        view.child(button("edit-document-key", if kind == DatabaseKind::MongoDB { "Edit document" } else { "Edit key value" }, ButtonKind::Quiet)
+                                            .on_click(cx.listener(move |this, _, window, cx| this.open_nonrelational_editor(session_id, tab_id, window, cx))))
                                     })
                                     .when(self.narrow_workspace && has_selected_row && !has_draft, |view| {
                                         view.child(button("show-row-details", "Row details", ButtonKind::Quiet)
@@ -651,6 +659,18 @@ impl DbxApp {
                     )
                 },
             )
+            .on_action(cx.listener(move |this, _: &editor::Undo, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, false, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &editor::Redo, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, true, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &UndoGridEdits, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, false, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &RedoGridEdits, _, cx| {
+                this.undo_grid_edits_for(session_id, tab_id, true, cx)
+            }))
             .on_action(cx.listener(move |this, _: &DeleteRows, _, cx| {
                 this.delete_rows_for(session_id, tab_id, None, cx)
             }))
@@ -660,70 +680,116 @@ impl DbxApp {
             .on_action(cx.listener(move |this, _: &PasteRows, _, cx| {
                 this.paste_rows_for(session_id, tab_id, cx)
             }))
-            .when(counts.total() > 0, |view| {
-                view.child(
-                    div()
-                        .flex_none()
-                        .px(crate::theme::ui_px(8.))
-                        .py(crate::theme::ui_px(5.))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(crate::theme::ui_px(8.))
-                        .border_b_1()
-                        .border_color(theme().border)
-                        .bg(theme().panel)
-                        .child(
-                            div()
-                                .text_size(crate::theme::text_px(11.))
-                                .text_color(theme().text)
-                                .child(if recovered {
-                                    format!("Recovered draft · {summary} · review required")
-                                } else {
-                                    summary
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(crate::theme::ui_px(6.))
-                                .child(
-                                    button("discard-cell-edits", "Discard", ButtonKind::Quiet)
-                                        .cursor_pointer()
-                                        .disabled(busy)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.request_discard_pending_edits_for(
-                                                session_id, tab_id, window, cx,
+            .when(
+                counts.total() > 0
+                    || self
+                        .data_tab(session_id, tab_id)
+                        .is_some_and(|data| data.edit_history.can_redo()),
+                |view| {
+                    view.child(
+                        div()
+                            .flex_none()
+                            .px(crate::theme::ui_px(8.))
+                            .py(crate::theme::ui_px(5.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(crate::theme::ui_px(8.))
+                            .border_b_1()
+                            .border_color(theme().border)
+                            .bg(theme().panel)
+                            .child(
+                                div()
+                                    .text_size(crate::theme::text_px(11.))
+                                    .text_color(theme().text)
+                                    .child(if recovered {
+                                        format!("Recovered draft · {summary} · review required")
+                                    } else {
+                                        summary
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(6.))
+                                    .child(
+                                        button("undo-grid-edits", "Undo", ButtonKind::Quiet)
+                                            .disabled(
+                                                busy || recovered
+                                                    || !self
+                                                        .data_tab(session_id, tab_id)
+                                                        .is_some_and(|data| {
+                                                            data.edit_history.can_undo()
+                                                        }),
                                             )
-                                        })),
-                                )
-                                .child(
-                                    button("review-cell-edits", "Review SQL", ButtonKind::Quiet)
-                                        .cursor_pointer()
-                                        .disabled(busy)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.review_changes_for(session_id, tab_id, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    button("save-cell-edits", "Commit", ButtonKind::Primary)
-                                        .cursor_pointer()
-                                        .disabled(busy)
-                                        .tooltip(if cfg!(target_os = "macos") {
-                                            "⌘S"
-                                        } else {
-                                            "Ctrl+S"
-                                        })
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.request_commit_changes_for(
-                                                session_id, tab_id, window, cx,
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.undo_grid_edits_for(
+                                                    session_id, tab_id, false, cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        button("redo-grid-edits", "Redo", ButtonKind::Quiet)
+                                            .disabled(
+                                                busy || recovered
+                                                    || !self
+                                                        .data_tab(session_id, tab_id)
+                                                        .is_some_and(|data| {
+                                                            data.edit_history.can_redo()
+                                                        }),
                                             )
-                                        })),
-                                ),
-                        ),
-                )
-            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.undo_grid_edits_for(
+                                                    session_id, tab_id, true, cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        button("discard-cell-edits", "Discard", ButtonKind::Quiet)
+                                            .cursor_pointer()
+                                            .disabled(busy)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.request_discard_pending_edits_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            })),
+                                    )
+                                    .child(
+                                        button(
+                                            "review-cell-edits",
+                                            "Review SQL",
+                                            ButtonKind::Quiet,
+                                        )
+                                        .cursor_pointer()
+                                        .disabled(busy)
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.review_changes_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        button("save-cell-edits", "Commit", ButtonKind::Primary)
+                                            .cursor_pointer()
+                                            .disabled(busy)
+                                            .tooltip(if cfg!(target_os = "macos") {
+                                                "⌘S"
+                                            } else {
+                                                "Ctrl+S"
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.request_commit_changes_for(
+                                                    session_id, tab_id, window, cx,
+                                                )
+                                            })),
+                                    ),
+                            ),
+                    )
+                },
+            )
             .child(
                 div()
                     .flex_1()
@@ -2414,6 +2480,12 @@ mod tests {
         let tab_id = Uuid::new_v4();
         let (app, cx) = cx.add_window_view(|window, cx| {
             let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
             app.vault_state = Some(VaultState::Unlocked);
             app.settings_store = None;
             app.ui_scale = 200;
@@ -2427,6 +2499,14 @@ mod tests {
                 window,
                 cx,
             );
+            session.engine = Some(Arc::new(
+                app.runtime
+                    .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                        DatabaseKind::SQLite,
+                        "sqlite::memory:",
+                    )))
+                    .unwrap(),
+            ));
             session.tables = vec![TableInfo::table("projects", None)];
             let table = TableRef::new("projects");
             let mut data = DataTab::new(session_id, tab_id, table.clone(), false, window, cx);

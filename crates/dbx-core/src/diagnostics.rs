@@ -51,6 +51,22 @@ pub fn execution_plan_query(kind: DatabaseKind, sql: &str) -> Result<String> {
     };
     Ok(format!("{prefix} {}", statements[0]))
 }
+
+/// ANALYZE executes a query. Only PostgreSQL's isolated read-only transaction
+/// path is supported; callers must use QuerySession::explain_analyze.
+pub fn execution_plan_analyze_query(kind: DatabaseKind, sql: &str) -> Result<String> {
+    if kind != DatabaseKind::PostgreSQL {
+        return Err(DbxError::Unsupported {
+            operation: "isolated read-only EXPLAIN ANALYZE".into(),
+            kind,
+        });
+    }
+    let plain = execution_plan_query(kind, sql)?;
+    let sql = plain
+        .strip_prefix("EXPLAIN (FORMAT JSON) ")
+        .expect("PostgreSQL plan prefix");
+    Ok(format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}"))
+}
 pub fn format_execution_plan(kind: DatabaseKind, result: &QueryResult) -> QueryResult {
     if !matches!(kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL) {
         return result.clone();
@@ -72,6 +88,9 @@ pub fn format_execution_plan(kind: DatabaseKind, result: &QueryResult) -> QueryR
         "Operation",
         "Estimated rows",
         "Estimated cost",
+        "Actual rows",
+        "Actual time (ms)",
+        "Actual loops",
         "Detail",
     ]
     .iter()
@@ -110,6 +129,18 @@ pub fn format_execution_plan(kind: DatabaseKind, result: &QueryResult) -> QueryR
                         object
                             .get("Total Cost")
                             .or_else(|| object.get("cost_info"))
+                            .map(|value| CellValue::Text(value.to_string()))
+                            .unwrap_or_default(),
+                        object
+                            .get("Actual Rows")
+                            .map(|value| CellValue::Text(value.to_string()))
+                            .unwrap_or_default(),
+                        object
+                            .get("Actual Total Time")
+                            .map(|value| CellValue::Text(value.to_string()))
+                            .unwrap_or_default(),
+                        object
+                            .get("Actual Loops")
                             .map(|value| CellValue::Text(value.to_string()))
                             .unwrap_or_default(),
                         CellValue::Text(detail),
@@ -173,6 +204,97 @@ pub fn compare_execution_plans(before: &QueryResult, after: &QueryResult) -> Que
     result
 }
 
+/// Statistics over the supplied client result only, never an implicit query
+/// over a whole table. Distinctness uses typed client values, not DB collation.
+pub fn loaded_column_statistics(source: &QueryResult) -> QueryResult {
+    use std::collections::BTreeSet;
+    let mut output = QueryResult::empty(None, 0);
+    output.columns = [
+        "Column",
+        "Type",
+        "Loaded rows",
+        "Nulls",
+        "Distinct non-null (client)",
+        "Numeric count",
+        "Numeric min (~)",
+        "Numeric max (~)",
+        "Numeric mean (~)",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, name)| {
+        ColumnInfo::result(
+            name,
+            index,
+            if index < 2 {
+                "TEXT"
+            } else if index < 6 {
+                "INTEGER"
+            } else {
+                "REAL"
+            },
+        )
+    })
+    .collect();
+    for (index, column) in source.columns.iter().enumerate() {
+        let mut distinct = BTreeSet::new();
+        let mut nulls = 0;
+        let mut numbers = 0;
+        let mut minimum = f64::INFINITY;
+        let mut maximum = f64::NEG_INFINITY;
+        let mut mean = 0.;
+        let numeric_type = ["int", "real", "float", "double", "decimal", "numeric"]
+            .iter()
+            .any(|name| column.data_type.to_ascii_lowercase().contains(name));
+        for row in &source.rows {
+            let value = row.values.get(index).unwrap_or(&CellValue::Null);
+            if *value == CellValue::Null {
+                nulls += 1;
+                continue;
+            }
+            distinct.insert(format!("{value:?}"));
+            let number = match value {
+                CellValue::Integer(value) => Some(*value as f64),
+                CellValue::Unsigned(value) => Some(*value as f64),
+                CellValue::Real(value) => Some(*value),
+                CellValue::Text(value) if numeric_type => value.parse::<f64>().ok(),
+                _ => None,
+            }
+            .filter(|number| number.is_finite());
+            if let Some(number) = number {
+                numbers += 1;
+                minimum = minimum.min(number);
+                maximum = maximum.max(number);
+                mean += (number - mean) / numbers as f64;
+            }
+        }
+        output.rows.push(RowData::new(vec![
+            CellValue::Text(column.name.clone()),
+            CellValue::Text(column.data_type.clone()),
+            CellValue::Integer(source.rows.len() as i64),
+            CellValue::Integer(nulls),
+            CellValue::Integer(distinct.len() as i64),
+            CellValue::Integer(numbers),
+            if numbers > 0 {
+                CellValue::Real(minimum)
+            } else {
+                CellValue::Null
+            },
+            if numbers > 0 {
+                CellValue::Real(maximum)
+            } else {
+                CellValue::Null
+            },
+            if numbers > 0 && mean.is_finite() {
+                CellValue::Real(mean)
+            } else {
+                CellValue::Null
+            },
+        ]));
+    }
+    output
+}
+
 #[derive(Clone, Debug)]
 pub struct MigrationDraft {
     pub sql: String,
@@ -187,7 +309,7 @@ pub fn schema_migration(
     after: &RelationalSchema,
 ) -> Result<MigrationDraft> {
     let details = before.details_captured && after.details_captured;
-    let mut draft = MigrationDraft { sql: "-- Migration from captured schema to current schema. Review before running.\n-- Scope: columns, defaults, primary keys, check constraints, indexes and foreign keys. Views, triggers, sequences and routines are compared when captured; grants are not captured.\n".into(), changes: Vec::new(), warnings: Vec::new() };
+    let mut draft = MigrationDraft { sql: "-- Migration from existing schema to desired schema. Review before running.\n-- Scope: columns, defaults, primary keys, check constraints, indexes and foreign keys. Views, triggers, sequences and routines are compared when captured; grants are not captured.\n".into(), changes: Vec::new(), warnings: Vec::new() };
     if !details {
         draft.warnings.push("The captured baseline predates default, index and check capture; recapture it to compare them".into());
     }
@@ -627,6 +749,54 @@ mod tests {
             execution_plan_query(DatabaseKind::SQLite, "SELECT 'DELETE'").unwrap(),
             "EXPLAIN QUERY PLAN SELECT 'DELETE'"
         );
+    }
+
+    #[test]
+    fn analyze_requires_postgres_and_one_read_statement() {
+        assert!(execution_plan_analyze_query(DatabaseKind::MySQL, "SELECT 1").is_err());
+        assert!(execution_plan_analyze_query(DatabaseKind::PostgreSQL, "DELETE FROM t").is_err());
+        assert!(
+            execution_plan_analyze_query(DatabaseKind::PostgreSQL, "SELECT 1; COMMIT").is_err()
+        );
+        assert!(
+            execution_plan_analyze_query(
+                DatabaseKind::PostgreSQL,
+                "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            execution_plan_analyze_query(DatabaseKind::PostgreSQL, "SELECT 1").unwrap(),
+            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT 1"
+        );
+    }
+
+    #[test]
+    fn loaded_statistics_distinguish_null_empty_and_literal_null_and_scope_to_result() {
+        let source = QueryResult {
+            columns: vec![
+                ColumnInfo::result("label", 0, "TEXT"),
+                ColumnInfo::result("count", 1, "INTEGER"),
+            ],
+            rows: vec![
+                RowData::new(vec![CellValue::Null, CellValue::Integer(1)]),
+                RowData::new(vec![CellValue::Text(String::new()), CellValue::Integer(3)]),
+                RowData::new(vec![CellValue::Text("NULL".into()), CellValue::Integer(5)]),
+                RowData::new(vec![CellValue::Text("NULL".into()), CellValue::Null]),
+            ],
+            truncated: true,
+            ..QueryResult::empty(None, 0)
+        };
+        let stats = loaded_column_statistics(&source);
+        assert_eq!(stats.rows[0].values[2], CellValue::Integer(4));
+        assert_eq!(stats.rows[0].values[3], CellValue::Integer(1));
+        assert_eq!(stats.rows[0].values[4], CellValue::Integer(2));
+        assert_eq!(stats.rows[0].values[6], CellValue::Null);
+        assert_eq!(stats.rows[1].values[5], CellValue::Integer(3));
+        assert_eq!(stats.rows[1].values[6], CellValue::Real(1.));
+        assert_eq!(stats.rows[1].values[7], CellValue::Real(5.));
+        assert_eq!(stats.rows[1].values[8], CellValue::Real(3.));
+        assert!(source.truncated);
     }
     #[test]
     fn postgres_plans_are_flattened_and_compared() {

@@ -550,6 +550,15 @@ impl DbxApp {
             .then(|| self.explorer_cursor_id(session_id))
             .flatten();
         let table_count = visible_tables.len();
+        let native_backup_available = self
+            .session(session_id)
+            .and_then(|session| session.engine.as_ref())
+            .is_some_and(|engine| engine.capabilities().native_backup);
+        let native_restore_available = native_backup_available
+            && self
+                .session(session_id)
+                .and_then(|session| session.engine.as_ref())
+                .is_some_and(|engine| !engine.is_read_only());
         let empty_note = visible_tables.is_empty().then(|| {
             let session = self.session(session_id);
             if session.is_some_and(|session| session.busy) {
@@ -689,7 +698,7 @@ impl DbxApp {
                                                             }),
                                                     )
                                                     .item(
-                                                        PopupMenuItem::new("Native backup…")
+                                                        PopupMenuItem::new("Native backup…").disabled(!native_backup_available)
                                                             .on_click(move |_, _, cx| {
                                                                 let _ = backup.update(
                                                                     cx,
@@ -704,7 +713,7 @@ impl DbxApp {
                                                     .item(
                                                         PopupMenuItem::new(
                                                             "Restore native backup…",
-                                                        )
+                                                        ).disabled(!native_restore_available)
                                                         .on_click(move |_, _, cx| {
                                                             let _ =
                                                                 restore.update(cx, |this, cx| {

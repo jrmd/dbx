@@ -805,3 +805,234 @@ mod tests {
         assert!(!truncated);
     }
 }
+
+/// Snapshot for a structured editor. The binary revision token never enters
+/// user JSON. A save checks the token and selected logical database atomically.
+#[derive(Clone)]
+pub struct RedisEditSnapshot {
+    pub key: String,
+    pub document: serde_json::Value,
+    dump: Vec<u8>,
+    database: usize,
+}
+const REDIS_EDIT_READ: &str = r#"
+local t=redis.call('TYPE',KEYS[1]).ok
+local memory=redis.call('MEMORY','USAGE',KEYS[1])
+if memory and memory>4194304 then return redis.error_reply('Key exceeds editor memory limit (4 MiB)') end
+local d=redis.call('DUMP',KEYS[1])
+if not d then return redis.error_reply('Key no longer exists') end
+local v
+if t=='string' then
+ if redis.call('STRLEN',KEYS[1])>1048576 then return redis.error_reply('Value exceeds editor limit (1 MiB)') end
+ v=redis.call('GET',KEYS[1])
+elseif t=='hash' then
+ if redis.call('HLEN',KEYS[1])>10000 then return redis.error_reply('Hash exceeds editor limit (10000 fields)') end
+ v=redis.call('HGETALL',KEYS[1])
+elseif t=='list' then
+ if redis.call('LLEN',KEYS[1])>10000 then return redis.error_reply('List exceeds editor limit (10000 entries)') end
+ v=redis.call('LRANGE',KEYS[1],0,-1)
+elseif t=='set' then
+ if redis.call('SCARD',KEYS[1])>10000 then return redis.error_reply('Set exceeds editor limit (10000 members)') end
+ v=redis.call('SMEMBERS',KEYS[1])
+elseif t=='zset' then
+ if redis.call('ZCARD',KEYS[1])>10000 then return redis.error_reply('Sorted set exceeds editor limit (10000 members)') end
+ v=redis.call('ZRANGE',KEYS[1],0,-1,'WITHSCORES')
+elseif t=='stream' then v=redis.call('XRANGE',KEYS[1],'-','+','COUNT',1000)
+else return redis.error_reply('This key type has no structured editor') end
+return {d,t,v}
+"#;
+const REDIS_EDIT_WRITE: &str = r#"
+if redis.call('DUMP',KEYS[1])~=ARGV[1] then return redis.error_reply('Key changed or expired; reload before saving') end
+local doc=cjson.decode(ARGV[2])
+local t=doc.type
+local ttl=redis.call('PTTL',KEYS[1])
+if ttl==-2 then return redis.error_reply('Key expired; reload before saving') end
+local v=doc.value
+if t=='stream' then
+ for _,entry in ipairs(doc.append) do
+  local args={KEYS[1],'*'}
+  for _,pair in ipairs(entry) do table.insert(args,pair[1]); table.insert(args,pair[2]) end
+  redis.call('XADD',unpack(args))
+ end
+ for _,id in ipairs(doc.delete) do redis.call('XDEL',KEYS[1],id) end
+ return 1
+end
+redis.call('DEL',KEYS[1])
+if t=='string' then redis.call('SET',KEYS[1],v)
+elseif t=='hash' then for _,pair in ipairs(v) do redis.call('HSET',KEYS[1],pair[1],pair[2]) end
+elseif t=='list' then for _,item in ipairs(v) do redis.call('RPUSH',KEYS[1],item) end
+elseif t=='set' then for _,item in ipairs(v) do redis.call('SADD',KEYS[1],item) end
+elseif t=='zset' then for _,pair in ipairs(v) do redis.call('ZADD',KEYS[1],pair[2],pair[1]) end end
+if ttl>=0 then redis.call('PEXPIRE',KEYS[1],ttl) end
+return 1
+"#;
+impl RedisEngine {
+    pub async fn read_structured(&self, key: &str) -> Result<RedisEditSnapshot> {
+        let mut connection = self.live_connection().await?;
+        let database = self.database.load(Ordering::SeqCst);
+        let (dump, kind, content): (Vec<u8>, String, Value) = redis::Script::new(REDIS_EDIT_READ)
+            .key(key)
+            .invoke_async(&mut *connection)
+            .await?;
+        let value = match kind.as_str() {
+            "string" => serde_json::json!(redis::from_redis_value::<String>(&content)?),
+            "stream" => {
+                let entries: Vec<(String, Vec<String>)> = redis::from_redis_value(&content)?;
+                let entries = entries.into_iter().map(|(id, values)| serde_json::json!({"id":id,"fields":values.chunks(2).map(|pair| pair.to_vec()).collect::<Vec<_>>()})).collect::<Vec<_>>();
+                return Ok(RedisEditSnapshot {
+                    key: key.into(),
+                    document: serde_json::json!({"type":"stream","entries":entries,"append":[],"delete":[]}),
+                    dump,
+                    database,
+                });
+            }
+            "hash" | "zset" => {
+                let values: Vec<String> = redis::from_redis_value(&content)?;
+                serde_json::json!(
+                    values
+                        .chunks(2)
+                        .map(|pair| pair.to_vec())
+                        .collect::<Vec<_>>()
+                )
+            }
+            _ => serde_json::json!(redis::from_redis_value::<Vec<String>>(&content)?),
+        };
+        Ok(RedisEditSnapshot {
+            key: key.into(),
+            document: serde_json::json!({"type":kind,"value":value}),
+            dump,
+            database,
+        })
+    }
+    pub async fn save_structured(
+        &self,
+        snapshot: &RedisEditSnapshot,
+        document: &serde_json::Value,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(DbxError::Query(
+                "Protected connection: writes are disabled".into(),
+            ));
+        }
+        validate_redis_edit(&snapshot.document, document)?;
+        let mut connection = self.live_connection().await?;
+        if self.database.load(Ordering::SeqCst) != snapshot.database {
+            return Err(DbxError::Query(
+                "Selected Redis database changed; reload the key".into(),
+            ));
+        }
+        redis::Script::new(REDIS_EDIT_WRITE)
+            .key(&snapshot.key)
+            .arg(&snapshot.dump)
+            .arg(document.to_string())
+            .invoke_async::<i64>(&mut *connection)
+            .await?;
+        Ok(())
+    }
+}
+/// Validate every argument before the atomic script can change the key.
+pub fn validate_redis_edit(
+    original: &serde_json::Value,
+    document: &serde_json::Value,
+) -> Result<()> {
+    use serde_json::Value as Json;
+    let invalid = || {
+        DbxError::Parse("Invalid structured Redis value. Keep the type; use strings for values, [field,value] pairs for hashes, and [member,score] pairs for sorted sets.".into())
+    };
+    let kind = original["type"].as_str().ok_or_else(invalid)?;
+    if document["type"].as_str() != Some(kind) || document.to_string().len() > 4 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    let strings = |value: &Json| {
+        value
+            .as_array()
+            .is_some_and(|values| values.len() <= 10000 && values.iter().all(Json::is_string))
+    };
+    let pairs = |value: &Json, scores: bool| {
+        value.as_array().is_some_and(|values| {
+            values.len() <= 10000
+                && values.iter().all(|value| {
+                    value.as_array().is_some_and(|pair| {
+                        pair.len() == 2
+                            && pair[0].is_string()
+                            && pair[1].as_str().is_some_and(|value| {
+                                !scores || value.parse::<f64>().is_ok_and(f64::is_finite)
+                            })
+                    })
+                })
+        })
+    };
+    let valid = match kind {
+        "string" => document["value"]
+            .as_str()
+            .is_some_and(|value| value.len() <= 1024 * 1024),
+        "hash" => pairs(&document["value"], false),
+        "list" | "set" => strings(&document["value"]),
+        "zset" => pairs(&document["value"], true),
+        "stream" => {
+            document["entries"] == original["entries"]
+                && document["append"].as_array().is_some_and(|entries| {
+                    entries.len() <= 1000
+                        && entries.iter().all(|entry| {
+                            pairs(entry, false)
+                                && entry.as_array().is_some_and(|fields| {
+                                    !fields.is_empty() && fields.len() <= 1000
+                                })
+                        })
+                })
+                && strings(&document["delete"])
+                && document["delete"].as_array().is_some_and(|ids| {
+                    ids.iter().all(|id| {
+                        original["entries"]
+                            .as_array()
+                            .is_some_and(|entries| entries.iter().any(|entry| entry["id"] == *id))
+                    })
+                })
+        }
+        _ => false,
+    };
+    if valid { Ok(()) } else { Err(invalid()) }
+}
+#[cfg(test)]
+mod structured_edit_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn structured_values_reject_lossy_or_invalid_mutations_before_writing() {
+        for document in [
+            json!({"type":"string","value":"hello"}),
+            json!({"type":"hash","value":[["field","value"]]}),
+            json!({"type":"list","value":["a","b"]}),
+            json!({"type":"set","value":["a"]}),
+            json!({"type":"zset","value":[["a","1.25"]]}),
+        ] {
+            validate_redis_edit(&document, &document).unwrap();
+        }
+        let original = json!({"type":"zset","value":[["a","1"]]});
+        assert!(
+            validate_redis_edit(&original, &json!({"type":"zset","value":[["a","NaN"]]})).is_err()
+        );
+        assert!(validate_redis_edit(&original, &json!({"type":"string","value":"x"})).is_err());
+        let stream = json!({"type":"stream","entries":[{"id":"1-0","fields":[["x","y"]]}],"append":[],"delete":[]});
+        let mut oversized = stream.clone();
+        oversized["append"] = json!([[["valid", "first"]], vec![json!(["field", "value"]); 1001]]);
+        assert!(
+            validate_redis_edit(&stream, &oversized).is_err(),
+            "the entire batch must validate before any append"
+        );
+        let string = json!({"type":"string","value":"original"});
+        assert!(
+            validate_redis_edit(
+                &string,
+                &json!({"type":"string","value":"x".repeat(1024 * 1024 + 1)})
+            )
+            .is_err()
+        );
+        let mut edit = stream.clone();
+        edit["append"] = json!([[["new", "value"]]]);
+        edit["delete"] = json!(["1-0"]);
+        validate_redis_edit(&stream, &edit).unwrap();
+        edit["entries"][0]["fields"] = json!([["x", "changed"]]);
+        assert!(validate_redis_edit(&stream, &edit).is_err());
+    }
+}

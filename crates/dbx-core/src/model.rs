@@ -255,6 +255,8 @@ impl fmt::Display for DatabaseKind {
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConnectionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_manifest: Option<std::path::PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_auth: Option<crate::CloudAuthentication>,
     #[serde(default)]
     pub read_only: bool,
@@ -286,6 +288,7 @@ impl ConnectionConfig {
     pub fn new(kind: DatabaseKind, url: impl Into<String>) -> Self {
         Self {
             kind,
+            driver_manifest: None,
             cloud_auth: None,
             url: url.into(),
             read_only: false,
@@ -313,6 +316,10 @@ impl ConnectionConfig {
     }
 
     pub fn validate(&self) -> crate::Result<()> {
+        if self.driver_manifest.is_some() {
+            crate::driver_plugin::validate_config(self)?;
+            return Ok(());
+        }
         crate::transport::validate(self)?;
         if let Some(provider) = self.cloud_auth {
             let valid = match provider {

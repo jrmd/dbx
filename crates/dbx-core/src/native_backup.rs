@@ -86,6 +86,11 @@ pub async fn native_backup(
     restore: bool,
     control: TransferControl,
 ) -> Result<String> {
+    if config.driver_manifest.is_some() {
+        return Err(invalid(
+            "Native backup and restore are unavailable for community drivers",
+        ));
+    }
     config.validate()?;
     if restore && config.read_only {
         return Err(invalid("Protected connection: restore is disabled"));
@@ -501,6 +506,27 @@ mod tests {
                         .contains("ignores TLS on local Unix sockets")
                 );
             }
+        }
+    }
+    #[tokio::test]
+    async fn community_driver_backups_are_rejected_before_loading_native_tools() {
+        let mut config =
+            ConnectionConfig::new(DatabaseKind::PostgreSQL, "community://localhost/database");
+        config.driver_manifest = Some("/nonexistent/driver-manifest.json".into());
+        for restore in [false, true] {
+            let error = native_backup(
+                config.clone(),
+                Path::new("/nonexistent/backup"),
+                restore,
+                TransferControl::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unavailable for community drivers")
+            );
         }
     }
 }

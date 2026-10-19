@@ -385,6 +385,14 @@ impl DbxApp {
         let detail = dialog.detail.clone();
         let sql = dialog.sql.clone();
         let confirm_label = dialog.confirm_label;
+        let confirmation_matches = self.table_confirmation_matches(cx);
+        let typed_input = matches!(dialog.action, ConfirmationAction::Table { .. })
+            .then(|| {
+                self.table_confirmation_input
+                    .as_ref()
+                    .map(|(name, input, _)| (name.clone(), input.clone()))
+            })
+            .flatten();
         let tone = dialog.tone;
         let priority = if matches!(dialog.action, ConfirmationAction::LockVault) {
             60
@@ -419,6 +427,7 @@ impl DbxApp {
             .child(
                 div()
                     .id("confirmation-dialog")
+                    .key_context("DbxConfirmation")
                     .debug_selector(|| "confirmation-dialog".into())
                     .w(crate::theme::ui_px(if sql.is_some() { 640. } else { 420. }))
                     .max_w(relative(0.95))
@@ -502,6 +511,26 @@ impl DbxApp {
                                 ),
                         )
                     })
+                    .when_some(typed_input, |dialog, (name, input)| {
+                        dialog.child(
+                            div()
+                                .px(crate::theme::ui_px(16.))
+                                .pb(crate::theme::ui_px(16.))
+                                .flex()
+                                .flex_col()
+                                .gap(crate::theme::ui_px(8.))
+                                .child(format!(
+                                    "Production connection: type {name} exactly to confirm."
+                                ))
+                                .child(editor::input_with_key_context(
+                                    input.clone(),
+                                    input.read(cx).focus_handle(),
+                                    false,
+                                    "DbxTextEditor DbxTableConfirmation",
+                                    cx,
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .px(crate::theme::ui_px(16.))
@@ -522,6 +551,7 @@ impl DbxApp {
                             )
                             .child(
                                 button("confirm-action", confirm_label, confirm_kind)
+                                    .disabled(!confirmation_matches)
                                     .debug_selector(|| "confirm-action".into())
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, window, cx| {

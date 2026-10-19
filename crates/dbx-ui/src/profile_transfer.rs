@@ -15,6 +15,8 @@ pub struct PortableProfile {
     pub config: ConnectionConfig,
     pub tag: Option<ConnectionTag>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_password: Option<String>,
 }
 impl Drop for PortableProfile {
@@ -40,7 +42,7 @@ pub struct ImportPreview {
 
 pub fn review_label(profile: &PortableProfile) -> String {
     format!(
-        "{} · {} · protected\n{}\n{} · tag: {} · cloud auth: {:?}",
+        "{} · {} · protected\n{}\n{} · tag: {} · folder: {} · cloud auth: {:?}",
         profile.name,
         profile.config.kind,
         password_free(&profile.config.url).unwrap_or_else(|_| "Review URL manually".into()),
@@ -65,6 +67,7 @@ pub fn review_label(profile: &PortableProfile) -> String {
             .as_ref()
             .map(|tag| tag.name.as_str())
             .unwrap_or("none"),
+        profile.folder.as_deref().unwrap_or("Ungrouped"),
         profile.config.cloud_auth
     )
 }
@@ -160,7 +163,14 @@ fn password_free(raw: &str) -> Result<String, String> {
 
 pub fn export(store: &ProfileStore, path: &Path, passphrase: Option<&str>) -> Result<(), String> {
     let mut profiles = Vec::new();
-    for profile in store.list().map_err(|error| error.to_string())? {
+    let saved = store.list().map_err(|error| error.to_string())?;
+    if saved
+        .iter()
+        .any(|profile| profile.driver_manifest.is_some())
+    {
+        return Err("Portable bundles do not support locally registered driver connections. Recreate those connections explicitly on the destination after registering a trusted driver.".into());
+    }
+    for profile in saved {
         let (config, ssh_password) = if passphrase.is_some() {
             let mut loaded = store.load(profile.id).map_err(|error| error.to_string())?;
             let ssh = loaded.config.ssh_password.take();
@@ -179,6 +189,7 @@ pub fn export(store: &ProfileStore, path: &Path, passphrase: Option<&str>) -> Re
             name: profile.name,
             config,
             tag: profile.tag,
+            folder: profile.folder,
             ssh_password,
         });
     }
@@ -209,8 +220,30 @@ pub fn decode(bytes: &[u8], passphrase: &str) -> Result<ImportPreview, String> {
     } else {
         Zeroizing::new(bytes.to_vec())
     };
-    let value: serde_json::Value = serde_json::from_slice(&plaintext).map_err(|_| "Expected a DBX or TablePro JSON profile export. TablePlus .tableplusconnection is proprietary; migrate using connection URLs.")?;
-    let mut preview = if value.get("formatVersion").is_some() {
+    let value: serde_json::Value = serde_json::from_slice(&plaintext)
+        .or_else(|_| serde_yaml::from_slice(&plaintext))
+        .unwrap_or(serde_json::Value::Null);
+    let is_env = std::str::from_utf8(&plaintext).is_ok_and(|text| {
+        text.lines().any(|line| {
+            line.trim()
+                .strip_prefix("export ")
+                .unwrap_or(line.trim())
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "DATABASE_URL")
+        })
+    });
+    let mut preview = if is_env {
+        decode_env(&plaintext)?
+    } else if value.get("services").is_some() {
+        decode_compose(&value)?
+    } else if value
+        .get("connections")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        decode_dbeaver(&value)?
+    } else if value.is_null() || value.is_string() {
+        decode_env(&plaintext)?
+    } else if value.get("formatVersion").is_some() {
         decode_tablepro(&value)?
     } else {
         let envelope: Envelope =
@@ -227,6 +260,9 @@ pub fn decode(bytes: &[u8], passphrase: &str) -> Result<ImportPreview, String> {
         return Err("Import requires 1–500 profiles".into());
     }
     for profile in &mut preview.profiles {
+        if profile.config.driver_manifest.is_some() {
+            return Err("Imported profiles cannot contain machine-specific driver programs. Register a trusted driver locally and create its connection explicitly.".into());
+        }
         if profile.name.trim().is_empty() || profile.name.chars().count() > 200 {
             return Err("Invalid imported profile name".into());
         }
@@ -240,6 +276,247 @@ pub fn decode(bytes: &[u8], passphrase: &str) -> Result<ImportPreview, String> {
             .map_err(|error| error.to_string())?;
     }
     preview.warnings.push("Imported profiles start protected. No connections or startup commands will run. Paths to key/certificate files are references; those files are not copied.".into());
+    Ok(preview)
+}
+
+fn imported_profile(
+    name: String,
+    fields: crate::connection_fields::ConnectionFields,
+    folder: Option<String>,
+) -> Result<PortableProfile, String> {
+    Ok(PortableProfile {
+        name,
+        config: fields.config()?,
+        tag: None,
+        folder,
+        ssh_password: None,
+    })
+}
+
+fn decode_env(bytes: &[u8]) -> Result<ImportPreview, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "Import must be UTF-8")?;
+    let mut profiles = Vec::new();
+    for line in text.lines() {
+        let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "DATABASE_URL" {
+            continue;
+        }
+        let value = value.trim();
+        let value = if value.starts_with(['\'', '"']) {
+            let quote = value.chars().next().unwrap();
+            let end = value[1..]
+                .find(quote)
+                .ok_or("Unclosed DATABASE_URL quote")?
+                + 1;
+            &value[1..end]
+        } else {
+            value.split(" #").next().unwrap_or(value).trim()
+        };
+        if value.contains('$') || value.contains('`') {
+            return Err("Resolve DATABASE_URL variables before importing; shell expressions are never evaluated".into());
+        }
+        let fields = crate::connection_fields::ConnectionFields::from_url(value)
+            .map_err(|_| "Invalid DATABASE_URL (value hidden)")?;
+        profiles.push(imported_profile("DATABASE_URL".into(), fields, None)?);
+    }
+    if profiles.is_empty() {
+        return Err("Choose DBX, TablePro, DBeaver data-sources.json, Docker Compose YAML, or a .env with DATABASE_URL. TablePlus files require migration via a connection URL.".into());
+    }
+    Ok(ImportPreview { profiles, warnings: vec!["Only DATABASE_URL is imported. Shell commands and variable expansion are never evaluated.".into()] })
+}
+
+fn decode_dbeaver(value: &serde_json::Value) -> Result<ImportPreview, String> {
+    let connections = value["connections"]
+        .as_object()
+        .ok_or("Invalid DBeaver connections")?;
+    let mut preview = ImportPreview { profiles: Vec::new(), warnings: vec!["DBeaver encrypted credentials, SSH/TLS custom properties and startup SQL are not imported. Review authentication and TLS before connecting.".into()] };
+    for connection in connections.values() {
+        let name = connection["name"]
+            .as_str()
+            .unwrap_or("DBeaver connection")
+            .to_owned();
+        let config = &connection["configuration"];
+        let raw = config["url"]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches("jdbc:");
+        let mut fields = if !raw.is_empty() {
+            match crate::connection_fields::ConnectionFields::from_url(raw) {
+                Ok(fields) => fields,
+                Err(_) => {
+                    preview
+                        .warnings
+                        .push(format!("{name}: unsupported JDBC URL; skipped"));
+                    continue;
+                }
+            }
+        } else {
+            let driver = connection["provider"]
+                .as_str()
+                .or_else(|| connection["driver"].as_str())
+                .unwrap_or_default()
+                .to_lowercase();
+            let kind = if driver.contains("postgres") || driver.contains("redshift") {
+                DatabaseKind::PostgreSQL
+            } else if driver.contains("mysql") || driver.contains("maria") {
+                DatabaseKind::MySQL
+            } else if driver.contains("sqlite") {
+                DatabaseKind::SQLite
+            } else {
+                preview
+                    .warnings
+                    .push(format!("{name}: unsupported DBeaver driver; skipped"));
+                continue;
+            };
+            let mut fields = crate::connection_fields::ConnectionFields::new(kind);
+            if kind.is_file() {
+                fields.connection_string = config["database"].as_str().unwrap_or_default().into();
+            } else {
+                fields.host = config["host"].as_str().unwrap_or("localhost").into();
+                fields.port = config["port"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| config["port"].as_u64().map(|p| p.to_string()))
+                    .unwrap_or_else(|| fields.port.clone());
+                fields.database = config["database"].as_str().unwrap_or_default().into();
+                fields.username = config["user"]
+                    .as_str()
+                    .or_else(|| config["userName"].as_str())
+                    .or_else(|| config["username"].as_str())
+                    .unwrap_or_default()
+                    .into();
+            }
+            fields
+        };
+        if fields.username.is_empty() && !fields.kind.is_file() {
+            fields.username = config["user"]
+                .as_str()
+                .or_else(|| config["userName"].as_str())
+                .or_else(|| config["username"].as_str())
+                .unwrap_or_default()
+                .into();
+            if !fields.username.is_empty() && !fields.connection_string.is_empty() {
+                let mut url =
+                    Url::parse(&fields.connection_string).map_err(|_| "Invalid DBeaver URL")?;
+                url.set_username(&fields.username.replace('%', "%25"))
+                    .map_err(|_| "Invalid DBeaver username")?;
+                fields.connection_string = url.into();
+            }
+        }
+        let folder = connection["folder"]
+            .as_str()
+            .and_then(|folder| value["folders"][folder]["name"].as_str().or(Some(folder)))
+            .map(str::to_owned);
+        preview
+            .profiles
+            .push(imported_profile(name, fields, folder)?);
+    }
+    Ok(preview)
+}
+
+fn decode_compose(value: &serde_json::Value) -> Result<ImportPreview, String> {
+    let services = value["services"]
+        .as_object()
+        .ok_or("Compose services must be a mapping")?;
+    let mut preview = ImportPreview { profiles: Vec::new(), warnings: vec!["Compose is read as data. Containers, env_file files, commands and variable interpolation are never executed. Review published host ports and credentials.".into()] };
+    for (name, service) in services {
+        let image = service["image"].as_str().unwrap_or_default().to_lowercase();
+        let (kind, prefix, default_user, default_db) = if image.contains("postgres") {
+            (DatabaseKind::PostgreSQL, "POSTGRES", "postgres", "postgres")
+        } else if image.contains("mariadb") {
+            (DatabaseKind::MySQL, "MARIADB", "root", "mysql")
+        } else if image.contains("mysql") {
+            (DatabaseKind::MySQL, "MYSQL", "root", "mysql")
+        } else if image.contains("redis") {
+            (DatabaseKind::Redis, "REDIS", "", "")
+        } else {
+            continue;
+        };
+        let mut env = std::collections::HashMap::<String, String>::new();
+        if let Some(map) = service["environment"].as_object() {
+            for (key, value) in map {
+                if let Some(value) = value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_i64().map(|v| v.to_string()))
+                {
+                    env.insert(key.clone(), value);
+                }
+            }
+        } else if let Some(values) = service["environment"].as_array() {
+            for value in values.iter().filter_map(|v| v.as_str()) {
+                if let Some((key, value)) = value.split_once('=') {
+                    env.insert(key.into(), value.into());
+                }
+            }
+        }
+        if env
+            .values()
+            .any(|value| value.contains('$') || value.contains('`'))
+        {
+            preview.warnings.push(format!(
+                "{name}: unresolved environment expressions; skipped"
+            ));
+            continue;
+        }
+        let mut fields = crate::connection_fields::ConnectionFields::new(kind);
+        fields.host = "localhost".into();
+        fields.username = env
+            .get(&format!("{prefix}_USER"))
+            .cloned()
+            .unwrap_or(default_user.into());
+        fields.database = env
+            .get(&format!("{prefix}_DB"))
+            .or_else(|| env.get(&format!("{prefix}_DATABASE")))
+            .cloned()
+            .unwrap_or_else(|| {
+                if kind == DatabaseKind::PostgreSQL {
+                    fields.username.clone()
+                } else {
+                    default_db.into()
+                }
+            });
+        fields.password = env
+            .get(&format!("{prefix}_PASSWORD"))
+            .or_else(|| env.get(&format!("{prefix}_ROOT_PASSWORD")))
+            .cloned()
+            .unwrap_or_default();
+        let mut published = None;
+        for port in service["ports"].as_array().into_iter().flatten() {
+            if let Some(port) = port.as_str() {
+                let pieces: Vec<_> = port.trim_end_matches("/tcp").split(':').collect();
+                if pieces.len() >= 2 && pieces.last().copied() == kind.default_port() {
+                    published = pieces[pieces.len() - 2]
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port > 0);
+                }
+            } else if port["target"].as_u64().map(|v| v.to_string()).as_deref()
+                == kind.default_port()
+            {
+                published = port["published"]
+                    .as_u64()
+                    .and_then(|v| u16::try_from(v).ok())
+                    .or_else(|| port["published"].as_str().and_then(|v| v.parse().ok()))
+                    .filter(|port| *port > 0);
+            }
+        }
+        let Some(port) = published else {
+            preview
+                .warnings
+                .push(format!("{name}: no fixed published database port; skipped"));
+            continue;
+        };
+        fields.port = port.to_string();
+        preview.profiles.push(imported_profile(
+            name.clone(),
+            fields,
+            Some("Docker Compose".into()),
+        )?);
+    }
     Ok(preview)
 }
 
@@ -434,6 +711,11 @@ fn decode_tablepro(value: &serde_json::Value) -> Result<ImportPreview, String> {
             name,
             config,
             tag,
+            folder: item["folderName"]
+                .as_str()
+                .or_else(|| item["groupName"].as_str())
+                .or_else(|| item["folder"].as_str())
+                .map(str::to_owned),
             ssh_password: credentials["sshPassword"].as_str().map(str::to_owned),
         });
     }
@@ -450,6 +732,12 @@ fn expand_path(path: &str) -> Result<std::path::PathBuf, String> {
 }
 
 pub fn import(store: &ProfileStore, profiles: Vec<PortableProfile>) -> Result<usize, String> {
+    if profiles
+        .iter()
+        .any(|profile| profile.config.driver_manifest.is_some())
+    {
+        return Err("Imported profiles cannot select local driver programs. Register a trusted driver and configure it explicitly.".into());
+    }
     let tags = store.tags().map_err(|error| error.to_string())?;
     let mut created = Vec::new();
     let mut created_tags = Vec::new();
@@ -458,6 +746,7 @@ pub fn import(store: &ProfileStore, profiles: Vec<PortableProfile>) -> Result<us
             let mut draft =
                 ConnectionProfileDraft::from_config(profile.name.clone(), profile.config.clone());
             draft.config.ssh_password = profile.ssh_password.clone();
+            draft.folder = profile.folder.clone();
             draft.tag = if let Some(tag) = &profile.tag {
                 if let Some(existing) = tags
                     .iter()
@@ -519,6 +808,126 @@ pub fn import(store: &ProfileStore, profiles: Vec<PortableProfile>) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn portable_imports_reject_local_driver_programs_before_validation_or_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("profiles.json"));
+        let mut config =
+            ConnectionConfig::new(DatabaseKind::SQLite, "example-sqlite:///private.sqlite");
+        config.driver_manifest = Some(directory.path().join("untrusted-not-registered.json"));
+        let profile = PortableProfile {
+            name: "Untrusted driver".into(),
+            config,
+            tag: None,
+            folder: None,
+            ssh_password: None,
+        };
+        let bytes = serde_json::to_vec(&Envelope {
+            version: 1,
+            profiles: vec![profile.clone()],
+        })
+        .unwrap();
+        let error = match decode(&bytes, "") {
+            Ok(_) => panic!("plugin import accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("machine-specific driver"));
+        assert!(
+            import(&store, vec![profile])
+                .unwrap_err()
+                .contains("local driver programs")
+        );
+        assert!(!store.path().exists());
+        assert!(
+            !directory
+                .path()
+                .join("untrusted-not-registered.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn portable_exports_reject_plugins_without_overwriting_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProfileStore::at(directory.path().join("profiles.json"));
+        store
+            .vault()
+            .unwrap()
+            .create("fixture plugin vault passphrase")
+            .unwrap();
+        let config = crate::profiles::plugin_profile_fixture(
+            directory.path(),
+            "example-sqlite:///absolute/database.sqlite",
+        );
+        store
+            .save(ConnectionProfileDraft::from_config("Local driver", config))
+            .unwrap();
+        let destination = directory.path().join("existing-export.json");
+        std::fs::write(&destination, b"keep existing export").unwrap();
+        for passphrase in [None, Some("portable fixture passphrase")] {
+            assert!(
+                export(&store, &destination, passphrase)
+                    .unwrap_err()
+                    .contains("locally registered driver")
+            );
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"keep existing export"
+            );
+        }
+    }
+
+    #[test]
+    fn imports_env_without_evaluating_shell_or_leaking_credentials() {
+        let preview = decode(
+            b"IGNORED=value\nexport DATABASE_URL='postgres://alice:secret@localhost/example'\n",
+            "",
+        )
+        .unwrap();
+        assert_eq!(preview.profiles.len(), 1);
+        assert!(preview.profiles[0].config.read_only);
+        assert!(!review_label(&preview.profiles[0]).contains("secret"));
+        assert!(decode(b"DATABASE_URL=$(run something)", "").is_err());
+        assert!(decode(b"DATABASE_URL=postgres://${USER}:secret@host/db", "").is_err());
+    }
+
+    #[test]
+    fn imports_compose_published_ports_and_skips_unresolved_secrets() {
+        let yaml = b"services:\n  local-db:\n    image: postgres:17\n    ports: [\"15432:5432\"]\n    environment:\n      POSTGRES_USER: alice\n      POSTGRES_PASSWORD: secret\n      POSTGRES_DB: sample\n    command: rm -rf /\n  unresolved:\n    image: mysql:8\n    ports: [\"13306:3306\"]\n    environment: [\"MYSQL_PASSWORD=${SECRET}\"]\n";
+        let preview = decode(yaml, "").unwrap();
+        assert_eq!(preview.profiles.len(), 1);
+        assert!(preview.profiles[0].config.url.contains(":15432/sample"));
+        assert_eq!(
+            preview.profiles[0].folder.as_deref(),
+            Some("Docker Compose")
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unresolved"))
+        );
+        assert!(
+            !serde_json::to_string(&preview.profiles)
+                .unwrap()
+                .contains("rm -rf")
+        );
+    }
+
+    #[test]
+    fn imports_dbeaver_folder_and_ignores_startup_sql_and_credentials_store() {
+        let json = br#"{"folders":{"f":{"name":"Team"}},"connections":{"pg":{"name":"Example","provider":"postgresql","folder":"f","configuration":{"url":"jdbc:postgresql://localhost:5432/sample","user":"alice","bootstrap":{"initQueries":["DROP TABLE users"]}}}}}"#;
+        let preview = decode(json, "").unwrap();
+        assert_eq!(preview.profiles[0].folder.as_deref(), Some("Team"));
+        assert_eq!(preview.profiles[0].config.kind, DatabaseKind::PostgreSQL);
+        assert!(preview.profiles[0].config.read_only);
+        assert!(
+            !serde_json::to_string(&preview.profiles)
+                .unwrap()
+                .contains("DROP TABLE")
+        );
+    }
+
     #[test]
     fn portable_profiles_are_password_free_or_authenticated_and_import_protected() {
         let directory = tempfile::tempdir().unwrap();

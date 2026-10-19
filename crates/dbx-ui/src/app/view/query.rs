@@ -5,18 +5,111 @@ use gpui::WeakEntity;
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 impl DbxApp {
+    fn render_plan_tree(result: &QueryResult) -> Option<AnyElement> {
+        let column = |name: &str| result.columns.iter().position(|column| column.name == name);
+        let (depth, operation) = (column("Depth")?, column("Operation")?);
+        let rows = result.rows.iter().enumerate().map(|(index, row)| {
+            let text = |name: &str| {
+                column(name)
+                    .and_then(|index| row.values.get(index))
+                    .map(|value| match value {
+                        CellValue::Text(value) => value.clone(),
+                        CellValue::Integer(value) => value.to_string(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default()
+            };
+            let level = match row.values.get(depth) {
+                Some(CellValue::Integer(value)) => (*value).clamp(0, 40) as f32,
+                _ => 0.,
+            };
+            let name = match row.values.get(operation) {
+                Some(CellValue::Text(value)) => value.clone(),
+                _ => "Plan step".into(),
+            };
+            let actual = text("Actual time (ms)");
+            let estimates = format!(
+                "rows {} · cost {}",
+                text("Estimated rows"),
+                text("Estimated cost")
+            );
+            let metrics = if actual.is_empty() {
+                estimates
+            } else {
+                format!(
+                    "{estimates} · actual {actual} ms/loop · {} rows/loop · {} loops",
+                    text("Actual rows"),
+                    text("Actual loops")
+                )
+            };
+            div()
+                .id(("query-plan-node", index))
+                .role(gpui::Role::TreeItem)
+                .aria_label(format!(
+                    "Level {}: {name}. {metrics}. {}",
+                    level as usize + 1,
+                    text("Detail")
+                ))
+                .ml(crate::theme::ui_px(level * 18.))
+                .pl(crate::theme::ui_px(10.))
+                .py(crate::theme::ui_px(7.))
+                .border_l_1()
+                .border_color(theme().border_strong)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(crate::theme::ui_px(8.))
+                        .child(div().text_color(theme().accent_text).child(if level > 0. {
+                            "↳"
+                        } else {
+                            "●"
+                        }))
+                        .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                        .child(
+                            div()
+                                .text_size(crate::theme::text_px(10.))
+                                .text_color(theme().text_muted)
+                                .child(metrics),
+                        ),
+                )
+                .child(
+                    div()
+                        .pl(crate::theme::ui_px(18.))
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child(text("Detail")),
+                )
+        });
+        Some(
+            div()
+                .id("query-plan-tree")
+                .debug_selector(|| "query-plan-tree".into())
+                .role(gpui::Role::Tree)
+                .aria_label("Execution plan")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .p(crate::theme::ui_px(12.))
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
     fn render_query_grid(
         result_grid: Entity<TableState<ResultTableDelegate>>,
         has_result: bool,
         has_rowset: bool,
+        failed: bool,
     ) -> AnyElement {
-        if !has_result {
+        if failed || !has_result {
             // The status strip and error banner already say what happened.
             return div().flex_1().into_any_element();
         }
 
         if !has_rowset {
             return div()
+                .debug_selector(|| "query-no-rows".into())
                 .flex_1()
                 .flex()
                 .items_center()
@@ -226,6 +319,34 @@ impl DbxApp {
                 ))
             })
             .unwrap_or_default();
+        let plan_available = self.active_query_tab(session_id).is_some_and(|query| {
+            query.result.as_ref().is_some_and(|result| {
+                result
+                    .columns
+                    .first()
+                    .is_some_and(|column| column.name == "Depth")
+                    && result
+                        .columns
+                        .get(1)
+                        .is_some_and(|column| column.name == "Operation")
+            })
+        });
+        let plan_tree = self
+            .active_query_tab(session_id)
+            .is_some_and(|query| query.plan_tree);
+        let watch_interval = self
+            .active_query_tab(session_id)
+            .and_then(|query| query.watch_interval);
+        let watch_supported = self
+            .session(session_id)
+            .is_some_and(|session| session.kind == DatabaseKind::PostgreSQL);
+        let plan_view = (error.is_none() && plan_tree)
+            .then(|| {
+                self.active_query_tab(session_id)
+                    .and_then(|query| query.result.as_deref())
+                    .and_then(Self::render_plan_tree)
+            })
+            .flatten();
         // Paint failed-query underlines only while the query revision still
         // matches the run that produced them; text edits clear the range.
         if sql_dialect {
@@ -254,6 +375,7 @@ impl DbxApp {
         let completion_up_editor = query_editor.clone();
         let completion_down_editor = query_editor.clone();
         let completion_enter_editor = query_editor.clone();
+        let completion_tab_editor = query_editor.clone();
         let mut editor_panel = div()
             .relative()
             .flex_1()
@@ -286,6 +408,16 @@ impl DbxApp {
                     session_id,
                     CompletionAction::Enter,
                     completion_enter_editor.clone(),
+                    window,
+                    cx,
+                );
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(move |this, _: &CompletionTab, window, cx| {
+                this.handle_completion_action(
+                    session_id,
+                    CompletionAction::Tab,
+                    completion_tab_editor.clone(),
                     window,
                     cx,
                 );
@@ -333,6 +465,23 @@ impl DbxApp {
         };
         let app = cx.entity().downgrade();
         let saved_queries = self.saved_queries_for(session_id);
+        let compare_connections = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.id != session_id
+                    && session.engine.is_some()
+                    && self
+                        .session(session_id)
+                        .is_some_and(|target| session.kind.dialect() == target.kind.dialect())
+            })
+            .map(|session| (session.id, session.name.clone()))
+            .collect::<Vec<_>>();
+        let (sql_files, sql_library_error) = match self.sql_library.entries() {
+            Ok(entries) => (entries, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let sql_library_path = self.sql_library.root().display().to_string();
         let timeout_secs = self
             .session(session_id)
             .and_then(|session| session.secondary_tabs.iter().find(|tab| tab.id == tab_id))
@@ -472,9 +621,9 @@ impl DbxApp {
                                 ),
                             )
                             .child(
-                                button("save-named-query", "Save", ButtonKind::Quiet)
+                                button("save-named-query", "Save to vault", ButtonKind::Quiet)
                                     .debug_selector(|| "save-named-query".into())
-                                    .accessible_name("Save this query to the connection").tooltip("Save this query to the connection")
+                                    .accessible_name("Save this query in the encrypted vault").tooltip("Save this query in the encrypted vault")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.save_named_query_for(session_id, cx)
                                     })),
@@ -586,7 +735,13 @@ impl DbxApp {
                                             busy,
                                             has_rowset,
                                             timeout_secs,
+                                            watch_interval,
+                                            watch_supported,
                                             saved: saved_queries.clone(),
+                                            compare_connections: compare_connections.clone(),
+                                            sql_files: sql_files.clone(),
+                                            sql_library_error: sql_library_error.clone(),
+                                            sql_library_path: sql_library_path.clone(),
                                             history: history.clone(),
                                             history_disabled,
                                             history_retention,
@@ -599,6 +754,12 @@ impl DbxApp {
             )
             .when(in_transaction, |view| view.child(div().px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.)).text_size(crate::theme::text_px(12.)).text_color(theme().warning_text)
                 .child("Transaction open in this tab · Commit to save or Rollback to discard. Closing the tab rolls it back.")))
+            .when_some(watch_interval, |view, interval| view.child(
+                div().id("query-watch-status").debug_selector(|| "query-watch-status".into()).px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.)).flex().items_center().gap(crate::theme::ui_px(8.))
+                    .text_size(crate::theme::text_px(11.)).text_color(theme().accent_text)
+                    .child(format!("Watch · every {interval}s while visible · isolated read-only transaction · edits stop watch"))
+                    .child(button("stop-query-watch", "Stop watch", ButtonKind::Quiet).debug_selector(|| "stop-query-watch".into()).on_click(cx.listener(move |this, _, _, cx| this.stop_query_watch(session_id, cx))))
+            ))
             .when_some(vim_mode, |view, mode| view.child(div().px(crate::theme::ui_px(10.)).py(crate::theme::ui_px(4.)).text_size(crate::theme::text_px(12.)).text_color(theme().accent_text)
                 .debug_selector(|| "vim-mode-indicator".into())
                 .child(format!("{} · i to insert · Esc for Normal · F6 to leave editor", mode.label()))))
@@ -691,6 +852,14 @@ impl DbxApp {
                                                     }),
                                             ),
                                     )
+                                    .when(plan_available, |strip| strip.child(
+                                        button("toggle-plan-tree", if plan_tree { "Show grid" } else { "Show plan tree" }, ButtonKind::Quiet)
+                                            .debug_selector(|| "toggle-plan-tree".into())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(query) = this.active_query_tab_mut(session_id) { query.plan_tree = !query.plan_tree; }
+                                                cx.notify();
+                                            }))
+                                    ))
                                     .when_some(executed_database, |strip, database| {
                                         strip.child(
                                             div()
@@ -739,6 +908,13 @@ impl DbxApp {
                                                 )
                                                 .when(sql_dialect, |actions| {
                                                     actions.child(
+                                                        button("fix-query-error", "Ask AI to fix", ButtonKind::Quiet)
+                                                            .debug_selector(|| "fix-query-error".into())
+                                                            .tooltip("Review an editable request containing the query and database error before sending it to your assistant")
+                                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                                this.ask_agent_to_fix_query(session_id, tab_id, window, cx);
+                                                            })),
+                                                    ).child(
                                                         button(
                                                             "locate-query-error",
                                                             "Locate in editor",
@@ -757,11 +933,12 @@ impl DbxApp {
                                         ),
                                 )
                             })
-                            .child(Self::render_query_grid(
+                            .child(plan_view.unwrap_or_else(|| Self::render_query_grid(
                                 result_grid,
                                 has_result,
                                 has_rowset,
-                            )),
+                                error.is_some(),
+                            ))),
                     ),
                 ),
             )
@@ -777,7 +954,13 @@ struct QueryOptions {
     busy: bool,
     has_rowset: bool,
     timeout_secs: u64,
+    watch_interval: Option<u64>,
+    watch_supported: bool,
     saved: Vec<SavedQuery>,
+    compare_connections: Vec<(SessionId, String)>,
+    sql_files: Vec<crate::query_library::SqlFileEntry>,
+    sql_library_error: Option<String>,
+    sql_library_path: String,
     history: Vec<QueryHistoryEntry>,
     history_disabled: bool,
     history_retention: usize,
@@ -820,7 +1003,44 @@ impl QueryOptions {
                         this.explain_query_for(session_id, cx)
                     })
                     .disabled(self.busy),
+                )
+                .item(
+                    self.item(
+                        "EXPLAIN ANALYZE… (executes query)",
+                        move |this, window, cx| {
+                            this.request_analyze_query_for(session_id, window, cx)
+                        },
+                    )
+                    .disabled(self.busy || !self.watch_supported),
                 );
+            let options = self.clone();
+            menu = menu.submenu(
+                "Watch read query (PostgreSQL)",
+                window,
+                cx,
+                move |mut menu, _, _| {
+                    for interval in [5, 10, 30, 60] {
+                        menu = menu.item(
+                            options
+                                .item(
+                                    format!("Every {interval} seconds while visible"),
+                                    move |this, _, cx| {
+                                        this.start_query_watch(session_id, interval, cx)
+                                    },
+                                )
+                                .checked(options.watch_interval == Some(interval))
+                                .disabled(options.busy || !options.watch_supported),
+                        );
+                    }
+                    menu.separator().item(
+                        options
+                            .item("Stop watch", move |this, _, cx| {
+                                this.stop_query_watch(session_id, cx)
+                            })
+                            .disabled(options.watch_interval.is_none()),
+                    )
+                },
+            );
             let options = self.clone();
             menu = menu.submenu("Diagnostics", window, cx, move |menu, _, _| {
                 let busy = options.busy;
@@ -864,9 +1084,44 @@ impl QueryOptions {
                         .disabled(busy),
                 )
             });
+            let options = self.clone();
+            menu = menu.submenu(
+                "Make this connection’s schema match…",
+                window,
+                cx,
+                move |mut menu, _, _| {
+                    if options.compare_connections.is_empty() {
+                        return menu.label("Open another connection of the same database type");
+                    }
+                    for (source_id, label) in &options.compare_connections {
+                        let source_id = *source_id;
+                        menu = menu.item(
+                            options
+                                .item(label.clone(), move |this, window, cx| {
+                                    this.compare_connection_schemas(
+                                        session_id, source_id, window, cx,
+                                    )
+                                })
+                                .disabled(options.busy),
+                        );
+                    }
+                    menu
+                },
+            );
             menu = menu.separator();
         }
 
+        let options = self.clone();
+        menu = menu.item(
+            options
+                .item(
+                    "Column statistics (loaded rows)",
+                    move |this, window, cx| {
+                        this.show_loaded_column_statistics(session_id, window, cx)
+                    },
+                )
+                .disabled(!options.has_rowset),
+        );
         let options = self.clone();
         menu = menu.submenu("Copy result", window, cx, move |mut menu, _, _| {
             let rows = options.has_rowset;
@@ -881,6 +1136,7 @@ impl QueryOptions {
                 ("As TSV", QueryResultExportFormat::Tsv),
                 ("As CSV", QueryResultExportFormat::Csv),
                 ("As JSON", QueryResultExportFormat::Json),
+                ("As Markdown", QueryResultExportFormat::Markdown),
                 ("As INSERT statements", QueryResultExportFormat::Insert),
             ] {
                 menu = menu.item(
@@ -906,6 +1162,8 @@ impl QueryOptions {
                 ("CSV…", QueryResultExportFormat::Csv),
                 ("TSV…", QueryResultExportFormat::Tsv),
                 ("JSON…", QueryResultExportFormat::Json),
+                ("Markdown…", QueryResultExportFormat::Markdown),
+                ("Excel XLSX…", QueryResultExportFormat::Xlsx),
                 ("INSERT statements…", QueryResultExportFormat::Insert),
             ] {
                 menu = menu.item(
@@ -942,35 +1200,120 @@ impl QueryOptions {
         });
         menu = menu.separator();
 
+        let files = self.clone();
+        menu = menu.submenu(
+            "SQL file library",
+            window,
+            cx,
+            move |mut menu, window, cx| {
+                menu = menu
+                    .label(format!("Plaintext .sql files · {}", files.sql_library_path))
+                    .item(files.item("Choose library folder…", |this, _, cx| {
+                        this.choose_sql_library_folder(cx)
+                    }))
+                    .item(files.item("Refresh files", |this, _, cx| {
+                        this.sql_library.invalidate();
+                        cx.notify();
+                    }))
+                    .item(files.item("Open .sql file…", move |this, window, cx| {
+                        this.open_sql_file_for(session_id, window, cx)
+                    }))
+                    .item(
+                        files.item("Save current query as .sql…", move |this, _, cx| {
+                            this.save_query_sql_file_for(session_id, cx)
+                        }),
+                    );
+                if let Some(error) = &files.sql_library_error {
+                    menu = menu.label(error.clone());
+                }
+                if files.sql_files.is_empty() {
+                    return menu.separator().label("No .sql files in this folder");
+                }
+                let favorites = files.clone();
+                menu = menu.submenu("Favorites", window, cx, move |mut menu, _, _| {
+                    let mut any = false;
+                    for entry in favorites.sql_files.iter().filter(|entry| entry.favorite) {
+                        any = true;
+                        let path = entry.relative_path.clone();
+                        menu = menu.item(favorites.item(entry.label(), move |this, window, cx| {
+                            this.open_library_sql_for(session_id, path.clone(), window, cx)
+                        }));
+                    }
+                    if !any {
+                        menu = menu.label("Mark a file below to add a favorite");
+                    }
+                    menu
+                });
+                menu = menu.separator();
+                for entry in &files.sql_files {
+                    let entry = entry.clone();
+                    let actions = files.clone();
+                    menu = menu.submenu(
+                        format!(
+                            "{}{}",
+                            if entry.favorite { "★ " } else { "" },
+                            entry.label()
+                        ),
+                        window,
+                        cx,
+                        move |menu, _, _| {
+                            let open_path = entry.relative_path.clone();
+                            let favorite_path = entry.relative_path.clone();
+                            menu.item(actions.item("Open as draft", move |this, window, cx| {
+                                this.open_library_sql_for(session_id, open_path.clone(), window, cx)
+                            }))
+                            .item(actions.item(
+                                if entry.favorite {
+                                    "Remove favorite"
+                                } else {
+                                    "Add favorite"
+                                },
+                                move |this, _, cx| {
+                                    this.toggle_sql_file_favorite(favorite_path.clone(), cx)
+                                },
+                            ))
+                        },
+                    );
+                }
+                menu
+            },
+        );
+
         if !self.saved.is_empty() {
             let options = self.clone();
-            menu = menu.submenu("Saved queries", window, cx, move |mut menu, window, cx| {
-                for saved in &options.saved {
-                    let saved = saved.clone();
-                    menu = menu.item(options.item(saved.name.clone(), move |this, window, cx| {
-                        this.open_saved_query_for(session_id, saved.clone(), window, cx)
-                    }));
-                }
-                let delete = options.clone();
-                menu.separator()
-                    .submenu("Delete", window, cx, move |mut menu, _, _| {
-                        for saved in &delete.saved {
-                            let name = saved.name.clone();
-                            menu = menu.item(delete.item(
-                                saved.name.clone(),
-                                move |this, window, cx| {
-                                    this.request_delete_saved_query_for(
-                                        session_id,
-                                        name.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                },
-                            ));
-                        }
-                        menu
-                    })
-            });
+            menu = menu.submenu(
+                "Vault saved queries",
+                window,
+                cx,
+                move |mut menu, window, cx| {
+                    for saved in &options.saved {
+                        let saved = saved.clone();
+                        menu =
+                            menu.item(options.item(saved.name.clone(), move |this, window, cx| {
+                                this.open_saved_query_for(session_id, saved.clone(), window, cx)
+                            }));
+                    }
+                    let delete = options.clone();
+                    menu.separator()
+                        .submenu("Delete", window, cx, move |mut menu, _, _| {
+                            for saved in &delete.saved {
+                                let name = saved.name.clone();
+                                menu = menu.item(delete.item(
+                                    saved.name.clone(),
+                                    move |this, window, cx| {
+                                        this.request_delete_saved_query_for(
+                                            session_id,
+                                            name.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                ));
+                            }
+                            menu
+                        })
+                },
+            );
         }
         let options = self.clone();
         menu = menu.submenu("History", window, cx, move |mut menu, window, cx| {
@@ -1049,5 +1392,131 @@ impl QueryOptions {
             .item(self.item("Reopen closed query", move |this, window, cx| {
                 this.reopen_last_closed_query_for(session_id, window, cx)
             }))
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn query_error_hides_success_message_and_opens_repair_prompt(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.connection_picker_open = false;
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            let tab_id = Uuid::new_v4();
+            let mut query = QueryTab::new(DatabaseKind::SQLite, session_id, tab_id, window, cx);
+            query
+                .query_editor
+                .update(cx, |editor, cx| editor.set_text("SELECT missing", cx));
+            query.set_result(Some(QueryResult::empty(None, 0)), cx);
+            query.error = Some("no such column: missing".into());
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Query(Box::new(query)),
+            });
+            session.active_secondary_tab = Some(tab_id);
+            session.pane = Pane::Query;
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("query-no-rows").is_none());
+        let fix = cx
+            .debug_bounds("fix-query-error")
+            .expect("repair button visible");
+        cx.simulate_click(fix.center(), Default::default());
+        app.read_with(cx, |app, _| {
+            let tab_id = app
+                .session(session_id)
+                .unwrap()
+                .active_secondary_tab
+                .unwrap();
+            assert!(app.agent_panel_open(session_id, tab_id));
+        });
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.active_query_tab_mut(session_id).unwrap().error = None;
+                cx.notify();
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("query-no-rows").is_some());
+    }
+
+    #[gpui::test]
+    fn tab_and_enter_accept_completion_and_tab_otherwise_indents(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            cx.bind_keys(editor::default_key_bindings());
+            cx.bind_keys([
+                gpui::KeyBinding::new("tab", CompletionTab, Some(editor::SQL_EDITOR_CONTEXT)),
+                gpui::KeyBinding::new("enter", CompletionEnter, Some(editor::SQL_EDITOR_CONTEXT)),
+            ]);
+        });
+        let session_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            app.connection_picker_open = false;
+            app.vim_mode = false;
+            app.sessions = vec![ConnectionSession::new(
+                session_id,
+                None,
+                "test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            )];
+            app.active_session_id = Some(session_id);
+            app.add_query_tab_for(session_id, window, cx);
+            app
+        });
+        let editor = app.read_with(cx, |app, _| {
+            app.active_query_tab(session_id)
+                .unwrap()
+                .query_editor
+                .clone()
+        });
+        for key in ["tab", "enter"] {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("SELE", cx);
+                    editor.move_cursor_to(4, cx);
+                    editor.focus_handle().focus(window, cx);
+                })
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("sql-completion-menu").is_some());
+            cx.simulate_keystrokes(key);
+            assert_eq!(
+                editor.read_with(cx, |editor, cx| editor.text(cx)).trim(),
+                "SELECT"
+            );
+        }
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("", cx);
+                editor.focus_handle().focus(window, cx);
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("sql-completion-menu").is_none());
+        cx.simulate_keystrokes("tab");
+        assert_eq!(editor.read_with(cx, |editor, cx| editor.text(cx)), "  ");
     }
 }

@@ -155,6 +155,13 @@ impl Engine for ProtectedEngine {
     async fn use_database(&self, name: &str) -> Result<()> {
         self.0.use_database(name).await
     }
+    async fn document_for_edit(
+        &self,
+        table: &TableRef,
+        identity: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.0.document_for_edit(table, identity).await
+    }
     async fn describe_table(&self, table: &TableRef) -> Result<Vec<ColumnInfo>> {
         self.0.describe_table(table).await
     }

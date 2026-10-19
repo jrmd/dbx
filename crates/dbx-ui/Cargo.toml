@@ -26,6 +26,8 @@ keyring.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
+rust_xlsxwriter = "0.100"
 secrecy.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -48,6 +50,7 @@ tempfile.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+zip = { version = "6", default-features = false, features = ["deflate"] }
 gpui = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
