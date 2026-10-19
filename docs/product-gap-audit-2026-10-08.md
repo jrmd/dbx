@@ -1,5 +1,16 @@
 # DBX product gap audit — 8 October 2026
 
+> **Historical snapshot, not the current backlog.** This audit inspected v0.5.0.
+> The v0.6.0 release delivered G01–G05, much of G06–G08, and G10–G13;
+> see the [implementation map](gap-fix-verification-2026-10-08.md),
+> [current capabilities](capability-matrix.md), and [changelog](../CHANGELOG.md).
+> G09 still needs comparative GUI measurements. MongoDB document editing and
+> connector-specific limits remain separate work. Intel Mac builds mentioned
+> in the follow-up were removed in v0.7.1; current releases support Apple Silicon
+> macOS and Linux x86_64. The old website redirects to
+> [dbx.bonusobjective.com](https://dbx.bonusobjective.com) (verified 19 October 2026).
+> Findings, line numbers and “current” below refer to the original audit date.
+
 ## Verdict
 
 DBX has a credible everyday database workbench foundation. Its biggest remaining gaps are workflow completeness, consistent connector behavior, and evidence of dependable desktop operation. Adding more connector names would have less value than closing those gaps.

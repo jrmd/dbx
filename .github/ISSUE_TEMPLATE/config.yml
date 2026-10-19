@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/jrmd/dbx/discussions
+    about: Discuss how to use DBX or explore an idea before opening an issue.

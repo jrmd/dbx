@@ -51,6 +51,7 @@ jobs:
           cargo test --locked --release --workspace
           cargo clippy --locked --release --workspace --all-targets -- -D warnings
           python3 scripts/test-macos-release.py
+          python3 scripts/test-release-notes.py
           cargo build --locked --release --package dbx-ui
       - name: Measure disposable workbench workload
         run: cargo run --locked --release -p dbx-core --example workbench_perf -- workbench-perf.json

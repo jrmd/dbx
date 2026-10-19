@@ -1,3 +1,24 @@
+# Changelog
+
+## Unreleased
+
+- Show failed statements as errors without a contradictory success message; preserve database detail, hints and source positions, and offer an editable AI repair request.
+- Accept SQL completions with Tab or Enter and suggest JOIN conditions from foreign keys.
+- Open SQLite from plain paths, home-directory paths, native file selection, dropped files and terminal arguments; new connections land in an empty workspace.
+- Keep long notifications readable and pause their dismissal on hover. Prioritize grid column names and route ER relationships around intervening tables.
+- Add an actions palette, a keyboard-shortcuts settings screen and editable JSON bindings. Settings opens on Appearance.
+- Add table name/DDL/INSERT copying and rename/duplicate SQL drafts; require the exact table name for production truncate/drop and warn about production/protected UPDATE or DELETE without WHERE.
+- Add connection folders, production window tint, hosted provider presets, and reviewed imports from DBeaver, Docker Compose and DATABASE_URL files.
+- Add bounded staged-edit undo/redo, bulk value/NULL edits, Markdown copying and XLSX export of loaded results.
+- Save and open shareable SQL files with directory-based favourites, alongside the existing encrypted workspace.
+- Bundle ten palettes and import Zed theme families as well as VS Code themes.
+- Add visual plan trees, explicit PostgreSQL EXPLAIN ANALYZE in a separate rolled-back read-only transaction, and migration drafts comparing two open connections.
+- Add PostgreSQL query watch intervals and clearly scoped statistics for loaded result columns.
+- Add MongoDB document replacement and structured Redis value/stream editors with explicit review and conflict checks.
+- Generate query drafts through OpenAI, Anthropic or Ollama without an installed agent CLI; API keys stay in the encrypted vault.
+- Register community driver executables through a bounded JSON process protocol, without adding native driver dependencies to DBX.
+- Add the MIT license, contribution guidance and GitHub templates, and publish version-specific changelog text in release bodies.
+
 ## 0.13.0 - 2026-10-19
 
 - View and edit binary values as hex bytes, binary digits, UUIDs, or MySQL swapped UUIDs.
@@ -61,11 +82,15 @@
 - Fix keyboard accessibility tests on macOS by using platform shortcuts and a settings control available on every platform.
 - Wait for the agent cancellation fixture to finish starting before checking its process, avoiding a race on busy CI runners.
 
+## 0.8.0 - 2026-10-11
+
+- Improve keyboard navigation, accessibility and workbench performance.
+- Add accessibility verification coverage for native and virtualized data tables.
+
 ## 0.7.3 - 2026-10-09
 
 - Drag the edge of the explorer sidebar or the row details panel to resize it. DBX remembers the widths; double-click an edge to restore the default.
 
-# Changelog
 
 ## 0.7.2 - 2026-10-09
 
@@ -119,3 +144,42 @@ Also:
 - Add explicitly paired local read-only MCP access, a disposable demo, task-oriented docs and Intel Mac build/release jobs.
 
 See the capability matrix and verification report for connector and environment limits.
+
+## 0.5.0 - 2026-10-08
+
+- Stage and review multi-row changesets before saving; resize columns, jump to tables with quick open, and browse large tables with bounded paging.
+
+## 0.4.0 - 2026-10-07
+
+- Add safer query sessions, database diagnostics, workspace recovery and expanded connector integration coverage.
+- Configure CLI query agents and use table row actions.
+
+## 0.3.2 - 2026-10-01
+
+- Fix SQL autocomplete in release builds when consuming opening quotes.
+
+## 0.3.1 - 2026-10-01
+
+- Add the ClickHouse connector and reuse release build dependencies.
+
+## 0.3.0 - 2026-10-01
+
+- Add eight database connectors, a database-type-first connection picker and a Settings screen.
+
+## 0.2.2 - 2026-10-01
+
+- Fix the macOS updater signing requirement.
+
+## 0.2.1 - 2026-10-01
+
+- Improve application updates and add Unix socket and SSH connections.
+
+## 0.2.0 - 2026-10-01
+
+- Move updates and release notes into Settings.
+- Package Apple Silicon macOS builds and use the host xkbcommon library in Linux AppImages.
+
+## 0.1.0 - 2026-09-30
+
+- First public release: browse PostgreSQL, MySQL, SQLite and Redis in a native Rust/GPUI workbench.
+- Edit relational rows, run SQL or Redis commands, import/export data and store credentials in an encrypted vault.

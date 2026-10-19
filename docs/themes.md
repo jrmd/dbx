@@ -2,11 +2,33 @@
 
 Open **Settings → Appearance**. Palettes are in the **Theme** group at the top.
 
-- Choose DBX, Ocean, Forest, Plum, Sand, or Graphite. Each preset has light and dark variants; System follows the OS appearance.
-- **Your themes** lists every imported or edited theme. The dashed **Import…** tile at the end adds a VS Code `.json`/`.jsonc` or DBX theme; importing a theme with the same name updates it instead of duplicating it. Selecting a theme made for one appearance (most VS Code themes) switches DBX to light or dark to match; its thumbnail always previews that variant. Hovering a theme reveals a × in its corner (red when targeted) that removes it after confirmation; removing the active theme returns to the preset.
+- Choose DBX, Ocean, Forest, Plum, Sand, Graphite, Dracula, Nord, Solarized, or Catppuccin. Each preset has light and dark variants; System follows the OS appearance.
+- **Your themes** lists every imported or edited theme. The dashed **Import…** tile at the end adds a VS Code `.json`/`.jsonc`, Zed theme family, or DBX theme; importing a theme with the same name updates it instead of duplicating it. Selecting a theme made for one appearance switches DBX to light or dark to match; its thumbnail always previews that variant. Hovering a theme reveals a × in its corner (red when targeted) that removes it after confirmation; removing the active theme returns to the preset.
 - Click **Edit…** in the Colours row, then search the colour list to edit any interface, material, grid, or SQL syntax colour. Use the colour picker or enter `#RGB`, `#RGBA`, `#RRGGBB`, or `#RRGGBBAA`, then **Apply** (or Enter). Alpha is the last component.
 - Changes apply immediately and persist. Edit the light and dark variants independently. **Reset** restores that token from the base preset. Editing a preset saves a new theme (“Custom Forest”, “Custom Forest 2”, …) under Your themes, so earlier edits are never overwritten.
 - **Export…** saves the selected theme as a portable DBX JSON containing every colour in both appearances. Files are processed locally.
+
+The familiar presets adapt the original [Dracula](https://draculatheme.com/spec),
+[Nord](https://www.nordtheme.com/docs/colors-and-palettes/),
+[Solarized](https://ethanschoonover.com/solarized/), and
+[Catppuccin](https://catppuccin.com/palette/) palettes to DBX's controls and SQL roles.
+Catppuccin uses Latte in light appearance and Mocha in dark appearance. Light
+Dracula and Nord are DBX adaptations. Contrast correction can adjust muted or
+syntax colours to keep them readable.
+
+## Zed imports
+
+Import a self-contained Zed theme family JSON/JSONC using **Import…**. Every
+entry in its `themes` array is added to **Your themes**, and the first is applied.
+A single theme object with `name`, `appearance`, and `style` is also accepted.
+Appearance must be `light` or `dark`; each imported variant retains its own name.
+The full file is validated before any saved themes change.
+
+The importer maps editor and panel surfaces, text, borders, controls, selections,
+status colours, and common SQL syntax captures. Missing roles use DBX fallbacks;
+alpha channels and contrast correction work as for VS Code imports. Font styles,
+terminal colours, icon definitions, and extension packages are not imported.
+The mapping follows [Zed's theme family format](https://zed.dev/docs/extensions/themes).
 
 ## VS Code imports
 

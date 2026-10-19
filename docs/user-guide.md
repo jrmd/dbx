@@ -34,6 +34,18 @@ private; neither includes key/certificate file contents.
 
 ## Find and query
 
+Use **Import connections…** on the connection screen for DBeaver connection
+JSON, Docker Compose YAML and `.env` files containing `DATABASE_URL`, as well
+as the existing DBX/TablePro formats. Review detected hosts, published ports,
+database names and warnings before saving. Compose variables are not evaluated
+as shell commands; unresolved values require manual entry. Imports do not run
+startup SQL. Profiles can be grouped in named folders from their connection form.
+
+`dbx /path/to/file.sqlite` and `dbx postgres://…` connect directly to that file
+or URI after vault unlock. SQLite also accepts `~` paths,
+the native file picker and dropped files. New connections do not automatically
+open their first table.
+
 Quick open searches tables, open documents and saved queries. The query menu's
 history search accepts `history: invoice success:true after:2026-10-01
 before:2026-10-09 connection:local`. Dates are UTC; history for currently open
@@ -44,6 +56,11 @@ private business data. Encrypted workspace recovery is a separate store.
 Run a selection or the current statement, use parameters, and inspect each
 statement's result. Native PostgreSQL/MySQL/SQLite/CockroachDB and SQL Server
 query tabs own independent sessions. An interrupted transaction is not replayed.
+See [query tools](query-tools.md) for plan trees, opt-in PostgreSQL ANALYZE,
+two-connection schema comparison, watch intervals and loaded-column statistics.
+The [query assistant](query-agents.md) supports CLI agents, direct OpenAI and
+Anthropic API keys, and Ollama. **Ask AI to fix** prepares an editable request
+from a failed query; generation and execution remain separate actions.
 
 ## Write SQL
 
@@ -97,6 +114,13 @@ and block Visual mode are not implemented.
 
 ## Navigate by keyboard
 
+Cmd/Ctrl-Shift-P opens the action command palette. Cmd/Ctrl-P keeps destination
+search for tables, queries and connections. **Settings → Keyboard shortcuts**
+shows the live bindings and lets you edit/save the contextual `keymap.json`.
+The screen displays its exact path. Each JSON block has an optional `context`
+and a `bindings` object mapping keys to action names; `null` unbinds a shortcut.
+Changes are validated before the file and live bindings change.
+
 | Action | macOS | Linux |
 | --- | --- | --- |
 | Next / previous control | Tab / Shift-Tab | Tab / Shift-Tab |
@@ -129,6 +153,17 @@ changes recover after reopening with matching database and column metadata.
 Review recovered drafts explicitly; they never auto-apply. Query results and
 open transactions are not restored. If the recovery budget is exceeded, save
 large work separately before exiting.
+
+Undo/Redo in the data toolbar or context menu changes staged edits only; it
+does not reverse a committed database write. Select multiple rows for bulk
+value/NULL staging. Production connections tint the workspace and require the
+exact table name before truncate/drop. UPDATE/DELETE without WHERE prompts for
+review on production or protected connections; protected execution still
+rejects writes. MongoDB and Redis use [structured editors](structured-editors.md).
+
+The query menu's SQL file library saves and opens plain `.sql` files in a
+chosen folder, with favourites in `.dbx-favorites.json`. Use it for queries you
+intend to share through git; encrypted workspace recovery remains separate.
 
 ## Change structure
 

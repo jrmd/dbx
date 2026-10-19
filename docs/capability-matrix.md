@@ -14,8 +14,10 @@ permissions remain authoritative, including function side effects.
 | DuckDB | Checked edits, partial-success reporting | No tab-owned transaction contract | Loaded-result export / no wizard import | No | File/in-memory analytics. |
 | Turso, Cloudflare D1 | Checked edits, partial-success reporting | No persistent provider transaction | Loaded-result export / no wizard import | No | API tokens; SQL editing uses provider APIs. |
 | BigQuery, ClickHouse, Snowflake | Read-only grid | No tab-owned transaction contract | Loaded-result export / no wizard import | No | SQL consoles retain provider-specific commands; ADC for BigQuery, explicit Snowflake token/JWT modes. |
-| MongoDB, Elasticsearch | Read-only document grid | No | Loaded-result export / no wizard import | No | Native JSON/HTTP commands; no relational structured-filter editor. |
-| Redis, Kafka | Provider-specific console | No SQL transaction contract | Loaded-result export / no wizard import | No | Redis incremental key browsing; Kafka metadata and bounded record inspection. |
+| MongoDB | Read-only sampled grid; separate document editor | No | Loaded-result export / no wizard import | No | Extended JSON replacement preserves `_id` and checks the original document before saving. |
+| Elasticsearch | Read-only document grid | No | Loaded-result export / no wizard import | No | Native HTTP commands; no relational structured-filter editor. |
+| Redis | Structured value editor and console | No SQL transaction contract | Loaded-result export / no wizard import | No | String, hash, list, set, sorted set and stream editing; conflict checks and TTL preservation. |
+| Kafka | Provider-specific console | No SQL transaction contract | Loaded-result export / no wizard import | No | Metadata and bounded record inspection. |
 
 Relational table/database exports use bounded pages; native SQL engines obtain
 consistent snapshots where available. MCP pairing and bounded cross-connection

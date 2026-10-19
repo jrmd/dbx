@@ -113,10 +113,19 @@ within a connection; saving the same name replaces its SQL. A save toast appears
 only after persistence succeeds. Normal query history retains its existing
 local storage contract.
 
+The SQL file library is an explicit alternative: choose a directory, save/open
+`.sql` files and keep favourites in `.dbx-favorites.json`. These files are plain
+text so they can be shared through git; saving is explicit and does not migrate
+encrypted drafts automatically. Review SQL for secrets before sharing.
+
 The query options menu can Explain a single read statement, pin its plan and
 compare with a later plan. PostgreSQL and MySQL JSON plans become a hierarchy
 grid with estimated rows/costs; other supported engines retain their native
-plan shape. Explain never adds ANALYZE. Comparisons align displayed steps and
+plan shape. Normal Explain never adds ANALYZE. The separate opt-in PostgreSQL
+Explain Analyze runs a read statement in an isolated read-only transaction and
+rolls it back, including on failure; it does not reuse a query tab transaction.
+Read-only SQL can still call external services or volatile functions, and a
+rollback cannot undo external effects. Comparisons align displayed steps and
 are aids for inspection, not semantic proof of equivalent plans.
 
 PostgreSQL/MySQL session and lock monitors open provider queries in new tabs.
@@ -125,6 +134,12 @@ Visibility depends on the account's server permissions. References:
 [MySQL lock waits](https://dev.mysql.com/doc/refman/8.4/en/performance-schema-data-lock-waits-table.html),
 [PostgreSQL EXPLAIN](https://www.postgresql.org/docs/current/sql-explain.html),
 and [SQLite query plans](https://www.sqlite.org/eqp.html).
+
+To compare two open connections with the same SQL dialect, choose **Make this
+connection’s schema match…** and select the desired source. DBX reads both
+catalogs and opens the migration draft on the target connection, with source
+and target named in comments. No DDL runs automatically. Finish active queries
+and transactions on both connections before comparing.
 
 Capture schema baseline stores normalized columns, defaults, primary keys,
 check constraints, indexes and foreign keys. Compare schema opens a migration
@@ -249,3 +264,27 @@ query menu to pause recording, retain 10/30/100 entries, search by date/outcome/
 connection, or clear it. Search results open new query drafts without execution.
 MCP pairing is explicitly enabled per open native SQL connection, read-only,
 loopback-only and revoked on close/lock/exit. See [local automation](local-mcp.md).
+
+
+## Query watch and loaded column statistics
+
+PostgreSQL query tabs can watch a single read statement every 5, 10, 30 or 60
+seconds. Each sample uses a separate server-enforced read-only transaction
+that rolls back. Watches pause while their tab is hidden, skip ticks while a
+sample is running, and stop on SQL edits, a manual run, an error or connection
+changes. Stop also cancels an in-flight sample. Read-only transactions do not
+undo external effects of functions; choose queries you understand.
+
+Column statistics summarize the currently loaded result: distinct values,
+NULL counts and min/max. They do not scan the entire table. Distinct values use
+client equality rather than server collation, and numeric summaries are
+explicitly approximate. Limited source results remain labelled as limited.
+
+## Loaded-result clipboard and files
+
+Copy Markdown and export XLSX operate on loaded rows. Use the streaming
+CSV/TSV/SQL workflows for full-query exports. XLSX preserves exact wide
+integers as text, writes user strings literally (including strings beginning
+with `=`), and includes a notes sheet describing NULL/empty-text handling.
+Table **Copy as INSERT** reads at most 1,000 rows and labels a limited copy;
+use table export for a complete SQL dump.
