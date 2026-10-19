@@ -1,3 +1,8 @@
+## 0.13.0 - 2026-10-19
+
+- View and edit binary values as hex bytes, binary digits, UUIDs, or MySQL swapped UUIDs.
+- Keep single-line fields tall enough for larger text, preserving vertical padding and text visibility.
+
 ## 0.12.0 - 2026-10-15
 
 - Choose from six colour themes (DBX, Ocean, Forest, Plum, Sand, and Graphite), each with light and dark variants, in a Theme group at the top of Appearance settings.
