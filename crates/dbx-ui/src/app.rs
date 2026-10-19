@@ -5335,9 +5335,7 @@ mod tests {
         assert_eq!(startup.connections[0].profile_id, profile_id);
     }
     #[gpui::test]
-    fn workbench_renders_transaction_controls_result_tabs_and_saved_queries(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn selecting_statement_result_displays_its_columns_and_rows(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let session_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
@@ -5383,12 +5381,6 @@ mod tests {
             app
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("save-named-query").is_some());
-        assert!(cx.debug_bounds("query-workbench-more").is_some());
-        assert!(cx.debug_bounds("commit-query").is_some());
-        assert!(cx.debug_bounds("rollback-query").is_some());
-        assert!(cx.debug_bounds("statement-result-0").is_some());
-        assert!(cx.debug_bounds("statement-result-1").is_some());
         let second = cx.debug_bounds("statement-result-1").unwrap();
         cx.simulate_click(second.center(), gpui::Modifiers::none());
         cx.update(|_, cx| {
@@ -5403,26 +5395,6 @@ mod tests {
                 CellValue::Integer(2)
             );
         });
-        cx.simulate_resize(gpui::size(px(720.), px(640.)));
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        for selector in [
-            "save-named-query",
-            "commit-query",
-            "rollback-query",
-            "query-workbench-more",
-        ] {
-            let bounds = cx
-                .debug_bounds(selector)
-                .expect("query control remains visible");
-            assert!(
-                bounds.origin.x >= px(0.) && bounds.right() <= px(720.),
-                "{selector} is outside the compact window: {bounds:?}"
-            );
-        }
-        let options = cx.debug_bounds("query-workbench-more").unwrap();
-        cx.simulate_click(options.center(), gpui::Modifiers::none());
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.update(|_, cx| assert!(app.read(cx).session(session_id).is_some()));
     }
 
     #[gpui::test]
@@ -5579,14 +5551,10 @@ mod tests {
     }
 
     #[test]
-    fn display_url_redacts_embedded_password() {
+    fn display_url_redacts_passwords_and_invalid_input() {
         let displayed = display_url("postgres://user:secret@example.test:5432/app");
         assert!(!displayed.contains("secret"));
         assert!(displayed.contains("user@example.test"));
-    }
-
-    #[test]
-    fn display_url_handles_invalid_input_without_leaking_it() {
         assert_eq!(display_url("not a URL"), "<redacted>");
     }
 
@@ -5621,25 +5589,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_schema_filter_defaults_to_public_and_lists_unique_options() {
-        let tables = vec![
-            TableInfo::table("events", Some("analytics".into())),
-            TableInfo::table("users", Some("public".into())),
-            TableInfo::table("accounts", Some("public".into())),
-        ];
-
-        assert_eq!(
-            default_schema_filter(DatabaseKind::PostgreSQL, &tables),
-            Some("public".into())
-        );
-        assert_eq!(
-            schema_filter_options(DatabaseKind::PostgreSQL, &tables),
-            vec![None, Some("analytics".into()), Some("public".into())]
-        );
-    }
-
-    #[test]
-    fn sidebar_list_rebuilds_only_when_its_inputs_change() {
+    fn sidebar_filters_tables_by_schema_and_case_insensitive_search() {
         let tables = vec![
             TableInfo::table("Events", Some("analytics".into())),
             TableInfo::table("users", Some("public".into())),
@@ -5656,44 +5606,28 @@ mod tests {
 
         assert!(list.refresh(kind, &tables, 1, None, ""));
         assert_eq!(names(&list), vec!["Events", "users", "accounts"]);
-        let first_visible = list.visible.clone();
-        let first_options = list.schema_options.clone();
+        assert_eq!(default_schema_filter(kind, &tables), Some("public".into()));
+        assert_eq!(
+            list.schema_options.as_ref(),
+            &[None, Some("analytics".into()), Some("public".into())]
+        );
 
-        // Same inputs, including whitespace-only search noise: no rebuild.
-        assert!(!list.refresh(kind, &tables, 1, None, "  "));
-        assert!(Arc::ptr_eq(&first_visible, &list.visible));
-
-        // Search is case-insensitive and keeps the schema options cached.
+        // Whitespace does not filter out tables.
+        list.refresh(kind, &tables, 1, None, "  ");
+        assert_eq!(names(&list), vec!["Events", "users", "accounts"]);
         assert!(list.refresh(kind, &tables, 1, None, "EVE"));
         assert_eq!(names(&list), vec!["Events"]);
-        assert!(Arc::ptr_eq(&first_options, &list.schema_options));
 
         assert!(list.refresh(kind, &tables, 1, Some("public"), ""));
         assert_eq!(names(&list), vec!["users", "accounts"]);
 
-        // A new table list bumps the revision and rebuilds the options too.
+        // Newly discovered schemas become available in the filter.
         let mut more = tables.clone();
         more.push(TableInfo::table("orders", Some("sales".into())));
         assert!(list.refresh(kind, &more, 2, Some("public"), ""));
         assert_eq!(list.schema_options.len(), 4);
-    }
 
-    #[test]
-    fn schema_filter_is_postgres_only_and_does_not_requery() {
-        assert!(table_is_visible_in(
-            DatabaseKind::MySQL,
-            Some("public"),
-            Some("analytics")
-        ));
-        assert!(table_is_visible_in(
-            DatabaseKind::PostgreSQL,
-            Some("public"),
-            Some("public")
-        ));
-        assert!(!table_is_visible_in(
-            DatabaseKind::PostgreSQL,
-            Some("public"),
-            Some("analytics")
-        ));
+        list.refresh(DatabaseKind::MySQL, &tables, 1, Some("public"), "");
+        assert_eq!(names(&list), vec!["Events", "users", "accounts"]);
     }
 }

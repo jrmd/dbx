@@ -8,7 +8,10 @@ constitute a published release. Scope and remaining limits are recorded in the
 ## Passed locally
 
 - `cargo fmt --all -- --check` and `git diff --check`.
-- `cargo test --locked --workspace`: 491 passed, no failures. Tests requiring
+- `cargo test --locked --workspace`: 476 passed, no failures after the test-suite
+  trim (previously 491). Duplicate fixtures and helper/layout assertions were
+  removed or consolidated; database safety and reported-bug regressions remain.
+  Tests requiring
   other external services or signing fixtures retain their explicit ignore markers.
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`.
 - `scripts/test-release-notes.py`: two tests; `scripts/test-macos-release.py`:

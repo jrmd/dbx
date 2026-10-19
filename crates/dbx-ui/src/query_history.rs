@@ -877,7 +877,7 @@ mod tests {
         store
             .record_at(
                 connection(),
-                "select token_count from metrics",
+                "select auth, token_count from audit_metrics",
                 1,
                 QueryHistoryOutcome::success("ok"),
             )
@@ -910,21 +910,10 @@ mod tests {
 
         let entries = store.recent(&connection(), 10).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sql, "select token_count from metrics");
-    }
-
-    #[test]
-    fn allows_ordinary_auth_identifier_queries() {
-        let (_directory, store) = store();
-        store
-            .record_at(
-                connection(),
-                "select auth, token_count from audit_metrics",
-                1,
-                QueryHistoryOutcome::success("ok"),
-            )
-            .unwrap();
-        assert_eq!(store.recent(&connection(), 10).unwrap().len(), 1);
+        assert_eq!(
+            entries[0].sql,
+            "select auth, token_count from audit_metrics"
+        );
     }
 
     #[test]

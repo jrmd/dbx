@@ -116,22 +116,12 @@ pub fn label(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn zed_shape_supports_contexts_chords_and_unbinding() {
-        let blocks: Vec<KeymapBlock> = serde_json::from_str(r#"[{"context":"QueryWorkbench","bindings":{"ctrl-k ctrl-r":"dbx_ui::RunQuery","cmd-enter":null}}]"#).unwrap();
-        assert_eq!(blocks[0].context.as_deref(), Some("QueryWorkbench"));
-        assert_eq!(blocks[0].bindings["cmd-enter"], None);
-        assert!(
-            serde_json::from_str::<Vec<KeymapBlock>>(r#"[{"bindings":{},"contxt":"typo"}]"#)
-                .is_err()
-        );
-        assert_eq!(label("dbx_ui::OpenQuickOpen"), "Open Quick Open");
-    }
     #[gpui::test]
     fn validates_actions_contexts_and_keystrokes_before_applying(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             assert!(parse(r#"[{"context":"QueryWorkbench","bindings":{"ctrl-k ctrl-r":"dbx_ui::RunQuery","cmd-enter":null}}]"#, cx).is_ok());
             assert!(parse(r#"[{"bindings":{"cmd-k":"missing::Action"}}]"#, cx).is_err());
+            assert!(parse(r#"[{"bindings":{},"contxt":"typo"}]"#, cx).is_err());
             assert!(parse(r#"[{"context":"(","bindings":{"cmd-k":null}}]"#, cx).is_err());
             assert!(parse(r#"[{"bindings":{"":null}}]"#, cx).is_err());
         });

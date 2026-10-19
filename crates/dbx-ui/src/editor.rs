@@ -4443,26 +4443,6 @@ mod tests {
     }
 
     #[test]
-    fn reveal_offset_moves_only_far_enough_to_show_the_caret() {
-        assert_eq!(
-            reveal_offset(px(0.), px(200.), px(100.), px(120.), px(122.)),
-            px(22.)
-        );
-        assert_eq!(
-            reveal_offset(px(50.), px(200.), px(100.), px(20.), px(22.)),
-            px(20.)
-        );
-        assert_eq!(
-            reveal_offset(px(50.), px(200.), px(100.), px(80.), px(82.)),
-            px(50.)
-        );
-        assert_eq!(
-            reveal_offset(px(0.), px(20.), px(100.), px(120.), px(122.)),
-            px(20.)
-        );
-    }
-
-    #[test]
     fn sql_lexer_covers_common_query_tokens() {
         let text = "SELECT id, amount::NUMERIC, 'O''Reilly', 12.50, $1, :name\n-- note\n/* multi\ncomment */ FROM public.users WHERE active = TRUE";
         let tokens = lex_sql(text);

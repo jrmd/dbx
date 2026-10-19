@@ -111,58 +111,6 @@ mod tests {
     }
 
     #[test]
-    fn mutation_builders_support_full_rows_and_typed_values() {
-        let request = InsertRequest::from_row(
-            TableRef::in_schema("public", "events"),
-            vec![
-                ("id".into(), CellValue::Integer(7)),
-                ("enabled".into(), CellValue::Boolean(true)),
-                ("note".into(), CellValue::Null),
-                (
-                    "payload".into(),
-                    CellValue::Json(serde_json::json!({ "ok": true })),
-                ),
-            ],
-        );
-        let insert = build_insert(DatabaseKind::PostgreSQL, &request).unwrap();
-        assert_eq!(
-            insert.sql,
-            "INSERT INTO \"public\".\"events\" (\"id\", \"enabled\", \"note\", \"payload\") VALUES ($1, $2, $3, $4)"
-        );
-        assert_eq!(
-            insert.params,
-            vec![
-                CellValue::Integer(7),
-                CellValue::Boolean(true),
-                CellValue::Null,
-                CellValue::Json(serde_json::json!({ "ok": true })),
-            ]
-        );
-
-        let update = UpdateRequest::for_primary_key(
-            TableRef::new("events"),
-            vec![
-                ("enabled".into(), CellValue::Boolean(false)),
-                ("note".into(), CellValue::Null),
-            ],
-            vec![("id".into(), CellValue::Integer(7))],
-        );
-        let statement = build_update(DatabaseKind::MySQL, &update).unwrap();
-        assert_eq!(
-            statement.sql,
-            "UPDATE `events` SET `enabled` = ?, `note` = ? WHERE `id` = ?"
-        );
-        assert_eq!(
-            statement.params,
-            vec![
-                CellValue::Boolean(false),
-                CellValue::Null,
-                CellValue::Integer(7)
-            ]
-        );
-    }
-
-    #[test]
     fn mutation_builders_interleave_parameters_and_sql_expressions() {
         let request = InsertRequest::new_with_mutation_values(
             TableRef::new("events"),

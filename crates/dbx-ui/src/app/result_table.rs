@@ -2600,7 +2600,7 @@ mod tests {
     }
 
     #[test]
-    fn result_grid_marks_populated_foreign_key_cells_as_navigable() {
+    fn result_grid_offers_foreign_key_navigation_only_for_populated_cells() {
         let foreign_key = ForeignKeyInfo {
             constraint_name: Some("orders_customer_id_fkey".into()),
             columns: vec!["customer_id".into()],
@@ -2616,10 +2616,10 @@ mod tests {
                 ColumnInfo::result("id", 0, "INTEGER"),
                 ColumnInfo::result("customer_id", 1, "INTEGER"),
             ],
-            rows: vec![RowData::new(vec![
-                CellValue::Integer(1),
-                CellValue::Integer(42),
-            ])],
+            rows: vec![
+                RowData::new(vec![CellValue::Integer(1), CellValue::Integer(42)]),
+                RowData::new(vec![CellValue::Integer(2), CellValue::Null]),
+            ],
             rows_affected: None,
             truncated: false,
             elapsed_ms: 0,
@@ -2634,37 +2634,7 @@ mod tests {
         );
 
         assert!(delegate.foreign_key_for_cell(0, 2).is_some());
-    }
-
-    #[test]
-    fn result_grid_hides_foreign_key_action_for_null_values() {
-        let foreign_key = ForeignKeyInfo {
-            constraint_name: None,
-            columns: vec!["customer_id".into()],
-            referenced_schema: Some("public".into()),
-            referenced_table: "customers".into(),
-            referenced_columns: vec!["id".into()],
-            on_update: None,
-            on_delete: None,
-        };
-        let tables = vec![TableInfo::table("customers", Some("public".into()))];
-        let result = QueryResult {
-            columns: vec![ColumnInfo::result("customer_id", 0, "INTEGER")],
-            rows: vec![RowData::new(vec![CellValue::Null])],
-            rows_affected: None,
-            truncated: false,
-            elapsed_ms: 0,
-        };
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(
-            Some(Arc::new(result)),
-            &HashMap::new(),
-            None,
-            &[foreign_key],
-            &tables,
-        );
-
-        assert!(delegate.foreign_key_for_cell(0, 1).is_none());
+        assert!(delegate.foreign_key_for_cell(1, 2).is_none());
     }
 
     #[test]

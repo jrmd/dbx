@@ -2634,42 +2634,39 @@ mod tests {
     }
 
     #[test]
-    fn sql_statements_split_across_strings_comments_and_delimiters() {
-        let script = "-- leading comment;\nSELECT 'a;b' FROM t; /* block ; comment */\nSELECT 2;# trailing\nUPDATE t SET x = 'it''s';\n";
-        let statements = split_sql_statements(script);
-        assert_eq!(statements.len(), 3);
-        assert_eq!(statements[0], "SELECT 'a;b' FROM t");
-        assert_eq!(statements[1], "SELECT 2");
-        assert_eq!(statements[2], "UPDATE t SET x = 'it''s'");
+    fn sql_statement_splitting_preserves_quoted_and_routine_terminators() {
+        for (script, expected) in [
+            (
+                "-- leading comment;\nSELECT 'a;b' FROM t; /* block ; comment */\nSELECT 2;# trailing\nUPDATE t SET x = 'it''s';\n",
+                vec![
+                    "SELECT 'a;b' FROM t",
+                    "SELECT 2",
+                    "UPDATE t SET x = 'it''s'",
+                ],
+            ),
+            (
+                "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  PERFORM 1; /* nested /* comment */ still inside */\nEND;\n$body$ LANGUAGE plpgsql;\nSELECT 1;",
+                vec![
+                    "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  PERFORM 1; /* nested /* comment */ still inside */\nEND;\n$body$ LANGUAGE plpgsql",
+                    "SELECT 1",
+                ],
+            ),
+            (
+                "DELIMITER ;;\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END;;\nDELIMITER ;\nCALL p();\n",
+                vec![
+                    "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+                    "CALL p()",
+                ],
+            ),
+            (
+                "SELECT `weird;name` FROM `t``ick`;",
+                vec!["SELECT `weird;name` FROM `t``ick`"],
+            ),
+        ] {
+            assert_eq!(split_sql_statements(script), expected, "{script}");
+        }
     }
 
-    #[test]
-    fn sql_statements_survive_dollar_quoting_and_nested_block_comments() {
-        let script = "CREATE FUNCTION f() RETURNS void AS $body$\nBEGIN\n  PERFORM 1; /* nested /* comment */ still inside */\nEND;\n$body$ LANGUAGE plpgsql;\nSELECT 1;";
-        let statements = split_sql_statements(script);
-        assert_eq!(statements.len(), 2);
-        assert!(statements[0].contains("PERFORM 1;"));
-        assert!(statements[0].ends_with("$body$ LANGUAGE plpgsql"));
-        assert_eq!(statements[1], "SELECT 1");
-    }
-
-    #[test]
-    fn sql_statements_honor_mysql_delimiter_directives() {
-        let script = "DELIMITER ;;\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END;;\nDELIMITER ;\nCALL p();\n";
-        let statements = split_sql_statements(script);
-        assert_eq!(statements.len(), 2);
-        assert_eq!(
-            statements[0],
-            "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END"
-        );
-        assert_eq!(statements[1], "CALL p()");
-    }
-
-    #[test]
-    fn sql_statements_keep_backtick_identifiers_intact() {
-        let statements = split_sql_statements("SELECT `weird;name` FROM `t``ick`;");
-        assert_eq!(statements, vec!["SELECT `weird;name` FROM `t``ick`"]);
-    }
     #[test]
     fn streamed_records_preserve_multiline_bom_headers_and_data() {
         let input = "\u{feff}\"multi\nline\",value\n\u{feff}data,\"\"\n";

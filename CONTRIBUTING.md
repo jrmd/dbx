@@ -20,6 +20,12 @@ python3 scripts/test-release-notes.py
 
 Start with focused tests while iterating. The full build includes native database
 and GPUI dependencies and can take substantial time on a fresh checkout.
+Add a test when it protects a meaningful behavior or reproduces a bug; do not
+test every helper, getter, label or reversible cosmetic change. Extend an
+existing scenario when it already exercises the behavior, and use table-driven
+cases for related input variations. Keep separate tests for distinct failure
+modes so failures remain easy to diagnose. Preserve coverage for data loss,
+transaction boundaries, cancellation, credentials and protected writes.
 Run `bash scripts/test-integration.sh` for the disposable Docker database suite;
 read the script and [desktop QA guide](docs/desktop-qa.md) before running platform
 or live-provider checks. Never use production databases for tests.

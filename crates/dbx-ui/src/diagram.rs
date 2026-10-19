@@ -1435,9 +1435,14 @@ mod tests {
             ],
             ..Default::default()
         });
+        let before = document.edges[0].points.clone();
         document.move_node("public.child", 44., 100.);
         document.move_node("public.parent", 900., 100.);
         document.move_node("public.blocker", 450., 80.);
+        assert_ne!(document.edges[0].points, before);
+        assert_eq!(document.node_position("public.parent"), Some((900., 100.)));
+        assert!(document.width >= 900. && document.height >= 100.);
+        assert!(!document.move_node("public.missing", 0., 0.));
         let edge = &document.edges[0];
         let cards = document
             .nodes
@@ -1568,31 +1573,6 @@ mod tests {
             .find(|column| column.name == "external_key")
             .expect("referenced column should be retained beyond the ordinary column limit");
         assert!(!referenced.foreign_key);
-    }
-
-    #[test]
-    fn moving_a_card_reroutes_its_relationships() {
-        let mut document = DiagramDocument::from_schema(&RelationalSchema {
-            database: "db".into(),
-            tables: vec![
-                table("parent", vec![column("id", 0, true)], vec![]),
-                table(
-                    "child",
-                    vec![column("id", 0, true), column("parent_id", 1, false)],
-                    vec![foreign(&["parent_id"], "parent", &["id"])],
-                ),
-            ],
-            ..Default::default()
-        });
-        let before = document.edges[0].points.clone();
-        assert!(document.move_node("public.parent", 900.0, 700.0));
-        assert_eq!(
-            document.node_position("public.parent"),
-            Some((900.0, 700.0))
-        );
-        assert_ne!(document.edges[0].points, before);
-        assert!(document.width >= 900.0 && document.height >= 700.0);
-        assert!(!document.move_node("public.missing", 0.0, 0.0));
     }
 
     #[test]
