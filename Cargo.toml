@@ -51,6 +51,14 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-base = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
+# Keep routine CI compilation fast while retaining the full workspace checks.
+[profile.ci]
+inherits = "dev"
+opt-level = 0
+debug = 0
+incremental = false
+lto = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -12,8 +12,8 @@ Use Rust 1.97 or newer and the checked-in Cargo.lock:
 ```sh
 cargo run --locked --release -p dbx-ui
 cargo fmt --all -- --check
-cargo test --locked --release --workspace
-cargo clippy --locked --release --workspace --all-targets -- -D warnings
+cargo test --locked --profile ci --workspace
+cargo clippy --locked --profile ci --workspace --all-targets -- -D warnings
 python3 scripts/test-macos-release.py
 python3 scripts/test-release-notes.py
 ```
@@ -29,6 +29,20 @@ transaction boundaries, cancellation, credentials and protected writes.
 Run `bash scripts/test-integration.sh` for the disposable Docker database suite;
 read the script and [desktop QA guide](docs/desktop-qa.md) before running platform
 or live-provider checks. Never use production databases for tests.
+
+## CI feedback
+
+Pull requests run one Linux job: formatting, Clippy, the workspace tests and
+release-script checks. The `ci` profile skips release optimisation and debug
+symbols, with a separate dependency cache. It keeps debug assertions and
+overflow checks enabled. It does not build a shipping binary or run benchmarks.
+
+Full Linux/macOS release builds run nightly and on manual dispatch. Live
+database/SSH/TLS checks run after relevant pushes to `main`, nightly and on
+manual dispatch. Both can be dispatched against a feature branch when changing
+platform or connector behavior. Tag releases still run their full validation
+before packaging and publishing. Cold PR caches will still take longer than
+warm runs; the individual CI steps expose compile and test timings separately.
 
 ## Make a change
 

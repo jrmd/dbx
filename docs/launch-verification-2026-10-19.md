@@ -71,11 +71,36 @@ covered by fixtures, including an actual loopback Ollama HTTP request; no
 user's hosted API key or cloud database account was used. Other server engines,
 physical Linux desktop interactions and a signed release install were not
 revalidated in this pass. CI remains responsible for its Linux/macOS build and
-full disposable-connector matrix.
+full disposable-connector matrix; those broader checks now run outside the PR
+feedback path as described below.
+
+## CI cost audit and changes
+
+The completed [release-check run 39241631197](https://github.com/jrmd/dbx/actions/runs/39241631197)
+took 61m05s on Linux and 51m45s on macOS despite dependency-cache hits. Linux
+release-test compilation took 30m03s; the test binaries ran in about nine
+seconds. The separate workbench benchmark step spent another 19m45s compiling
+before a roughly two-second run. This was an older revision with 421 Linux
+tests, not a measurement of the current 476-test suite.
+
+PRs and relevant main-branch pushes now run one Linux job using the unoptimised
+`ci` profile, with separate formatting, Clippy, test-compilation, test-execution
+and release-script steps. The workspace tests remain enabled. The CI profile
+keeps debug/overflow assertions and uses a cache separate from release builds.
+The standalone shipping-binary build and benchmark were removed from PR checks.
+Full Linux/macOS release builds run nightly or on manual dispatch; disposable
+database checks run on relevant main-branch pushes, nightly or manually.
+Release-tag validation, signing and publication gates are unchanged.
+
+Workflow syntax was validated with actionlint; all 476 tests and strict
+all-target Clippy passed locally with `--profile ci`. The seven Python
+release-script checks also passed. Hosted runtime improvement is not yet
+measured; the first new CI-profile run must populate its cold cache.
 
 All 24 existing published GitHub releases have version-specific notes. Topics
 and Discussions are enabled. The old HTTPS domain was verified returning a
 308 redirect to `https://dbx.bonusobjective.com/`.
 
-Benchmarking was deferred by the user. No performance measurements or
-competitor speed/RAM claims were produced, and no launch post was submitted.
+Comparative benchmarking was deferred by the user. No competitor speed/RAM
+claims were produced, and no launch post was submitted. The existing CI
+workbench measurement step has now also been removed.
