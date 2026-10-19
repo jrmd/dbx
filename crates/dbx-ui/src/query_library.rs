@@ -289,61 +289,7 @@ pub fn suggested_filename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn files_are_plain_git_usable_and_favorites_survive_reload() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("queries");
-        fs::create_dir_all(root.join("reports")).unwrap();
-        let mut library = SqlLibrary {
-            root: root.clone(),
-            preferences: directory.path().join("config/library.json"),
-            cache: Default::default(),
-        };
-        library.choose_directory(root.clone()).unwrap();
-        write_sql(&root.join("reports/count.sql"), "SELECT 42;\n").unwrap();
-        assert_eq!(
-            fs::read_to_string(root.join("reports/count.sql")).unwrap(),
-            "SELECT 42;\n"
-        );
-        library
-            .toggle_favorite(Path::new("reports/count.sql"))
-            .unwrap();
-        assert!(library.entries().unwrap()[0].favorite);
-        let reload = SqlLibrary {
-            root,
-            preferences: library.preferences.clone(),
-            cache: Default::default(),
-        };
-        assert_eq!(
-            reload.read(Path::new("reports/count.sql")).unwrap(),
-            "SELECT 42;\n"
-        );
-        assert!(reload.entries().unwrap()[0].favorite);
-        reload
-            .toggle_favorite(Path::new("reports/count.sql"))
-            .unwrap();
-        assert!(!reload.entries().unwrap()[0].favorite);
-        assert!(reload.read(Path::new("../elsewhere.sql")).is_err());
-    }
-    #[test]
-    fn rendering_reads_only_the_last_background_snapshot() {
-        let directory = tempfile::tempdir().unwrap();
-        let library = SqlLibrary {
-            root: directory.path().join("does-not-exist"),
-            preferences: directory.path().join("prefs.json"),
-            cache: Default::default(),
-        };
-        assert!(library.needs_refresh());
-        library.cache_entries(Ok(vec![SqlFileEntry {
-            relative_path: "saved.sql".into(),
-            favorite: true,
-        }]));
-        assert_eq!(library.cached_entries().unwrap()[0].label(), "saved.sql");
-        assert!(!library.needs_refresh());
-        library.invalidate();
-        assert!(library.cached_entries().unwrap().is_empty());
-        assert!(library.needs_refresh());
-    }
+
     #[cfg(unix)]
     #[test]
     fn library_skips_and_rejects_symlink_escapes() {

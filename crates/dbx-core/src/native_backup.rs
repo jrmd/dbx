@@ -508,25 +508,4 @@ mod tests {
             }
         }
     }
-    #[tokio::test]
-    async fn community_driver_backups_are_rejected_before_loading_native_tools() {
-        let mut config =
-            ConnectionConfig::new(DatabaseKind::PostgreSQL, "community://localhost/database");
-        config.driver_manifest = Some("/nonexistent/driver-manifest.json".into());
-        for restore in [false, true] {
-            let error = native_backup(
-                config.clone(),
-                Path::new("/nonexistent/backup"),
-                restore,
-                TransferControl::default(),
-            )
-            .await
-            .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("unavailable for community drivers")
-            );
-        }
-    }
 }

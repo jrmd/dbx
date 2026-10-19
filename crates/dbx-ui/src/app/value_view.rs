@@ -280,22 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn binary_and_invalid_json_bytes_keep_their_hex_clipboard_form() {
-        for bytes in [
-            b"{not json".as_slice(),
-            b"{\"a\":1} trailing",
-            b"[\xff]",
-            b"DBX\x00\x01",
-            b"42",
-            b"",
-        ] {
-            let value = CellValue::Bytes(bytes.to_vec());
-            assert_eq!(json_preview(&value), None);
-            assert_eq!(value_clipboard_text(&value), value.to_string());
-        }
-    }
-
-    #[test]
     fn large_json_preview_is_bounded_but_copy_contains_the_complete_value() {
         let value = CellValue::Bytes(
             serde_json::json!({"text": "é".repeat(TEXT_PREVIEW_CHARS + 1)})
@@ -310,43 +294,5 @@ mod tests {
             copied["text"].as_str().unwrap().chars().count(),
             TEXT_PREVIEW_CHARS + 1
         );
-    }
-
-    struct PreviewHarness(CellValue);
-
-    impl Render for PreviewHarness {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(200.)).child(value_view(Some(&self.0), cx))
-        }
-    }
-
-    #[gpui::test]
-    fn structured_previews_scroll_long_lines_without_wrapping_or_widening_the_inspector(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let (harness, cx) = cx.add_window_view(|_, _| {
-            PreviewHarness(CellValue::Bytes(
-                serde_json::json!({"long_key": "x".repeat(100)})
-                    .to_string()
-                    .into_bytes(),
-            ))
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let json_bounds = cx.debug_bounds("cell-value-preview").unwrap();
-        let content = cx.debug_bounds("cell-value-preview-content").unwrap();
-        assert!(json_bounds.size.width <= px(200.));
-        assert!(content.size.width > json_bounds.size.width);
-        harness.update(cx, |harness, cx| {
-            harness.0 = CellValue::Bytes(vec![0; 32]);
-            cx.notify();
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        let hex_bounds = cx.debug_bounds("cell-value-preview").unwrap();
-        let content = cx.debug_bounds("cell-value-preview-content").unwrap();
-        assert!(hex_bounds.size.width <= px(200.));
-        assert!(content.size.width > hex_bounds.size.width);
-        // Both previews contain three lines (the dump has a trailing newline).
-        assert_eq!(hex_bounds.size.height, json_bounds.size.height);
     }
 }

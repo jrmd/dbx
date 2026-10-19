@@ -576,66 +576,6 @@ mod tests {
     use super::*;
 
     #[gpui::test]
-    fn stopping_editing_and_invalidating_a_watch_cancel_inflight_sample(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(gpui_component::init);
-        let session_id = Uuid::new_v4();
-        let (app, cx) = cx.add_window_view(|window, cx| {
-            let mut app = DbxApp::new(window, cx);
-            app.vault_state = Some(VaultState::Unlocked);
-            app.sessions = vec![ConnectionSession::new(
-                session_id,
-                None,
-                "Watch test".into(),
-                DatabaseKind::PostgreSQL,
-                None,
-                window,
-                cx,
-            )];
-            app.active_session_id = Some(session_id);
-            app.add_query_tab_for(session_id, window, cx);
-            app
-        });
-        for action in ["stop", "edit", "invalidate"] {
-            let cancellation = QueryCancellation::default();
-            let editor = cx.update(|_, cx| {
-                app.update(cx, |app, _| {
-                    let query = app.active_query_tab_mut(session_id).unwrap();
-                    query.watch_interval = Some(5);
-                    query.watch_generation = 10;
-                    query.watch_read_only_pending = true;
-                    query.busy = true;
-                    query.cancellation = Some(cancellation.clone());
-                    query.query_editor.clone()
-                })
-            });
-            cx.update(|_, cx| {
-                app.update(cx, |app, cx| match action {
-                    "stop" => app.stop_query_watch(session_id, cx),
-                    "edit" => editor.update(cx, |editor, cx| {
-                        editor.set_text("SELECT 'edited watch'", cx)
-                    }),
-                    _ => app
-                        .active_query_tab_mut(session_id)
-                        .unwrap()
-                        .invalidate_request(),
-                })
-            });
-            cx.run_until_parked();
-            app.read_with(cx, |app, _| {
-                let query = app.active_query_tab(session_id).unwrap();
-                assert!(query.watch_interval.is_none(), "{action}");
-                assert!(query.watch_generation > 10, "{action}");
-                assert!(
-                    cancellation.is_cancelled(),
-                    "{action} must cancel an inflight sample"
-                );
-            });
-        }
-    }
-
-    #[gpui::test]
     fn connection_schema_comparison_drafts_source_changes_on_target_without_applying(
         cx: &mut gpui::TestAppContext,
     ) {

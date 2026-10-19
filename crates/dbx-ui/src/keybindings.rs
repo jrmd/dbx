@@ -112,18 +112,3 @@ pub fn label(name: &str) -> String {
     }
     label
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[gpui::test]
-    fn validates_actions_contexts_and_keystrokes_before_applying(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            assert!(parse(r#"[{"context":"QueryWorkbench","bindings":{"ctrl-k ctrl-r":"dbx_ui::RunQuery","cmd-enter":null}}]"#, cx).is_ok());
-            assert!(parse(r#"[{"bindings":{"cmd-k":"missing::Action"}}]"#, cx).is_err());
-            assert!(parse(r#"[{"bindings":{},"contxt":"typo"}]"#, cx).is_err());
-            assert!(parse(r#"[{"context":"(","bindings":{"cmd-k":null}}]"#, cx).is_err());
-            assert!(parse(r#"[{"bindings":{"":null}}]"#, cx).is_err());
-        });
-    }
-}

@@ -267,7 +267,7 @@ pub enum SqlTokenKind {
     Type,
 }
 
-/// A token returned by [`lex_sql`].
+/// A token returned by [`lex_sql_for`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlToken {
     pub kind: SqlTokenKind,
@@ -381,18 +381,6 @@ pub struct SqlCompletionContext {
     /// user is completing inside a quoted identifier.
     pub quote: Option<char>,
     pub replacement_range: Range<usize>,
-}
-
-/// Lex SQL into byte ranges suitable for syntax highlighting.
-///
-/// The lexer is deliberately tolerant: malformed or unfinished strings and
-/// comments are highlighted through the end of the input, which keeps the
-/// query editor useful while a statement is being written.  Whitespace and
-/// punctuation are omitted from the result and should use the editor's base
-/// color.
-#[cfg(test)]
-pub fn lex_sql(text: &str) -> Vec<SqlToken> {
-    lex_sql_for(text, None)
 }
 
 /// Lex SQL using `dialect`'s comment and string rules, so `#` is an operator
@@ -762,19 +750,7 @@ pub fn lex_json(text: &str) -> Vec<JsonToken> {
     tokens
 }
 
-/// Return the completion context at a UTF-8 cursor offset.
-///
-/// This is intentionally a small, tolerant lexer-side context detector rather
-/// than a full SQL parser. It is safe while a statement is incomplete and
-/// understands the contexts that matter most for a database workbench:
-/// tables after `FROM`/`JOIN`/`UPDATE`/`INTO`, columns after projection and
-/// predicate keywords, and qualified names after a dot.
-#[cfg(test)]
-pub fn sql_completion_context(text: &str, cursor: usize) -> Option<SqlCompletionContext> {
-    sql_completion_context_for(text, cursor, None)
-}
-
-/// [`sql_completion_context`] with `dialect`'s comment and string rules.
+/// Return completion context using `dialect`'s comment and string rules.
 pub fn sql_completion_context_for(
     text: &str,
     cursor: usize,
@@ -1125,19 +1101,7 @@ pub(super) fn expand_to_identifier(text: &str, at: usize) -> Option<Range<usize>
     (end > 0).then_some(start..at + end)
 }
 
-/// Format a SQL string with DBX's tolerant pretty-printer.
-///
-/// The formatter is token-driven on top of [`lex_sql`], so it is safe on
-/// incomplete statements and never rewrites strings, comments, parameters, or
-/// identifier casing. It uppercases keywords and types, breaks major clauses
-/// onto indented lines, puts top-level projection/VALUES list items on their
-/// own lines, and separates statements with a blank line.
-#[cfg(test)]
-pub fn format_sql(text: &str) -> String {
-    format_sql_for(text, None)
-}
-
-/// [`format_sql`] with `dialect`'s comment and string rules.
+/// Format SQL using `dialect`'s comment and string rules.
 pub fn format_sql_for(text: &str, dialect: SqlDialect) -> String {
     SqlFormatter::new(text, dialect).run()
 }

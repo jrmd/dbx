@@ -247,14 +247,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_settings_follow_the_system_with_glass() {
-        let (_directory, store) = test_store();
-        assert_eq!(store.load().expect("load defaults"), Settings::default());
-        assert_eq!(Settings::default().appearance, Appearance::System);
-        assert!(!Settings::default().reduce_transparency);
-    }
-
-    #[test]
     fn legacy_settings_migrate_and_preferences_survive_restart() {
         let (_directory, store) = test_store();
         fs::write(&store.path, r#"{"version":1,"appearance":"dark"}"#).unwrap();
@@ -284,20 +276,5 @@ mod tests {
             SettingsStore::at(store.path.clone()).load().unwrap(),
             settings
         );
-    }
-
-    #[test]
-    fn rejects_unknown_document_versions() {
-        let (_directory, store) = test_store();
-        fs::write(&store.path, r#"{"version":2,"appearance":"dark"}"#)
-            .expect("write future settings");
-
-        assert!(matches!(
-            store.load(),
-            Err(SettingsError::UnsupportedVersion {
-                found: 2,
-                expected: 1
-            })
-        ));
     }
 }

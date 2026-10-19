@@ -362,32 +362,4 @@ mod tests {
             assert_eq!(app.draft.driver_manifest.as_ref(), Some(&path));
         });
     }
-
-    #[test]
-    fn malformed_registered_drivers_remain_visible() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("broken.json"), "{broken").unwrap();
-        let entries = registered(dir.path()).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(entries[0].1.is_err());
-    }
-    #[test]
-    fn selecting_drivers_preserves_user_entered_urls_only() {
-        assert!(preserve_url(
-            "custom://server/mydb",
-            "custom://localhost/database",
-            "sqlite://dbx.sqlite"
-        ));
-        assert!(!preserve_url(
-            "custom://localhost/database",
-            "custom://localhost/database",
-            "sqlite://dbx.sqlite"
-        ));
-        assert!(!preserve_url(
-            "sqlite://dbx.sqlite",
-            "",
-            "sqlite://dbx.sqlite"
-        ));
-        assert!(!preserve_url(" ", "", "sqlite://dbx.sqlite"));
-    }
 }

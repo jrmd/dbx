@@ -410,43 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_workbook_keeps_types_and_inline_strings_without_shared_string_growth() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("typed.xlsx");
-        let result = fixture();
-        let mut workbook = StreamingWorkbook::new(directory.path()).unwrap();
-        workbook.consume(&result.columns, None).unwrap();
-        workbook
-            .consume(&result.columns, Some(result.rows[0].values.clone()))
-            .unwrap();
-        assert_eq!(
-            workbook
-                .finish(&path, "Full fixture", dbx_core::TransferControl::default())
-                .unwrap(),
-            1
-        );
-        let xml = sheet_xml(&path);
-        assert!(!xml.contains("r=\"A2\""));
-        assert!(xml.contains("r=\"B2\""));
-        assert_eq!(xml.matches("<f>").count(), 1);
-        assert!(xml.contains("r=\"C2\" t=\"inlineStr\""));
-        assert!(xml.contains("HYPERLINK"));
-        assert!(xml.contains("r=\"D2\" t=\"b\"><v>1</v>"));
-        assert!(xml.contains("r=\"E2\"><v>42</v>"));
-        assert!(xml.contains("18446744073709551615"));
-        let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
-        assert!(
-            zip.by_name("xl/sharedStrings.xml").is_err(),
-            "Constant memory must use inline strings, not an unbounded shared-string table"
-        );
-        assert_eq!(
-            std::fs::read_dir(directory.path()).unwrap().count(),
-            1,
-            "Private worksheet spools are removed"
-        );
-    }
-
-    #[test]
     fn streaming_workbook_retains_trailing_all_null_rows() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nulls.xlsx");

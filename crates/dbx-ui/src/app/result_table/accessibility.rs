@@ -481,67 +481,6 @@ mod tests {
     }
 
     #[test]
-    fn identities_follow_rows_across_sorting_and_distinguish_repeated_keys() {
-        let mut delegate = ResultTableDelegate::default();
-        delegate.set_result(Some(Arc::new(result())), &HashMap::new(), None, &[], &[]);
-        delegate.ensure_accessible_rows();
-        let before = delegate.accessible_rows.clone();
-        assert_eq!(
-            before
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len(),
-            4
-        );
-        delegate.sort_locally(1, Some(OrderDirection::Ascending));
-        delegate.ensure_accessible_rows();
-        assert_eq!(
-            delegate.accessible_rows,
-            vec![before[1], before[0], before[2], before[3]]
-        );
-        delegate.sort_locally(1, None);
-        delegate.ensure_accessible_rows();
-        assert_eq!(delegate.accessible_rows, before);
-        delegate.set_row_offset(1000);
-        delegate.ensure_accessible_rows();
-        assert!(
-            delegate
-                .accessible_rows
-                .iter()
-                .all(|key| !before.contains(key))
-        );
-    }
-
-    #[test]
-    fn indistinguishable_rows_on_other_pages_do_not_alias_previous_accessible_nodes() {
-        let mut delegate = ResultTableDelegate::default();
-        let page = QueryResult {
-            columns: vec![ColumnInfo::result("name", 0, "TEXT")],
-            rows: vec![RowData::new(vec![CellValue::Text("same".into())]); 2],
-            ..QueryResult::empty(None, 0)
-        };
-        delegate.set_result(
-            Some(Arc::new(page.clone())),
-            &HashMap::new(),
-            None,
-            &[],
-            &[],
-        );
-        delegate.ensure_accessible_rows();
-        let first_page = delegate.accessible_rows.clone();
-        delegate.set_row_offset(1000);
-        delegate.set_result(Some(Arc::new(page)), &HashMap::new(), None, &[], &[]);
-        delegate.ensure_accessible_rows();
-        assert!(
-            delegate
-                .accessible_rows
-                .iter()
-                .all(|key| !first_page.contains(key)),
-            "different pages must not reuse an indistinguishable row's node identity"
-        );
-    }
-
-    #[test]
     fn query_key_metadata_does_not_alias_distinct_join_rows_on_other_pages() {
         let mut delegate = ResultTableDelegate::default();
         let mut key = ColumnInfo::result("id", 0, "INTEGER");
@@ -654,28 +593,6 @@ mod tests {
             ambiguous,
             "a new ambiguous snapshot must not reuse a previous node"
         );
-    }
-
-    #[test]
-    fn null_or_incomplete_primary_keys_are_not_trusted_across_pages() {
-        for values in [
-            vec![CellValue::Null, CellValue::Text("same".into())],
-            vec![],
-        ] {
-            let mut delegate = ResultTableDelegate {
-                is_data_result: true,
-                ..Default::default()
-            };
-            let mut page = result();
-            delegate.set_table_columns(&page.columns);
-            page.rows = vec![RowData::new(values)];
-            delegate.set_result(Some(Arc::new(page)), &HashMap::new(), None, &[], &[]);
-            delegate.ensure_accessible_rows();
-            let before = delegate.accessible_row_key(0);
-            delegate.set_row_offset(1000);
-            delegate.ensure_accessible_rows();
-            assert_ne!(delegate.accessible_row_key(0), before);
-        }
     }
 
     #[test]

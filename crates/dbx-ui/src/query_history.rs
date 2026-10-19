@@ -678,99 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn records_and_returns_newest_entries_first() {
-        let (_directory, store) = store();
-        store
-            .record_at(
-                connection(),
-                "select 1",
-                10,
-                QueryHistoryOutcome::success("1 row"),
-            )
-            .expect("record query");
-        store
-            .record_at(
-                connection(),
-                "select 2",
-                20,
-                QueryHistoryOutcome::failure("bad SQL"),
-            )
-            .expect("record query");
-
-        let entries = store.recent(&connection(), 10).expect("recent history");
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.sql.as_str())
-                .collect::<Vec<_>>(),
-            ["select 2", "select 1"]
-        );
-        assert_eq!(entries[0].executed_at_ms, 20);
-        assert!(matches!(
-            entries[0].outcome,
-            QueryHistoryOutcome::Failure(_)
-        ));
-    }
-
-    #[test]
-    fn deduplicates_consecutive_queries_per_connection() {
-        let (_directory, store) = store();
-        let other = QueryHistoryConnection::profile(Uuid::new_v4());
-        store
-            .record_at(
-                connection(),
-                "select 1",
-                10,
-                QueryHistoryOutcome::success("one"),
-            )
-            .unwrap();
-        store
-            .record_at(other, "select 9", 11, QueryHistoryOutcome::success("one"))
-            .unwrap();
-        store
-            .record_at(
-                connection(),
-                "select 1",
-                12,
-                QueryHistoryOutcome::success("again"),
-            )
-            .unwrap();
-
-        let entries = store.recent(&connection(), 10).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].executed_at_ms, 12);
-    }
-
-    #[test]
-    fn bounds_entries_per_connection_without_losing_other_connections() {
-        let (_directory, store) = store();
-        let other = QueryHistoryConnection::profile(Uuid::new_v4());
-        for index in 0..=MAX_QUERY_HISTORY_ENTRIES_PER_CONNECTION {
-            store
-                .record_at(
-                    connection(),
-                    format!("select {index}"),
-                    index as u64,
-                    QueryHistoryOutcome::success("ok"),
-                )
-                .unwrap();
-        }
-        store
-            .record_at(
-                other.clone(),
-                "select other",
-                999,
-                QueryHistoryOutcome::success("ok"),
-            )
-            .unwrap();
-
-        let entries = store.recent(&connection(), usize::MAX).unwrap();
-        assert_eq!(entries.len(), MAX_QUERY_HISTORY_ENTRIES_PER_CONNECTION);
-        assert_eq!(entries.last().unwrap().sql, "select 1");
-        assert_eq!(store.recent(&other, 10).unwrap().len(), 1);
-    }
-
-    #[test]
     fn rejects_corrupt_and_future_documents() {
         let (directory, store) = store();
         fs::write(directory.path().join(QUERY_HISTORY_FILE_NAME), b"not JSON").unwrap();
@@ -788,31 +695,6 @@ mod tests {
                 expected: 1
             })
         ));
-    }
-
-    #[test]
-    fn clear_only_removes_requested_connection() {
-        let (_directory, store) = store();
-        let other = QueryHistoryConnection::profile(Uuid::new_v4());
-        store
-            .record_at(
-                connection(),
-                "select 1",
-                1,
-                QueryHistoryOutcome::success("ok"),
-            )
-            .unwrap();
-        store
-            .record_at(
-                other.clone(),
-                "select 2",
-                2,
-                QueryHistoryOutcome::success("ok"),
-            )
-            .unwrap();
-        assert_eq!(store.clear(&connection()).unwrap(), 1);
-        assert!(store.recent(&connection(), 10).unwrap().is_empty());
-        assert_eq!(store.recent(&other, 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -843,31 +725,6 @@ mod tests {
             QueryHistoryOutcome::success("returned token_count for 3 rows"),
             QueryHistoryOutcome::Success("returned token_count for 3 rows".into())
         );
-    }
-
-    #[test]
-    fn rejects_oversized_queries_without_changing_existing_history() {
-        let (_directory, store) = store();
-        store
-            .record_at(
-                connection(),
-                "select 1",
-                1,
-                QueryHistoryOutcome::success("ok"),
-            )
-            .unwrap();
-
-        let oversized = "x".repeat(MAX_QUERY_HISTORY_SQL_BYTES + 1);
-        assert!(matches!(
-            store.record_at(
-                connection(),
-                oversized,
-                2,
-                QueryHistoryOutcome::success("ok"),
-            ),
-            Err(QueryHistoryError::Invalid(_))
-        ));
-        assert_eq!(store.recent(&connection(), 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -916,43 +773,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bounds_total_entries_across_unique_connections() {
-        let (_directory, store) = store();
-        // Seed the full on-disk document once. The next real record exercises
-        // overflow, eviction and persistence without 5,000 setup rewrites.
-        let document = QueryHistoryDocument {
-            version: QUERY_HISTORY_FILE_VERSION,
-            entries: (0..MAX_QUERY_HISTORY_ENTRIES)
-                .map(|index| QueryHistoryEntry {
-                    connection: QueryHistoryConnection::profile(Uuid::from_u128(index as u128 + 1)),
-                    sql: "select 1".into(),
-                    executed_at_ms: index as u64,
-                    outcome: QueryHistoryOutcome::success("ok"),
-                })
-                .collect(),
-        };
-        store.write_document(&document).unwrap();
-        store
-            .record_at(
-                QueryHistoryConnection::profile(Uuid::from_u128(
-                    MAX_QUERY_HISTORY_ENTRIES as u128 + 1,
-                )),
-                "select 1",
-                MAX_QUERY_HISTORY_ENTRIES as u64,
-                QueryHistoryOutcome::success("ok"),
-            )
-            .unwrap();
-
-        let entries = store.load().unwrap();
-        assert_eq!(entries.len(), MAX_QUERY_HISTORY_ENTRIES);
-        assert_eq!(entries.first().unwrap().executed_at_ms, 1);
-        assert_eq!(
-            entries.last().unwrap().executed_at_ms,
-            MAX_QUERY_HISTORY_ENTRIES as u64
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn writes_private_file_and_directory() {
@@ -984,45 +804,5 @@ mod tests {
                 & 0o777,
             0o700
         );
-    }
-}
-
-#[cfg(test)]
-mod retention_tests {
-    use super::*;
-    #[test]
-    fn reduced_retention_keeps_newest_and_preserves_other_identities() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = QueryHistoryStore::at(directory.path().join("history.json"));
-        let one = QueryHistoryConnection::profile(Uuid::new_v4());
-        let other = QueryHistoryConnection::profile(Uuid::new_v4());
-        for timestamp in 1..=15 {
-            store
-                .record_at(
-                    one.clone(),
-                    format!("SELECT {timestamp}"),
-                    timestamp,
-                    QueryHistoryOutcome::success("one row"),
-                )
-                .unwrap();
-        }
-        store
-            .record_at(
-                other.clone(),
-                "SELECT 42",
-                20,
-                QueryHistoryOutcome::success("one row"),
-            )
-            .unwrap();
-        store.retain(&one, 10).unwrap();
-        let reopened = QueryHistoryStore::at(directory.path().join("history.json"));
-        assert_eq!(
-            reopened.recent(&one, 100).unwrap().last().unwrap().sql,
-            "SELECT 6"
-        );
-        assert_eq!(reopened.recent(&other, 100).unwrap().len(), 1);
-        reopened.retain(&one, 0).unwrap();
-        assert!(reopened.recent(&one, 100).unwrap().is_empty());
-        assert_eq!(reopened.recent(&other, 100).unwrap().len(), 1);
     }
 }

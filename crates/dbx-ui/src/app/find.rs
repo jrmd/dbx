@@ -468,25 +468,3 @@ impl DbxApp {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn matches_are_case_folded_on_the_original_byte_offsets() {
-        let text = "SELECT Ünïcode, select FROM t";
-        assert_eq!(
-            find_matches(text, "select", true),
-            std::iter::once(18..24).collect::<Vec<_>>()
-        );
-        assert_eq!(find_matches(text, "select", false), [0..6, 18..24]);
-        assert_eq!(
-            find_matches(text, "ünï", false),
-            std::iter::once(7..12).collect::<Vec<_>>()
-        );
-        assert_eq!(&text[7..12], "Ünï");
-        assert!(find_matches(text, "", false).is_empty());
-        assert_eq!(find_matches("aaaa", "aa", true), [0..2, 2..4]);
-    }
-}

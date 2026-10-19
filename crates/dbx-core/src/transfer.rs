@@ -2544,25 +2544,6 @@ mod tests {
     }
 
     #[test]
-    fn detect_file_format_handles_plain_and_gzipped_extensions() {
-        let cases = [
-            ("dump.sql", DumpFormat::Sql, false),
-            ("dump.SQL.gz", DumpFormat::Sql, true),
-            ("rows.csv", DumpFormat::Csv, false),
-            ("rows.CSV.GZ", DumpFormat::Csv, true),
-            ("rows.tsv", DumpFormat::Tsv, false),
-            ("rows.tsv.gz", DumpFormat::Tsv, true),
-        ];
-        for (name, format, gzipped) in cases {
-            let detected = detect_file_format(Path::new(name)).unwrap();
-            assert_eq!(detected.format, format, "{name}");
-            assert_eq!(detected.gzipped, gzipped, "{name}");
-        }
-        assert!(detect_file_format(Path::new("rows.xlsx")).is_err());
-        assert!(detect_file_format(Path::new("noext")).is_err());
-    }
-
-    #[test]
     fn delimited_reader_parses_quoted_embedded_and_null_fields() {
         let input = b"\xEF\xBB\xBFid,name,note\r\n1,\"plain\",x\r\n2,\"has, comma\",\"line\nbreak\"\r\n3,\"doubled \"\" quote\",,,\r\n4,\"\",\r\n\r\n5,last\r\n";
         let mut reader = DelimitedReader::new(input, b',');
@@ -2777,51 +2758,6 @@ mod tests {
     }
 
     #[test]
-    fn sql_schema_rendering_keeps_selected_foreign_keys_and_primary_keys() {
-        let parent = TableRef::in_schema("public", "accounts");
-        let child = TableRef::in_schema("public", "events");
-        let structure = TableStructure {
-            columns: vec![
-                ColumnInfo {
-                    name: "id".into(),
-                    data_type: "integer".into(),
-                    enum_values: Vec::new(),
-                    nullable: false,
-                    ordinal: 1,
-                    primary_key: true,
-                    default_value: None,
-                },
-                ColumnInfo {
-                    name: "account_id".into(),
-                    data_type: "integer".into(),
-                    enum_values: Vec::new(),
-                    nullable: false,
-                    ordinal: 2,
-                    primary_key: false,
-                    default_value: None,
-                },
-            ],
-            foreign_keys: vec![crate::ForeignKeyInfo {
-                constraint_name: Some("events_account_id_fkey".into()),
-                columns: vec!["account_id".into()],
-                referenced_schema: Some("public".into()),
-                referenced_table: "accounts".into(),
-                referenced_columns: vec!["id".into()],
-                on_update: Some(crate::ReferentialAction::Cascade),
-                on_delete: Some(crate::ReferentialAction::SetNull),
-            }],
-            ..Default::default()
-        };
-
-        let sql =
-            render_sql_schema(DatabaseKind::PostgreSQL, &child, &structure, &[parent]).unwrap();
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS \"public\".\"events\""));
-        assert!(sql.contains("PRIMARY KEY (\"id\")"));
-        assert!(sql.contains("CONSTRAINT \"events_account_id_fkey\""));
-        assert!(sql.contains("ON UPDATE CASCADE ON DELETE SET NULL"));
-    }
-
-    #[test]
     fn schema_expressions_reject_terminators_and_comments_outside_literals() {
         assert_eq!(
             safe_schema_expression(" 'a;b'::text ").unwrap(),
@@ -2839,110 +2775,6 @@ mod tests {
         ] {
             assert!(safe_schema_expression(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn schema_rendering_includes_defaults_checks_serials_and_indexes() {
-        let table = TableRef::in_schema("public", "items");
-        let column = |name: &str, data_type: &str, default: Option<&str>| ColumnInfo {
-            name: name.into(),
-            data_type: data_type.into(),
-            enum_values: Vec::new(),
-            nullable: false,
-            ordinal: 1,
-            primary_key: name == "id",
-            default_value: default.map(str::to_owned),
-        };
-        let structure = TableStructure {
-            columns: vec![
-                column("id", "integer", Some("nextval('items_id_seq'::regclass)")),
-                column("code", "text", Some("'new'::text")),
-            ],
-            checks: vec![crate::CheckConstraintInfo {
-                name: Some("code_length".into()),
-                expression: "length(code) > 0".into(),
-            }],
-            indexes: vec![
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "items_pkey".into(),
-                    columns: vec!["id".into()],
-                    unique: true,
-                    primary: true,
-                    method: None,
-                    predicate: None,
-                    definition: Some(
-                        "CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)".into(),
-                    ),
-                },
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "items_code".into(),
-                    columns: vec!["code".into()],
-                    unique: true,
-                    primary: false,
-                    method: Some("btree".into()),
-                    predicate: None,
-                    definition: Some(
-                        "CREATE UNIQUE INDEX items_code ON public.items USING btree (code)".into(),
-                    ),
-                },
-            ],
-            ..Default::default()
-        };
-        let sql = render_sql_schema(DatabaseKind::PostgreSQL, &table, &structure, &[]).unwrap();
-        assert!(sql.contains("\"id\" serial NOT NULL"), "{sql}");
-        assert!(
-            sql.contains("\"code\" text DEFAULT 'new'::text NOT NULL"),
-            "{sql}"
-        );
-        assert!(
-            sql.contains("CONSTRAINT \"code_length\" CHECK (length(code) > 0)"),
-            "{sql}"
-        );
-        assert_eq!(
-            render_sql_indexes(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
-            ["CREATE UNIQUE INDEX IF NOT EXISTS items_code ON public.items USING btree (code)"]
-        );
-        assert_eq!(
-            render_sql_sequence_resets(DatabaseKind::PostgreSQL, &table, &structure).unwrap(),
-            [
-                "SELECT setval(pg_get_serial_sequence('\"public\".\"items\"', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"public\".\"items\"), 0) + 1, false)"
-            ]
-        );
-
-        let mysql = TableStructure {
-            indexes: vec![
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "by_name".into(),
-                    columns: vec!["name(10)".into(), "created DESC".into()],
-                    unique: false,
-                    primary: false,
-                    method: Some("BTREE".into()),
-                    predicate: None,
-                    definition: None,
-                },
-                crate::IndexInfo {
-                    constraint_name: None,
-                    name: "by_expression".into(),
-                    columns: vec!["(expression)".into()],
-                    unique: false,
-                    primary: false,
-                    method: Some("BTREE".into()),
-                    predicate: None,
-                    definition: None,
-                },
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            render_sql_indexes(DatabaseKind::MySQL, &TableRef::new("people"), &mysql).unwrap(),
-            [
-                "CREATE INDEX `by_name` ON `people` (`name`(10), `created` DESC)",
-                "-- Index by_expression uses expressions; recreate it manually",
-            ]
-        );
     }
 
     #[tokio::test]

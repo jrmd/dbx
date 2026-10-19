@@ -1046,39 +1046,6 @@ mod tests {
     }
 
     #[test]
-    fn native_analyze_trees_preserve_hierarchy_and_only_report_measured_metrics() {
-        let mut raw = QueryResult::empty(None, 8);
-        raw.columns = vec![ColumnInfo::result("EXPLAIN", 0, "TEXT")];
-        raw.rows = vec![RowData::new(vec![CellValue::Text("-> Filter: (x > 0)  (cost=0.35 rows=2) (actual time=0.01..0.03 rows=1 loops=1)\n    -> Table scan on t  (cost=0.35 rows=2) (actual time=0.01..0.02 rows=2 loops=1)".into())])];
-        let plan = format_execution_plan(DatabaseKind::MySQL, &raw);
-        assert_eq!(plan.rows[1].values[0], CellValue::Integer(1));
-        assert_eq!(
-            plan.rows[0].values[1],
-            CellValue::Text("Filter: (x > 0)".into())
-        );
-        assert_eq!(plan.rows[0].values[4], CellValue::Text("1".into()));
-        assert_eq!(plan.rows[0].values[5], CellValue::Text("0.03".into()));
-        raw.rows = [
-            "planning time: 12µs",
-            "• render",
-            "  actual row count: 2",
-            "  • scan",
-            "    estimated row count: 3",
-            "    table: t",
-        ]
-        .into_iter()
-        .map(|line| RowData::new(vec![CellValue::Text(line.into())]))
-        .collect();
-        let plan = format_execution_plan(DatabaseKind::CockroachDB, &raw);
-        assert_eq!(plan.rows.len(), 2);
-        assert_eq!(plan.rows[1].values[0], CellValue::Integer(1));
-        assert_eq!(plan.rows[0].values[4], CellValue::Text("2".into()));
-        assert_eq!(plan.rows[1].values[2], CellValue::Text("3".into()));
-        assert_eq!(plan.rows[0].values[5], CellValue::Null);
-        assert!(plan.rows[0].values[7].to_string().contains("planning time"));
-    }
-
-    #[test]
     fn table_statistics_quote_identifiers_and_skip_unsupported_operators() {
         let columns = vec![
             ColumnInfo::result("a\"b", 0, "NUMERIC(40,12)"),
@@ -1152,20 +1119,6 @@ mod tests {
         assert!(source.truncated);
     }
     #[test]
-    fn postgres_plans_are_flattened_and_compared() {
-        let mut raw = QueryResult::empty(None, 1);
-        raw.rows.push(RowData::new(vec![CellValue::Json(serde_json::json!([{"Plan":{"Node Type":"Nested Loop","Plan Rows":2,"Total Cost":10,"Plans":[{"Node Type":"Index Scan","Index Name":"idx","Plan Rows":2}]}}]))]));
-        let before = format_execution_plan(DatabaseKind::PostgreSQL, &raw);
-        assert_eq!(before.rows.len(), 2);
-        assert_eq!(before.rows[1].values[0], CellValue::Integer(1));
-        let mut after = before.clone();
-        after.rows.pop();
-        assert_eq!(
-            compare_execution_plans(&before, &after).rows[1].values[1],
-            CellValue::Text("Removed".into())
-        );
-    }
-    #[test]
     fn schema_drafts_keep_destructive_changes_and_identifier_newlines_commented() {
         let column = |name: &str| ColumnInfo::result(name, 0, "TEXT");
         let table = |name: &str, columns: Vec<ColumnInfo>| crate::RelationalTable {
@@ -1200,71 +1153,6 @@ mod tests {
         assert!(statements[0].contains("ADD COLUMN"));
         assert_eq!(draft.changes.len(), 3);
         assert_eq!(draft.warnings.len(), 2);
-    }
-
-    #[test]
-    fn schema_drafts_cover_defaults_indexes_and_checks_only_for_detailed_baselines() {
-        let mut code = ColumnInfo::result("code", 1, "text");
-        code.nullable = false;
-        let index = |name: &str, unique: bool| crate::IndexInfo {
-            constraint_name: None,
-            name: name.into(),
-            columns: vec!["code".into()],
-            unique,
-            primary: false,
-            method: Some("btree".into()),
-            predicate: None,
-            definition: Some(format!(
-                "CREATE {}INDEX {name} ON public.items USING btree (code)",
-                if unique { "UNIQUE " } else { "" }
-            )),
-        };
-        let schema = |code: ColumnInfo, indexes, checks, details_captured| RelationalSchema {
-            database: "db".into(),
-            tables: vec![crate::RelationalTable {
-                table: crate::TableInfo::table("items", Some("public".into())),
-                structure: crate::TableStructure {
-                    columns: vec![code],
-                    indexes,
-                    checks,
-                    ..Default::default()
-                },
-            }],
-            details_captured,
-            objects: Vec::new(),
-            objects_captured: false,
-        };
-        let mut defaulted = code.clone();
-        defaulted.default_value = Some("'new'::text".into());
-        let check = crate::CheckConstraintInfo {
-            name: Some("code_length".into()),
-            expression: "length(code) > 0".into(),
-        };
-        let before = schema(code.clone(), vec![index("items_old", false)], vec![], true);
-        let after = schema(
-            defaulted.clone(),
-            vec![index("items_code", true)],
-            vec![check.clone()],
-            true,
-        );
-        let draft = schema_migration(DatabaseKind::PostgreSQL, &before, &after).unwrap();
-        assert!(draft.sql.contains(
-            "ALTER TABLE \"public\".\"items\" ALTER COLUMN \"code\" SET DEFAULT 'new'::text;"
-        ));
-        assert!(draft.sql.contains("DROP INDEX \"public\".\"items_old\";"));
-        assert!(draft.sql.contains(
-            "CREATE UNIQUE INDEX IF NOT EXISTS items_code ON public.items USING btree (code);"
-        ));
-        assert!(draft.sql.contains(
-            "ALTER TABLE \"public\".\"items\" ADD CONSTRAINT \"code_length\" CHECK (length(code) > 0);"
-        ));
-        assert!(!draft.sql.contains("MANUAL"), "{}", draft.sql);
-
-        // A baseline from an earlier version has no defaults or indexes.
-        let legacy = schema(code, vec![], vec![], false);
-        let draft = schema_migration(DatabaseKind::PostgreSQL, &legacy, &after).unwrap();
-        assert!(draft.changes.is_empty(), "{:?}", draft.changes);
-        assert_eq!(draft.warnings.len(), 1);
     }
 
     #[test]

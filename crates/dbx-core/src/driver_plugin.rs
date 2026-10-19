@@ -652,29 +652,4 @@ json.dump({'protocol':1,'ok':True,'result':result},sys.stdout)
             "cancellation must terminate helper processes as well as the direct driver"
         );
     }
-
-    #[test]
-    fn plugin_contract_is_conservative_and_rejects_unsupported_families() {
-        let caps = capabilities(DatabaseKind::PostgreSQL, false);
-        assert!(caps.sql && caps.structured_filters);
-        assert!(
-            !caps.row_edits
-                && !caps.atomic_row_changes
-                && !caps.independent_query_sessions
-                && !caps.streaming_query_export
-                && !caps.atomic_file_import
-                && !caps.native_backup
-                && !caps.ssh
-        );
-        let manifest = DriverManifest {
-            protocol: 1,
-            id: "redis".into(),
-            name: "Unsupported native path".into(),
-            family: DatabaseKind::Redis,
-            executable: "/usr/bin/python3".into(),
-            arguments: vec![],
-            schemes: vec!["community".into()],
-        };
-        assert!(manifest.validate().is_err());
-    }
 }

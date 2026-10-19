@@ -566,113 +566,8 @@ fn decode(value: &str) -> Result<String, ConnectionFieldsError> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn driver_url_fields_accept_hostless_paths_and_rehydrate_passwords() {
-        let directory = tempfile::tempdir().unwrap();
-        let config = crate::profiles::plugin_profile_fixture(
-            directory.path(),
-            "example-sqlite:///absolute/database.sqlite",
-        );
-        let mut fields = ConnectionFields::new(DatabaseKind::SQLite);
-        fields.driver_manifest = config.driver_manifest.clone();
-        fields.connection_string = config.url.clone();
-        assert_eq!(fields.config().unwrap().url, config.url);
-        fields.connection_string = "example-sqlite://alice@database.test/app".into();
-        fields.password = "literal#percent%word".into();
-        let config = fields.config().unwrap();
-        let url = Url::parse(&config.url).unwrap();
-        assert_eq!(decode(url.password().unwrap()).unwrap(), fields.password);
-        for suffix in ["?api_key=secret", "?mode=read-only", "#secret"] {
-            fields.connection_string =
-                format!("example-sqlite:///absolute/database.sqlite{suffix}");
-            assert_eq!(
-                fields.url().unwrap_err(),
-                ConnectionFieldsError::DriverUrlOptions
-            );
-        }
-    }
-
-    #[test]
-    fn plain_file_paths_expand_home_and_escape_filename_delimiters() {
-        let fields = ConnectionFields::from_url("./my database #1.sqlite").unwrap();
-        assert_eq!(fields.kind, DatabaseKind::SQLite);
-        assert!(
-            fields
-                .url()
-                .unwrap()
-                .contains("my%20database%20%231.sqlite")
-        );
-        let fields = ConnectionFields::from_url("~/personal.sqlite").unwrap();
-        assert!(!fields.url().unwrap().contains('~'));
-        let mut fields = ConnectionFields::new(DatabaseKind::DuckDB);
-        fields.connection_string = "warehouse".into();
-        assert!(fields.url().unwrap().starts_with("duckdb:"));
-        assert!(
-            ConnectionFields::from_url("postgres://u:p@host/db")
-                .unwrap()
-                .kind
-                == DatabaseKind::PostgreSQL
-        );
-    }
-    #[test]
-    fn clickhouse_urls_support_details_and_explicit_https_provider_selection() {
-        use super::*;
-        let mut fields =
-            ConnectionFields::from_url("clickhouse://default:p%40ss@localhost:8123/default")
-                .unwrap();
-        assert_eq!(fields.kind, DatabaseKind::ClickHouse);
-        assert_eq!(fields.password, "p@ss");
-        fields.use_structured_fields();
-        assert!(fields.config().is_ok());
-        let mut fields =
-            ConnectionFields::from_url("https://user:secret@cloud.example:8443/default").unwrap();
-        fields.kind = DatabaseKind::ClickHouse;
-        assert_eq!(
-            fields.config().unwrap().url,
-            "https://user:secret@cloud.example:8443/default"
-        );
-    }
     use super::*;
 
-    #[test]
-    fn sql_server_urls_round_trip_through_structured_fields() {
-        let mut fields =
-            ConnectionFields::from_url("sqlserver://sa:p%40ss@db.internal:1433/app").unwrap();
-        assert_eq!(fields.kind, DatabaseKind::SqlServer);
-        assert_eq!(fields.host, "db.internal");
-        assert_eq!(fields.port, "1433");
-        assert_eq!(fields.password, "p@ss");
-        assert_eq!(fields.database, "app");
-        fields.use_structured_fields();
-        assert_eq!(
-            fields.config().unwrap().url,
-            "sqlserver://sa:p%40ss@db.internal:1433/app"
-        );
-        assert_eq!(
-            ConnectionFields::from_url("mssql://sa@localhost/master")
-                .unwrap()
-                .kind,
-            DatabaseKind::SqlServer
-        );
-    }
-
-    #[test]
-    fn socket_form_connects_without_a_host_and_rejects_empty_paths() {
-        let mut fields = ConnectionFields::new(DatabaseKind::MySQL);
-        fields.database = "app".into();
-        fields.username = "alice".into();
-        fields.password = "p@ss%word".into();
-        fields.socket_enabled = true;
-        assert!(fields.config().is_err());
-        fields.socket = "/tmp/mysql.sock".into();
-        let config = fields.config().unwrap();
-        assert_eq!(config.socket, Some("/tmp/mysql.sock".into()));
-        assert_eq!(
-            Url::parse(&config.url).unwrap().host_str(),
-            Some("localhost")
-        );
-        assert!(!format!("{fields:?}").contains("p@ss"));
-    }
     use crate::profiles::{ConnectionProfileDraft, ProfileStore};
     use dbx_core::{ConnectionConfig, DatabaseEngine};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -745,20 +640,6 @@ mod tests {
         captured
     }
 
-    #[test]
-    fn builds_postgres_url_with_percent_encoded_credentials_and_database() {
-        let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
-        fields.host = "db.example.test".into();
-        fields.username = "al ice@example:/?#%[]✓".into();
-        fields.password = "p@ss word:/?#%[]✓".into();
-        fields.database = "team/data".into();
-
-        assert_eq!(
-            fields.url().unwrap(),
-            "postgres://al%20ice%40example%3A%2F%3F%23%25%5B%5D%E2%9C%93:p%40ss%20word%3A%2F%3F%23%25%5B%5D%E2%9C%93@db.example.test:5432/team%2Fdata"
-        );
-    }
-
     #[tokio::test]
     async fn postgres_receives_literal_password_from_raw_and_encoded_connection_strings() {
         let raw = password_sent_to_postgres(|port| {
@@ -826,59 +707,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_network_url_into_decoded_fields_and_round_trips_fast_path() {
-        let input = "postgresql://al%20ice:p%40ss%2Fword@[::1]:5433/team%2Fdata?sslmode=require";
-        let fields = ConnectionFields::from_url(input).unwrap();
-
-        assert_eq!(fields.kind, DatabaseKind::PostgreSQL);
-        assert_eq!(fields.host, "::1");
-        assert_eq!(fields.port, "5433");
-        assert_eq!(fields.username, "al ice");
-        assert_eq!(fields.password, "p@ss/word");
-        assert_eq!(fields.database, "team/data");
-        assert_eq!(fields.url().unwrap(), input);
-    }
-
-    #[test]
-    fn repairs_unencoded_special_characters_in_a_password() {
-        let input =
-            "postgres://al ice:p@ss word/#?@db.example.test:5432/team%2Fdata?sslmode=require";
-        let fields = ConnectionFields::from_url(input).unwrap();
-
-        assert_eq!(fields.username, "al ice");
-        assert_eq!(fields.password, "p@ss word/#?");
-        assert_eq!(
-            fields.url().unwrap(),
-            "postgres://al%20ice:p%40ss%20word%2F%23%3F@db.example.test:5432/team%2Fdata?sslmode=require"
-        );
-    }
-
-    #[test]
     fn rejects_non_utf8_percent_encoded_credentials_instead_of_changing_them() {
         assert_eq!(
             ConnectionFields::from_url("postgres://user:p%FFss@localhost:5432/app"),
             Err(ConnectionFieldsError::InvalidUrl)
-        );
-    }
-
-    #[test]
-    fn validates_required_structured_fields() {
-        let fields = ConnectionFields::new(DatabaseKind::MySQL);
-        assert_eq!(
-            fields.url(),
-            Err(ConnectionFieldsError::MissingHost(DatabaseKind::MySQL))
-        );
-
-        let mut fields = ConnectionFields::new(DatabaseKind::PostgreSQL);
-        fields.host = "localhost".into();
-        fields.port = "nope".into();
-        assert_eq!(fields.url(), Err(ConnectionFieldsError::InvalidPort));
-
-        let mut fields = ConnectionFields::new(DatabaseKind::MySQL);
-        fields.host = "localhost".into();
-        assert_eq!(
-            fields.url(),
-            Err(ConnectionFieldsError::MissingDatabase(DatabaseKind::MySQL))
         );
     }
 

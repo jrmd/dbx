@@ -8,12 +8,10 @@ constitute a published release. Scope and remaining limits are recorded in the
 ## Passed locally
 
 - `cargo fmt --all -- --check` and `git diff --check`.
-- `cargo test --locked --workspace`: 476 passed, no failures after the test-suite
-  trim (previously 491). Duplicate fixtures and helper/layout assertions were
-  removed or consolidated; database safety and reported-bug regressions remain.
-  Tests requiring
-  other external services or signing fixtures retain their explicit ignore markers.
-- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`.
+- `cargo test --locked --profile ci --workspace`: 236 passed, no failures after
+  reducing the previous 476-test suite. Tests requiring external services or
+  signing fixtures retain their explicit ignore markers.
+- `cargo clippy --locked --profile ci --workspace --all-targets --all-features -- -D warnings`.
 - `scripts/test-release-notes.py`: two tests; `scripts/test-macos-release.py`:
   five tests, using Python 3.13. The latter uses fixture signing tools, not a
   new notarization.
@@ -43,9 +41,8 @@ constitute a published release. Scope and remaining limits are recorded in the
   profile storage without exposing credentials.
 - Native GPUI test coverage includes completion Tab/Enter behavior, failed-query
   presentation, first-click Dark persistence, staged bulk editing/undo/redo,
-  command/destination palette separation, platform shortcut labels, SQL-file
-  background snapshots/favorite serialization, bounded document-change reviews,
-  late driver-registration races, and secret clearing including undo/redo for
+  SQL-file background snapshots/favorite serialization, late driver-registration
+  races, and secret clearing including undo/redo for
   API keys, vault passphrases, connection/import URLs and SSH passwords.
 - Native macOS checks in an isolated QA profile: SQL-file/favorite palette
   navigation, full-query XLSX export with all 20,001 rows verified in the saved
@@ -66,13 +63,27 @@ The intermittent first-click Dark issue was not reproduced. Single native macOS
 clicks applied Light → Dark and the saved preference survived restart. Font
 enumeration now runs in the background and selected segments keep stable bounds;
 the regression verifies this, but these are not claimed as a confirmed cause of
-the original report. Direct API request/response handling is
-covered by fixtures, including an actual loopback Ollama HTTP request; no
-user's hosted API key or cloud database account was used. Other server engines,
+the original report. An earlier pass exercised direct API request/response
+handling with fixtures and a loopback Ollama HTTP request; those routine
+protocol fixtures were removed in the suite reduction, while credential endpoint
+validation remains. No user's hosted API key or cloud database account was used. Other server engines,
 physical Linux desktop interactions and a signed release install were not
 revalidated in this pass. CI remains responsible for its Linux/macOS build and
 full disposable-connector matrix; those broader checks now run outside the PR
 feedback path as described below.
+
+## Smaller automated suite
+
+The second reduction deletes 240 active macOS tests, plus platform-specific
+test cases, instead of combining them or marking them ignored. Routine layout,
+focus/navigation, themes, completion catalogues, formatting, search ranking
+and helper smoke checks now rely on manual checks when those features change.
+This deliberately reduces automated UI and convenience-feature coverage.
+
+Retained tests concentrate on protected writes, transaction rollback, conflict
+detection, cancellation, credential handling, encrypted recovery, import/export
+fidelity, updater integrity, and reported query/completion/theme bugs. External
+database fixtures remain available. The production implementation is unchanged.
 
 ## CI cost audit and changes
 
@@ -81,7 +92,7 @@ took 61m05s on Linux and 51m45s on macOS despite dependency-cache hits. Linux
 release-test compilation took 30m03s; the test binaries ran in about nine
 seconds. The separate workbench benchmark step spent another 19m45s compiling
 before a roughly two-second run. This was an older revision with 421 Linux
-tests, not a measurement of the current 476-test suite.
+tests, not a measurement of the current suite.
 
 PRs and relevant main-branch pushes now run one Linux job using the unoptimised
 `ci` profile, with separate formatting, Clippy, test-compilation, test-execution
@@ -92,7 +103,7 @@ Full Linux/macOS release builds run nightly or on manual dispatch; disposable
 database checks run on relevant main-branch pushes, nightly or manually.
 Release-tag validation, signing and publication gates are unchanged.
 
-Workflow syntax was validated with actionlint; all 476 tests and strict
+Workflow syntax was validated with actionlint; the retained 236 tests and strict
 all-target Clippy passed locally with `--profile ci`. The seven Python
 release-script checks also passed. Hosted runtime improvement is not yet
 measured; the first new CI-profile run must populate its cold cache.

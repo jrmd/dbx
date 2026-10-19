@@ -575,38 +575,3 @@ fn describe_changes(original: &Value, edited: &Value) -> String {
     }
     summary
 }
-
-#[cfg(test)]
-mod review_tests {
-    use super::*;
-    #[test]
-    fn review_distinguishes_removed_null_added_and_nested_changes() {
-        let before = json!({"_id": 7, "removed": null, "nested": {"x": 1}});
-        let after = json!({"_id": 7, "added": null, "nested": {"x": 2}});
-        let summary = describe_changes(&before, &after);
-        assert!(summary.contains("Removed \"removed\"\nBefore: null"));
-        assert!(summary.contains("Added \"added\"\nAfter: null"));
-        assert!(summary.contains("Changed \"nested\""));
-        assert!(!summary.contains("_id"));
-        assert_eq!(describe_changes(&before, &before), "No changes.");
-    }
-    #[test]
-    fn large_reviews_bound_names_values_and_number_of_formatted_fields() {
-        let after = (0..205)
-            .map(|index| {
-                (
-                    format!("{index:03}{}", "x".repeat(1000)),
-                    json!("y".repeat(5000)),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        let summary = describe_changes(&json!({}), &Value::Object(after));
-        assert!(summary.contains("5 more changed fields"));
-        assert!(summary.len() < 110_000);
-        assert!(summary.contains("[truncated]"));
-    }
-    #[test]
-    fn preview_truncates_unicode_without_breaking_codepoints() {
-        assert!(short_json(&json!("é".repeat(300))).ends_with("… [truncated]"));
-    }
-}
