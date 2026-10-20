@@ -415,19 +415,29 @@ impl DbxApp {
 
     pub(super) fn render_agent_settings(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let selected = self.agent_setup.preferences.default_cli;
-        let choices = AgentCli::ALL.into_iter().map(|cli| {
-            segment(cli.label(), cli == selected)
-                .id(SharedString::from(format!("agent-choice-{cli:?}")))
-                .pressable(cli.label())
-                .role(gpui::Role::RadioButton)
-                .aria_toggled(if cli == selected {
-                    gpui::accesskit::Toggled::True
-                } else {
-                    gpui::accesskit::Toggled::False
-                })
-                .debug_selector(move || format!("agent-choice-{cli:?}"))
-                .on_click(cx.listener(move |this, _, _, cx| this.select_agent(cli, cx)))
-        });
+        let app = cx.entity().downgrade();
+        // A menu keeps the label readable at any width or interface scale,
+        // however many assistants are offered.
+        let provider_menu = button("agent-provider", selected.label(), ButtonKind::Quiet)
+            .dropdown_caret(true)
+            .w(crate::theme::ui_px(200.))
+            .accessible_name(format!("Provider: {}", selected.label()))
+            .tooltip("Choose provider")
+            .debug_selector(|| "agent-provider".into())
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for choice in AgentCli::ALL {
+                    let app = app.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == selected)
+                            .on_click(move |_, _, cx| {
+                                let _ = app.update(cx, |this, cx| this.select_agent(choice, cx));
+                            }),
+                    );
+                }
+                menu
+            });
         let (status_title, detail, color) = match &self.agent_setup.status {
             None => ("Not checked", None, theme().text_muted),
             Some(CliStatus::Checking) => ("Checking…", None, theme().text_muted),
@@ -551,7 +561,7 @@ impl DbxApp {
                         self.scrolling_settings_group(
                             "settings-agent-basic",
                             [
-                                settings_row("Provider", None, segmented_track().flex_wrap().children(choices))
+                                settings_row("Provider", None, provider_menu)
                                     .into_any_element(),
                                 settings_row(
                                     div()

@@ -867,6 +867,10 @@ pub(super) struct DataTab {
     pub(super) inspector_expanded: bool,
     pub(super) inspector_focus: FocusHandle,
     pub(super) inspector_scroll: ScrollHandle,
+    /// The (row, field) whose Copy button briefly reads "Copied", and the
+    /// generation that lets a later click or reload supersede its reset timer.
+    pub(super) inspector_copied: Option<(usize, usize)>,
+    pub(super) inspector_copy_generation: u64,
     pub(super) draft_mode: DraftMode,
     pub(super) row_draft: Option<RowDraftModel>,
     pub(super) row_draft_subscriptions: Vec<Subscription>,
@@ -938,6 +942,8 @@ impl DataTab {
             inspector_expanded: false,
             inspector_focus: cx.focus_handle(),
             inspector_scroll: ScrollHandle::new(),
+            inspector_copied: None,
+            inspector_copy_generation: 0,
             draft_mode: DraftMode::Update,
             row_draft: None,
             row_draft_subscriptions: Vec::new(),
@@ -1005,6 +1011,7 @@ impl DataTab {
         self.result_table = None;
         self.edit_history = Default::default();
         self.selected_row = None;
+        self.inspector_copied = None;
         self.marked_rows.clear();
         self.mark_anchor = None;
         self.draft_insert = None;

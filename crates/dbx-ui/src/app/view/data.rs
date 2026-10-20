@@ -816,6 +816,42 @@ impl DbxApp {
             .into_any_element()
     }
 
+    /// Copy one inspector value and show "Copied" on its button until the
+    /// timer lapses. Copying again, or copying another field, restarts the
+    /// timer, so an older timer can never clear newer feedback.
+    fn copy_inspector_value(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        row: usize,
+        field: usize,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
+            return;
+        };
+        data.inspector_copied = Some((row, field));
+        data.inspector_copy_generation = data.inspector_copy_generation.wrapping_add(1);
+        let generation = data.inspector_copy_generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(data) = this.data_tab_mut(session_id, tab_id)
+                    && data.inspector_copy_generation == generation
+                {
+                    data.inspector_copied = None;
+                    cx.notify();
+                }
+            })
+        })
+        .detach();
+    }
+
     fn render_inspector(
         &mut self,
         session_id: SessionId,
@@ -906,6 +942,11 @@ impl DbxApp {
         let binary_formats = (0..static_fields.len())
             .map(|column| data.data_grid.read(cx).delegate().binary_format(column))
             .collect::<Vec<_>>();
+        let selected_row = data.selected_row.unwrap_or_default();
+        let copied_field = data
+            .inspector_copied
+            .filter(|&(row, _)| Some(row) == data.selected_row)
+            .map(|(_, field)| field);
         let scroll = data.inspector_scroll.clone();
         let focus = data.inspector_focus.clone();
         let label = match draft_mode {
@@ -1232,22 +1273,46 @@ impl DbxApp {
                                                             .child(display_type(&data_type)),
                                                     )
                                                     .when_some(copy_text, |view, text| {
+                                                        let copied = copied_field == Some(index);
+                                                        let name = if copied {
+                                                            format!("Copied {name} value")
+                                                        } else {
+                                                            copy_name.clone()
+                                                        };
                                                         view.child(
                                                             Button::new(SharedString::from(
                                                                 format!("inspector-copy-{index}"),
                                                             ))
-                                                            .label("Copy")
-                                                            .accessible_name(copy_name.clone())
+                                                            .icon(if copied {
+                                                                gpui_component::Icon::new(
+                                                                    gpui_component::IconName::Check,
+                                                                )
+                                                                .text_color(theme().success_text)
+                                                            } else {
+                                                                gpui_component::Icon::new(
+                                                                    gpui_component::IconName::Copy,
+                                                                )
+                                                            })
+                                                            .when(copied, |button| {
+                                                                button.label("Copied")
+                                                            })
+                                                            .accessible_name(name.clone())
+                                                            .tooltip(name)
                                                             .with_size(Size::XSmall)
                                                             .compact()
                                                             .ghost()
-                                                            .on_click(move |_, _, cx| {
-                                                                cx.write_to_clipboard(
-                                                                    ClipboardItem::new_string(
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.copy_inspector_value(
+                                                                        session_id,
+                                                                        tab_id,
+                                                                        selected_row,
+                                                                        index,
                                                                         text.clone(),
-                                                                    ),
-                                                                );
-                                                            }),
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            )),
                                                         )
                                                     }),
                                             ),

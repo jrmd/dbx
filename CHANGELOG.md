@@ -4,6 +4,7 @@
 
 - Match context-menu spacing across the workbench, remove the extra row-number column, and let Backspace stage selected-row deletions alongside Delete.
 - Allow selecting and copying part of a row-inspector value; align its row-action buttons and the filter controls, with a compact Add condition button.
+- Choose the query-assistant provider from a menu so its label stays readable at any width or interface size; row-inspector Copy buttons now use a copy icon and briefly confirm with a check and “Copied”.
 - Simplify empty structure sections and show table definitions as formatted, syntax-highlighted SQL.
 
 ## 0.14.0 - 2026-10-20
