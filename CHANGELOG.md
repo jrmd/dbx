@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.0 - 2026-10-20
+
 - Select multiple sidebar tables with Control/Command-click and open, copy names, export, truncate or delete the selection. Truncate confirmations offer optional cascading for PostgreSQL and CockroachDB.
 - Simplify New connection: a quieter picker with a More menu, cloud presets alongside the databases and community drivers folded away; PostgreSQL/MySQL authentication is one selector beside the credentials, and Network settings stay collapsed until configured.
 - Choose a connection folder from a menu of existing folders, or create one inline with New folder…; names are checked before they are applied and match existing folders regardless of case.
