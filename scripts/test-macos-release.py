@@ -17,11 +17,13 @@ if name=='uname': print('Darwin' if args==['-s'] else os.environ.get('FIXTURE_AR
 elif name=='openssl': print('fixture-keychain-password')
 elif name=='security':
  if args[0]=='create-keychain': pathlib.Path(args[-1]).touch()
- if args[0]=='find-identity': print('1) ABCDEF "Developer ID Application: Fixture ('+os.environ.get('IDENTITY_TEAM','TESTTEAM01')+')"')
+ if args[0]=='find-identity': print('1) '+('A'*40)+' "Developer ID Application: Fixture ('+os.environ.get('IDENTITY_TEAM','TESTTEAM01')+')"')
+ if args==['list-keychains','-d','user']: print('    "/fixture/login.keychain-db"\\n    "/fixture/other keychain.keychain-db"')
 elif name=='codesign' and '-dv' in args:
  print('TeamIdentifier=TESTTEAM01',file=sys.stderr)
  print('Authority=Developer ID Application: Fixture (TESTTEAM01)',file=sys.stderr)
 elif name=='xcrun':
+ if args[:2]==['notarytool','history'] and os.environ.get('NOTARY_MISSING'): sys.exit(1)
  if args[:2]==['notarytool','submit']: print(json.dumps({'status':os.environ.get('NOTARY_STATUS','Accepted')}))
 elif name=='ditto': pathlib.Path(args[-1]).write_text('fixture archive')
 elif name=='shasum': print('fixture-checksum  '+args[-1])
@@ -72,6 +74,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertLess(calls.index("stapler validate"), calls.rindex("ditto"))
         self.assertLess(calls.index("spctl --assess"), calls.rindex("ditto"))
         self.assertIn("security delete-keychain", calls)
+        self.assertIn("security list-keychains -d user -s /fixture/login.keychain-db /fixture/other keychain.keychain-db", calls)
         self.assertFalse(list(self.root.glob("dbx-release.*")))
 
     def test_release_build_ignores_inherited_local_profile(self):
@@ -106,6 +109,52 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([p.name for p in self.archives()], ["DBX-0.1.0-macos-arm64-unsigned.zip"])
         self.assertNotIn("notarytool", (self.root / "calls.log").read_text())
+
+    def local_environment(self):
+        for name in list(self.environment):
+            if name.startswith("APPLE_"):
+                del self.environment[name]
+        self.environment["DBX_KEYCHAIN"] = str(self.root / "personal.keychain-db")
+        self.environment["DBX_NOTARY_PROFILE"] = "local-profile"
+
+    def test_local_signing_uses_existing_keychain_without_import_or_mutation(self):
+        self.local_environment()
+        result = self.release("local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([p.name for p in self.archives()], ["DBX-0.1.0-macos-arm64.zip"])
+        calls = (self.root / "calls.log").read_text()
+        for forbidden in ("create-keychain", "delete-keychain", "security import", "list-keychains", "store-credentials"):
+            self.assertNotIn(forbidden, calls)
+        self.assertIn("--keychain-profile local-profile --keychain " + self.environment["DBX_KEYCHAIN"], calls)
+        self.assertLess(calls.index("notarytool history"), calls.index("\nbuild\n"))
+
+    def test_check_local_does_not_build(self):
+        self.local_environment()
+        result = self.release("check-local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("\nbuild\n", (self.root / "calls.log").read_text())
+        self.assertEqual(self.archives(), [])
+
+    def test_missing_local_credentials_fail_before_compilation(self):
+        self.local_environment()
+        self.environment["NOTARY_MISSING"] = "1"
+        self.assertNotEqual(self.release("local").returncode, 0)
+        self.assertNotIn("\nbuild\n", (self.root / "calls.log").read_text())
+
+    def test_local_wrong_team_and_identity_are_rejected(self):
+        self.local_environment()
+        for name, value in (("APPLE_TEAM_ID", "WRONGTEAM1"), ("DBX_SIGNING_NAME", "-")):
+            with self.subTest(name=name):
+                self.environment[name] = value
+                self.assertNotEqual(self.release("local").returncode, 0)
+                self.assertNotIn("\nbuild\n", (self.root / "calls.log").read_text())
+                del self.environment[name]
+
+    def test_local_rejected_notarization_cannot_package(self):
+        self.local_environment()
+        self.environment["NOTARY_STATUS"] = "Invalid"
+        self.assertNotEqual(self.release("local").returncode, 0)
+        self.assertEqual(self.archives(), [])
 
 
 if __name__ == "__main__":

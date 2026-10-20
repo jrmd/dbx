@@ -129,12 +129,14 @@ certificate verification. Native PostgreSQL tools use libpq host/hostaddr separa
 Certificates and trusted SSH host keys are still required. See the
 [task guide](docs/user-guide.md) and [capability matrix](docs/capability-matrix.md).
 
-The [release workflow](.github/workflows/release.yml) runs on `vVERSION` tags
-matching the workspace version. It builds Linux x86_64 on Ubuntu 22.04 and signed,
-notarized macOS Apple Silicon bundles; Intel Macs are not supported. All tests and platform builds
-must succeed; assets are uploaded to a draft before the complete release is
-published. The existing Mac candidate workflow remains available for testing.
-See [release setup](docs/macos-release.md) for the required Apple secrets.
+Maintainer releases are built locally on an Apple Silicon Mac: `make release`
+builds signed, notarized macOS bundles plus Linux x86_64 packages in an Ubuntu
+22.04 Docker container, with persistent build caches. `make release-publish`
+uploads and verifies all assets before publishing the complete release. Intel
+Macs are not supported. Fast CI and database checks remain automatic; hosted
+release workflows are manual fallbacks and tag pushes do not launch builds.
+Run `make release-doctor` to check setup and see the
+[release guide](docs/macos-release.md) for signing credentials and commands.
 
 ### macOS
 
@@ -182,7 +184,7 @@ cargo build --locked --release --package dbx-ui
 
 ## Your own Mac signing key
 
-**You do not need the maintainer's signing key to build and run DBX on your Mac.** For maintainer-signed release candidates, see the [macOS release workflow](docs/macos-release.md). The tag-triggered release workflow publishes notarized bundles only after all platform builds and validation succeed.
+**You do not need the maintainer's signing key to build and run DBX on your Mac.** For maintainer-signed releases, see the [local release guide](docs/macos-release.md). Release publication requires both platform builds and validation to succeed.
 
 `make build`, `make run` and `make install` use [the Mac build helper](scripts/build-macos-app.sh), which signs the bundle with identifier `dev.jrmd.dbx` using a real certificate already installed in your login keychain. It prefers a **Developer ID Application** certificate and otherwise uses an **Apple Development** certificate (a free Apple Account works: add one in Xcode under **Settings → Accounts → Manage Certificates**). The identity is chosen by SHA-1 fingerprint and checked before the long Cargo build starts. macOS may ask you to unlock the keychain or allow `codesign` to use the key.
 
@@ -224,7 +226,7 @@ The local build helper does **not notarize** the app. Passing `codesign --verify
 
 For distribution under your own identity, obtain a **Developer ID Application** certificate through your Apple Developer Program account, install it together with its private key, sign the app with the hardened runtime and a secure timestamp, then submit it for notarization and staple the accepted ticket. See [Apple's Developer ID certificate instructions](https://developer.apple.com/help/account/certificates/create-developer-id-certificates) and [notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-Use `DBX_SIGNING_MODE=developer-id` (optionally with `DBX_SIGNING_NAME`) for distribution builds: this requires an existing Developer ID Application identity, rejects Apple Development, ad-hoc and self-signed identities, never creates a replacement, and adds secure timestamps. The [release workflow](docs/macos-release.md) builds on GitHub's Mac runners, notarizes and staples the bundle, verifies Gatekeeper acceptance, and uploads a candidate ZIP and checksum. Do not share or commit your private key or certificate export.
+Use `DBX_SIGNING_MODE=developer-id` (optionally with `DBX_SIGNING_NAME`) for distribution builds: this requires an existing Developer ID Application identity, rejects Apple Development, ad-hoc and self-signed identities, never creates a replacement, and adds secure timestamps. The [local release command](docs/macos-release.md) also notarizes and staples the bundle, verifies Gatekeeper acceptance, and produces the release ZIP and checksum. Do not share or commit your private key or certificate export.
 
 ## First connection
 

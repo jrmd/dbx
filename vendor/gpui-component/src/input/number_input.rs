@@ -156,6 +156,9 @@ impl RenderOnce for NumberInput {
             })
             .input(
                 Input::new(&self.state)
+                    // The spinbutton owns the shared focus handle. Registering
+                    // it again on the text field panics during accessible paint.
+                    .track_focus(false)
                     .appearance(false)
                     .with_size(button_size)
                     .h_full()

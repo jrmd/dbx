@@ -37,11 +37,16 @@ pub struct Settings {
     pub font_family: Option<String>,
     #[serde(default)]
     pub mono_font_family: Option<String>,
+    #[serde(default)]
+    pub row_font_family: Option<String>,
     #[serde(default = "font_size_default")]
     pub font_size: u16,
     /// Older settings used font_size for both families.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mono_font_size: Option<u16>,
+    /// Older settings sized ordinary row values with the interface font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_font_size: Option<u16>,
     #[serde(default = "remember_device_default")]
     pub drag_row_selection: bool,
     /// Keep the vault key in the system keychain so launches skip the
@@ -93,8 +98,10 @@ impl Settings {
             editor_scale: 100,
             font_family: None,
             mono_font_family: None,
+            row_font_family: None,
             font_size: 12,
             mono_font_size: None,
+            row_font_size: None,
             drag_row_selection: true,
             remember_device: true,
             touch_id_enabled: false,
@@ -269,13 +276,17 @@ mod tests {
         assert_eq!(settings.font_size, 12);
         assert!(settings.font_family.is_none());
         assert!(settings.mono_font_family.is_none());
+        assert!(settings.row_font_family.is_none());
+        assert!(settings.row_font_size.is_none());
         assert!(settings.drag_row_selection);
         assert!(settings.remember_device);
         assert!(!settings.touch_id_enabled);
         settings.font_family = Some("Helvetica".into());
         settings.mono_font_family = Some("Menlo".into());
+        settings.row_font_family = Some("Courier New".into());
         settings.font_size = 16;
         settings.mono_font_size = Some(14);
+        settings.row_font_size = Some(18);
         settings.drag_row_selection = false;
         settings.remember_device = false;
         settings.touch_id_enabled = true;

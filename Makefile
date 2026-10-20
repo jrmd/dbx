@@ -1,4 +1,5 @@
 SHELL := /bin/bash
+.DEFAULT_GOAL := build
 
 MACOS_APP_SCRIPT := scripts/build-macos-app.sh
 LINUX_APP_SCRIPT := scripts/build-linux-app.sh
@@ -17,6 +18,18 @@ export DBX_CARGO_PROFILE
 linux-build linux-package linux-appimage: DBX_CARGO_PROFILE := $(DBX_PACKAGE_PROFILE)
 
 .PHONY: build run install macos-build macos-run linux-build linux-run linux-package linux-appimage cargo-build cargo-run
+.PHONY: release-doctor release release-publish
+
+# Build both shipping platforms locally, then publish the verified artifacts.
+# TAG defaults to v<workspace version>. Publishing is a separate explicit step.
+release-doctor:
+	bash scripts/release-local.sh doctor
+
+release:
+	bash scripts/release-local.sh build $(if $(TAG),--tag "$(TAG)")
+
+release-publish:
+	bash scripts/release-local.sh publish $(if $(TAG),--tag "$(TAG)")
 
 # Local Mac workflow. The helper packages the Rust binary as DBX.app, signs it
 # with an installed Developer ID Application or Apple Development certificate

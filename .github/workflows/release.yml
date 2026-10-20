@@ -1,8 +1,7 @@
-name: Release
+name: Release (manual hosted fallback)
 
 on:
-  push:
-    tags: ['v*']
+  # Normal releases are built on the maintainer's Mac with `make release`.
   workflow_dispatch:
 
 permissions:

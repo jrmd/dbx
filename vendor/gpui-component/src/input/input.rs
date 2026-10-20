@@ -120,6 +120,7 @@ pub struct Input {
     readonly: bool,
     bordered: bool,
     focus_bordered: bool,
+    track_focus: bool,
     tab_index: isize,
     selected: bool,
     content_type: Option<InputContentType>,
@@ -191,6 +192,7 @@ impl Input {
             readonly: false,
             bordered: true,
             focus_bordered: true,
+            track_focus: true,
             tab_index: 0,
             selected: false,
             content_type: None,
@@ -209,6 +211,12 @@ impl Input {
 
     pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
         self.aria_label = Some(label.into());
+        self
+    }
+
+    /// Composite inputs already register this handle on their outer frame.
+    pub(super) fn track_focus(mut self, track: bool) -> Self {
+        self.track_focus = track;
         self
     }
 
@@ -540,7 +548,7 @@ impl RenderOnce for Input {
         BaseInput::new(("input", state.entity_id()))
             .focused(focused)
             .disabled(disabled)
-            .track_focus(&frame_focus_handle)
+            .when(self.track_focus, |this| this.track_focus(&frame_focus_handle))
             .styles(|styles| {
                 styles.focused(|style| {
                     style.when(

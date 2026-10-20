@@ -929,10 +929,12 @@ pub struct DbxApp {
     editor_scale: u16,
     font_family: Option<String>,
     mono_font_family: Option<String>,
+    row_font_family: Option<String>,
     font_size: u16,
     mono_font_size: u16,
-    font_size_inputs: Option<[Entity<gpui_component::input::InputState>; 2]>,
-    font_pickers: Option<[Entity<SelectState<SearchableVec<SharedString>>>; 2]>,
+    row_font_size: u16,
+    font_size_inputs: Option<[Entity<gpui_component::input::InputState>; 3]>,
+    font_pickers: Option<[Entity<SelectState<SearchableVec<SharedString>>>; 3]>,
     font_names_loading: bool,
     drag_row_selection: bool,
     row_drag: Option<(SessionId, SecondaryTabId, usize)>,
@@ -1128,12 +1130,18 @@ impl DbxApp {
             mono_font_family: saved_settings
                 .as_ref()
                 .and_then(|s| s.mono_font_family.clone()),
+            row_font_family: saved_settings
+                .as_ref()
+                .and_then(|s| s.row_font_family.clone()),
             font_size: saved_settings
                 .as_ref()
                 .map_or(12, |s| s.font_size.clamp(10, 20)),
             mono_font_size: saved_settings.as_ref().map_or(12, |s| {
                 s.mono_font_size.unwrap_or(s.font_size).clamp(10, 20)
             }),
+            row_font_size: saved_settings
+                .as_ref()
+                .map_or(12, |s| s.row_font_size.unwrap_or(s.font_size).clamp(10, 20)),
             font_size_inputs: None,
             font_pickers: None,
             font_names_loading: false,
@@ -1518,8 +1526,10 @@ impl DbxApp {
         settings.editor_scale = self.editor_scale;
         settings.font_family = self.font_family.clone();
         settings.mono_font_family = self.mono_font_family.clone();
+        settings.row_font_family = self.row_font_family.clone();
         settings.font_size = self.font_size;
         settings.mono_font_size = Some(self.mono_font_size);
+        settings.row_font_size = Some(self.row_font_size);
         settings.drag_row_selection = self.drag_row_selection;
         settings.explorer_width = self.explorer_width.map(|width| width.round() as u32);
         settings.inspector_width = self.inspector_width.map(|width| width.round() as u32);

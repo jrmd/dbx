@@ -61,3 +61,5 @@ jobs:
         run: python3 scripts/test-build-profiles.py
       - name: Test release notes
         run: python3 scripts/test-release-notes.py
+      - name: Test local release publication gates
+        run: python3 scripts/test-local-release.py

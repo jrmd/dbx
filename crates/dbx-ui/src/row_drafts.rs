@@ -445,9 +445,11 @@ impl FieldRow {
         let editor = cx.new(|editor_cx| {
             if value_kind == FieldValueKind::Json {
                 TextEditor::new_json(value.clone(), window, editor_cx)
+                    .row_value()
                     .accessibility_label(column.name.clone())
             } else {
                 TextEditor::new(value.clone(), false, window, editor_cx)
+                    .row_value()
                     .accessibility_label(column.name.clone())
             }
         });

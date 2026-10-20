@@ -317,6 +317,7 @@ pub struct TextEditor {
     /// clipboard, undo or assistive technology. The owner may still replace
     /// the value programmatically with [`Self::set_text`].
     read_only: bool,
+    row_value: bool,
     accessibility_label: SharedString,
     accessible_text: std::rc::Rc<std::cell::RefCell<accessibility::AccessibleText>>,
     /// UTF-8 byte ranges at grapheme boundaries.
@@ -416,6 +417,7 @@ impl TextEditor {
             language,
             password: false,
             read_only: false,
+            row_value: false,
             accessibility_label: match language {
                 EditorLanguage::Sql(_) => "SQL query",
                 EditorLanguage::Redis => "Redis command",
@@ -488,6 +490,12 @@ impl TextEditor {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Use the row-value font, including for JSON, and follow preference changes.
+    pub fn row_value(mut self) -> Self {
+        self.row_value = true;
+        self
     }
 
     /// A persistent field name, independent of its value or placeholder.
@@ -2379,11 +2387,15 @@ impl EntityInputHandler for TextEditor {
 
 impl Render for TextEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Code fields must not inherit the surrounding form's proportional
-        // font. Apply the same family to the text and SQL line-number gutter,
-        // including JSON and single-line SQL expressions without a gutter.
-        let code_font = (!self.password && self.language != EditorLanguage::PlainText)
-            .then(|| cx.theme().mono_font_family.clone());
+        // Row fields follow the row preference, including JSON. Other code
+        // fields use the editor font for both text and the line-number gutter,
+        // including single-line SQL expressions without a gutter.
+        let code_font = if self.row_value && !self.password {
+            Some(dbx_ui_components::theme::row_font_family())
+        } else {
+            (!self.password && self.language != EditorLanguage::PlainText)
+                .then(|| cx.theme().mono_font_family.clone())
+        };
         if self.is_code() {
             self.reconcile_folds(cx);
         }
@@ -3425,14 +3437,20 @@ fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Statefu
         })
 }
 
-/// The height of a standard single-line field, for sibling controls that
-/// must line up with it.
-pub fn single_line_input_height(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
-    let text = if editor.read(cx).is_code() {
+fn input_font_size(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
+    if editor.read(cx).row_value {
+        dbx_ui_components::theme::row_text_px(12.)
+    } else if editor.read(cx).is_code() {
         dbx_ui_components::theme::mono_text_px(12.) * dbx_ui_components::theme::editor_scale()
     } else {
         dbx_ui_components::theme::text_px(12.)
-    };
+    }
+}
+
+/// The height of a standard single-line field, for sibling controls that
+/// must line up with it.
+pub fn single_line_input_height(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
+    let text = input_font_size(editor, cx);
     // Match GPUI's default line height and pixel rounding. Both lengths are
     // already in pixels, so the rem size is unused here.
     let line_height = gpui::phi().to_pixels(text.into(), text).round();
@@ -3478,11 +3496,7 @@ fn input_with_context(
         // Colour only: a width change would shift neighbouring controls.
         .focus(|style| style.border_color(theme().focus_ring))
         .rounded(dbx_ui_components::theme::ui_px(5.))
-        .text_size(if editor.read(cx).is_code() {
-            dbx_ui_components::theme::mono_text_px(12.) * dbx_ui_components::theme::editor_scale()
-        } else {
-            dbx_ui_components::theme::text_px(12.)
-        })
+        .text_size(input_font_size(&editor, cx))
         .when(!multiline, |this| this.line_height(gpui::phi()))
         .text_color(theme().text)
         .on_action({

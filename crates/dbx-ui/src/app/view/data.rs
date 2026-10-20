@@ -1082,7 +1082,7 @@ impl DbxApp {
                                 .map(|selector| {
                                     div()
                                         .w_full()
-                                        .h(crate::theme::control_height(32.))
+                                        .min_h(crate::theme::control_height(32.))
                                         .flex_none()
                                         .child(crate::accessibility::focus_reveal(
                                             SharedString::from(format!("row-value-{field_id}")),
@@ -1091,7 +1091,9 @@ impl DbxApp {
                                                 .with_size(Size::Medium)
                                                 .w_full()
                                                 .menu_max_h(crate::theme::ui_px(220.))
-                                                .text_size(crate::theme::text_px(11.))
+                                                .h(crate::theme::grid_row_height())
+                                                .text_size(crate::theme::row_text_px(11.))
+                                                .font_family(crate::theme::row_font_family())
                                                 .bg(theme().canvas)
                                                 .border_color(theme().border_strong)
                                                 .text_color(theme().text)
@@ -2363,7 +2365,7 @@ fn protected_sql_spans(
 /// A read-only field for an inspected value. It matches the row editor's
 /// field so part of a long value can be selected and copied; the field's
 /// Copy button still copies the complete value. `kind` is `None` for
-/// formatted bytes, which keep their monospace layout.
+/// formatted bytes.
 fn read_only_value(
     id: String,
     label: String,
@@ -2379,7 +2381,6 @@ fn read_only_value(
     } else {
         editor::EditorLanguage::PlainText
     };
-    let monospace = kind.is_none();
     let multiline = kind != Some(InspectorText::Plain) || text.contains(['\n', '\r']);
     // A single-line field would turn line breaks into spaces, so any break,
     // including a bare CR, keeps the value multiline and literal.
@@ -2392,6 +2393,7 @@ fn read_only_value(
             let value = cx.new(|_| String::new());
             editor::TextEditor::new_with_language(value, multiline, language, window, cx)
                 .read_only()
+                .row_value()
                 .accessibility_label(label)
         },
     );
@@ -2411,16 +2413,13 @@ fn read_only_value(
             .count()
             .max(1);
         // GPUI's default line height, plus the field's padding and border.
-        (crate::theme::text_px(12.) * 1.618 * lines as f32 + crate::theme::ui_px(22.))
+        (crate::theme::row_text_px(12.) * 1.618 * lines as f32 + crate::theme::ui_px(22.))
             .min(max_height)
     } else {
         crate::theme::ui_px(32.)
     };
     editor::input_with_height(field, focus, multiline, height, cx)
         .debug_selector(move || id.clone())
-        .when(monospace, |field| {
-            field.font_family(cx.theme().mono_font_family.clone())
-        })
         .into_any_element()
 }
 

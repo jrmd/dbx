@@ -270,9 +270,29 @@ thread_local! {
     static PRODUCTION_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PRODUCTION_PALETTE: std::cell::RefCell<Option<(Theme, bool, Theme)>> = const { std::cell::RefCell::new(None) };
     static MONO_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
+    static ROW_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static UI_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
     static EDITOR_SCALE: std::cell::Cell<u16> = const { std::cell::Cell::new(100) };
+    static DEFAULT_ROW_FONT_FAMILY: SharedString = gpui_component::Theme::default().mono_font_family;
+    static ROW_FONT_FAMILY: std::cell::RefCell<Option<SharedString>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Row values have their own font, independent of interface and editor fonts.
+pub fn set_row_font_family(family: Option<&str>) {
+    ROW_FONT_FAMILY.with_borrow_mut(|current| {
+        if current.as_deref() != family {
+            *current = family.map(|family| SharedString::from(family.to_owned()));
+        }
+    });
+}
+
+pub fn row_font_family() -> SharedString {
+    ROW_FONT_FAMILY.with_borrow(|family| {
+        family
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ROW_FONT_FAMILY.with(Clone::clone))
+    })
 }
 
 pub fn set_text_scales(ui: u16, editor: u16) {
@@ -280,9 +300,14 @@ pub fn set_text_scales(ui: u16, editor: u16) {
     EDITOR_SCALE.set(editor.clamp(100, 200));
 }
 
-pub fn set_font_sizes(normal: u16, mono: u16) {
+pub fn set_font_sizes(normal: u16, mono: u16, row: u16) {
     FONT_SIZE.set(normal.clamp(10, 20));
     MONO_FONT_SIZE.set(mono.clamp(10, 20));
+    ROW_FONT_SIZE.set(row.clamp(10, 20));
+}
+
+pub fn row_text_px(value: f32) -> gpui::Pixels {
+    ui_px(value * ROW_FONT_SIZE.get() as f32 / 12.)
 }
 
 pub fn mono_text_px(value: f32) -> gpui::Pixels {
@@ -304,7 +329,7 @@ pub fn font_scale() -> f32 {
 }
 
 pub fn grid_row_height() -> gpui::Pixels {
-    ui_px(30. + 18. * ((FONT_SIZE.get().max(MONO_FONT_SIZE.get()) as f32 / 12.).max(1.) - 1.))
+    ui_px(30. + 18. * ((FONT_SIZE.get().max(ROW_FONT_SIZE.get()) as f32 / 12.).max(1.) - 1.))
 }
 
 pub fn ui_scale() -> f32 {

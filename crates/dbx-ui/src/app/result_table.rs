@@ -17,7 +17,7 @@ use gpui::{
     prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Sizable as _,
+    Sizable as _,
     button::{Button, ButtonVariants as _},
     table::{Column as DataColumn, ColumnSort, TableDelegate, TableState},
 };
@@ -1021,8 +1021,8 @@ impl ResultTableDelegate {
             .unwrap_or_default();
 
         // This is an initial width, not a prison sentence. The user can resize it.
-        crate::theme::text_px(
-            ((header_chars.max(value_chars) as f32 * 7.0) + 20.0).clamp(80.0, 420.0),
+        crate::theme::text_px((header_chars as f32 * 7.0 + 20.0).clamp(80.0, 420.0)).max(
+            crate::theme::row_text_px((value_chars as f32 * 7.0 + 20.0).clamp(80.0, 420.0)),
         )
     }
 
@@ -1205,7 +1205,7 @@ impl ResultTableDelegate {
             .unwrap_or_default() as f32
             * 7.0
             + 20.0;
-        Some(crate::theme::text_px(header).max(crate::theme::mono_text_px(values)))
+        Some(crate::theme::text_px(header).max(crate::theme::row_text_px(values)))
     }
 
     fn foreign_key_for_cell(&self, row_ix: usize, col_ix: usize) -> Option<ForeignKeyInfo> {
@@ -2152,9 +2152,9 @@ impl TableDelegate for ResultTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let json = self.is_json_cell(row_ix, col_ix);
-        let semantic_cell = self.accessible_cell(row_ix, col_ix, cx).when(json, |cell| {
-            cell.font_family(cx.theme().mono_font_family.clone())
-        });
+        let semantic_cell = self
+            .accessible_cell(row_ix, col_ix, cx)
+            .font_family(crate::theme::row_font_family());
         if let Some((_, _, editor)) = self.editing.as_ref().filter(|(row, column, _)| {
             *row == row_ix && Some(*column) == self.result_column(col_ix)
         }) {
@@ -2176,11 +2176,7 @@ impl TableDelegate for ResultTableDelegate {
                     .h_auto()
                     .py(crate::theme::ui_px(0.))
                     .px(crate::theme::ui_px(7.))
-                    .text_size(if json {
-                        crate::theme::mono_text_px(11.)
-                    } else {
-                        crate::theme::text_px(11.)
-                    }),
+                    .text_size(crate::theme::row_text_px(11.)),
                 )
                 .into_any_element();
         }
@@ -2213,11 +2209,7 @@ impl TableDelegate for ResultTableDelegate {
                 .flex()
                 .items_center()
                 .px(crate::theme::ui_px(8.))
-                .text_size(if json {
-                    crate::theme::mono_text_px(11.)
-                } else {
-                    crate::theme::text_px(11.)
-                })
+                .text_size(crate::theme::row_text_px(11.))
                 .text_color(if muted {
                     theme().text_muted
                 } else {
@@ -2243,11 +2235,7 @@ impl TableDelegate for ResultTableDelegate {
                 .items_center()
                 .px(crate::theme::ui_px(8.))
                 .bg(theme().warning.alpha(0.16))
-                .text_size(if json {
-                    crate::theme::mono_text_px(11.)
-                } else {
-                    crate::theme::text_px(11.)
-                })
+                .text_size(crate::theme::row_text_px(11.))
                 .text_color(if muted {
                     theme().text_muted
                 } else {
@@ -2322,11 +2310,7 @@ impl TableDelegate for ResultTableDelegate {
             .px(crate::theme::ui_px(8.))
             .whitespace_nowrap()
             .truncate()
-            .text_size(if json {
-                crate::theme::mono_text_px(11.)
-            } else {
-                crate::theme::text_px(11.)
-            })
+            .text_size(crate::theme::row_text_px(11.))
             .text_color(if deleted {
                 theme().text_muted
             } else {

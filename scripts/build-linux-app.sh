@@ -111,10 +111,20 @@ APPRUN
 	chmod +x "$APPDIR/AppRun"
 
 	fetch_appimagetool
+	local packaging_tool="$APPIMAGETOOL"
+	# Rosetta can execute the extracted tool but rejects the AppImage runtime's
+	# nonstandard ELF header. Extract its SquashFS without executing that runtime.
+	if [[ ${DBX_EXTRACT_APPIMAGETOOL:-0} == 1 ]]; then
+		require_command unsquashfs
+		appimagetool_extract_dir=$(mktemp -d "$(dirname -- "$APPIMAGETOOL")/extracted.XXXXXX")
+		trap 'rm -rf -- "$appimagetool_extract_dir"' EXIT
+		python3 "$ROOT_DIR/scripts/extract-appimage.py" "$APPIMAGETOOL" "$appimagetool_extract_dir"
+		packaging_tool="$appimagetool_extract_dir/AppRun"
+	fi
 	log "building AppImage"
 	rm -f "$APPIMAGE_PATH"
 	# Extract-and-run avoids needing FUSE on CI runners.
-	APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$APPIMAGETOOL" --no-appstream "$APPDIR" "$APPIMAGE_PATH"
+	APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$packaging_tool" --no-appstream "$APPDIR" "$APPIMAGE_PATH"
 	(cd "$(dirname -- "$APPIMAGE_PATH")" && sha256sum "$(basename -- "$APPIMAGE_PATH")" > "$(basename -- "$APPIMAGE_PATH").sha256")
 	log "AppImage: $APPIMAGE_PATH"
 }

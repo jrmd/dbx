@@ -1,8 +1,7 @@
 name: Full release check
 
 on:
-  schedule:
-    - cron: '43 2 * * *'
+  # Full validation runs locally for each release. Hosted runs are opt-in.
   workflow_dispatch:
 
 permissions:

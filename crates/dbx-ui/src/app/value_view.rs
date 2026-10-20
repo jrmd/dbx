@@ -108,8 +108,16 @@ pub(super) fn monospace_block(text: String, json: bool, cx: &App) -> impl IntoEl
         .bg(theme().panel_raised)
         .border_1()
         .border_color(theme().border)
-        .font_family(cx.theme().mono_font_family.clone())
-        .text_size(crate::theme::mono_text_px(11.))
+        .font_family(if json {
+            crate::theme::row_font_family()
+        } else {
+            cx.theme().mono_font_family.clone()
+        })
+        .text_size(if json {
+            crate::theme::row_text_px(11.)
+        } else {
+            crate::theme::mono_text_px(11.)
+        })
         .text_color(theme().text)
         .whitespace_nowrap()
         .child(
@@ -129,7 +137,8 @@ pub(super) fn monospace_block(text: String, json: bool, cx: &App) -> impl IntoEl
 pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
     let Some(value) = value else {
         return div()
-            .text_size(crate::theme::text_px(12.))
+            .font_family(crate::theme::row_font_family())
+            .text_size(crate::theme::row_text_px(12.))
             .text_color(theme().text_muted)
             .child("—")
             .into_any_element();
@@ -139,7 +148,8 @@ pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
     }
     match value {
         CellValue::Null => div()
-            .text_size(crate::theme::text_px(12.))
+            .font_family(crate::theme::row_font_family())
+            .text_size(crate::theme::row_text_px(12.))
             .italic()
             .text_color(theme().text_muted)
             .child("NULL")
@@ -175,7 +185,8 @@ pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
                 .into_any_element()
         }
         value => div()
-            .text_size(crate::theme::text_px(12.))
+            .font_family(crate::theme::row_font_family())
+            .text_size(crate::theme::row_text_px(12.))
             .text_color(theme().text)
             .whitespace_normal()
             .child(truncate_preview(value.to_string()))

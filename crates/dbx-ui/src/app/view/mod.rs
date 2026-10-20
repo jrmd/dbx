@@ -24,7 +24,8 @@ impl Render for DbxApp {
             crate::theme::sync_component_theme(Some(window), cx);
         }
         crate::theme::set_text_scales(self.ui_scale, self.editor_scale);
-        crate::theme::set_font_sizes(self.font_size, self.mono_font_size);
+        crate::theme::set_font_sizes(self.font_size, self.mono_font_size, self.row_font_size);
+        crate::theme::set_row_font_family(self.row_font_family.as_deref());
         {
             let theme = gpui_component::Theme::global_mut(cx);
             if let Some(family) = &self.font_family {

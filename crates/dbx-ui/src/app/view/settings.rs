@@ -1,7 +1,7 @@
 use super::super::*;
 use crate::theme::{SPACE_1, SPACE_2, SPACE_4};
 use gpui_component::ActiveTheme as _;
-use gpui_component::input::{InputEvent, InputState, NumberInput, NumberInputEvent, StepAction};
+use gpui_component::input::{InputEvent, InputState, NumberInput};
 
 const TAG_PALETTE: [u32; 8] = [
     0xef6b73, 0xe5b567, 0x8fcf9c, 0x82aaff, 0xb48ead, 0x56b6c2, 0xe89bb5, 0xaab2bf,
@@ -258,18 +258,23 @@ impl DbxApp {
         }
         // Paint the controls immediately. Enumerating installed fonts can be slow
         // on real desktops and must not block the first Appearance interaction.
-        let pickers = [false, true].map(|mono| {
-            let current = if mono {
-                self.mono_font_family
+        let pickers = [0, 1, 2].map(|index| {
+            let current = match index {
+                0 => self
+                    .font_family
                     .clone()
-                    .unwrap_or_else(|| cx.theme().mono_font_family.to_string())
-            } else {
-                self.font_family
+                    .unwrap_or_else(|| cx.theme().font_family.to_string()),
+                1 => self
+                    .mono_font_family
                     .clone()
-                    .unwrap_or_else(|| cx.theme().font_family.to_string())
+                    .unwrap_or_else(|| cx.theme().mono_font_family.to_string()),
+                _ => self
+                    .row_font_family
+                    .clone()
+                    .unwrap_or_else(|| crate::theme::row_font_family().to_string()),
             };
             let options = vec![current.clone()];
-            let index = options.iter().position(|name| name == &current);
+            let selected_index = options.iter().position(|name| name == &current);
             let picker = cx.new(|cx| {
                 SelectState::new(
                     SearchableVec::new(
@@ -278,7 +283,7 @@ impl DbxApp {
                             .map(SharedString::from)
                             .collect::<Vec<_>>(),
                     ),
-                    index.map(gpui_component::IndexPath::new),
+                    selected_index.map(gpui_component::IndexPath::new),
                     window,
                     cx,
                 )
@@ -288,10 +293,10 @@ impl DbxApp {
                 &picker,
                 move |this, _, event: &SelectEvent<SearchableVec<SharedString>>, cx| {
                     if let SelectEvent::Confirm(Some(value)) = event {
-                        if mono {
-                            this.mono_font_family = Some(value.to_string());
-                        } else {
-                            this.font_family = Some(value.to_string());
+                        match index {
+                            0 => this.font_family = Some(value.to_string()),
+                            1 => this.mono_font_family = Some(value.to_string()),
+                            _ => this.row_font_family = Some(value.to_string()),
                         }
                         this.persist_settings(cx);
                         cx.refresh_windows();
@@ -339,15 +344,13 @@ impl DbxApp {
             Ok::<(), anyhow::Error>(())
         })
         .detach();
-        self.font_size_inputs = Some([false, true].map(|mono| {
-            let size = if mono {
-                self.mono_font_size
-            } else {
-                self.font_size
-            };
+        self.font_size_inputs = Some([0, 1, 2].map(|index| {
+            let size = self.font_size_preference(index);
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .default_value(size.to_string())
+                    .min(10.)
+                    .max(20.)
                     .validate(|value, _| {
                         value.is_empty()
                             || (value.len() <= 3 && value.bytes().all(|c| c.is_ascii_digit()))
@@ -357,21 +360,17 @@ impl DbxApp {
                 &input,
                 window,
                 move |this, input, event: &InputEvent, window, cx| {
-                    let current = if mono {
-                        this.mono_font_size
-                    } else {
-                        this.font_size
-                    };
+                    let current = this.font_size_preference(index);
                     let value = input.read(cx).value().parse::<u16>().ok();
                     match event {
                         InputEvent::Change => {
                             if let Some(size @ 10..=20) = value {
-                                this.set_font_size_preference(size, mono, cx);
+                                this.set_font_size_preference(size, index, cx);
                             }
                         }
                         InputEvent::Blur | InputEvent::PressEnter { .. } => {
                             let size = value.unwrap_or(current).clamp(10, 20);
-                            this.set_font_size_preference(size, mono, cx);
+                            this.set_font_size_preference(size, index, cx);
                             if input.read(cx).value() != size.to_string() {
                                 input.update(cx, |input, cx| {
                                     input.set_value(size.to_string(), window, cx)
@@ -383,45 +382,30 @@ impl DbxApp {
                 },
             )
             .detach();
-            cx.subscribe_in(
-                &input,
-                window,
-                move |this, input, event: &NumberInputEvent, window, cx| {
-                    let NumberInputEvent::Step(action) = event;
-                    let current = if mono {
-                        this.mono_font_size
-                    } else {
-                        this.font_size
-                    };
-                    let size = if *action == StepAction::Increment {
-                        current.saturating_add(1)
-                    } else {
-                        current.saturating_sub(1)
-                    }
-                    .clamp(10, 20);
-                    this.set_font_size_preference(size, mono, cx);
-                    input.update(cx, |input, cx| {
-                        input.set_value(size.to_string(), window, cx)
-                    });
-                },
-            )
-            .detach();
             input
         }));
     }
 
-    fn set_font_size_preference(&mut self, size: u16, mono: bool, cx: &mut Context<Self>) {
-        let old_grid_size = self.font_size.max(self.mono_font_size);
-        let preference = if mono {
-            &mut self.mono_font_size
-        } else {
-            &mut self.font_size
+    fn font_size_preference(&self, index: usize) -> u16 {
+        match index {
+            0 => self.font_size,
+            1 => self.mono_font_size,
+            _ => self.row_font_size,
+        }
+    }
+
+    fn set_font_size_preference(&mut self, size: u16, index: usize, cx: &mut Context<Self>) {
+        let old_grid_size = self.font_size.max(self.row_font_size);
+        let preference = match index {
+            0 => &mut self.font_size,
+            1 => &mut self.mono_font_size,
+            _ => &mut self.row_font_size,
         };
         if *preference == size {
             return;
         }
         *preference = size;
-        let ratio = self.font_size.max(self.mono_font_size) as f32 / old_grid_size as f32;
+        let ratio = self.font_size.max(self.row_font_size) as f32 / old_grid_size as f32;
         if ratio != 1. {
             for session in &mut self.sessions {
                 for tab in &mut session.secondary_tabs {
@@ -565,12 +549,20 @@ impl DbxApp {
             );
         }
         if let Some(pickers) = &self.font_pickers {
-            for (index, label) in ["Interface font", "Monospace font"].into_iter().enumerate() {
+            for (index, label) in ["Interface font", "Monospace font", "Row font"]
+                .into_iter()
+                .enumerate()
+            {
                 rows.push(
                     settings_row(
                         label,
-                        self.font_names_loading
-                            .then(|| "Loading installed fonts…".into()),
+                        if self.font_names_loading {
+                            Some("Loading installed fonts…".into())
+                        } else if index == 2 {
+                            Some("Values in tables and row details. Monospace by default.".into())
+                        } else {
+                            None
+                        },
                         div().w(crate::theme::ui_px(240.)).child(
                             Select::new(&pickers[index])
                                 .disabled(self.font_names_loading)
@@ -583,31 +575,33 @@ impl DbxApp {
                     )
                     .into_any_element(),
                 );
-                if let Some(inputs) = &self.font_size_inputs {
+                if let Some(input) = self
+                    .font_size_inputs
+                    .as_ref()
+                    .and_then(|inputs| inputs.get(index))
+                {
                     rows.push(
                         settings_row(
-                            if index == 0 {
-                                "Interface font size"
-                            } else {
-                                "Monospace font size"
+                            match index {
+                                0 => "Interface font size",
+                                1 => "Monospace font size",
+                                _ => "Row font size",
                             },
                             Some("10–20 px, independent of interface zoom.".into()),
                             div()
-                                .id(if index == 0 {
-                                    "interface-font-size"
-                                } else {
-                                    "mono-font-size"
+                                .id(match index {
+                                    0 => "interface-font-size",
+                                    1 => "mono-font-size",
+                                    _ => "row-font-size",
                                 })
-                                .debug_selector(move || {
-                                    if index == 0 {
-                                        "interface-font-size".into()
-                                    } else {
-                                        "mono-font-size".into()
-                                    }
+                                .debug_selector(move || match index {
+                                    0 => "interface-font-size".into(),
+                                    1 => "mono-font-size".into(),
+                                    _ => "row-font-size".into(),
                                 })
                                 .w(crate::theme::ui_px(144.))
                                 .child(
-                                    NumberInput::new(&inputs[index])
+                                    NumberInput::new(input)
                                         .h(crate::theme::control_height(32.))
                                         .suffix("px")
                                         .w_full(),

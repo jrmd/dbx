@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.17.0 - 2026-10-20
+
+- Choose a separate row font and font size for table values and row details in Appearance settings, with a monospace default.
+- Fix a crash when rendering numeric settings controls with accessibility enabled.
+- Build, sign and notarize releases locally on the maintainer’s Mac, including Linux packages through Docker; retain automatic fast CI and database checks.
+
 ## 0.16.1 - 2026-10-20
 
 - Switch binary values between hex, bits, UUID and MySQL swapped UUID directly in row details.

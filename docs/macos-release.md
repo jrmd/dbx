@@ -1,8 +1,109 @@
-# macOS release candidates
+# Local releases and macOS signing
 
-DBX can be built, signed, and notarized on GitHub's hosted Mac runners without a personal Mac. The manual candidate and tag-triggered release workflows target **Apple Silicon (arm64)** only; Intel Macs are not supported. The release workflow also builds Linux x86_64.
+Normal releases are built on the maintainer's **Apple Silicon Mac**. macOS is
+built natively; Linux x86_64 is built in an Ubuntu 22.04 Docker container on the
+same machine. Intel Macs are not supported. GitHub hosts the downloads, but
+normal release builds use no GitHub Actions minutes.
 
-## Signing setup
+## Set up this Mac once
+
+Install Xcode with Metal tools, Rust with `rustfmt` and `clippy`, CMake, Python
+3.11+, Docker Desktop, and an authenticated `gh`. Keep Docker running. The
+Enable **Use Rosetta for x86_64/amd64 emulation on Apple Silicon** in Docker
+Desktop's General settings (with the Apple Virtualization framework). The
+QEMU emulator can crash when starting Rust; the release preflight checks the
+Linux compiler before starting either platform's compilation. See
+[Docker's settings documentation](https://docs.docker.com/desktop/settings-and-maintenance/settings/).
+The release launcher finds a suitable Python on PATH or in mise, so Apple's default
+Python 3.9 does not need replacing. `DBX_PYTHON=/absolute/path/to/python3` selects
+an explicit interpreter.
+
+Import the existing **Developer ID Application** certificate and its matching
+private key into the login Keychain. Use the same Apple team as existing
+releases so installed apps accept updates. An Apple Development certificate is
+enough for development, but cannot produce distribution releases. Import the
+backed-up `.p12` using Keychain Access; the password is entered there.
+If the identity is on another Mac, export it with its private key as a
+password-protected `.p12` and import it here. Downloading the certificate from
+Apple again does not recover the private key. See
+[Apple's signing identity export guide](https://help.apple.com/xcode/mac/current/en.lproj/dev8a2822e0b.html).
+
+Save notarization credentials once using Apple's interactive secure prompt:
+
+```bash
+xcrun notarytool store-credentials dbx-release \
+  --keychain "$HOME/Library/Keychains/login.keychain-db"
+
+make release-doctor
+```
+
+The command prompts for the Apple Account, team and app-specific password and
+validates them before storing them. The release scripts use that Keychain
+profile; they do not need exported passwords or CI certificate secrets.
+`DBX_NOTARY_PROFILE`, `DBX_NOTARY_KEYCHAIN`, `DBX_KEYCHAIN`, and
+`DBX_SIGNING_NAME` can select another saved profile, Keychain, or signing
+identity. `APPLE_TEAM_ID` optionally restricts identity selection to a team.
+The doctor checks Docker, GitHub authentication, Metal, Rust components, the
+distribution identity, and notarization access before compilation.
+
+## Build and publish locally
+
+1. Update the workspace version, lockfile, and versioned changelog entry.
+2. Commit the release changes and create the matching local `vVERSION` tag.
+   The checkout must be clean and HEAD must match that tag.
+3. Run `make release`. `TAG=vVERSION` is optional; it defaults to the workspace
+   version.
+4. Inspect `target/releases/vVERSION/`, extract the Mac ZIP, and smoke-test the
+   signed app.
+5. Run `make release-publish`. This pushes the selected tag if needed, uploads
+   all six assets to a draft, downloads and verifies them, and publishes the
+   complete release as latest.
+
+```bash
+# After committing the version bump and creating its local tag:
+make release
+make release-publish
+```
+
+`make release` does not upload, push, or publish. It builds a frozen snapshot of
+the tagged commit, runs workspace tests and strict Clippy in the shipping
+profile on both platforms, and checks formatting and release helpers. It signs,
+notarizes, staples, and verifies the Mac bundle, including the signed updater
+installation test. All checks must pass before it writes a release manifest.
+The manifest binds the artifacts and release notes to the exact tag and commit.
+
+Both platforms build concurrently. Logs are
+`target/releases/vVERSION/macos-build.log` and `linux-build.log`. macOS reuses
+`target/release-macos-cache/release`, isolated from concurrent development
+builds; Linux keeps Cargo downloads and compilation artifacts in the
+Docker volumes `dbx-release-linux-registry`, `dbx-release-linux-git`, and
+`dbx-release-linux-target`. Do not prune these volumes if you want to retain the
+cache. The Linux image uses the Mac's exact stable Rust version and Ubuntu 22.04
+for glibc compatibility. Linux defaults to two compilation jobs to fit a modest
+Docker VM; increase `DBX_LINUX_BUILD_JOBS` only with enough VM memory.
+
+The first release populates both caches and may take a long time. Linux uses
+x86_64 emulation on Apple Silicon; the packager extracts appimagetool's SquashFS
+before invoking it because Rosetta rejects the AppImage runtime's ELF header.
+Persistent caches avoid rebuilding unchanged dependencies, but this is not a
+guarantee of faster cold builds. Apple's notarization service is still
+required; `DBX_NOTARY_TIMEOUT` defaults to `30m`.
+
+Publication refuses mismatched remote tags, changed or incomplete local
+artifacts, and already-published releases. If an upload fails, fix the problem
+and rerun `make release-publish`: it resumes the draft and rechecks every
+download before publication. It never overwrites a published release.
+
+Fast CI and live database checks remain automatic. Tag pushes no longer launch
+release builds, and the full release check no longer runs nightly. The hosted
+[release](../.github/workflows/release.yml),
+[full release check](../.github/workflows/release-check.yml), and
+[Mac candidate](../.github/workflows/macos-release.yml) workflows remain
+available by manual dispatch. These workflow trigger changes take effect on
+GitHub once the changes are committed and pushed; do not run the hosted fallback
+and local publisher for the same tag at the same time.
+
+## Hosted fallback signing setup
 
 Create an RSA 2048-bit private key and SHA-256 certificate signing request using OpenSSL on a trusted machine. Keep the key outside the repository in an owner-only directory. Submit the request through [Apple's certificate portal](https://developer.apple.com/account/resources/certificates/list) for a **Developer ID Application** certificate, selecting the G2 intermediate if prompted. The final certificate's name follows the enrolled Apple account, rather than the request's common name.
 
@@ -53,12 +154,13 @@ The private Keychain and temporary certificate are cleaned up at job exit. Rejec
 
 Artifacts are **release candidates**. The workflow does not create or publish a public GitHub Release. Before publication, download and extract the final archive on a Mac, confirm Gatekeeper launch, and smoke-test vault creation/device unlock, connection testing, table browsing, row editing, and queries. Automated Mac tests and signature checks do not establish that hands-on UI evidence.
 
-## Publish a release with updates
+## Hosted fallback publication and updater compatibility
 
-The [release workflow](../.github/workflows/release.yml) builds all platforms from
-one version tag. Set the workspace version in `Cargo.toml`, update `Cargo.lock`,
-commit the release changes, and push a matching `vVERSION` tag. A manual workflow
-rerun must also select that tag. All five Apple secrets above must be available.
+The manually dispatched [release workflow](../.github/workflows/release.yml)
+builds all platforms from one version tag. Set the workspace version in
+`Cargo.toml`, update `Cargo.lock`, commit the release changes, and push a matching
+`vVERSION` tag. Dispatch the workflow on that tag explicitly. All five Apple
+secrets above must be available.
 The workflow rejects mismatched tags and prerelease versions, runs tests and
 Clippy, builds Linux x86_64 plus Apple Silicon macOS, and requires successful
 notarization for the Mac bundle. It verifies archive checksums, uploads all
@@ -87,13 +189,13 @@ DBX saves encrypted query drafts, ordered workspace tabs and staged changesets. 
 
 macOS uses opaque surfaces and an opaque window backdrop. Light/dark/system
 appearance remains available, while the transparency toggle is hidden on Mac.
-Verify the final appearance and update/restart journey on both Mac architectures
+Verify the final appearance and update/restart journey on supported platforms
 before calling them device-verified.
 
-## Build reuse
+## Hosted fallback build reuse
 
 Both workflows run tests in the release profile, matching the packaging scripts.
-The tag-triggered release and separate build check also run strict Clippy.
+The hosted release and separate full release check also run strict Clippy.
 This avoids compiling the shared dependencies once in
 debug mode and again in release mode. GPUI's test-support feature still needs
 a separate test variant; the distributed binary keeps its production features.
@@ -101,8 +203,9 @@ a separate test variant; the distributed binary keeps its production features.
 The shared preparation action caches Cargo downloads and `target/release`
 dependency artifacts per operating system, architecture, compiler, and Cargo
 inputs. Packaged apps and notarization output are excluded. The
-[release build check](../.github/workflows/build-check.yml) runs on relevant
-`main` pushes and can be dispatched manually to warm the default-branch cache.
+[full release check](../.github/workflows/release-check.yml) can be dispatched
+manually on `main` to warm the default-branch release cache. Fast CI uses a
+separate `ci` profile and does not warm the shipping cache.
 GitHub allows new release tags to restore that cache; a cache saved only on an
 older tag is unavailable to a new tag. For fastest releases, let the build check
 finish on `main` before pushing the version tag. Cold caches or toolchain/native
@@ -112,10 +215,18 @@ the signed updater installation check always run for each release.
 ## Local verification
 
 ```bash
-bash -n scripts/build-macos-app.sh scripts/release-macos.sh
+bash -n scripts/build-macos-app.sh scripts/release-macos.sh scripts/release-local.sh scripts/release-linux-container.sh
 python3 scripts/test-macos-release.py
+python3 scripts/test-local-release.py
+python3 scripts/test-build-profiles.py
+python3 scripts/test-release-notes.py
 ```
 
-The Python suite exercises acceptance/rejection, wrong-team, cleanup, and unsigned-label gates with fixture Mac tools. It does not prove real Apple signing or notarization. `scripts/release-macos.sh` needs macOS and Python 3.11 or newer; run it with `signed` or `unsigned` on a Mac runner.
+Use Python 3.11+ for these checks. The Python suites exercise acceptance/rejection,
+wrong-team, cleanup, local Keychain use, checksum verification, draft recovery,
+and publication gates with fixtures. They do not prove real Apple signing or
+notarization. `scripts/release-macos.sh` supports `local` for an installed
+distribution identity and saved notary credentials, `check-local` for its
+preflight, and `signed`/`unsigned` for hosted candidates.
 
 Sources: [Developer ID certificates](https://developer.apple.com/help/account/certificates/create-developer-id-certificates/), [Apple's notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow), and [GitHub's signing-Keychain guidance](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications).

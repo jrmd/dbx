@@ -484,6 +484,7 @@ impl DbxApp {
                 window,
                 cx,
             )
+            .row_value()
             .accessibility_label(format!(
                 "{column_name}, row {}{}",
                 row + 1,
