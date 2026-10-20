@@ -29,6 +29,16 @@ url.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
+# Touch ID: a biometry-gated Keychain item (security-framework) and the
+# LocalAuthentication capability probe (objc2). Both are already in the
+# workspace's dependency graph through the GPUI stack and keyring.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSError", "NSString"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "LAError"] }
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+
 [features]
 # Exposes constructors that point stores at temporary directories, for
 # dependants' own test suites.

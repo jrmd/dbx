@@ -149,7 +149,7 @@ brew install cmake
 The command-line tools installer may report they are already installed. If GPUI reports that `metal` is missing, follow the [Metal toolchain troubleshooting steps](https://zed.dev/docs/development/macos#troubleshooting) before rebuilding.
 
 ```bash
-# Build DBX.app and sign it with your own local identity.
+# Build DBX.app and sign it with your installed Apple certificate.
 make build
 
 # Build, sign, and open it.
@@ -182,22 +182,11 @@ cargo build --locked --release --package dbx-ui
 
 ## Your own Mac signing key
 
-**You do not need the maintainer's signing key or a paid Apple Developer account to build and run DBX on your Mac.** For maintainer-signed release candidates, see the [macOS release workflow](docs/macos-release.md). The tag-triggered release workflow publishes notarized bundles only after all platform builds and validation succeed.
+**You do not need the maintainer's signing key to build and run DBX on your Mac.** For maintainer-signed release candidates, see the [macOS release workflow](docs/macos-release.md). The tag-triggered release workflow publishes notarized bundles only after all platform builds and validation succeed.
 
-On the first `make build` or `make run`, [the Mac build helper](scripts/build-macos-app.sh) creates a self-signed **DBX Local Development** code-signing certificate and its private key in your login keychain. Later builds reuse that identity to sign the bundle with identifier `dev.jrmd.dbx`. macOS may ask you to unlock the keychain or allow `codesign` to use the key.
+`make build`, `make run` and `make install` use [the Mac build helper](scripts/build-macos-app.sh), which signs the bundle with identifier `dev.jrmd.dbx` using a real certificate already installed in your login keychain. It prefers a **Developer ID Application** certificate and otherwise uses an **Apple Development** certificate (a free Apple Account works: add one in Xcode under **Settings → Accounts → Manage Certificates**). The identity is chosen by SHA-1 fingerprint and checked before the long Cargo build starts. macOS may ask you to unlock the keychain or allow `codesign` to use the key.
 
-Keep the same identity for subsequent builds. It helps preserve access to the Keychain item used by **Unlock automatically on this device**; replacing the certificate or using ad-hoc signatures may cause new access prompts. The signing key is separate from your vault passphrase and database credentials.
-
-### If automatic certificate creation fails
-
-Create the local identity once in **Keychain Access**:
-
-1. Choose **Keychain Access → Certificate Assistant → Create a Certificate**.
-2. Set **Name** to `DBX Local Development`.
-3. Set **Identity Type** to **Self Signed Root**.
-4. Set **Certificate Type** to **Code Signing**.
-5. Save it in the **login** keychain, including its private key.
-6. Run `make run` again.
+The helper never silently creates a certificate. If no suitable identity is installed, or several match, the build stops and tells you what to do. Keep using the same identity: it helps preserve access to the Keychain item used by **Unlock automatically on this device**, and switching certificates or using ad-hoc signatures may cause new access prompts. The signing key is separate from your vault passphrase and database credentials.
 
 Check the available identities and the finished bundle:
 
@@ -206,24 +195,36 @@ security find-identity -v -p codesigning "$HOME/Library/Keychains/login.keychain
 codesign --verify --deep --strict --verbose=2 target/macos/DBX.app
 ```
 
-To use another local certificate name or keychain, pass the same settings on every build/run/install:
+### Choosing an identity
+
+| Setting | Effect |
+| --- | --- |
+| `DBX_SIGNING_NAME="Apple Development: Name (TEAMID)"` | Use this installed identity. A SHA-1 fingerprint also works, which resolves several certificates with the same name. |
+| `DBX_KEYCHAIN=/path/to/keychain-db` | Search and sign with this keychain instead of the login keychain. |
+| `DBX_SIGNING_MODE=apple-development` | Require an Apple Development identity. |
+| `DBX_SIGNING_MODE=developer-id` | Require a Developer ID Application identity (see below). |
+| `DBX_SIGNING_MODE=local` | Opt in to a self-signed identity (`DBX Local Development`, or `DBX_SIGNING_NAME`) that is created in the keychain if missing. |
+| `DBX_SIGNING_NAME=-` | Opt in to ad-hoc signing without a certificate. Keychain access may need renewed approval after rebuilds. |
+
+For example:
 
 ```bash
-DBX_SIGNING_NAME="My DBX Development" make run
+DBX_SIGNING_NAME="Apple Development: Name (TEAMID)" make run
 
-DBX_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db" \
-DBX_SIGNING_NAME="My DBX Development" make build
+DBX_SIGNING_MODE=local make run
 ```
 
-As a temporary fallback, `DBX_SIGNING_NAME=- make run` uses ad-hoc signing without creating a certificate. This gives up the stable certificate identity and may require renewed Keychain approval after rebuilds.
+### If you have no certificate
+
+Add an Apple Development certificate in Xcode, or opt in to a self-signed one with `DBX_SIGNING_MODE=local make run`. If automatic creation fails, create it once in **Keychain Access**: choose **Certificate Assistant → Create a Certificate**, name it `DBX Local Development`, set **Identity Type** to **Self Signed Root** and **Certificate Type** to **Code Signing**, save it in the **login** keychain with its private key, then run `DBX_SIGNING_MODE=local make run` again.
 
 ### Distributing a Mac build to other people
 
-A self-signed local build is **not notarized** and does not provide Developer ID trust on someone else's Mac. Passing `codesign --verify` checks the signature's integrity; it does not mean Gatekeeper will accept a downloaded app.
+The local build helper does **not notarize** the app. Passing `codesign --verify` checks the signature's integrity; it does not mean Gatekeeper will accept a downloaded app.
 
 For distribution under your own identity, obtain a **Developer ID Application** certificate through your Apple Developer Program account, install it together with its private key, sign the app with the hardened runtime and a secure timestamp, then submit it for notarization and staple the accepted ticket. See [Apple's Developer ID certificate instructions](https://developer.apple.com/help/account/certificates/create-developer-id-certificates) and [notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-Use `DBX_SIGNING_MODE=developer-id` with `DBX_SIGNING_NAME` for distribution builds: this requires an existing Developer ID Application identity, refuses a self-signed fallback, and adds secure timestamps. The [release workflow](docs/macos-release.md) builds on GitHub's Mac runners, notarizes and staples the bundle, verifies Gatekeeper acceptance, and uploads a candidate ZIP and checksum. Do not share or commit your private key or certificate export.
+Use `DBX_SIGNING_MODE=developer-id` (optionally with `DBX_SIGNING_NAME`) for distribution builds: this requires an existing Developer ID Application identity, rejects Apple Development, ad-hoc and self-signed identities, never creates a replacement, and adds secure timestamps. The [release workflow](docs/macos-release.md) builds on GitHub's Mac runners, notarizes and staples the bundle, verifies Gatekeeper acceptance, and uploads a candidate ZIP and checksum. Do not share or commit your private key or certificate export.
 
 ## First connection
 

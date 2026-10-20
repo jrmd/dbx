@@ -856,6 +856,10 @@ pub struct DbxApp {
     /// Whether a passphrase unlock also trusts this device, keeping the vault
     /// key in the system keychain so later launches skip the passphrase.
     remember_device: bool,
+    touch_id_enabled: bool,
+    touch_id_available: bool,
+    touch_id_enrolled: bool,
+    touch_id_probe_generation: u64,
     saving_connection: bool,
     vault_generation: u64,
     credential_hydrating: bool,
@@ -1035,7 +1039,13 @@ impl DbxApp {
             vault_busy: false,
             remember_device: saved_settings
                 .as_ref()
-                .is_none_or(|settings| settings.remember_device),
+                .is_none_or(|settings| settings.remember_device && !settings.touch_id_enabled),
+            touch_id_enabled: saved_settings
+                .as_ref()
+                .is_some_and(|settings| settings.touch_id_enabled),
+            touch_id_available: false,
+            touch_id_enrolled: false,
+            touch_id_probe_generation: 0,
             saving_connection: false,
             vault_generation: 0,
             credential_hydrating: false,
@@ -1142,6 +1152,7 @@ impl DbxApp {
             error: profile_error,
         };
         crate::theme::catalog::set_preferences(&this.theme_preferences);
+        this.refresh_touch_id(cx);
         this.try_device_unlock(cx);
         if !cfg!(test) && std::env::var_os("DBX_DISABLE_UPDATES").is_none() {
             this.check_for_updates(cx);
@@ -1477,6 +1488,7 @@ impl DbxApp {
         let mut settings = Settings::new(self.appearance)
             .with_reduce_transparency(self.reduce_transparency)
             .with_remember_device(self.remember_device);
+        settings.touch_id_enabled = self.touch_id_enabled;
         settings.theme = self.theme_preferences.clone();
         settings.agents = self.agent_setup.preferences.clone();
         settings.vim_mode = self.vim_mode;
@@ -5153,6 +5165,88 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[gpui::test]
+    fn large_setup_can_scroll_to_submit(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (_app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Uninitialized);
+            app.ui_scale = 150;
+            app.font_size = 18;
+            app
+        });
+        cx.simulate_resize(gpui::size(px(960.), px(640.)));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let gate = cx.debug_bounds("vault-gate").unwrap();
+        let before = cx.debug_bounds("vault-submit").unwrap();
+        assert!(before.bottom() > gate.bottom(), "fixture must overflow");
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: gate.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1200.))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let after = cx.debug_bounds("vault-submit").unwrap();
+        assert!(
+            after.top() >= gate.top() && after.bottom() <= gate.bottom(),
+            "submit must scroll into view: before={before:?}, after={after:?}, gate={gate:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn touch_id_preference_excludes_silent_unlock(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.touch_id_available = true;
+                app.remember_device = true;
+                app.toggle_touch_id(cx);
+                assert!(app.touch_id_enabled);
+                assert!(!app.remember_device);
+                app.toggle_remember_device(cx);
+                assert!(!app.remember_device);
+                let saved = app.settings_store.as_ref().unwrap().load().unwrap();
+                assert!(saved.touch_id_enabled);
+                assert!(!saved.remember_device);
+
+                app.vault_busy = true;
+                app.toggle_touch_id(cx);
+                assert!(app.touch_id_enabled);
+                app.vault_busy = false;
+                // Removing a fingerprint or losing the sensor must not trap
+                // the user in a preference they can no longer turn off.
+                app.touch_id_available = false;
+                app.toggle_touch_id(cx);
+                assert!(!app.touch_id_enabled);
+                assert!(!app.remember_device);
+                app.toggle_touch_id(cx);
+                assert!(!app.touch_id_enabled);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn touch_id_requires_explicit_ready_locked_state(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Locked);
+                app.touch_id_enabled = true;
+                app.remember_device = true; // Inconsistent legacy preferences.
+                app.try_device_unlock(cx);
+                assert!(!app.vault_busy);
+                app.touch_id_available = false;
+                app.touch_id_enrolled = true;
+                app.unlock_with_touch_id(cx);
+                assert!(!app.vault_busy);
+                assert_eq!(app.vault_state, Some(VaultState::Locked));
+                assert_eq!(app.vault_generation, 0);
+            });
+        });
+    }
 
     #[gpui::test]
     fn named_query_drafts_are_flushed_before_vault_lock(cx: &mut gpui::TestAppContext) {

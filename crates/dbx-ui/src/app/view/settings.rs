@@ -656,54 +656,91 @@ impl DbxApp {
 
     fn render_settings_connections(&mut self, cx: &mut Context<Self>) -> Div {
         let unavailable = self.vault_state != Some(VaultState::Unlocked) || self.vault_busy;
-        div().child(
-            self.scrolling_settings_group(
-                "settings-connections-row",
-                [
-                    (
-                        0,
-                        "Export profiles",
-                        "Save connection details without passwords.",
-                        "Export…",
-                    ),
-                    (
-                        1,
-                        "Export encrypted bundle",
-                        "Back up connections and credentials with a separate passphrase.",
-                        "Export…",
-                    ),
-                    (
-                        2,
-                        "Import profiles",
-                        "Review a DBX or TablePro export before importing.",
-                        "Import…",
-                    ),
-                ]
-                .into_iter()
-                .map(|(mode, label, detail, action)| {
-                    settings_row(
-                        label,
-                        Some(detail.into()),
-                        button(
-                            SharedString::from(format!("profile-portability-{mode}")),
-                            action,
-                            ButtonKind::Quiet,
+        let automatic_unlock = div()
+            .flex()
+            .flex_col()
+            .px(crate::theme::ui_px(SPACE_4))
+            .py(crate::theme::ui_px(12.))
+            .gap(crate::theme::ui_px(SPACE_2))
+            .child(
+                gpui_component::checkbox::Checkbox::new("settings-remember-device")
+                    .label("Unlock automatically on this device")
+                    .with_size(Size::Small)
+                    .checked(self.remember_device)
+                    .disabled(unavailable || self.touch_id_enabled)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_remember_device(cx))),
+            )
+            .child(
+                div()
+                    .text_size(crate::theme::text_px(11.))
+                    .text_color(theme().text_muted)
+                    .child(if self.touch_id_enabled {
+                        "Automatic unlock is unavailable while Touch ID is enabled."
+                    } else {
+                        "Save the vault key in your system keychain to skip the passphrase on launch."
+                    }),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(SPACE_4))
+            .child(settings_section(
+                "Vault",
+                self.scrolling_settings_group(
+                    "settings-vault-row",
+                    [automatic_unlock.into_any_element()],
+                ),
+            ))
+            .child(
+                self.scrolling_settings_group(
+                    "settings-connections-row",
+                    [
+                        (
+                            0,
+                            "Export profiles",
+                            "Save connection details without passwords.",
+                            "Export…",
+                        ),
+                        (
+                            1,
+                            "Export encrypted bundle",
+                            "Back up connections and credentials with a separate passphrase.",
+                            "Export…",
+                        ),
+                        (
+                            2,
+                            "Import profiles",
+                            "Review a DBX or TablePro export before importing.",
+                            "Import…",
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(mode, label, detail, action)| {
+                        settings_row(
+                            label,
+                            Some(detail.into()),
+                            button(
+                                SharedString::from(format!("profile-portability-{mode}")),
+                                action,
+                                ButtonKind::Quiet,
+                            )
+                            .accessible_name(match mode {
+                                0 => "Export password-free connection profiles",
+                                1 => "Export encrypted connection bundle",
+                                _ => "Import connection profiles",
+                            })
+                            .debug_selector(move || format!("profile-portability-{mode}"))
+                            .disabled(unavailable)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.open_profile_transfer(mode, window, cx)
+                                },
+                            )),
                         )
-                        .accessible_name(match mode {
-                            0 => "Export password-free connection profiles",
-                            1 => "Export encrypted connection bundle",
-                            _ => "Import connection profiles",
-                        })
-                        .debug_selector(move || format!("profile-portability-{mode}"))
-                        .disabled(unavailable)
-                        .on_click(cx.listener(
-                            move |this, _, window, cx| this.open_profile_transfer(mode, window, cx),
-                        )),
-                    )
-                    .into_any_element()
-                }),
-            ),
-        )
+                        .into_any_element()
+                    }),
+                ),
+            )
     }
 
     fn render_settings_editor(&mut self, cx: &mut Context<Self>) -> Div {

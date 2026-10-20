@@ -1,5 +1,5 @@
 use super::*;
-use crate::device_unlock::DeviceUnlock;
+use crate::device_unlock::{DeviceUnlock, TouchId, TouchIdUnlock};
 
 fn hydration_matches_current_draft(
     selected_profile: Option<Uuid>,
@@ -312,11 +312,134 @@ impl DbxApp {
         Some(DeviceUnlock::for_vault(vault.path()))
     }
 
+    fn touch_id(&self) -> Option<TouchId> {
+        if cfg!(test) {
+            return None;
+        }
+        let vault = self.profile_store.as_ref().and_then(ProfileStore::vault)?;
+        Some(TouchId::for_vault(vault.path()))
+    }
+
+    /// Capability and enrollment queries never ask for authentication.
+    pub(super) fn refresh_touch_id(&mut self, cx: &mut Context<Self>) {
+        let Some(touch_id) = self.touch_id() else {
+            return;
+        };
+        self.touch_id_probe_generation += 1;
+        let generation = self.touch_id_probe_generation;
+        let runtime = self.runtime.clone();
+        cx.spawn(async move |this, cx| {
+            let (available, enrolled) = runtime
+                .spawn_blocking(move || {
+                    (
+                        TouchId::is_available(),
+                        touch_id.is_enrolled().unwrap_or(false),
+                    )
+                })
+                .await
+                .unwrap_or((false, false));
+            this.update(cx, |this, cx| {
+                if this.touch_id_probe_generation != generation {
+                    return;
+                }
+                this.touch_id_available = available;
+                this.touch_id_enrolled = enrolled;
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// Selecting biometrics always turns off silent unlock. Enrollment (or
+    /// removal) happens only after a successful passphrase authentication.
+    pub(super) fn toggle_touch_id(&mut self, cx: &mut Context<Self>) {
+        if self.vault_busy || (!self.touch_id_available && !self.touch_id_enabled) {
+            return;
+        }
+        self.touch_id_enabled = !self.touch_id_enabled;
+        self.remember_device = false;
+        self.persist_settings(cx);
+        cx.notify();
+    }
+
+    pub(super) fn unlock_with_touch_id(&mut self, cx: &mut Context<Self>) {
+        if self.vault_busy
+            || self.vault_state != Some(VaultState::Locked)
+            || !self.touch_id_enabled
+            || !self.touch_id_enrolled
+            || !self.touch_id_available
+        {
+            return;
+        }
+        let (Some(vault), Some(touch_id)) = (
+            self.profile_store.as_ref().and_then(ProfileStore::vault),
+            self.touch_id(),
+        ) else {
+            return;
+        };
+        self.clear_vault_inputs(cx);
+        self.error = None;
+        self.vault_busy = true;
+        self.vault_generation += 1;
+        let generation = self.vault_generation;
+        let runtime = self.runtime.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = runtime
+                .spawn_blocking(move || {
+                    match touch_id.unlock(crate::device_unlock::DEFAULT_UNLOCK_REASON) {
+                        TouchIdUnlock::Unlocked(key) => {
+                            vault.unlock_with_key(key).map(|()| true).map_err(|_| {
+                                "Enter your passphrase to set up Touch ID again.".to_string()
+                            })
+                        }
+                        TouchIdUnlock::Cancelled => Ok(false),
+                        TouchIdUnlock::NotEnrolled | TouchIdUnlock::Invalidated => {
+                            Err("Enter your passphrase to set up Touch ID again.".into())
+                        }
+                        TouchIdUnlock::Unavailable => {
+                            Err("Touch ID isn’t available right now. Use your passphrase.".into())
+                        }
+                        TouchIdUnlock::Failed(message) => Err(message),
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    Err("Touch ID couldn’t finish. Use your passphrase to unlock.".into())
+                });
+            this.update(cx, |this, cx| {
+                if this.vault_generation != generation {
+                    return;
+                }
+                this.vault_busy = false;
+                match result {
+                    Ok(true) => {
+                        this.vault_state = Some(VaultState::Unlocked);
+                        this.error = None;
+                        if let Some(id) = this.draft.selected_profile {
+                            this.hydrate_saved_credential(id, cx);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => this.set_error(error),
+                }
+                this.refresh_touch_id(cx);
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
     /// Unlock with the key this device remembered, if any. The passphrase
     /// gate stays up (showing "Unlocking…") until the keychain answers, and
     /// remains the fallback when it has nothing or refuses.
     pub(super) fn try_device_unlock(&mut self, cx: &mut Context<Self>) {
-        if self.vault_state != Some(VaultState::Locked) || !self.remember_device {
+        if self.vault_state != Some(VaultState::Locked)
+            || !self.remember_device
+            || self.touch_id_enabled
+        {
             return;
         }
         let (Some(vault), Some(device)) = (
@@ -363,15 +486,69 @@ impl DbxApp {
         .detach();
     }
 
-    /// Takes effect at the next passphrase unlock, which stores or forgets
-    /// the key; the choice itself is saved now so the gate remembers it.
+    /// Apply the Settings choice to the keychain while the vault is unlocked.
     pub(super) fn toggle_remember_device(&mut self, cx: &mut Context<Self>) {
-        self.remember_device = !self.remember_device;
-        self.persist_settings(cx);
+        if self.vault_busy
+            || self.touch_id_enabled
+            || self.vault_state != Some(VaultState::Unlocked)
+        {
+            return;
+        }
+        let enabled = !self.remember_device;
+        let Some(device) = self.device_unlock() else {
+            return;
+        };
+        let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
+            return;
+        };
+        // Persist opting out before attempting deletion, so a keychain error
+        // cannot leave automatic unlock enabled on the next launch.
+        if !enabled {
+            self.remember_device = false;
+            self.persist_settings(cx);
+        }
+        let touch_id = self.touch_id();
+        let runtime = self.runtime.clone();
+        self.vault_busy = true;
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = runtime
+                .spawn_blocking(move || -> Result<(), String> {
+                    if enabled {
+                        if let Some(touch_id) = touch_id {
+                            touch_id.forget()?;
+                        }
+                        let key = vault.key().map_err(|error| error.to_string())?;
+                        device.store(&key)
+                    } else {
+                        device.forget()
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.vault_busy = false;
+                match outcome {
+                    Ok(Ok(())) => {
+                        this.remember_device = enabled;
+                        this.persist_settings(cx);
+                    }
+                    _ => this.show_toast(
+                        ToastKind::Error,
+                        "Couldn’t update automatic unlock in the system keychain.",
+                        cx,
+                    ),
+                }
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     pub(super) fn submit_vault_passphrase(&mut self, creating: bool, cx: &mut Context<Self>) {
+        if self.vault_busy {
+            return;
+        }
         let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
             self.set_error("The vault is unavailable".into());
             cx.notify();
@@ -401,11 +578,13 @@ impl DbxApp {
         let generation = self.vault_generation;
         let runtime = self.runtime.clone();
         let device = self.device_unlock();
+        let touch_id = self.touch_id();
+        let touch_id_enabled = self.touch_id_enabled;
         let remember_device = self.remember_device;
         self.error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let (result, device_error) = runtime
+            let outcome = runtime
                 .spawn_blocking(move || {
                     let result = if creating {
                         vault.create(passphrase)
@@ -414,23 +593,55 @@ impl DbxApp {
                     };
                     // Trusting (or untrusting) the device never blocks the
                     // unlock itself; a keychain failure is only reported.
-                    let device_error = match (&result, device) {
-                        (Ok(()), Some(device)) if remember_device => vault
-                            .key()
-                            .map_err(|error| error.to_string())
-                            .and_then(|key| device.store(&key))
-                            .err(),
-                        (Ok(()), Some(device)) => device.forget().err(),
-                        _ => None,
+                    let device_error = if result.is_ok() {
+                        (|| -> Result<(), String> {
+                            if touch_id_enabled {
+                                // Remove the unprotected copy FIRST. If that fails,
+                                // never claim that biometric enrollment succeeded.
+                                if let Some(device) = device {
+                                    device.forget()?;
+                                }
+                                if let Some(touch_id) = touch_id {
+                                    let key = vault.key().map_err(|error| error.to_string())?;
+                                    touch_id.store(&key).map_err(|error| {
+                                        format!("Touch ID wasn’t set up. Use your passphrase next time. {error}")
+                                    })?;
+                                }
+                            } else {
+                                if let Some(touch_id) = touch_id {
+                                    touch_id.forget()?;
+                                }
+                                if let Some(device) = device {
+                                    if remember_device {
+                                        let key = vault.key().map_err(|error| error.to_string())?;
+                                        device.store(&key)?;
+                                    } else {
+                                        device.forget()?;
+                                    }
+                                }
+                            }
+                            Ok(())
+                        })()
+                        .err()
+                    } else {
+                        None
                     };
                     (result, device_error)
                 })
-                .await?;
+                .await;
             this.update(cx, |this, cx| {
                 if this.vault_generation != generation {
                     return;
                 }
                 this.vault_busy = false;
+                let (result, device_error) = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        this.set_error("Couldn’t finish unlocking. Try your passphrase again.".into());
+                        cx.notify();
+                        return;
+                    }
+                };
                 match result {
                     Ok(()) => {
                         this.vault_state = Some(VaultState::Unlocked);
@@ -447,6 +658,7 @@ impl DbxApp {
                         if let Some(error) = device_error {
                             this.show_toast(ToastKind::Error, error, cx);
                         }
+                        this.refresh_touch_id(cx);
                     }
                     Err(_) => this.set_error(if creating {
                         "Couldn’t create the vault".into()
@@ -569,6 +781,7 @@ impl DbxApp {
         self.clear_vault_inputs(cx);
         self.clear_assistant_secret(cx);
         self.error = recovery_error;
+        self.refresh_touch_id(cx);
         cx.notify();
     }
 

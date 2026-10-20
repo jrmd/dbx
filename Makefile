@@ -18,9 +18,11 @@ linux-build linux-package linux-appimage: DBX_CARGO_PROFILE := $(DBX_PACKAGE_PRO
 
 .PHONY: build run install macos-build macos-run linux-build linux-run linux-package linux-appimage cargo-build cargo-run
 
-# Local Mac workflow. The helper creates a stable, self-signed development
-# identity once, packages the Rust binary as DBX.app, signs it, and launches it.
-# Uses $(DBX_CARGO_PROFILE) (release-local by default).
+# Local Mac workflow. The helper packages the Rust binary as DBX.app, signs it
+# with an installed Developer ID Application or Apple Development certificate
+# (found automatically; it fails if none or several match), and launches it.
+# DBX_SIGNING_MODE=local opts in to a self-signed identity; DBX_SIGNING_NAME=-
+# opts in to ad-hoc signing. Uses $(DBX_CARGO_PROFILE) (release-local by default).
 build:
 	bash $(MACOS_APP_SCRIPT) build
 

@@ -48,6 +48,9 @@ pub struct Settings {
     /// passphrase.
     #[serde(default = "remember_device_default")]
     pub remember_device: bool,
+    /// Require biometric authentication to release the device's vault key.
+    #[serde(default)]
+    pub touch_id_enabled: bool,
     #[serde(default)]
     pub agents: crate::agents::AgentPreferences,
     /// Use modal Vim bindings in SQL query editors only.
@@ -94,6 +97,7 @@ impl Settings {
             mono_font_size: None,
             drag_row_selection: true,
             remember_device: true,
+            touch_id_enabled: false,
             agents: crate::agents::AgentPreferences::default(),
             vim_mode: false,
             explorer_width: None,
@@ -266,11 +270,15 @@ mod tests {
         assert!(settings.font_family.is_none());
         assert!(settings.mono_font_family.is_none());
         assert!(settings.drag_row_selection);
+        assert!(settings.remember_device);
+        assert!(!settings.touch_id_enabled);
         settings.font_family = Some("Helvetica".into());
         settings.mono_font_family = Some("Menlo".into());
         settings.font_size = 16;
         settings.mono_font_size = Some(14);
         settings.drag_row_selection = false;
+        settings.remember_device = false;
+        settings.touch_id_enabled = true;
         store.save(settings.clone()).unwrap();
         assert_eq!(
             SettingsStore::at(store.path.clone()).load().unwrap(),

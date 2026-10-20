@@ -2008,13 +2008,18 @@ dependencies = [
  "argon2",
  "arrayref",
  "chacha20poly1305",
+ "core-foundation 0.10.0",
  "dbx-core",
  "dirs 5.0.1",
  "getrandom 0.4.3",
  "keyring",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-local-authentication",
  "pbkdf2 0.12.2",
  "percent-encoding",
  "secrecy",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5752,6 +5757,16 @@ dependencies = [
  "bitflags 2.13.1",
  "objc2 0.6.4",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]

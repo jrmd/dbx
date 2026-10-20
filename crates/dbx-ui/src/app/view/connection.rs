@@ -672,34 +672,190 @@ impl DbxApp {
             )
     }
 
+    /// The vault gate borrows the macOS lock screen: a centred identity, one
+    /// compact passphrase pill with an inline submit arrow, and quiet options
+    /// beneath. Nothing is boxed in a card; the window material is the stage.
     fn render_vault_gate(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.vault_state;
         let creating = state == Some(VaultState::Uninitialized);
         let unavailable = state.is_none();
+        let busy = self.vault_busy;
+        // Touch ID state is owned by the app; this view only reflects it.
+        let touch_id_available = self.touch_id_available;
+        let touch_id_enabled = self.touch_id_enabled;
+        let touch_id_ready = touch_id_enabled && touch_id_available && self.touch_id_enrolled;
+        let show_touch_id_unlock = touch_id_ready && !creating && !unavailable;
         let passphrase_focus = self.vault_editors.passphrase_editor.read(cx).focus_handle();
         let confirmation_focus = self
             .vault_editors
             .confirmation_editor
             .read(cx)
             .focus_handle();
-        let remember_device = Checkbox::new("vault-remember-device")
-            .label("Unlock automatically on this device")
-            .checked(self.remember_device)
-            .with_size(Size::Small)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_remember_device(cx)));
-        let submit_label = match (self.vault_busy, creating) {
-            (true, true) => "Creating…",
+
+        let field_width = crate::theme::ui_px(272.);
+        // The editor shell itself becomes the pill, keeping its scale-aware
+        // height and vertical padding so text never clips at large UI sizes.
+        let pill =
+            |editor: Entity<TextEditor>, focus: FocusHandle, trailing_room: bool, cx: &App| {
+                editor::input_with_key_context(editor, focus, false, VAULT_TEXT_EDITOR_CONTEXT, cx)
+                    .rounded_full()
+                    .bg(theme().glass_hover)
+                    .border_color(theme().hairline)
+                    // Restate the focus ring after recolouring the resting edge.
+                    .focus(|style| style.border_color(theme().focus_ring))
+                    .pl(crate::theme::ui_px(14.))
+                    .pr(crate::theme::ui_px(if trailing_room { 38. } else { 14. }))
+            };
+        // Compact external labels name each field while creating, where two
+        // identical masked pills would otherwise be indistinguishable.
+        let labeled = |label: &'static str, field: AnyElement| {
+            div()
+                .w(field_width)
+                .max_w_full()
+                .flex()
+                .flex_col()
+                .gap(crate::theme::ui_px(4.))
+                .child(
+                    div()
+                        .pl(crate::theme::ui_px(14.))
+                        .text_size(crate::theme::text_px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme().text_muted)
+                        .child(label),
+                )
+                .child(field)
+        };
+        let submit_label = match (busy, creating) {
+            (true, true) => "Creating vault…",
             (true, false) => "Unlocking…",
             (false, true) => "Create vault",
             (false, false) => "Unlock",
         };
-        let submit = button("submit-vault-passphrase", submit_label, ButtonKind::Primary)
+        // A real button: a Tab stop with Return/Space activation and the
+        // shared focus ring, not just a clickable circle.
+        let submit = Button::new("submit-vault-passphrase")
             .debug_selector(|| "vault-submit".into())
-            .when(!self.vault_busy, |button| {
+            .with_size(Size::XSmall)
+            .compact()
+            .accessible_name(submit_label)
+            .tooltip(submit_label)
+            .size(crate::theme::ui_px(24.))
+            .p_0()
+            .flex_none()
+            .rounded_full()
+            .border_0()
+            .bg(theme().accent)
+            .child(icon(Icon::ArrowRight, theme().accent_foreground).size(crate::theme::ui_px(14.)))
+            .disabled(busy)
+            .when(busy, |button| button.opacity(0.45))
+            .when(!busy, |button| {
                 button.cursor_pointer().on_click(
                     cx.listener(move |this, _, _, cx| this.submit_vault_passphrase(creating, cx)),
                 )
             });
+        // The arrow rides inside the last field, as on the macOS login window.
+        let (submit_editor, submit_focus) = if creating {
+            (
+                self.vault_editors.confirmation_editor.clone(),
+                confirmation_focus,
+            )
+        } else {
+            (
+                self.vault_editors.passphrase_editor.clone(),
+                passphrase_focus.clone(),
+            )
+        };
+        let submit_field = div()
+            .relative()
+            .w_full()
+            .child(pill(submit_editor, submit_focus, true, cx))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(crate::theme::ui_px(5.))
+                    .flex()
+                    .items_center()
+                    .child(submit),
+            );
+        let fields = if creating {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(crate::theme::ui_px(12.))
+                .child(labeled(
+                    "Passphrase",
+                    pill(
+                        self.vault_editors.passphrase_editor.clone(),
+                        passphrase_focus,
+                        false,
+                        cx,
+                    )
+                    .into_any_element(),
+                ))
+                .child(labeled(
+                    "Confirm passphrase",
+                    submit_field.into_any_element(),
+                ))
+        } else {
+            div().w(field_width).max_w_full().child(submit_field)
+        };
+        let caption = |text: SharedString| {
+            div()
+                .text_size(crate::theme::text_px(11.))
+                .text_color(theme().text_muted)
+                .text_center()
+                .child(text)
+        };
+
+        let title = if unavailable {
+            "DBX Vault unavailable"
+        } else if creating {
+            "Create DBX Vault"
+        } else {
+            "DBX Vault"
+        };
+        let subtitle = if unavailable {
+            "Saved connection passwords can’t be read on this device."
+        } else if creating {
+            "Choose a passphrase to protect saved connection passwords."
+        } else {
+            "Enter your passphrase to unlock saved connections."
+        };
+        // Below the field: progress first, then the most useful hint.
+        let hint: Option<SharedString> = if busy {
+            Some(submit_label.into())
+        } else if creating {
+            Some("At least 12 characters. If it’s lost, saved passwords can’t be recovered.".into())
+        } else if show_touch_id_unlock {
+            Some("Use Touch ID or enter your passphrase".into())
+        } else if touch_id_enabled && !touch_id_available {
+            Some("Touch ID isn’t available right now. Enter your passphrase.".into())
+        } else {
+            None
+        };
+
+        let use_touch_id = Checkbox::new("vault-use-touch-id")
+            .label("Use Touch ID")
+            .checked(touch_id_enabled)
+            .with_size(Size::Small)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_touch_id(cx)));
+        let touch_id_unlock = button(
+            "vault-touch-id-unlock",
+            "Unlock with Touch ID",
+            ButtonKind::Quiet,
+        )
+        .debug_selector(|| "vault-touch-id-unlock".into())
+        .when(busy, |button| button.disabled(true))
+        .when(!busy, |button| {
+            button
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| this.unlock_with_touch_id(cx)))
+        });
+
         div().id("vault-gate").role(gpui::Role::Pane)
             .aria_label(if creating { "Create DBX Vault" } else { "Unlock DBX Vault" })
             .aria_description("Passphrases must contain at least 12 characters. If the passphrase is lost, saved passwords cannot be recovered.")
@@ -709,22 +865,71 @@ impl DbxApp {
                     this.submit_vault_passphrase(creating, cx);
                 }
             }))
-            .flex_1().min_h_0().flex().items_center().justify_center()
-            .when(self.compact_layout, |view| view.items_start())
-            .p(crate::theme::ui_px(20.))
-            .child(glass_raised(div().id("vault-card").debug_selector(|| "vault-card".into()), RADIUS_GLASS + 4.).min_w_0().flex_none().w_full().max_w(crate::theme::ui_px(420.)).p(crate::theme::ui_px(24.)).flex().flex_col().gap(crate::theme::ui_px(14.))
-                .child(img(self.logo.clone()).id("vault-logo").size(crate::theme::ui_px(40.)))
-                .child(div().text_size(crate::theme::text_px(18.)).font_weight(FontWeight::SEMIBOLD).child(if unavailable { "DBX Vault unavailable" } else if creating { "Create DBX Vault" } else { "Unlock DBX Vault" }))
-                .when(unavailable, |view| view.child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Saved connection passwords can’t be read on this device.")))
-                .when(creating, |view| view.child(div().p(crate::theme::ui_px(10.)).rounded(px(RADIUS_PANEL - 2.)).bg(theme().accent_soft).text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("If this passphrase is lost, saved passwords cannot be recovered.")))
+            .flex_1().min_h_0().h_full()
+            // Let the inner layout grow beyond the viewport so oversized
+            // setup content contributes to the scrollable bounds.
+            .child(div().w_full().min_h_full().flex().items_center().justify_center()
+            .p(crate::theme::ui_px(24.))
+            .child(div().id("vault-card").debug_selector(|| "vault-card".into())
+                .min_w_0().flex_none().w_full().max_w(crate::theme::ui_px(360.))
+                .flex().flex_col().items_center()
+                // Nudge the composition above true centre, where the eye rests.
+                .pb(crate::theme::ui_px(if self.compact_layout { 0. } else { 48. }))
+                .child(
+                    div()
+                        .size(crate::theme::ui_px(88.))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(theme().glass_raised)
+                        .border_1()
+                        .border_color(theme().hairline)
+                        .shadow(glass_shadow(16.))
+                        .child(img(self.logo.clone()).id("vault-logo").size(crate::theme::ui_px(54.))),
+                )
+                .child(
+                    div()
+                        .mt(crate::theme::ui_px(16.))
+                        .text_size(crate::theme::text_px(17.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme().text)
+                        .text_center()
+                        .child(title),
+                )
+                .child(div().mt(crate::theme::ui_px(4.)).max_w(crate::theme::ui_px(300.)).child(caption(subtitle.into())))
                 .when(!unavailable, |view| view
-                    .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Passphrase (12 characters minimum)")).child(editor::input_with_key_context(self.vault_editors.passphrase_editor.clone(), passphrase_focus, false, VAULT_TEXT_EDITOR_CONTEXT, cx)))
-                    .when(creating, |view| view.child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Confirm passphrase")).child(editor::input_with_key_context(self.vault_editors.confirmation_editor.clone(), confirmation_focus, false, VAULT_TEXT_EDITOR_CONTEXT, cx))))
-                    .child(div().flex().flex_wrap().items_center().justify_between().gap(crate::theme::ui_px(12.))
-                        .when(self.compact_layout || crate::theme::font_scale() > 1., |view| view.flex_col().items_start())
-                        .child(div().w_full().min_w_0().child(remember_device))
-                        .child(submit)))
-                .when_some(self.error.clone(), |view, error| view.child(crate::accessibility::announcement("vault-error", error.clone(), true).text_size(crate::theme::text_px(11.)).text_color(theme().danger_text).child(error))))
+                    .child(div().mt(crate::theme::ui_px(22.)).w_full().flex().justify_center().child(fields))
+                    .when_some(hint, |view, hint| view.child(div().mt(crate::theme::ui_px(10.)).max_w(field_width).child(caption(hint))))
+                    .when_some(self.error.clone(), |view, error| view.child(
+                        crate::accessibility::announcement("vault-error", error.clone(), true)
+                            .mt(crate::theme::ui_px(6.))
+                            .max_w(field_width)
+                            .text_center()
+                            .text_size(crate::theme::text_px(11.))
+                            .text_color(theme().danger_text)
+                            .child(error),
+                    ))
+                    .when(show_touch_id_unlock, |view| view.child(div().mt(crate::theme::ui_px(16.)).child(touch_id_unlock)))
+                    .when(touch_id_available || touch_id_enabled, |view| view.child(
+                        div()
+                            .mt(crate::theme::ui_px(20.))
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .gap(crate::theme::ui_px(8.))
+                            // Stay visible while enabled so it can be turned off even
+                            // when the sensor is unavailable (lid closed, no keyboard).
+                            .child(use_touch_id),
+                    )))
+                .when(unavailable, |view| view.when_some(self.error.clone(), |view, error| view.child(
+                    crate::accessibility::announcement("vault-error", error.clone(), true)
+                        .mt(crate::theme::ui_px(10.))
+                        .text_center()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().danger_text)
+                        .child(error),
+                )))))
     }
 }
 

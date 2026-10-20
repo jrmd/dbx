@@ -6,8 +6,18 @@ ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 APP_DIR="${DBX_APP_DIR:-$ROOT_DIR/target/macos/DBX.app}"
 BUNDLE_ID="${DBX_BUNDLE_ID:-dev.jrmd.dbx}"
-SIGNING_NAME="${DBX_SIGNING_NAME:-DBX Local Development}"
-SIGNING_MODE="${DBX_SIGNING_MODE:-local}"
+# Signing modes (DBX_SIGNING_MODE):
+#   auto               installed Developer ID Application, else Apple Development (default)
+#   apple-development  requires an Apple Development identity
+#   developer-id       requires a Developer ID Application identity; adds a secure timestamp
+#   local              self-signed identity, created if missing (explicit opt-in)
+# DBX_SIGNING_NAME selects an identity by exact name or SHA-1 fingerprint; "-" is ad-hoc.
+SIGNING_NAME="${DBX_SIGNING_NAME:-}"
+SIGNING_MODE="${DBX_SIGNING_MODE:-auto}"
+LOCAL_IDENTITY_NAME="DBX Local Development"
+# The codesign --sign argument (a fingerprint, or "-") and a label for logs.
+SIGNING_IDENTITY=""
+SIGNING_LABEL=""
 KEYCHAIN="${DBX_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 CARGO_BIN="${CARGO:-cargo}"
 
@@ -62,19 +72,81 @@ check_host() {
 	[[ -f "$KEYCHAIN" ]] || die "login keychain not found: $KEYCHAIN"
 }
 
-identity_is_available() {
-	security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null \
-		| grep -Fq "\"$SIGNING_NAME\""
+IDENTITY_IDS=()
+IDENTITY_NAMES=()
+MATCH_IDS=()
+MATCH_NAMES=()
+
+load_identities() {
+	local output line
+	local pattern='^[[:space:]]*[0-9]+\)[[:space:]]+([0-9A-Fa-f]{40})[[:space:]]+"([^"]*)"'
+	IDENTITY_IDS=()
+	IDENTITY_NAMES=()
+	output="$(security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null)" \
+		|| die "could not list code-signing identities in $KEYCHAIN"
+	while IFS= read -r line; do
+		if [[ "$line" =~ $pattern ]]; then
+			IDENTITY_IDS+=("${BASH_REMATCH[1]}")
+			IDENTITY_NAMES+=("${BASH_REMATCH[2]}")
+		fi
+	done <<<"$output"
+}
+
+# Fill MATCH_* with valid identities whose name starts with $1 or, when $2 is
+# "exact", whose name or SHA-1 fingerprint equals $1.
+find_identities() {
+	local value="$1" exact="${2:-}" fingerprint i
+	fingerprint="$(printf '%s' "$value" | tr 'a-f' 'A-F')"
+	MATCH_IDS=()
+	MATCH_NAMES=()
+	load_identities
+	for ((i = 0; i < ${#IDENTITY_IDS[@]}; i++)); do
+		if [[ -n "$exact" ]]; then
+			[[ "${IDENTITY_NAMES[$i]}" == "$value" || "${IDENTITY_IDS[$i]}" == "$fingerprint" ]] || continue
+		else
+			[[ "${IDENTITY_NAMES[$i]}" == "$value"* ]] || continue
+		fi
+		MATCH_IDS+=("${IDENTITY_IDS[$i]}")
+		MATCH_NAMES+=("${IDENTITY_NAMES[$i]}")
+	done
+}
+
+# Use the single match found by find_identities; $1 describes what was searched.
+use_single_match() {
+	local i
+	if [[ "${#MATCH_IDS[@]}" -ne 1 ]]; then
+		printf 'DBX: found %s matching identities for %s in %s:\n' "${#MATCH_IDS[@]}" "$1" "$KEYCHAIN" >&2
+		for ((i = 0; i < ${#MATCH_IDS[@]}; i++)); do
+			printf '  %s  %s\n' "${MATCH_IDS[$i]}" "${MATCH_NAMES[$i]}" >&2
+		done
+		die "set DBX_SIGNING_NAME to the full certificate name or SHA-1 fingerprint to choose one"
+	fi
+	SIGNING_IDENTITY="${MATCH_IDS[0]}"
+	SIGNING_LABEL="${MATCH_NAMES[0]}"
+}
+
+no_apple_identity() {
+	cat >&2 <<EOF
+DBX: No Developer ID Application or Apple Development identity was found in
+$KEYCHAIN
+
+Install one (Xcode > Settings > Accounts > Manage Certificates), or choose
+explicitly:
+  DBX_SIGNING_MODE=local   self-signed '$LOCAL_IDENTITY_NAME', created if missing
+  DBX_SIGNING_NAME=-       ad-hoc signing (Keychain permissions may not survive rebuilds)
+  DBX_SIGNING_NAME=<name or SHA-1 fingerprint> and/or DBX_KEYCHAIN=<keychain>
+EOF
+	exit 1
 }
 
 print_manual_identity_instructions() {
 	cat >&2 <<EOF
-DBX: Could not find a usable '$SIGNING_NAME' identity.
+DBX: Could not find a usable '$1' identity.
 
 Create it once in Keychain Access:
   1. Open Keychain Access.
   2. Keychain Access > Certificate Assistant > Create a Certificate.
-  3. Name: $SIGNING_NAME
+  3. Name: $1
   4. Identity Type: Self Signed Root
   5. Certificate Type: Code Signing
   6. Save it in the login keychain.
@@ -85,8 +157,9 @@ EOF
 }
 
 create_local_identity() {
+	local name="$1"
 	if ! command -v openssl >/dev/null 2>&1; then
-		print_manual_identity_instructions
+		print_manual_identity_instructions "$name"
 		die "openssl is unavailable, so the local identity must be created in Keychain Access"
 	fi
 
@@ -103,10 +176,10 @@ create_local_identity() {
 	}
 	trap cleanup_temp_identity EXIT
 
-	log "creating local code-signing identity '$SIGNING_NAME'"
+	log "creating local code-signing identity '$name'"
 	openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 \
 		-days 3650 \
-		-subj "/CN=$SIGNING_NAME" \
+		-subj "/CN=$name" \
 		-addext "basicConstraints=critical,CA:false" \
 		-addext "keyUsage=critical,digitalSignature" \
 		-addext "extendedKeyUsage=critical,1.3.6.1.5.5.7.3.3" \
@@ -114,12 +187,12 @@ create_local_identity() {
 		-out "$cert_file" \
 		>/dev/null 2>&1 \
 		|| {
-			print_manual_identity_instructions
+			print_manual_identity_instructions "$name"
 			die "could not generate the local code-signing certificate"
 		}
 
 	openssl pkcs12 -export \
-		-name "$SIGNING_NAME" \
+		-name "$name" \
 		-inkey "$key_file" \
 		-in "$cert_file" \
 		-out "$bundle_file" \
@@ -136,33 +209,70 @@ create_local_identity() {
 		-T /usr/bin/codesign \
 		>/dev/null \
 		|| {
-			print_manual_identity_instructions
+			print_manual_identity_instructions "$name"
 			die "could not import the local identity into the login keychain"
 		}
-
-	if ! identity_is_available; then
-		print_manual_identity_instructions
-		die "the imported identity was not available to codesign"
-	fi
 
 	cleanup_temp_identity
 	trap - EXIT
 	log "local identity is ready"
 }
 
-ensure_signing_identity() {
-	if [[ "$SIGNING_MODE" == "developer-id" ]]; then
-		[[ "$SIGNING_NAME" == "Developer ID Application: "* ]] || die "distribution requires a Developer ID Application identity"
-		identity_is_available || die "Developer ID identity is missing; refusing to create a self-signed replacement"
-		return
-	fi
-	[[ "$SIGNING_MODE" == "local" ]] || die "unknown signing mode: $SIGNING_MODE"
+# Resolve SIGNING_IDENTITY before the expensive build. Only local mode ever
+# creates a certificate; every other mode fails if nothing suitable is installed.
+resolve_signing_identity() {
+	local prefix="" name candidate
+	case "$SIGNING_MODE" in
+	auto | local) ;;
+	apple-development) prefix="Apple Development: " ;;
+	developer-id) prefix="Developer ID Application: " ;;
+	*) die "unknown signing mode: $SIGNING_MODE (expected auto, apple-development, developer-id or local)" ;;
+	esac
+
 	if [[ "$SIGNING_NAME" == "-" ]]; then
+		[[ -z "$prefix" ]] || die "$SIGNING_MODE mode requires a '$prefix' identity, not ad-hoc signing"
 		log "using ad-hoc signing; Keychain permissions may not survive rebuilds"
+		SIGNING_IDENTITY="-"
+		SIGNING_LABEL="ad-hoc"
 		return
 	fi
 
-	identity_is_available || create_local_identity
+	if [[ "$SIGNING_MODE" == "local" ]]; then
+		name="${SIGNING_NAME:-$LOCAL_IDENTITY_NAME}"
+		find_identities "$name" exact
+		if [[ "${#MATCH_IDS[@]}" -eq 0 ]]; then
+			create_local_identity "$name"
+			find_identities "$name" exact
+			if [[ "${#MATCH_IDS[@]}" -eq 0 ]]; then
+				print_manual_identity_instructions "$name"
+				die "the imported identity was not available to codesign"
+			fi
+		fi
+		use_single_match "'$name'"
+		return
+	fi
+
+	if [[ -n "$SIGNING_NAME" ]]; then
+		find_identities "$SIGNING_NAME" exact
+		[[ "${#MATCH_IDS[@]}" -gt 0 ]] || die "no valid code-signing identity '$SIGNING_NAME' in $KEYCHAIN; refusing to create a replacement"
+		use_single_match "'$SIGNING_NAME'"
+		[[ -z "$prefix" || "$SIGNING_LABEL" == "$prefix"* ]] \
+			|| die "$SIGNING_MODE mode requires a '$prefix' identity; '$SIGNING_LABEL' is not one"
+		return
+	fi
+
+	# Discover: prefer Developer ID Application, then Apple Development.
+	local candidates=("Developer ID Application: " "Apple Development: ")
+	[[ -z "$prefix" ]] || candidates=("$prefix")
+	for candidate in "${candidates[@]}"; do
+		find_identities "$candidate"
+		if [[ "${#MATCH_IDS[@]}" -gt 0 ]]; then
+			use_single_match "'$candidate'"
+			return
+		fi
+	done
+	[[ -z "$prefix" ]] || die "no valid '$prefix' identity found in $KEYCHAIN; refusing to create a self-signed replacement"
+	no_apple_identity
 }
 
 render_icon_png() {
@@ -244,12 +354,12 @@ build_bundle() {
 }
 
 sign_bundle() {
-	local identity="$SIGNING_NAME"
+	local identity="$SIGNING_IDENTITY"
 	local sign_options=(--force --options runtime --keychain "$KEYCHAIN")
 	if [[ "$SIGNING_MODE" == "developer-id" ]]; then
 		sign_options+=(--timestamp)
 	fi
-	log "signing $APP_DIR"
+	log "signing $APP_DIR with $SIGNING_LABEL"
 
 	# Sign nested code first. Do not use --deep for signing.
 	codesign "${sign_options[@]}" \
@@ -264,8 +374,9 @@ sign_bundle() {
 }
 
 build_app() {
+	# Fail on a missing or ambiguous identity before the long cargo build.
+	resolve_signing_identity
 	build_bundle
-	ensure_signing_identity
 	sign_bundle
 	log "ready: $APP_DIR"
 }

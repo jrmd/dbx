@@ -6,6 +6,10 @@
 //! only to builds carrying the same code signature, so a stable local signing
 //! identity keeps it from prompting after every rebuild. The key opens this
 //! one vault; a recreated vault gets a new salt and a new key.
+//!
+//! [`TouchId`] is the stricter, separate alternative: the same key behind a
+//! biometry-gated Keychain item that prompts on every read. Callers must not
+//! keep both: enabling Touch ID should `DeviceUnlock::forget` first.
 
 use std::path::Path;
 
@@ -13,10 +17,20 @@ use keyring::{Entry, Error as KeyringError};
 use secrecy::{ExposeSecret, SecretBox};
 use zeroize::Zeroize;
 
+mod touch_id;
+
+pub use touch_id::{DEFAULT_UNLOCK_REASON, TouchId, TouchIdAvailability, TouchIdUnlock};
+
 const SERVICE: &str = "dev.jrmd.dbx.vault";
 const KEY_LEN: usize = 32;
 
 pub type VaultKey = SecretBox<[u8; KEY_LEN]>;
+
+/// One keychain account per vault file, shared by [`DeviceUnlock`] and
+/// [`TouchId`] (they use different services).
+fn vault_account(vault_path: &Path) -> String {
+    format!("vault-key:{}", vault_path.display())
+}
 
 #[derive(Clone, Debug)]
 pub struct DeviceUnlock {
@@ -28,7 +42,7 @@ impl DeviceUnlock {
     /// shares an entry with the real one.
     pub fn for_vault(vault_path: &Path) -> Self {
         Self {
-            account: format!("vault-key:{}", vault_path.display()),
+            account: vault_account(vault_path),
         }
     }
 
