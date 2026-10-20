@@ -6,11 +6,14 @@ use std::rc::Rc;
 
 use gpui::{
     Anchor, Context, DismissEvent, ElementId, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, RenderOnce, SharedString, StyleRefinement, Styled, Window,
-    prelude::FluentBuilder,
+    IntoElement, ParentElement, RenderOnce, SharedString, StatefulInteractiveElement,
+    StyleRefinement, Styled, Window, prelude::FluentBuilder,
 };
 
-use gpui_component::{Selectable, button::Button, menu::PopupMenu, popover::Popover};
+use gpui_component::{
+    ActiveTheme as _, Selectable, ThemeStyled as _, button::Button, menu::PopupMenu,
+    popover::Popover,
+};
 
 type MenuBuilder = dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu;
 
@@ -274,6 +277,75 @@ fn move_popover_focus(focus: &FocusHandle, forward: bool, window: &mut Window, c
         }
     }
     focus.focus(window, cx);
+}
+
+/// Metrics shared by every context menu. `PopupMenu` draws the result-grid and
+/// toolbar menus; app-owned menus that need their own keyboard model (the
+/// explorer's) must wear the same surface and rows so the two stay identical.
+const MENU_ITEM_HEIGHT: f32 = 26.;
+
+/// The menu panel: popover surface, 4px padding and 2px between rows.
+pub(crate) fn menu_surface<T: Styled>(panel: T, cx: &gpui::App) -> T {
+    panel
+        .popover_style(cx)
+        .flex()
+        .flex_col()
+        .p_1()
+        .gap_y_0p5()
+        .min_w(gpui::rems(8.))
+        .max_w(gpui::px(500.))
+}
+
+/// One menu row. `highlighted` marks the keyboard cursor; hover is added for
+/// enabled rows. `highlight` overrides the accent fill (and keeps the row's
+/// own text colour), for rows with a warning or danger tone.
+pub(crate) fn menu_item<T: Styled + StatefulInteractiveElement + FluentBuilder>(
+    row: T,
+    enabled: bool,
+    highlighted: bool,
+    highlight: Option<gpui::Rgba>,
+    cx: &gpui::App,
+) -> T {
+    let theme = cx.theme();
+    let background = highlight.map_or(*theme.tokens.accent, gpui::Hsla::from);
+    let foreground = if highlight.is_some() {
+        None
+    } else {
+        Some(theme.accent_foreground)
+    };
+    row.h(gpui::px(MENU_ITEM_HEIGHT))
+        .flex()
+        .items_center()
+        .px_2()
+        .text_sm()
+        .rounded(theme.radius.min(gpui::px(8.)))
+        .text_color(if enabled {
+            theme.popover_foreground
+        } else {
+            theme.muted_foreground
+        })
+        .when(highlighted && enabled, |row| {
+            row.bg(background)
+                .when_some(foreground, |row, color| row.text_color(color))
+        })
+        .when(enabled, |row| {
+            row.cursor_pointer().hover(move |style| {
+                let style = style.bg(background);
+                match foreground {
+                    Some(color) => style.text_color(color),
+                    None => style,
+                }
+            })
+        })
+}
+
+/// A horizontal rule between menu groups, matching `PopupMenuItem::Separator`.
+pub(crate) fn menu_separator(cx: &gpui::App) -> gpui::Div {
+    gpui::div()
+        .my_0p5()
+        .mx_neg_1()
+        .border_b(gpui::px(2.))
+        .border_color(cx.theme().border)
 }
 
 /// Below the popup surface, above the workspace. It catches wheel and trackpad

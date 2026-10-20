@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Match context-menu spacing across the workbench, remove the extra row-number column, and let Backspace stage selected-row deletions alongside Delete.
+- Allow selecting and copying part of a row-inspector value; align its row-action buttons and the filter controls, with a compact Add condition button.
+- Simplify empty structure sections and show table definitions as formatted, syntax-highlighted SQL.
+
 ## 0.14.0 - 2026-10-20
 
 - Show failed statements as errors without a contradictory success message; preserve database detail, hints and source positions, and offer an editable AI repair request.

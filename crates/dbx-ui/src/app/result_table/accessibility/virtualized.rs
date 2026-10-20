@@ -191,9 +191,9 @@ impl GridSnapshot {
             .as_ref()
             .is_some_and(|result| result.truncated);
         let description = format!(
-            "{} loaded rows and {} data columns, with row numbers. Starting at row {}{}. Arrow keys navigate cells. Control or Command plus Shift and Left or Right resizes the selected column; Home fits it.",
+            "{} loaded rows and {} data columns. Starting at row {}{}. Arrow keys navigate cells. Control or Command plus Shift and Left or Right resizes the selected column; Home fits it.",
             rows,
-            columns.saturating_sub(1),
+            columns,
             delegate.row_offset + 1,
             if truncated {
                 "; more rows are available"
@@ -322,9 +322,7 @@ impl ResultTableDelegate {
             }
         });
         let mut node = Node::new(Role::ColumnHeader);
-        node.set_label(
-            metadata.map_or_else(|| "Row number".to_string(), |column| column.name.clone()),
-        );
+        node.set_label(metadata.map_or_else(String::new, |column| column.name.clone()));
         node.set_row_index(0);
         node.set_column_index(column);
         node.set_author_id(format!(

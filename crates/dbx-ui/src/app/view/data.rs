@@ -53,7 +53,11 @@ fn row_field_heading(
 }
 
 impl DbxApp {
-    pub(super) fn render_data(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_data(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(session_id) = self.active_session_id() else {
             return div().into_any_element();
         };
@@ -407,6 +411,10 @@ impl DbxApp {
                                         value_editor,
                                     )| {
                                         let value_focus = value_editor.read(cx).focus_handle();
+                                        // Every control matches the value field, which grows
+                                        // with the text size.
+                                        let control_height =
+                                            editor::single_line_input_height(&value_editor, cx);
                                         div()
                                             .id(SharedString::from(format!("filter-row-{row_id}")))
                                             .w_full()
@@ -418,7 +426,7 @@ impl DbxApp {
                                                 div().flex_1().min_w_0().max_w(crate::theme::ui_px(240.)).child(
                                                     Select::new(&column_selector)
                                                         .with_size(Size::Small)
-                                                        .h(crate::theme::control_height(FILTER_CONTROL_HEIGHT))
+                                                        .h(control_height)
                                                         .rounded(crate::theme::ui_px(5.))
                                                         .w_full()
                                                         .menu_max_h(crate::theme::ui_px(220.))
@@ -434,7 +442,7 @@ impl DbxApp {
                                                 div().flex_1().min_w_0().max_w(crate::theme::ui_px(220.)).child(
                                                     Select::new(&operator_selector)
                                                         .with_size(Size::Small)
-                                                        .h(crate::theme::control_height(FILTER_CONTROL_HEIGHT))
+                                                        .h(control_height)
                                                         .rounded(crate::theme::ui_px(5.))
                                                         .w_full()
                                                         .menu_max_h(crate::theme::ui_px(220.))
@@ -452,17 +460,19 @@ impl DbxApp {
                                                     .when(
                                                         operator_requires_value(operator),
                                                         |view| {
-                                                            view.child(editor::input(
+                                                            view.child(editor::input_with_height(
                                                                 value_editor,
                                                                 value_focus,
                                                                 false,
-                                                             cx))
+                                                                control_height,
+                                                                cx,
+                                                            ))
                                                         },
                                                     )
                                                     .when(
                                                         !operator_requires_value(operator),
                                                         |view| {
-                                                            view.h(crate::theme::control_height(FILTER_CONTROL_HEIGHT))
+                                                            view.h(control_height)
                                                                 .px(crate::theme::ui_px(9.))
                                                                 .flex()
                                                                 .items_center()
@@ -478,7 +488,7 @@ impl DbxApp {
                                                     "remove-filter-{row_id}"
                                                 )))
                                                 .flex_none()
-                                                .size(crate::theme::ui_px(FILTER_CONTROL_HEIGHT))
+                                                .size(control_height)
                                                 .with_size(Size::XSmall)
                                                 .compact()
                                                 .ghost()
@@ -493,16 +503,20 @@ impl DbxApp {
                                             )
                                     },
                                 ))
+                                // A row keeps the button at its label width rather
+                                // than stretching it across the filter list.
                                 .child(
-                                    Button::new("add-filter-inline")
-                                        .label("Add condition")
-                                        .with_size(Size::XSmall)
-                                        .compact()
-                                        .ghost()
-                                        .text_color(theme().accent_text)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.add_filter_for(session_id, tab_id, window, cx)
-                                        })),
+                                    div().flex().child(
+                                        Button::new("add-filter-inline")
+                                            .label("Add condition")
+                                            .with_size(Size::XSmall)
+                                            .compact()
+                                            .ghost()
+                                            .text_color(theme().accent_text)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.add_filter_for(session_id, tab_id, window, cx)
+                                            })),
+                                    ),
                                 ),
                         )
                     }),
@@ -515,7 +529,7 @@ impl DbxApp {
                     .flex()
                     .when(!inspector_page, |view| view.child(self.render_grid(session_id, tab_id, cx)))
                     .when(inspector_open && (!self.narrow_workspace || inspector_page), |view| {
-                        view.child(self.render_inspector(session_id, tab_id, cx))
+                        view.child(self.render_inspector(session_id, tab_id, window, cx))
                     }),
             )
             .into_any_element()
@@ -806,6 +820,7 @@ impl DbxApp {
         &mut self,
         session_id: SessionId,
         tab_id: SecondaryTabId,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let Some((
@@ -1203,7 +1218,7 @@ impl DbxApp {
                                             .child(
                                                 div()
                                                     .text_size(crate::theme::text_px(11.))
-                                                    .child(name),
+                                                    .child(name.clone()),
                                             )
                                             .child(
                                                 div()
@@ -1237,11 +1252,29 @@ impl DbxApp {
                                                     }),
                                             ),
                                     )
-                                    .child(if let Some(text) = binary_text {
-                                        crate::app::value_view::monospace_block(text, false, cx)
-                                            .into_any_element()
-                                    } else {
-                                        crate::app::value_view::value_view(value.as_ref(), cx)
+                                    .child({
+                                        let text =
+                                            binary_text.map(|text| (text, None)).or_else(|| {
+                                                crate::app::value_view::inspector_text(
+                                                    value.as_ref(),
+                                                )
+                                                .map(|(text, kind)| (text, Some(kind)))
+                                            });
+                                        match text {
+                                            Some((text, kind)) => read_only_value(
+                                                format!("row-detail-value-{tab_id}-{index}"),
+                                                format!("{name} value"),
+                                                text,
+                                                kind,
+                                                multiline_height,
+                                                window,
+                                                cx,
+                                            ),
+                                            None => crate::app::value_view::value_view(
+                                                value.as_ref(),
+                                                cx,
+                                            ),
+                                        }
                                     })
                             },
                         ))
@@ -1303,22 +1336,28 @@ impl DbxApp {
                                 .items_center()
                                 .justify_between()
                                 .child(
-                                    Button::new("delete-row")
-                                        .label(if row_deleted {
+                                    // Same pill as Edit row and the draft's Cancel.
+                                    button(
+                                        "delete-row",
+                                        if row_deleted {
                                             "Restore row"
                                         } else {
                                             "Delete row"
-                                        })
-                                        .with_size(Size::XSmall)
-                                        .compact()
-                                        .ghost()
-                                        .text_color(theme().danger_text)
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                        },
+                                        if row_deleted {
+                                            ButtonKind::Quiet
+                                        } else {
+                                            ButtonKind::Danger
+                                        },
+                                    )
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
                                             this.request_delete_selected_for(
                                                 session_id, tab_id, window, cx,
                                             )
-                                        })),
+                                        },
+                                    )),
                                 )
                                 .when(!row_deleted, |actions| {
                                     actions.child(
@@ -1345,7 +1384,11 @@ impl DbxApp {
             .into_any_element()
     }
 
-    pub(super) fn render_structure(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_structure(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (tab_id, indexes, checks, definition, scroll) = self
             .active_session()
             .and_then(|session| {
@@ -1446,7 +1489,6 @@ impl DbxApp {
                             .text_size(crate::theme::text_px(10.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme().text_muted)
-                            .child(structure_cell(STRUCTURE_ORDINAL_WIDTH).child("#"))
                             .child(structure_cell(STRUCTURE_KEY_WIDTH).child("Key"))
                             .child(div().flex_1().min_w_0().child("Column"))
                             .child(div().flex_1().min_w_0().child("Type"))
@@ -1487,12 +1529,6 @@ impl DbxApp {
                             })
                             .when(index % 2 == 1, |row| row.bg(theme().grid_alternate))
                             .hover(|style| style.bg(theme().glass_hover))
-                            .child(
-                                structure_cell(STRUCTURE_ORDINAL_WIDTH)
-                                    .text_size(crate::theme::text_px(10.))
-                                    .text_color(theme().text_muted)
-                                    .child(format!("{}", index + 1)),
-                            )
                             .child(
                                 structure_cell(STRUCTURE_KEY_WIDTH)
                                     .flex()
@@ -1616,25 +1652,11 @@ impl DbxApp {
                 self.render_structure_section(
                     (session_id, tab_id),
                     StructureSection::ForeignKeys,
-                    Some(foreign_keys.len()),
+                    // Loading metadata is not the same as having none.
+                    (!busy || !foreign_keys.is_empty()).then_some(foreign_keys.len()),
                     div()
-                        .when(
-                            foreign_keys.is_empty() && !busy && error.is_none(),
-                            |view| {
-                                view.child(
-                                    div()
-                                        .mt(crate::theme::ui_px(8.))
-                                        .px(crate::theme::ui_px(10.))
-                                        .py(crate::theme::ui_px(12.))
-                                        .border_1()
-                                        .border_color(theme().border)
-                                        .rounded(crate::theme::ui_px(6.))
-                                        .text_size(crate::theme::text_px(11.))
-                                        .text_color(theme().text_muted)
-                                        .child("No foreign keys"),
-                                )
-                            },
-                        )
+                        .border_t_1()
+                        .border_color(theme().border)
                         .children(foreign_keys.iter().enumerate().map(|(index, foreign_key)| {
                             let source = foreign_key.columns.join(", ");
                             let target_table = match &foreign_key.referenced_schema {
@@ -1811,6 +1833,34 @@ impl DbxApp {
                 )
             })
             .when_some(definition, |view, definition| {
+                let dialect = self.session(session_id).map(|session| session.kind);
+                let definition = readable_definition(&definition, dialect);
+                let copied = definition.clone();
+                let field = window.use_keyed_state(
+                    SharedString::from(format!("structure-definition-sql-{tab_id}")),
+                    cx,
+                    |window, cx| {
+                        let value = cx.new(|_| String::new());
+                        editor::TextEditor::new_sql(value, dialect, window, cx)
+                            .read_only()
+                            .accessibility_label("Table definition")
+                    },
+                );
+                if *field.read(cx).value_entity().read(cx) != definition {
+                    field.update(cx, |field, cx| {
+                        field.set_text(definition.clone(), cx);
+                        field.move_cursor_to(0, cx);
+                    });
+                }
+                let focus = field.read(cx).focus_handle();
+                // Fit the statement, within reason; longer ones scroll inside.
+                let lines = definition.lines().count().max(1) as f32;
+                let height = (crate::theme::mono_text_px(12.)
+                    * crate::theme::editor_scale()
+                    * 1.618
+                    * lines
+                    + crate::theme::ui_px(24.))
+                .min(crate::theme::ui_px(420.));
                 view.child(
                     self.render_structure_section(
                         (session_id, tab_id),
@@ -1818,18 +1868,47 @@ impl DbxApp {
                         None,
                         div()
                             .flex_none()
-                            .p(crate::theme::ui_px(10.))
-                            .rounded(crate::theme::ui_px(6.))
-                            .border_1()
+                            .relative()
+                            .border_t_1()
                             .border_color(theme().border)
-                            .bg(theme().panel_raised)
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(crate::theme::mono_text_px(11.))
-                            .text_color(theme().text)
-                            .whitespace_normal()
-                            .child(definition)
+                            .child(
+                                editor::input_with_height(field, focus, true, height, cx)
+                                    // The section is the frame; the field
+                                    // only fills it.
+                                    .border_0()
+                                    .rounded_none()
+                                    .follow_bottom_corners(6.)
+                                    .bg(theme().panel_raised),
+                            )
                             .into_any_element(),
                         cx,
+                    )
+                    // Copy sits in the header, beside rather than inside the
+                    // header button, so it never covers the statement and
+                    // is not a button nested in a button. The header's label
+                    // is short, leaving its right edge free.
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .top(crate::theme::ui_px(6.))
+                            .right(crate::theme::ui_px(8.))
+                            .occlude()
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "structure-definition-copy-{tab_id}"
+                                )))
+                                .label("Copy")
+                                .accessible_name("Copy table definition")
+                                .with_size(Size::XSmall)
+                                .compact()
+                                .ghost()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copied.clone(),
+                                    ));
+                                }),
+                            ),
                     ),
                 )
             })
@@ -1920,6 +1999,34 @@ impl DbxApp {
                 if structure.expanded_sections.contains(&section))
             });
         let selector = section.selector();
+        if count == Some(0) {
+            // Nothing to expand: a single quiet row says so.
+            return div()
+                .flex_none()
+                .mt(crate::theme::ui_px(12.))
+                .border_1()
+                .border_color(theme().border)
+                .rounded(crate::theme::ui_px(6.))
+                .debug_selector(move || selector.into())
+                .px(crate::theme::ui_px(10.))
+                .h(crate::theme::control_height(34.))
+                .flex()
+                .items_center()
+                .gap(crate::theme::ui_px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(crate::theme::text_px(11.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(section.label()),
+                )
+                .child(
+                    div()
+                        .text_size(crate::theme::text_px(10.))
+                        .text_color(theme().text_muted)
+                        .child("None"),
+                );
+        }
         div()
             .flex_none()
             .mt(crate::theme::ui_px(12.))
@@ -1987,6 +2094,194 @@ impl DbxApp {
     }
 }
 
+/// Lay a one-line `CREATE TABLE` out one column or constraint per line, the
+/// way MySQL and PostgreSQL print their own definitions. Definitions that
+/// already span lines are left as the server wrote them; other statements go
+/// through the editor's formatter. The result is what Copy puts on the
+/// clipboard, so any syntax this cannot read unambiguously is returned as
+/// written rather than risk altering a name or literal.
+fn readable_definition(sql: &str, dialect: editor::SqlDialect) -> String {
+    let sql = sql.trim();
+    if sql.contains('\n') {
+        return sql.to_owned();
+    }
+    let Some(protected) = protected_sql_spans(sql, dialect) else {
+        return sql.to_owned();
+    };
+    // Judge the statement by its keywords only: a quoted name may contain
+    // parentheses or the words `AS` and `TABLE`.
+    let keywords = sql
+        .char_indices()
+        .map(|(offset, character)| {
+            if protected.iter().any(|range| range.contains(&offset)) {
+                '_'
+            } else {
+                character.to_ascii_uppercase()
+            }
+        })
+        .collect::<String>();
+    let Some(open) = keywords.find('(') else {
+        return format_unbracketed(sql, dialect);
+    };
+    let head = &keywords[..open];
+    if !head.starts_with("CREATE") || !head.contains(" TABLE ") || head.contains(" AS ") {
+        return format_unbracketed(sql, dialect);
+    }
+    let mut output = String::with_capacity(sql.len() + 64);
+    let mut depth = 0usize;
+    let mut skip_space = false;
+    for (offset, character) in sql.char_indices() {
+        if protected.iter().any(|range| range.contains(&offset)) {
+            skip_space = false;
+            output.push(character);
+            continue;
+        }
+        if skip_space && character.is_whitespace() {
+            continue;
+        }
+        skip_space = false;
+        match character {
+            '(' if depth == 0 => {
+                output.truncate(output.trim_end().len());
+                output.push_str(" (\n    ");
+                depth = 1;
+                skip_space = true;
+            }
+            '(' => {
+                depth += 1;
+                output.push(character);
+            }
+            ')' if depth == 1 => {
+                output.truncate(output.trim_end().len());
+                output.push_str("\n)");
+                depth = 0;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                output.push(character);
+            }
+            ',' if depth == 1 => {
+                output.push_str(",\n    ");
+                skip_space = true;
+            }
+            character => output.push(character),
+        }
+    }
+    if depth == 0 { output } else { sql.to_owned() }
+}
+
+/// The editor's formatter does not read `[bracket]` names (SQLite and SQL
+/// Server) and could re-space them, so statements using them stay as written.
+fn format_unbracketed(sql: &str, dialect: editor::SqlDialect) -> String {
+    if sql.contains('[') {
+        sql.to_owned()
+    } else {
+        editor::format_sql_for(sql, dialect)
+    }
+}
+
+/// Byte ranges of strings, comments and quoted names (`"x"`, `` `x` `` and
+/// `[x]`), whose content must reach the output exactly as written. `None`
+/// when the text is ambiguous: an unclosed `[`, or a bracket name containing a
+/// quote or comment marker that the lexer would read as running past it.
+fn protected_sql_spans(
+    sql: &str,
+    dialect: editor::SqlDialect,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let mut spans = editor::lex_sql_for(sql, dialect)
+        .into_iter()
+        .filter(|token| {
+            matches!(
+                token.kind,
+                editor::SqlTokenKind::String | editor::SqlTokenKind::Comment
+            ) || sql[token.range.clone()].starts_with(['"', '`'])
+        })
+        .map(|token| token.range)
+        .collect::<Vec<_>>();
+    let lexed = spans.clone();
+    let mut brackets: Vec<std::ops::Range<usize>> = Vec::new();
+    for (offset, character) in sql.char_indices() {
+        let covered = |range: &std::ops::Range<usize>| range.contains(&offset);
+        if character != '[' || lexed.iter().any(covered) || brackets.iter().any(covered) {
+            continue;
+        }
+        let end = offset + 1 + sql[offset + 1..].find(']')? + 1;
+        if lexed
+            .iter()
+            .any(|token| token.start > offset && token.start < end && token.end > end)
+        {
+            return None;
+        }
+        brackets.push(offset..end);
+    }
+    spans.extend(brackets);
+    Some(spans)
+}
+
+/// A read-only field for an inspected value. It matches the row editor's
+/// field so part of a long value can be selected and copied; the field's
+/// Copy button still copies the complete value. `kind` is `None` for
+/// formatted bytes, which keep their monospace layout.
+fn read_only_value(
+    id: String,
+    label: String,
+    text: String,
+    kind: Option<crate::app::value_view::InspectorText>,
+    max_height: Pixels,
+    window: &mut Window,
+    cx: &mut Context<DbxApp>,
+) -> AnyElement {
+    use crate::app::value_view::InspectorText;
+    let language = if kind == Some(InspectorText::Json) {
+        editor::EditorLanguage::Json
+    } else {
+        editor::EditorLanguage::PlainText
+    };
+    let monospace = kind.is_none();
+    let multiline = kind != Some(InspectorText::Plain) || text.contains(['\n', '\r']);
+    // A single-line field would turn line breaks into spaces, so any break,
+    // including a bare CR, keeps the value multiline and literal.
+    // Keyed by presentation so a column whose values switch between text and
+    // JSON gets a field of the right mode.
+    let field = window.use_keyed_state(
+        SharedString::from(format!("{id}-{multiline}-{language:?}")),
+        cx,
+        |window, cx| {
+            let value = cx.new(|_| String::new());
+            editor::TextEditor::new_with_language(value, multiline, language, window, cx)
+                .read_only()
+                .accessibility_label(label)
+        },
+    );
+    if *field.read(cx).value_entity().read(cx) != text {
+        field.update(cx, |field, cx| {
+            field.set_text(text, cx);
+            field.move_cursor_to(0, cx);
+        });
+    }
+    let focus = field.read(cx).focus_handle();
+    let height = if multiline {
+        let lines = field
+            .read(cx)
+            .value_entity()
+            .read(cx)
+            .lines()
+            .count()
+            .max(1);
+        // GPUI's default line height, plus the field's padding and border.
+        (crate::theme::text_px(12.) * 1.618 * lines as f32 + crate::theme::ui_px(22.))
+            .min(max_height)
+    } else {
+        crate::theme::ui_px(32.)
+    };
+    editor::input_with_height(field, focus, multiline, height, cx)
+        .debug_selector(move || id.clone())
+        .when(monospace, |field| {
+            field.font_family(cx.theme().mono_font_family.clone())
+        })
+        .into_any_element()
+}
+
 /// One named index or constraint: its name and traits on top, the indexed
 /// parts or expression below.
 fn structure_detail_row(
@@ -2048,10 +2343,6 @@ fn structure_detail_row(
         })
 }
 
-/// Every control in a filter row matches the single-line editor height.
-const FILTER_CONTROL_HEIGHT: f32 = 32.0;
-
-const STRUCTURE_ORDINAL_WIDTH: f32 = 32.0;
 const STRUCTURE_KEY_WIDTH: f32 = 56.0;
 const STRUCTURE_NULL_WIDTH: f32 = 84.0;
 
@@ -2356,5 +2647,21 @@ mod tests {
             );
         });
         crate::theme::set_text_scales(100, 100);
+    }
+
+    #[test]
+    fn readable_definition_keeps_quoted_names_exactly_as_written() {
+        let dialect = Some(DatabaseKind::SQLite);
+        // Copy is executable SQL: no line break, spacing or depth change may
+        // land inside a name, however it is quoted.
+        let sql = r#"CREATE TABLE "odd (name), x" ([a,b] TEXT, [c (d] TEXT, `e,f` TEXT, g TEXT DEFAULT 'h,(i')"#;
+        let formatted = readable_definition(sql, dialect);
+        assert_eq!(
+            formatted,
+            "CREATE TABLE \"odd (name), x\" (\n    [a,b] TEXT,\n    [c (d] TEXT,\n    `e,f` TEXT,\n    g TEXT DEFAULT 'h,(i'\n)"
+        );
+        // An unclosed bracket name is ambiguous and stays as the server wrote it.
+        let ambiguous = "CREATE TABLE t ([a,b TEXT, c TEXT)";
+        assert_eq!(readable_definition(ambiguous, dialect), ambiguous);
     }
 }

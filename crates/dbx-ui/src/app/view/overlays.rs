@@ -700,11 +700,7 @@ impl DbxApp {
 
         let app = cx.entity().downgrade();
         let items = rows.into_iter().enumerate().map(|(index, row)| match row {
-            TableMenuRow::Separator => div()
-                .my(crate::theme::ui_px(4.))
-                .border_t_1()
-                .border_color(theme().border)
-                .into_any_element(),
+            TableMenuRow::Separator => crate::popups::menu_separator(cx).into_any_element(),
             TableMenuRow::Item {
                 command,
                 label,
@@ -712,52 +708,48 @@ impl DbxApp {
                 tone,
             } => {
                 let highlighted = enabled && menu.cursor == Some(index);
-                let highlight = if tone == MenuTone::Normal {
-                    theme().accent_soft
-                } else {
-                    theme().panel
-                };
-                div()
-                    .id(("table-menu-item", index))
-                    .role(gpui::Role::MenuItem)
-                    .aria_label(label)
-                    .a11y_synthetic_children(move |builder| {
-                        if !enabled {
-                            builder.parent_node().set_disabled();
-                        }
-                    })
-                    .when(highlighted && menu.focus.is_focused(window), |view| {
-                        view.aria_active_descendant()
-                    })
-                    .on_a11y_action(gpui::AccessibleAction::Click, {
-                        let app = app.clone();
-                        move |_, window, cx| {
-                            if enabled {
-                                let _ = app.update(cx, |this, cx| {
-                                    this.run_table_menu_command(command, window, cx)
-                                });
+                // Warning and danger rows keep their tone colour, so they
+                // highlight with a neutral fill instead of the accent.
+                let highlight = (tone != MenuTone::Normal).then(|| theme().panel);
+                crate::popups::menu_item(
+                    div()
+                        .id(("table-menu-item", index))
+                        .role(gpui::Role::MenuItem)
+                        .aria_label(label)
+                        .a11y_synthetic_children(move |builder| {
+                            if !enabled {
+                                builder.parent_node().set_disabled();
                             }
-                        }
+                        })
+                        .when(highlighted && menu.focus.is_focused(window), |view| {
+                            view.aria_active_descendant()
+                        })
+                        .on_a11y_action(gpui::AccessibleAction::Click, {
+                            let app = app.clone();
+                            move |_, window, cx| {
+                                if enabled {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.run_table_menu_command(command, window, cx)
+                                    });
+                                }
+                            }
+                        }),
+                    enabled,
+                    highlighted,
+                    highlight,
+                    cx,
+                )
+                .when(enabled && tone != MenuTone::Normal, |view| {
+                    view.text_color(match tone {
+                        MenuTone::Warning => theme().warning_text,
+                        _ => theme().danger_text,
                     })
-                    .px(crate::theme::ui_px(8.))
-                    .py(crate::theme::ui_px(7.))
-                    .rounded(crate::theme::ui_px(5.))
-                    .text_color(match (enabled, tone) {
-                        (false, _) => theme().text_muted,
-                        (true, MenuTone::Normal) => theme().text,
-                        (true, MenuTone::Warning) => theme().warning_text,
-                        (true, MenuTone::Danger) => theme().danger_text,
-                    })
-                    .when(highlighted, |view| view.bg(highlight))
-                    .when(enabled, |view| {
-                        view.cursor_pointer()
-                            .hover(move |style| style.bg(highlight))
-                    })
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_table_menu_command(command, window, cx)
-                    }))
-                    .into_any_element()
+                })
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run_table_menu_command(command, window, cx)
+                }))
+                .into_any_element()
             }
         });
 
@@ -766,7 +758,7 @@ impl DbxApp {
                 .position(menu.position)
                 .snap_to_window_with_margin(crate::theme::ui_px(8.))
                 .child(
-                    div()
+                    crate::popups::menu_surface(div(), cx)
                         .id("table-context-menu")
                         .role(gpui::Role::Menu)
                         .aria_label(table_sidebar_label(&menu.table, None))
@@ -781,25 +773,17 @@ impl DbxApp {
                         .key_context("DbxTableMenu")
                         .track_focus(&menu.focus)
                         .occlude()
-                        .w(crate::theme::ui_px(220.))
-                        .p(crate::theme::ui_px(6.))
-                        .rounded(crate::theme::ui_px(RADIUS_PANEL))
-                        .border_1()
-                        .border_color(theme().hairline)
-                        .bg(theme().glass_raised)
-                        .shadow(glass_shadow(18.))
-                        .text_size(crate::theme::text_px(12.))
                         .on_mouse_down_out(
                             cx.listener(|this, _, _, cx| this.close_table_context_menu(cx)),
                         )
                         .child(
                             div()
-                                .px(crate::theme::ui_px(8.))
-                                .pt(crate::theme::ui_px(5.))
-                                .pb(crate::theme::ui_px(7.))
-                                .text_size(crate::theme::text_px(10.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme().text_muted)
+                                .h(gpui::px(26.))
+                                .flex()
+                                .items_center()
+                                .px_2()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
                                 .child(table_sidebar_label(&menu.table, None)),
                         )
                         .children(items),

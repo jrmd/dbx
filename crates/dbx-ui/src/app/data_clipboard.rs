@@ -423,7 +423,7 @@ impl DbxApp {
         // Pasted fields fill columns in display order from the selected cell.
         let order = grid.delegate().display_order().to_vec();
         let (start_row, start_column) = match grid.selected_cell() {
-            Some((row, column)) => (row, column.saturating_sub(1)),
+            Some((row, column)) => (row, column),
             None => (data.loaded_rows_with_inserts(), 0),
         };
         let total_rows = data.loaded_rows_with_inserts();

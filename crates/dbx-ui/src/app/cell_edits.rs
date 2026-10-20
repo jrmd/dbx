@@ -1614,7 +1614,14 @@ mod tests {
     #[gpui::test]
     fn json_editor_validates_and_persists_the_complete_document(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        cx.update(|cx| cx.bind_keys(editor::default_key_bindings()));
+        cx.update(|cx| {
+            cx.bind_keys(editor::default_key_bindings());
+            cx.bind_keys([gpui::KeyBinding::new(
+                "backspace",
+                DeleteRows,
+                Some("DbxDataGrid"),
+            )]);
+        });
         let session_id = Uuid::new_v4();
         let tab_id = Uuid::new_v4();
         let (app,cx) = cx.add_window_view(|window,cx| {
@@ -1675,11 +1682,29 @@ mod tests {
             editor.read_with(cx, |editor, cx| editor.text(cx)),
             "{invalid"
         );
+        // Backspace deletes marked rows from the grid, never while typing.
+        cx.update(|_, cx| {
+            app.update(cx, |app, _| {
+                app.data_tab_mut(session_id, tab_id)
+                    .unwrap()
+                    .marked_rows
+                    .insert(1);
+            })
+        });
         cx.simulate_keystrokes("backspace");
         assert_eq!(
             editor.read_with(cx, |editor, cx| editor.text(cx)),
             "{invali"
         );
+        cx.update(|_, cx| {
+            assert!(
+                app.read(cx)
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .pending_deletes
+                    .is_empty()
+            )
+        });
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
@@ -1914,7 +1939,7 @@ mod tests {
                 app.on_data_grid_event(
                     session_id,
                     tab_id,
-                    &TableEvent::DoubleClickedCell(0, 2),
+                    &TableEvent::DoubleClickedCell(0, 1),
                     window,
                     cx,
                 );
@@ -2136,14 +2161,14 @@ mod tests {
             })
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        let text_before = cx.debug_bounds("result-cell-text-0-2").unwrap();
+        let text_before = cx.debug_bounds("result-cell-text-0-1").unwrap();
         let row_before = cx.debug_bounds("dbx-result-row-0").unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.on_data_grid_event(
                     session_id,
                     tab_id,
-                    &TableEvent::DoubleClickedCell(0, 2),
+                    &TableEvent::DoubleClickedCell(0, 1),
                     window,
                     cx,
                 );

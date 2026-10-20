@@ -56,7 +56,6 @@ pub(super) struct GridChanges {
     pub(super) marked: BTreeSet<usize>,
 }
 
-const ROW_NUMBER_COLUMN_KEY: &str = "__dbx_row_number";
 const MIN_COLUMN_WIDTH: f32 = 60.;
 const MAX_COLUMN_WIDTH: f32 = 1_200.;
 const RESIZE_HANDLE_WIDTH: f32 = 7.;
@@ -264,7 +263,7 @@ pub(super) struct ResultTableDelegate {
     accessible_header_focus: Option<SharedString>,
     accessible_header_selection: Option<(usize, usize)>,
     accessible_geometry: Rc<std::cell::RefCell<accessibility::GridGeometry>>,
-    /// Result column shown at each display position after the row number.
+    /// Result column shown at each display position.
     /// Pinned columns come first; hidden columns are absent.
     order: Vec<usize>,
     /// The result column under the last right-click, for column actions.
@@ -289,7 +288,7 @@ impl Default for ResultTableDelegate {
     fn default() -> Self {
         Self {
             result: None,
-            columns: vec![Self::row_number_column(0)],
+            columns: Vec::new(),
             numeric: Vec::new(),
             cell_text: Vec::new(),
             binary_formats: HashMap::new(),
@@ -412,26 +411,19 @@ impl ResultTableDelegate {
     pub(super) fn set_row_offset(&mut self, row_offset: usize) {
         if self.row_offset != row_offset {
             self.row_offset = row_offset;
-            let last_row = row_offset.saturating_add(self.loaded_rows());
-            if let Some(column) = self.columns.first_mut() {
-                *column = Self::row_number_column(last_row);
-            }
             self.accessible_rows.clear();
             self.accessible_revision = self.accessible_revision.wrapping_add(1);
         }
     }
 
-    /// The result column a grid column shows. Column 0 is the row number.
+    /// The result column a grid column shows.
     pub(super) fn result_column(&self, col_ix: usize) -> Option<usize> {
-        self.order.get(col_ix.checked_sub(1)?).copied()
+        self.order.get(col_ix).copied()
     }
 
     /// The grid column showing a result column, if it is visible.
     pub(super) fn grid_column(&self, column: usize) -> Option<usize> {
-        self.order
-            .iter()
-            .position(|shown| *shown == column)
-            .map(|index| index + 1)
+        self.order.iter().position(|shown| *shown == column)
     }
 
     pub(super) fn binary_format(&self, column: usize) -> super::value_view::BinaryFormat {
@@ -957,7 +949,7 @@ impl ResultTableDelegate {
                         let value = row.values.get(*column_index)?;
                         (!super::find::find_matches(&value.to_string(), needle, case_sensitive)
                             .is_empty())
-                        .then_some((row_index, position + 1))
+                        .then_some((row_index, position))
                     })
             })
             .collect()
@@ -1011,22 +1003,6 @@ impl ResultTableDelegate {
         self.result.as_deref().map(json_result)
     }
 
-    fn row_number_column(last_row: usize) -> DataColumn {
-        // Numeric position needs room for its complete digits and the same
-        // scaled padding as a data cell, including later database pages.
-        let digits = last_row.max(1).ilog10() + 1;
-        let width = crate::theme::ui_px((digits as f32 * 8. + 16.).max(44.));
-        DataColumn::new(ROW_NUMBER_COLUMN_KEY, "#")
-            .width(width)
-            .fixed_left()
-            .resizable(false)
-            .movable(false)
-            .selectable(false)
-            .min_width(width)
-            .max_width(width)
-            .p_0()
-    }
-
     fn data_column_key(index: usize, column: &ColumnInfo) -> String {
         // Query results may legally contain duplicate column names, so the ordinal is
         // part of the key. Humanity has already made SQL aliases difficult enough.
@@ -1068,10 +1044,7 @@ impl ResultTableDelegate {
         if !same_source {
             self.accessible_dataset_revision = self.accessible_dataset_revision.wrapping_add(1);
         }
-        let last_row = self
-            .row_offset
-            .saturating_add(result.as_ref().map_or(0, |result| result.rows.len()));
-        let mut columns = vec![Self::row_number_column(last_row)];
+        let mut columns = Vec::new();
         self.unsorted = None;
         self.sort = match self.sorting {
             ResultSorting::Server => self.server_order.as_ref().and_then(|order| {
@@ -1178,13 +1151,9 @@ impl ResultTableDelegate {
     pub(super) fn widths_by_key(&self, widths: &[Pixels]) -> HashMap<String, Pixels> {
         let mut remembered = HashMap::new();
 
-        if let Some(width) = widths.first().copied() {
-            remembered.insert(ROW_NUMBER_COLUMN_KEY.to_owned(), width);
-        }
-
         if let Some(result) = self.result.as_deref() {
             for (position, &index) in self.order.iter().enumerate() {
-                if let Some(width) = widths.get(position + 1).copied() {
+                if let Some(width) = widths.get(position).copied() {
                     remembered.insert(Self::data_column_key(index, &result.columns[index]), width);
                 }
             }
@@ -1200,7 +1169,7 @@ impl ResultTableDelegate {
         };
         self.order
             .iter()
-            .zip(self.columns.iter().skip(1))
+            .zip(self.columns.iter())
             .map(|(&index, column)| (result.columns[index].name.clone(), f32::from(column.width)))
             .collect()
     }
@@ -1240,9 +1209,6 @@ impl ResultTableDelegate {
     }
 
     fn foreign_key_for_cell(&self, row_ix: usize, col_ix: usize) -> Option<ForeignKeyInfo> {
-        if col_ix == 0 {
-            return None;
-        }
         let result = self.result.as_ref()?;
         let row = result.rows.get(row_ix)?;
         let column = result.columns.get(self.result_column(col_ix)?)?;
@@ -1454,14 +1420,11 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) {
-        let (Some(from), Some(to)) = (col_ix.checked_sub(1), to_ix.checked_sub(1)) else {
-            return;
-        };
-        if from >= self.order.len() || to >= self.order.len() {
+        if col_ix >= self.order.len() || to_ix >= self.order.len() {
             return;
         }
-        let index = self.order.remove(from);
-        self.order.insert(to, index);
+        let index = self.order.remove(col_ix);
+        self.order.insert(to_ix, index);
         let column = self.columns.remove(col_ix);
         self.columns.insert(to_ix, column);
     }
@@ -1501,7 +1464,7 @@ impl TableDelegate for ResultTableDelegate {
         let numeric = index
             .and_then(|index| self.numeric.get(index).copied())
             .unwrap_or(false);
-        let label = column.map_or_else(|| "Row number".to_owned(), |column| column.name.clone());
+        let label = column.map_or_else(String::new, |column| column.name.clone());
         let key = self.columns[col_ix].key.clone();
         let sort = index.and_then(|index| self.column_sort(index));
         let author_id = format!("dbx-grid-{}-header-{key}", cx.entity_id());
@@ -1820,7 +1783,7 @@ impl TableDelegate for ResultTableDelegate {
             ResultSorting::Disabled => {}
             ResultSorting::Local => {
                 self.sort_locally(index, direction);
-                for (column_ix, column) in self.columns.iter_mut().enumerate().skip(1) {
+                for (column_ix, column) in self.columns.iter_mut().enumerate() {
                     column.sort = Some(if column_ix == col_ix {
                         sort
                     } else {
@@ -2234,18 +2197,17 @@ impl TableDelegate for ResultTableDelegate {
             table.set_right_clicked_row(Some(row_ix), cx);
         });
         if let Some(insert) = self.insert_row(row_ix) {
-            let text = match data_column {
-                None => Some("+".to_owned()),
-                Some(column) => insert
+            let text = data_column.and_then(|column| {
+                insert
                     .get(column)
                     .cloned()
                     .flatten()
                     .map(|value| match &value {
                         MutationValue::Parameter(value) => self.formatted_value(column, value),
                         _ => staged_text(&value),
-                    }),
-            };
-            let muted = text.is_none() || col_ix == 0;
+                    })
+            });
+            let muted = text.is_none();
             return semantic_cell
                 .size_full()
                 .flex()
@@ -2261,7 +2223,7 @@ impl TableDelegate for ResultTableDelegate {
                 } else {
                     theme().text
                 })
-                .when(muted && col_ix > 0, |cell| cell.italic())
+                .when(muted, |cell| cell.italic())
                 .child(div().min_w_0().truncate().child(rendered_cell_text(
                     text.unwrap_or_else(|| "DEFAULT".into()).into(),
                     json && !muted,
@@ -2345,10 +2307,7 @@ impl TableDelegate for ResultTableDelegate {
                 }
             }
         } else {
-            (
-                (self.row_offset + row_ix + 1).to_string().into(),
-                theme().text_muted,
-            )
+            (SharedString::default(), theme().text_muted)
         };
         let foreign_key = self.foreign_key_for_cell(row_ix, col_ix);
         let numeric = data_column
@@ -2374,7 +2333,7 @@ impl TableDelegate for ResultTableDelegate {
                 text_color
             })
             .when(null, |cell| cell.italic())
-            .when(deleted && col_ix > 0, |cell| cell.line_through())
+            .when(deleted, |cell| cell.line_through())
             .when(numeric && foreign_key.is_none(), |cell| cell.justify_end());
         if foreign_key.is_some() {
             cell = cell
@@ -2448,10 +2407,6 @@ impl TableDelegate for ResultTableDelegate {
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
-        if col_ix == 0 {
-            return (self.row_offset + row_ix + 1).to_string();
-        }
-
         self.result
             .as_ref()
             .and_then(|result| result.rows.get(row_ix))

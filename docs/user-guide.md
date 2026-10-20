@@ -222,6 +222,12 @@ outside this implementation.
 
 ## Back up and restore
 
+**Export database…** uses DBX's exporter to write selected tables as SQL, CSV or
+TSV, with gzip and schema-only SQL options. Use it for data transfers and
+table-level exports. **Native backup…** uses the database vendor's tools for
+recovery backups, including database details that DBX's export metadata does not
+represent, such as grants and generated column expressions.
+
 Use the database menu's native backup actions with installed `pg_dump` /
 `pg_restore` or `mysqldump` / `mysql`. PostgreSQL uses a custom archive; MySQL uses
 SQL. The job detects tools, reports progress/logs, supports cancellation and

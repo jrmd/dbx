@@ -212,6 +212,9 @@ fn main() {
             KeyBinding::new("cmd-s", app::CommitChanges, Some("DbxDataTab")),
             KeyBinding::new("ctrl-s", app::CommitChanges, Some("DbxDataTab")),
             KeyBinding::new("delete", app::DeleteRows, Some("DbxDataGrid")),
+            // Text inputs and editors bind Backspace in a deeper context, so
+            // typing never reaches this; it only fires on the grid itself.
+            KeyBinding::new("backspace", app::DeleteRows, Some("DbxDataGrid")),
             KeyBinding::new("cmd-backspace", app::DeleteRows, Some("DbxDataGrid")),
             KeyBinding::new("ctrl-backspace", app::DeleteRows, Some("DbxDataGrid")),
             KeyBinding::new("cmd-c", app::CopyDataSelection, Some("DbxDataGrid")),

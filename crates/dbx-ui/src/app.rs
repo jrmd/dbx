@@ -3855,7 +3855,7 @@ impl DbxApp {
         };
 
         match event {
-            TableEvent::DoubleClickedCell(row, column) if *column > 0 => {
+            TableEvent::DoubleClickedCell(row, column) => {
                 query_tab.inspected_value = query_tab
                     .result_grid
                     .read(cx)

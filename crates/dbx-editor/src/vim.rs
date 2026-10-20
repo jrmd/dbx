@@ -153,7 +153,7 @@ impl TextEditor {
     }
 
     pub fn accepts_insert_input(&self) -> bool {
-        self.vim_mode().is_none_or(|mode| mode == VimMode::Insert)
+        !self.read_only && self.vim_mode().is_none_or(|mode| mode == VimMode::Insert)
     }
 
     pub(super) fn vim_key(&mut self, action: &Key, window: &mut Window, cx: &mut Context<Self>) {

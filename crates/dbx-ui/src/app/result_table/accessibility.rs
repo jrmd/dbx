@@ -63,7 +63,7 @@ impl RenderOnce for AccessibleGrid {
             .aria_label(self.label)
             .aria_row_count(rows + 1)
             .aria_column_count(columns)
-            .aria_description(format!("{} loaded rows and {} data columns, with row numbers. Starting at row {}{}. Arrow keys navigate cells. Control or Command plus Shift and Left or Right resizes the selected column; Home fits it.", rows, columns.saturating_sub(1), offset + 1, if truncated { "; more rows are available" } else { "" }));
+            .aria_description(format!("{} loaded rows and {} data columns. Starting at row {}{}. Arrow keys navigate cells. Control or Command plus Shift and Left or Right resizes the selected column; Home fits it.", rows, columns, offset + 1, if truncated { "; more rows are available" } else { "" }));
         for (action, delta) in [
             (gpui::AccessibleAction::ScrollDown, 20isize),
             (gpui::AccessibleAction::ScrollUp, -20),
@@ -138,7 +138,7 @@ impl RenderOnce for AccessibleGrid {
                 }
                 cx.stop_propagation();
                 keyboard.update(cx, |table, cx| {
-                    let col = table.selected_cell().map_or(1, |(_, col)| col);
+                    let col = table.selected_cell().map_or(0, |(_, col)| col);
                     let delegate = table.delegate_mut();
                     let Some(column) = delegate.columns.get(col) else {
                         return;
@@ -178,7 +178,10 @@ impl ResultTableDelegate {
         AccessibleCellTarget {
             row,
             row_key: self.accessible_row_key(row),
-            column_key: self.columns[col].key.clone(),
+            column_key: self
+                .columns
+                .get(col)
+                .map_or_else(SharedString::default, |column| column.key.clone()),
             revision: self.accessible_revision,
         }
     }
@@ -291,9 +294,7 @@ impl ResultTableDelegate {
         table_id: gpui::EntityId,
     ) -> gpui::accesskit::Node {
         let data_column = self.result_column(col);
-        let value = if col == 0 {
-            format!("Row {}", self.row_offset + row + 1)
-        } else if let Some(insert) = self.insert_row(row) {
+        let value = if let Some(insert) = self.insert_row(row) {
             data_column
                 .and_then(|index| insert.get(index))
                 .and_then(Option::as_ref)
@@ -324,7 +325,7 @@ impl ResultTableDelegate {
             });
         let changed =
             data_column.is_some_and(|column| self.changes.edits.contains_key(&(row, column)));
-        let read_only = !self.accessible_editable || deleted || col == 0;
+        let read_only = !self.accessible_editable || deleted;
         let selected = self.accessible_selected_cell == Some((row, col));
         let description = format!(
             "Row {}, column {} of {}. {}{}{}{}",
@@ -342,11 +343,7 @@ impl ResultTableDelegate {
             if changed { ", unsaved change" } else { "" },
             if editing { ", editing" } else { "" }
         );
-        let mut node = gpui::accesskit::Node::new(if col == 0 {
-            gpui::Role::RowHeader
-        } else {
-            gpui::Role::GridCell
-        });
+        let mut node = gpui::accesskit::Node::new(gpui::Role::GridCell);
         node.set_label(value);
         node.set_description(description);
         node.set_row_index(row + 1);
@@ -402,11 +399,7 @@ impl ResultTableDelegate {
         let column_index_text = (col + 1).to_string();
         let mut cell = div()
             .id(SharedString::from(format!("dbx-result-cell-{key}")))
-            .role(if col == 0 {
-                gpui::Role::RowHeader
-            } else {
-                gpui::Role::GridCell
-            })
+            .role(gpui::Role::GridCell)
             .aria_label(value)
             .aria_description(description)
             .aria_column_index(col)
@@ -542,10 +535,10 @@ mod tests {
         );
         delegate.ensure_accessible_rows();
         let key = delegate.accessible_row_key(0);
-        let old_target = delegate.accessible_cell_target(0, 2);
+        let old_target = delegate.accessible_cell_target(0, 1);
         assert_eq!(
             delegate.resolve_accessible_cell_target(&old_target),
-            Some(2)
+            Some(1)
         );
         page.rows[0].values[1] = CellValue::Text("after".into());
         delegate.set_result(
@@ -566,8 +559,8 @@ mod tests {
             None,
             "queued old callbacks cannot act on a replaced snapshot"
         );
-        let current = delegate.accessible_cell_target(0, 2);
-        assert_eq!(delegate.resolve_accessible_cell_target(&current), Some(2));
+        let current = delegate.accessible_cell_target(0, 1);
+        assert_eq!(delegate.resolve_accessible_cell_target(&current), Some(1));
         delegate.is_data_result = false;
         delegate.set_result(
             Some(Arc::new(page.clone())),

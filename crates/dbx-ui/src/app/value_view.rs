@@ -183,6 +183,28 @@ pub(super) fn value_view(value: Option<&CellValue>, cx: &App) -> AnyElement {
     }
 }
 
+/// How the row inspector presents a value as selectable text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InspectorText {
+    Plain,
+    Json,
+}
+
+/// The selectable inspector text for a value: pretty JSON or the display
+/// text, truncated like the preview. `None` for a missing value or SQL NULL,
+/// which [`value_view`] labels instead, and for bytes, which the inspector
+/// formats itself.
+pub(super) fn inspector_text(value: Option<&CellValue>) -> Option<(String, InspectorText)> {
+    let value = value?;
+    if let Some(json) = json_preview(value) {
+        return Some((truncate_preview(json), InspectorText::Json));
+    }
+    match value {
+        CellValue::Null | CellValue::Bytes(_) => None,
+        value => Some((truncate_preview(value.to_string()), InspectorText::Plain)),
+    }
+}
+
 fn truncate_preview(text: String) -> String {
     match text.char_indices().nth(TEXT_PREVIEW_CHARS) {
         Some((end, _)) => format!("{}… (copy for the full value)", &text[..end]),

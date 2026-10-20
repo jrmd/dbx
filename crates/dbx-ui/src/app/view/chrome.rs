@@ -902,8 +902,8 @@ impl DbxApp {
             .flex_col()
             .child(self.render_tabs(cx))
             .child(match pane {
-                Pane::Data => self.render_data(cx).into_any_element(),
-                Pane::Structure => self.render_structure(cx).into_any_element(),
+                Pane::Data => self.render_data(window, cx).into_any_element(),
+                Pane::Structure => self.render_structure(window, cx).into_any_element(),
                 Pane::Query => self.render_query(window, cx).into_any_element(),
                 Pane::Diagram => self.render_diagram(window, cx).into_any_element(),
             })

@@ -313,6 +313,10 @@ pub struct TextEditor {
     /// Paint text as bullets while retaining the backing value for input and
     /// connection-string construction.
     password: bool,
+    /// Allow selection, copy and scrolling but no text changes from input,
+    /// clipboard, undo or assistive technology. The owner may still replace
+    /// the value programmatically with [`Self::set_text`].
+    read_only: bool,
     accessibility_label: SharedString,
     accessible_text: std::rc::Rc<std::cell::RefCell<accessibility::AccessibleText>>,
     /// UTF-8 byte ranges at grapheme boundaries.
@@ -411,6 +415,7 @@ impl TextEditor {
             multiline,
             language,
             password: false,
+            read_only: false,
             accessibility_label: match language {
                 EditorLanguage::Sql(_) => "SQL query",
                 EditorLanguage::Redis => "Redis command",
@@ -475,6 +480,16 @@ impl TextEditor {
         self
     }
 
+    /// Make the editor a selectable, copyable view of its value.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// A persistent field name, independent of its value or placeholder.
     pub fn accessibility_label(mut self, label: impl Into<SharedString>) -> Self {
         self.accessibility_label = label.into();
@@ -502,6 +517,9 @@ impl TextEditor {
         cx: &mut Context<Self>,
     ) {
         use gpui::accesskit::{Action, ActionData};
+        if self.read_only && matches!(action, Action::SetValue | Action::ReplaceSelectedText) {
+            return;
+        }
         match (action, data) {
             (Action::SetValue, Some(ActionData::Value(value))) => self.set_text(value.as_ref(), cx),
             (Action::ReplaceSelectedText, Some(ActionData::Value(value))) => {
@@ -737,6 +755,9 @@ impl TextEditor {
         edit: impl FnOnce(&str, &[Range<usize>]) -> commands::MultiEdit,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let (selections, primary) = self.all_selections();
         let edit = edit(self.value.read(cx), &selections);
         self.typing_run = None;
@@ -1293,6 +1314,9 @@ impl TextEditor {
         record: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let text = self.text(cx);
         let range = clamp_range(&text, range);
         let inserted = normalize_value(inserted, self.multiline);
@@ -1319,6 +1343,9 @@ impl TextEditor {
     }
 
     fn record_history(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.vim.as_ref().is_some_and(|vim| {
             vim.mode == VimMode::Insert && self.undo_history.len() > vim.insert_undo_start
         }) {
@@ -1346,6 +1373,9 @@ impl TextEditor {
 
     /// Undo the most recent local text replacement, including IME commits.
     pub fn undo(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some(snapshot) = self.undo_history.pop() else {
             return;
         };
@@ -1356,6 +1386,9 @@ impl TextEditor {
 
     /// Redo a replacement reversed by [`Self::undo`].
     pub fn redo(&mut self, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some(snapshot) = self.redo_history.pop() else {
             return;
         };
@@ -1535,6 +1568,9 @@ impl TextEditor {
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if !self.extra_selections.is_empty() {
             self.edit_all_selections(
                 |text, selections| commands::delete_at_all(text, selections, true),
@@ -1560,6 +1596,9 @@ impl TextEditor {
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if !self.extra_selections.is_empty() {
             self.edit_all_selections(
                 |text, selections| commands::delete_at_all(text, selections, false),
@@ -1586,6 +1625,9 @@ impl TextEditor {
 
     /// Replace the whole text and selection as one undo step.
     fn apply_edit(&mut self, edit: commands::Edit, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         self.typing_run = None;
         self.extra_selections.clear();
         if edit.text != *self.value.read(cx) {
@@ -1709,6 +1751,9 @@ impl TextEditor {
     }
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             let text = self.text(cx);
             self.select_to(previous_word_boundary(&text, self.cursor_offset()), cx);
@@ -1722,6 +1767,9 @@ impl TextEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         if self.selected_range.is_empty() {
             let text = self.text(cx);
             self.select_to(line_start(&text, self.cursor_offset()), cx);
@@ -1730,6 +1778,9 @@ impl TextEditor {
     }
 
     fn newline(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if self.is_code() {
             self.insert_newline(cx);
         } else if self.multiline {
@@ -2875,7 +2926,8 @@ impl Element for TextEditorText {
         } else {
             Vec::new()
         };
-        let cursor_quad = focused.then(|| {
+        // A read-only view keeps selection but has no insertion point.
+        let cursor_quad = (focused && !editor.read_only).then(|| {
             fill(
                 Bounds::new(
                     point(
@@ -3271,6 +3323,7 @@ pub fn sql_input_fill(
 fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Stateful<gpui::Div> {
     let state = editor.read(cx);
     let password = state.password;
+    let read_only = state.read_only;
     let multiline = state.multiline;
     let invalid = state
         .diagnostics
@@ -3322,6 +3375,9 @@ fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Statefu
             if invalid {
                 node.set_invalid(gpui::accesskit::Invalid::True);
             }
+            if read_only {
+                node.set_read_only();
+            }
             if password {
                 return;
             }
@@ -3349,6 +3405,15 @@ fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Statefu
                 if password && action == gpui::AccessibleAction::SetTextSelection {
                     continue;
                 }
+                if read_only
+                    && matches!(
+                        action,
+                        gpui::AccessibleAction::SetValue
+                            | gpui::AccessibleAction::ReplaceSelectedText
+                    )
+                {
+                    continue;
+                }
                 let entity = entity.clone();
                 view = view.on_a11y_action(action, move |data, window, cx| {
                     entity.update(cx, |editor, cx| {
@@ -3360,7 +3425,9 @@ fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Statefu
         })
 }
 
-fn single_line_input_height(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
+/// The height of a standard single-line field, for sibling controls that
+/// must line up with it.
+pub fn single_line_input_height(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
     let text = if editor.read(cx).is_code() {
         dbx_ui_components::theme::mono_text_px(12.) * dbx_ui_components::theme::editor_scale()
     } else {
