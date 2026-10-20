@@ -230,9 +230,13 @@ def release_info(tag):
     try:
         return json.loads(run("gh", "api", f"repos/{REPO}/releases/tags/{tag}", capture=True))
     except subprocess.CalledProcessError as error:
-        if "HTTP 404" in error.stderr:
-            return None
-        raise
+        if "HTTP 404" not in (error.stderr or ""):
+            raise
+    # GitHub's release-by-tag endpoint omits drafts. The authenticated list
+    # includes them, including drafts beyond its first page.
+    pages = json.loads(run("gh", "api", "--paginate", "--slurp",
+                           f"repos/{REPO}/releases?per_page=100", capture=True))
+    return next((info for page in pages for info in page if info.get("tag_name") == tag), None)
 
 
 def require_draft(info):

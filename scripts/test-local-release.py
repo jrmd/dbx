@@ -62,6 +62,36 @@ class AppImageExtractionTests(unittest.TestCase):
         self.assertEqual(existing.read_text(), "preserve")
 
 
+class ReleaseLookupTests(unittest.TestCase):
+    def missing_tag(self):
+        return subprocess.CalledProcessError(1, ["gh", "api"], stderr="gh: Not Found (HTTP 404)")
+
+    def test_published_release_uses_tag_lookup(self):
+        info = {"tag_name": "v1.2.3", "draft": False, "assets": []}
+        with patch.object(release, "run", return_value=json.dumps(info)) as run:
+            self.assertEqual(release.release_info("v1.2.3"), info)
+        self.assertEqual(run.call_count, 1)
+
+    def test_draft_is_found_on_later_authenticated_list_page(self):
+        draft = {"tag_name": "v1.2.3", "draft": True, "assets": []}
+        pages = [[{"tag_name": "v1.2.4", "draft": True}], [draft]]
+        with patch.object(release, "run", side_effect=[self.missing_tag(), json.dumps(pages)]) as run:
+            self.assertEqual(release.release_info("v1.2.3"), draft)
+        self.assertIn("--paginate", run.call_args.args)
+        self.assertIn("--slurp", run.call_args.args)
+
+    def test_absent_release_returns_none(self):
+        with patch.object(release, "run", side_effect=[self.missing_tag(), "[[]]"]):
+            self.assertIsNone(release.release_info("v1.2.3"))
+
+    def test_authentication_failure_is_not_treated_as_missing(self):
+        error = subprocess.CalledProcessError(1, ["gh", "api"], stderr="HTTP 401")
+        with patch.object(release, "run", side_effect=error) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                release.release_info("v1.2.3")
+        self.assertEqual(run.call_count, 1)
+
+
 class LocalReleaseTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
