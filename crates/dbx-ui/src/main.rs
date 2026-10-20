@@ -1,31 +1,24 @@
-mod accessibility;
 mod agents;
 mod app;
-mod assets;
-mod binary_values;
-mod config;
-mod connection_fields;
-mod device_unlock;
 mod diagram;
-mod editor;
 #[allow(dead_code)]
 mod filters;
 mod keybindings;
-mod motion;
 mod popups;
-mod profile_transfer;
-mod profiles;
-#[allow(dead_code)]
-mod query_history;
-mod query_library;
 mod result_export;
 #[allow(dead_code)]
 mod row_drafts;
 mod settings;
-mod theme;
 mod updater;
-mod vault;
-mod workspace;
+
+// The extracted crates keep their historical module paths, so `crate::theme`,
+// `crate::editor`, `crate::vault`, ... resolve exactly as before the split.
+use dbx_editor as editor;
+use dbx_storage::{
+    binary_values, config, connection_fields, device_unlock, profile_transfer, profiles,
+    query_history, query_library, vault, workspace,
+};
+use dbx_ui_components::{accessibility, assets, motion, theme};
 
 use app::DbxApp;
 use gpui::{

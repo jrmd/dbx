@@ -8,13 +8,31 @@ APP_DIR="${DBX_LINUX_DIR:-$ROOT_DIR/target/linux/DBX}"
 VERSION="$(python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' "$ROOT_DIR/Cargo.toml")"
 ARCHIVE_PATH="${DBX_LINUX_ARCHIVE:-$ROOT_DIR/target/linux/DBX-$VERSION-linux-$(uname -m).tar.gz}"
 CARGO_BIN="${CARGO:-cargo}"
+
+# Cargo profile. Direct invocation builds the shipping `release` profile; `make`
+# sets DBX_CARGO_PROFILE=release-local for routine local builds.
+CARGO_PROFILE="${DBX_CARGO_PROFILE:-release}"
+[[ "$CARGO_PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || { printf 'DBX: invalid DBX_CARGO_PROFILE: %s\n' "$CARGO_PROFILE" >&2; exit 1; }
+case "$CARGO_PROFILE" in
+release) CARGO_PROFILE_ARGS=(--release) ;;
+*) CARGO_PROFILE_ARGS=(--profile "$CARGO_PROFILE") ;;
+esac
+# Cargo writes dev and test to debug/ and bench to release/; custom profiles use their own name.
+case "$CARGO_PROFILE" in
+dev | test) CARGO_PROFILE_DIR=debug ;;
+bench) CARGO_PROFILE_DIR=release ;;
+*) CARGO_PROFILE_DIR="$CARGO_PROFILE" ;;
+esac
+# CARGO_TARGET_DIR is relative to the directory cargo runs in, which is ROOT_DIR.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+[[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$ROOT_DIR/$TARGET_DIR"
+BINARY_PATH="$TARGET_DIR/$CARGO_PROFILE_DIR/dbx"
 ARCH="$(uname -m)"
 APPDIR="${DBX_APPDIR:-$ROOT_DIR/target/linux/DBX.AppDir}"
 APPIMAGE_PATH="${DBX_APPIMAGE:-$ROOT_DIR/target/linux/DBX-$VERSION-linux-$ARCH.AppImage}"
 APPIMAGETOOL="${APPIMAGETOOL:-$ROOT_DIR/target/linux/tools/appimagetool-$ARCH.AppImage}"
 readonly APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
 
-readonly BINARY_PATH="$ROOT_DIR/target/release/dbx"
 readonly DESKTOP_FILE="$ROOT_DIR/packaging/linux/dbx.desktop"
 readonly LOGO_SVG="$ROOT_DIR/logo.svg"
 readonly LOGO_PNG="$ROOT_DIR/logo.png"
@@ -39,10 +57,14 @@ check_inputs() {
 	[[ -f "$LOGO_SVG" ]] || die "missing vector logo: $LOGO_SVG"
 }
 
+build_binary() {
+	log "building $CARGO_PROFILE binary"
+	(cd "$ROOT_DIR" && "$CARGO_BIN" build --locked "${CARGO_PROFILE_ARGS[@]}" --package dbx-ui)
+	[[ -x "$BINARY_PATH" ]] || die "$CARGO_PROFILE binary was not produced: $BINARY_PATH"
+}
+
 build_package() {
-	log "building release binary"
-	(cd "$ROOT_DIR" && "$CARGO_BIN" build --locked --release --package dbx-ui)
-	[[ -x "$BINARY_PATH" ]] || die "release binary was not produced: $BINARY_PATH"
+	build_binary
 
 	log "staging Linux application with desktop metadata and SVG icon"
 	mkdir -p \
@@ -110,7 +132,7 @@ main() {
 		build_appimage
 		;;
 	run)
-		build_package
+		build_binary
 		exec "$BINARY_PATH"
 		;;
 	*)

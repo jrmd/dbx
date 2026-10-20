@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/dbx-core", "crates/dbx-ui"]
+members = [
+  "crates/dbx-core",
+  "crates/dbx-editor",
+  "crates/dbx-storage",
+  "crates/dbx-ui",
+  "crates/dbx-ui-components",
+]
 resolver = "2"
 exclude = ["vendor/gpui-component", "vendor/accesskit_atspi_common", "vendor/accesskit_unix"]
 
@@ -63,6 +69,16 @@ lto = false
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Faster local release-like builds for checking performance-sensitive changes;
+# the shipping `release` profile above is unchanged.
+[profile.release-local]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+incremental = true
+strip = "none"
 
 [patch."https://github.com/longbridge/gpui-component"]
 gpui-component = { path = "vendor/gpui-component" }

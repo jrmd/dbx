@@ -15,6 +15,7 @@ use gpui_component::{
     select::{SearchableVec, SelectState},
 };
 
+use crate::binary_values::parse_hex_bytes;
 use crate::editor::{EditorLanguage, TextEditor};
 
 /// A stable identity for one field in a row draft.
@@ -252,33 +253,6 @@ pub fn parse_field_value(column: &ColumnInfo, text: &str) -> Result<CellValue, F
             .map_err(|error| FieldValueError::new(kind, text, format!("invalid JSON ({error})"))),
         FieldValueKind::Text => Ok(CellValue::Text(text.to_owned())),
     }
-}
-
-pub(crate) fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, &'static str> {
-    let compact: String = text
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect();
-    let digits = compact
-        .strip_prefix("0x")
-        .or_else(|| compact.strip_prefix("0X"))
-        .unwrap_or(&compact);
-    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("use hexadecimal digits only");
-    }
-    if !digits.len().is_multiple_of(2) {
-        return Err("use an even number of hexadecimal digits, optionally prefixed with 0x");
-    }
-    digits
-        .as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair).map_err(|_| "use hexadecimal digits only")?;
-            u8::from_str_radix(pair, 16).map_err(|_| "use hexadecimal digits only")
-        })
-        .collect()
 }
 
 /// Alias matching the core model's `CellValue` terminology.

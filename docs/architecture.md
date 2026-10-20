@@ -48,8 +48,8 @@ behavior each module hides:
   hydration, Test Connection, and session-opening workflow.
 - `app/transfer.rs` owns database/table import and export prompts,
   confirmations, background work, and generation-safe result application.
-- `app/workspace.rs` owns encrypted draft recovery and named queries; `workspace.rs`
-  stores bounded, revision-ordered documents in the vault. `app/diagnostics.rs`
+- `app/workspace.rs` owns encrypted draft recovery and named queries; `dbx-storage`'s
+  `workspace.rs` stores bounded, revision-ordered documents in the vault. `app/diagnostics.rs`
   coordinates plans, server monitors, and schema comparison drafts.
 - `app/sql_completion.rs` owns SQL tokenization, scope/source inference,
   dialect-aware candidate ranking, and its focused regression tests.
@@ -58,6 +58,49 @@ behavior each module hides:
 - `app/view/` owns GPUI element construction, split into `connection`, `chrome`,
   `overlays`, `data`, and `query` surfaces. Focus/key contexts stay beside the
   view node that receives them.
+
+### Crate boundaries
+
+The workspace is split so that a small edit in application code does not
+recompile code that rarely changes. Dependencies only point downwards:
+
+```text
+dbx-ui ──► dbx-editor ──► dbx-ui-components ──► dbx-core
+   ├─────► dbx-storage ──────────────────────► dbx-core
+   └─────► dbx-ui-components
+```
+
+- `dbx-ui-components` owns embedded assets (including `assets/icons`), the theme
+  catalog and the process-wide theme/appearance state, the accessibility helpers,
+  and reduced-motion detection. Its platform dependencies (`zbus`,
+  `objc2-app-kit`, `windows-sys`) live here. It must stay a single crate so the
+  theme singleton is shared by the editor and the application.
+- `dbx-editor` owns the native text editor: input handling, SQL/JSON/Redis
+  syntax, folding, signatures, commands and vim mode. The `dbx_text_editor`
+  action namespace and key contexts are unchanged.
+- `dbx-storage` owns persistence with no GPUI dependency: connection profiles
+  and keyring access, the encrypted vault, profile import/export, query history,
+  the SQL library, workspace drafts, and the `binary_values` formats they store.
+- `dbx-ui` keeps the GPUI application (`app/`), result export, the updater,
+  filters, row drafts, diagrams and settings. `main.rs` re-exports the other
+  crates under their historical names (`crate::theme`, `crate::editor`,
+  `crate::vault`, ...), so call sites did not change.
+
+Only items that cross a crate boundary are `pub`. Test-only constructors that
+`dbx-ui` tests need (`ConnectionProfileDraft::new`, `SqlLibrary::at`,
+`theme::appearance_test_lock`) are behind each crate's `test-support` feature,
+which `dbx-ui` enables only as a dev-dependency.
+
+`updater` and `result_export` are independent of the UI and could become their
+own crate later, but are not large enough to justify one yet. Use
+`cargo build --locked --profile release-local` for a faster release-like local build; the
+shipping `release` profile is unchanged.
+
+Edits under `dbx-ui/src/app/` reuse the extracted libraries. Editing a library
+still rebuilds its dependants, and the executable still needs linking.
+`release-local` also reuses unchanged compilation work within each crate through
+incremental compilation, and disables cross-crate LTO. Add `--timings` to the
+build command to see which crates were rebuilt in `target/cargo-timings/`.
 
 Keep new behavior with the workflow that owns its invariants. In particular,
 database and keyring I/O stays outside rendering, stale async results remain

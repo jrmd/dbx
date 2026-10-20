@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 /// Binary representations use explicit byte order; MySQL's swapped form matches UUID_TO_BIN(uuid, 1).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum BinaryFormat {
+pub enum BinaryFormat {
     Binary,
     #[default]
     Hex,
@@ -12,7 +12,7 @@ pub(crate) enum BinaryFormat {
 }
 
 impl BinaryFormat {
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Binary => "binary digits",
             Self::Hex => "hex bytes",
@@ -21,7 +21,7 @@ impl BinaryFormat {
         }
     }
 
-    pub(crate) fn limited_text(self, value: &CellValue, max_bytes: usize) -> String {
+    pub fn limited_text(self, value: &CellValue, max_bytes: usize) -> String {
         if matches!(self, Self::Binary | Self::Hex)
             && let CellValue::Bytes(bytes) = value
             && bytes.len() > max_bytes
@@ -35,7 +35,7 @@ impl BinaryFormat {
         self.text(value)
     }
 
-    pub(crate) fn text(self, value: &CellValue) -> String {
+    pub fn text(self, value: &CellValue) -> String {
         let CellValue::Bytes(bytes) = value else {
             return value.to_string();
         };
@@ -61,11 +61,11 @@ impl BinaryFormat {
         }
     }
 
-    pub(crate) fn editor_text(self, value: &CellValue) -> String {
+    pub fn editor_text(self, value: &CellValue) -> String {
         self.text(value)
     }
 
-    pub(crate) fn parse(self, text: &str) -> Result<CellValue, String> {
+    pub fn parse(self, text: &str) -> Result<CellValue, String> {
         if matches!(self, Self::Uuid | Self::UuidSwapped) {
             let uuid = Uuid::parse_str(text.trim()).map_err(|_| {
                 "Enter a valid UUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)".to_owned()
@@ -98,9 +98,36 @@ impl BinaryFormat {
                     .collect(),
             ))
         } else {
-            crate::row_drafts::parse_hex_bytes(text)
+            parse_hex_bytes(text)
                 .map(CellValue::Bytes)
                 .map_err(str::to_owned)
         }
     }
+}
+
+pub fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, &'static str> {
+    let compact: String = text
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    let digits = compact
+        .strip_prefix("0x")
+        .or_else(|| compact.strip_prefix("0X"))
+        .unwrap_or(&compact);
+    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("use hexadecimal digits only");
+    }
+    if !digits.len().is_multiple_of(2) {
+        return Err("use an even number of hexadecimal digits, optionally prefixed with 0x");
+    }
+    digits
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| "use hexadecimal digits only")?;
+            u8::from_str_radix(pair, 16).map_err(|_| "use hexadecimal digits only")
+        })
+        .collect()
 }

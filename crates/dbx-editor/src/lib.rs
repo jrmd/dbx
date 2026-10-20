@@ -34,7 +34,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme::theme;
+use dbx_ui_components::theme::theme;
 use gpui_component::ActiveTheme as _;
 use gpui_component::input::{
     MoveEnd, MoveHome, MoveToNextWord, MoveToPreviousWord, SelectToEndOfLine, SelectToNextWordEnd,
@@ -594,7 +594,7 @@ impl TextEditor {
     }
 
     /// Forget a secret field without leaving its value in undo/redo history.
-    pub(crate) fn clear_secret(&mut self, cx: &mut Context<Self>) {
+    pub fn clear_secret(&mut self, cx: &mut Context<Self>) {
         use zeroize::Zeroize;
         self.value.update(cx, |value, cx| {
             value.zeroize();
@@ -1058,7 +1058,9 @@ impl TextEditor {
         let x = self
             .last_layout
             .get(line)
-            .map_or(crate::theme::ui_px(0.), |shaped| shaped.x_for_index(column));
+            .map_or(dbx_ui_components::theme::ui_px(0.), |shaped| {
+                shaped.x_for_index(column)
+            });
         let position = point(
             bounds.left() + x,
             bounds.top() + self.last_layout.top(line, line_height),
@@ -1079,14 +1081,14 @@ impl TextEditor {
         let card = div()
             .id("dbx-editor-signature")
             .debug_selector(|| "dbx-editor-signature".into())
-            .max_w(crate::theme::ui_px(480.))
-            .px(crate::theme::ui_px(9.))
-            .py(crate::theme::ui_px(6.))
-            .rounded(crate::theme::ui_px(7.))
+            .max_w(dbx_ui_components::theme::ui_px(480.))
+            .px(dbx_ui_components::theme::ui_px(9.))
+            .py(dbx_ui_components::theme::ui_px(6.))
+            .rounded(dbx_ui_components::theme::ui_px(7.))
             .border_1()
             .border_color(theme().border_strong)
             .bg(theme().panel_raised)
-            .text_size(crate::theme::text_px(12.))
+            .text_size(dbx_ui_components::theme::text_px(12.))
             .child(
                 div()
                     .flex()
@@ -1103,8 +1105,8 @@ impl TextEditor {
             )
             .child(
                 div()
-                    .pt(crate::theme::ui_px(3.))
-                    .text_size(crate::theme::text_px(11.))
+                    .pt(dbx_ui_components::theme::ui_px(3.))
+                    .text_size(dbx_ui_components::theme::text_px(11.))
                     .text_color(theme().text_muted)
                     .child(signature.summary),
             );
@@ -1112,8 +1114,14 @@ impl TextEditor {
             deferred(
                 anchored()
                     .anchor(gpui::Anchor::BottomLeft)
-                    .position(position - point(crate::theme::ui_px(9.), crate::theme::ui_px(4.)))
-                    .snap_to_window_with_margin(crate::theme::ui_px(8.))
+                    .position(
+                        position
+                            - point(
+                                dbx_ui_components::theme::ui_px(9.),
+                                dbx_ui_components::theme::ui_px(4.),
+                            ),
+                    )
+                    .snap_to_window_with_margin(dbx_ui_components::theme::ui_px(8.))
                     .child(card),
             )
             .with_priority(30)
@@ -1191,20 +1199,20 @@ impl TextEditor {
         let card = div()
             .id("dbx-editor-hover")
             .debug_selector(|| "dbx-editor-hover".into())
-            .max_w(crate::theme::ui_px(420.))
-            .px(crate::theme::ui_px(9.))
-            .py(crate::theme::ui_px(6.))
-            .rounded(crate::theme::ui_px(7.))
+            .max_w(dbx_ui_components::theme::ui_px(420.))
+            .px(dbx_ui_components::theme::ui_px(9.))
+            .py(dbx_ui_components::theme::ui_px(6.))
+            .rounded(dbx_ui_components::theme::ui_px(7.))
             .border_1()
             .border_color(theme().border_strong)
             .bg(theme().panel_raised)
-            .text_size(crate::theme::text_px(12.))
+            .text_size(dbx_ui_components::theme::text_px(12.))
             .text_color(theme().text)
             .child(hover.info.title.clone())
             .children(hover.info.detail.clone().map(|detail| {
                 div()
-                    .pt(crate::theme::ui_px(3.))
-                    .text_size(crate::theme::text_px(11.))
+                    .pt(dbx_ui_components::theme::ui_px(3.))
+                    .text_size(dbx_ui_components::theme::text_px(11.))
                     .text_color(theme().text_muted)
                     .child(detail)
             }));
@@ -1212,9 +1220,13 @@ impl TextEditor {
             deferred(
                 anchored()
                     .position(
-                        hover.position + point(crate::theme::ui_px(0.), crate::theme::ui_px(18.)),
+                        hover.position
+                            + point(
+                                dbx_ui_components::theme::ui_px(0.),
+                                dbx_ui_components::theme::ui_px(18.),
+                            ),
                     )
-                    .snap_to_window_with_margin(crate::theme::ui_px(8.))
+                    .snap_to_window_with_margin(dbx_ui_components::theme::ui_px(8.))
                     .child(card),
             )
             .with_priority(40)
@@ -1591,7 +1603,7 @@ impl TextEditor {
         self.indent_selection(cx);
     }
 
-    pub(crate) fn indent_selection(&mut self, cx: &mut Context<Self>) {
+    pub fn indent_selection(&mut self, cx: &mut Context<Self>) {
         if !self.is_code() {
             cx.propagate();
             return;
@@ -1909,7 +1921,10 @@ fn completion_anchor(
     layout: &LineLayouts,
 ) -> Point<Pixels> {
     let Some(bounds) = bounds else {
-        return point(crate::theme::ui_px(0.), crate::theme::ui_px(0.));
+        return point(
+            dbx_ui_components::theme::ui_px(0.),
+            dbx_ui_components::theme::ui_px(0.),
+        );
     };
     let cursor = clamp_boundary(text, cursor);
     let (line, column) = line_and_column(text, cursor);
@@ -1917,7 +1932,7 @@ fn completion_anchor(
     let x = layout
         .get(line)
         .map(|line| line.x_for_index(column))
-        .unwrap_or(crate::theme::ui_px(0.));
+        .unwrap_or(dbx_ui_components::theme::ui_px(0.));
     point(
         bounds.left() + x,
         bounds.top() + layout.top(line, line_height) + line_height,
@@ -2664,7 +2679,7 @@ impl Element for TextEditorText {
                 .split('\n')
                 .map(|line| shape(window, line))
                 .max()
-                .unwrap_or(crate::theme::ui_px(1.));
+                .unwrap_or(dbx_ui_components::theme::ui_px(1.));
             (width, painted.split('\n').count())
         } else {
             let mut cache = editor.paint_cache.borrow_mut();
@@ -2682,7 +2697,7 @@ impl Element for TextEditorText {
                         .into_iter()
                         .map(|line| shape(window, cache.line(text, line)))
                         .max()
-                        .unwrap_or(crate::theme::ui_px(1.));
+                        .unwrap_or(dbx_ui_components::theme::ui_px(1.));
                     cache.width = Some((font_size, text_style.font_family.clone(), width));
                     width
                 }
@@ -2692,7 +2707,9 @@ impl Element for TextEditorText {
         };
 
         let mut style = Style::default();
-        style.size.width = measured_width.max(crate::theme::ui_px(1.)).into();
+        style.size.width = measured_width
+            .max(dbx_ui_components::theme::ui_px(1.))
+            .into();
         style.size.height = (window.line_height() * line_count.max(1) as f32).into();
         (window.request_layout(style, [], cx), ())
     }
@@ -2777,13 +2794,13 @@ impl Element for TextEditorText {
             let line = cache.line(text, cursor_line);
             let measured = cursor_shaped.x_for_index(next_boundary(line, cursor_col))
                 - cursor_shaped.x_for_index(cursor_col);
-            if measured > crate::theme::ui_px(0.) {
+            if measured > dbx_ui_components::theme::ui_px(0.) {
                 measured
             } else {
-                crate::theme::ui_px(8.)
+                dbx_ui_components::theme::ui_px(8.)
             }
         } else {
-            crate::theme::ui_px(2.)
+            dbx_ui_components::theme::ui_px(2.)
         };
         let cursor_position = point(
             cursor_shaped.x_for_index(display_column(cursor_line, cursor_col)),
@@ -2849,9 +2866,9 @@ impl Element for TextEditorText {
                                     + shaped.x_for_index(display_column(line, column)),
                                 paint_bounds.top() + line_height * rows.row(line) as f32,
                             ),
-                            size(crate::theme::ui_px(2.), line_height),
+                            size(dbx_ui_components::theme::ui_px(2.), line_height),
                         ),
-                        crate::theme::theme().focus_ring,
+                        dbx_ui_components::theme::theme().focus_ring,
                     ))
                 })
                 .collect()
@@ -2865,12 +2882,12 @@ impl Element for TextEditorText {
                         paint_bounds.left() + cursor_position.x,
                         paint_bounds.top() + cursor_position.y,
                     ),
-                    size(crate::theme::ui_px(2.), line_height),
+                    size(dbx_ui_components::theme::ui_px(2.), line_height),
                 ),
                 // Pure blue vanishes on the dark canvas; the focus ring
                 // colour is tuned for contrast in both appearances.
                 {
-                    let mut color = crate::theme::theme().focus_ring;
+                    let mut color = dbx_ui_components::theme::theme().focus_ring;
                     if block_caret {
                         color.a = 0.4;
                     }
@@ -2895,7 +2912,7 @@ impl Element for TextEditorText {
                 let start = if line == start_line {
                     shaped_line.x_for_index(display_column(line, start_col))
                 } else {
-                    crate::theme::ui_px(0.)
+                    dbx_ui_components::theme::ui_px(0.)
                 };
                 let end = if line == end_line {
                     shaped_line.x_for_index(display_column(line, end_col))
@@ -3020,7 +3037,7 @@ impl Element for TextEditorText {
                 &[TextRun {
                     len: "⋯".len(),
                     font: style.font(),
-                    color: crate::theme::theme().text_muted.into(),
+                    color: dbx_ui_components::theme::theme().text_muted.into(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -3028,21 +3045,24 @@ impl Element for TextEditorText {
                 None,
             );
             let top = paint_bounds.top() + line_height * rows.row(region.start_line) as f32;
-            let left = paint_bounds.left() + shaped.width + crate::theme::ui_px(6.);
+            let left = paint_bounds.left() + shaped.width + dbx_ui_components::theme::ui_px(6.);
             decorations.push(
                 fill(
                     Bounds::new(
-                        point(left, top + crate::theme::ui_px(2.)),
+                        point(left, top + dbx_ui_components::theme::ui_px(2.)),
                         size(
-                            marker.width + crate::theme::ui_px(8.),
-                            line_height - crate::theme::ui_px(4.),
+                            marker.width + dbx_ui_components::theme::ui_px(8.),
+                            line_height - dbx_ui_components::theme::ui_px(4.),
                         ),
                     ),
-                    crate::theme::theme().grid_alternate,
+                    dbx_ui_components::theme::theme().grid_alternate,
                 )
-                .corner_radii(crate::theme::ui_px(3.)),
+                .corner_radii(dbx_ui_components::theme::ui_px(3.)),
             );
-            fold_markers.push((point(left + crate::theme::ui_px(4.), top), marker));
+            fold_markers.push((
+                point(left + dbx_ui_components::theme::ui_px(4.), top),
+                marker,
+            ));
         }
         let lines = LineLayouts {
             count: row_count,
@@ -3218,9 +3238,9 @@ pub fn bare_input(
 ) -> impl IntoElement {
     input_with_context(editor, focus, false, TEXT_EDITOR_CONTEXT, false, cx)
         .h(height)
-        .px(crate::theme::ui_px(0.))
-        .py(crate::theme::ui_px(0.))
-        .pt(crate::theme::ui_px(3.))
+        .px(dbx_ui_components::theme::ui_px(0.))
+        .py(dbx_ui_components::theme::ui_px(0.))
+        .pt(dbx_ui_components::theme::ui_px(3.))
         .bg(gpui::transparent_black())
         .border_0()
 }
@@ -3342,15 +3362,16 @@ fn accessible_input_shell(editor: Entity<TextEditor>, cx: &App) -> gpui::Statefu
 
 fn single_line_input_height(editor: &Entity<TextEditor>, cx: &App) -> Pixels {
     let text = if editor.read(cx).is_code() {
-        crate::theme::mono_text_px(12.) * crate::theme::editor_scale()
+        dbx_ui_components::theme::mono_text_px(12.) * dbx_ui_components::theme::editor_scale()
     } else {
-        crate::theme::text_px(12.)
+        dbx_ui_components::theme::text_px(12.)
     };
     // Match GPUI's default line height and pixel rounding. Both lengths are
     // already in pixels, so the rem size is unused here.
     let line_height = gpui::phi().to_pixels(text.into(), text).round();
     // Seven design pixels of padding on each side, plus two unscaled borders.
-    crate::theme::ui_px(32.).max(line_height + crate::theme::ui_px(14.) + px(2.))
+    dbx_ui_components::theme::ui_px(32.)
+        .max(line_height + dbx_ui_components::theme::ui_px(14.) + px(2.))
 }
 
 fn input_with_context(
@@ -3373,15 +3394,15 @@ fn input_with_context(
         .when(fill_height, |this| this.flex_1().min_h_0().h_full())
         .when(!fill_height, |this| {
             this.h(if multiline {
-                crate::theme::ui_px(204.)
+                dbx_ui_components::theme::ui_px(204.)
             } else {
                 single_line_input_height(&editor, cx)
             })
         })
         .p(if multiline {
-            crate::theme::ui_px(10.)
+            dbx_ui_components::theme::ui_px(10.)
         } else {
-            crate::theme::ui_px(7.)
+            dbx_ui_components::theme::ui_px(7.)
         })
         .overflow_hidden()
         .bg(theme().canvas)
@@ -3389,11 +3410,11 @@ fn input_with_context(
         .border_color(theme().input_border)
         // Colour only: a width change would shift neighbouring controls.
         .focus(|style| style.border_color(theme().focus_ring))
-        .rounded(crate::theme::ui_px(5.))
+        .rounded(dbx_ui_components::theme::ui_px(5.))
         .text_size(if editor.read(cx).is_code() {
-            crate::theme::mono_text_px(12.) * crate::theme::editor_scale()
+            dbx_ui_components::theme::mono_text_px(12.) * dbx_ui_components::theme::editor_scale()
         } else {
-            crate::theme::text_px(12.)
+            dbx_ui_components::theme::text_px(12.)
         })
         .when(!multiline, |this| this.line_height(gpui::phi()))
         .text_color(theme().text)
@@ -3827,7 +3848,7 @@ fn apply_marked_runs(
                 len: end - start,
                 underline: Some(UnderlineStyle {
                     color: Some(run.color),
-                    thickness: crate::theme::ui_px(1.),
+                    thickness: dbx_ui_components::theme::ui_px(1.),
                     wavy: false,
                 }),
                 ..run.clone()
@@ -3880,7 +3901,7 @@ fn apply_diagnostic_runs(
                     len: end - start,
                     underline: Some(UnderlineStyle {
                         color: Some(color.into()),
-                        thickness: crate::theme::ui_px(1.),
+                        thickness: dbx_ui_components::theme::ui_px(1.),
                         wavy: true,
                     }),
                     ..run.clone()
@@ -3921,7 +3942,7 @@ fn redis_token_color(kind: RedisTokenKind) -> gpui::Hsla {
     }
 }
 
-pub(crate) fn json_token_color(kind: JsonTokenKind) -> gpui::Hsla {
+pub fn json_token_color(kind: JsonTokenKind) -> gpui::Hsla {
     match kind {
         JsonTokenKind::Property => theme().sql_identifier.into(),
         JsonTokenKind::String => theme().sql_string.into(),
@@ -4115,8 +4136,8 @@ fn reveal_offset(
     target_end: Pixels,
 ) -> Pixels {
     let mut next = current.clamp(
-        crate::theme::ui_px(0.),
-        maximum.max(crate::theme::ui_px(0.)),
+        dbx_ui_components::theme::ui_px(0.),
+        maximum.max(dbx_ui_components::theme::ui_px(0.)),
     );
     // If the target itself is taller/wider than the viewport, neither edge
     // can be revealed at once. Keeping the existing offset avoids a frame to
@@ -4130,8 +4151,8 @@ fn reveal_offset(
         next = target_end - viewport;
     }
     next.clamp(
-        crate::theme::ui_px(0.),
-        maximum.max(crate::theme::ui_px(0.)),
+        dbx_ui_components::theme::ui_px(0.),
+        maximum.max(dbx_ui_components::theme::ui_px(0.)),
     )
 }
 

@@ -1,7 +1,5 @@
 //! Provision only the repository's disposable QA vault using DBX's real codec.
-#[allow(dead_code)]
-#[path = "../src/vault.rs"]
-mod vault;
+use dbx_storage::vault;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = std::env::args_os()

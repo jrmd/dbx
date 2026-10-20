@@ -9,6 +9,8 @@ mode=${1:-signed}
 [[ $mode == signed || $mode == unsigned ]] || { echo 'Usage: release-macos.sh [signed|unsigned]' >&2; exit 1; }
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
 export DBX_VERSION="$version"
+# Distributions always use the shipping profile, whatever the caller exported.
+export DBX_CARGO_PROFILE=release
 export DBX_APP_DIR="$root/target/macos/DBX.app"
 mkdir -p target/macos
 temporary=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/dbx-release.XXXXXX")

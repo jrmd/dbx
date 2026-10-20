@@ -1,0 +1,33 @@
+[package]
+name = "dbx-ui-components"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dbx-core = { path = "../dbx-core" }
+gpui.workspace = true
+gpui-base.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# Exposes process-global test helpers to dependants' own test suites.
+test-support = []
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "=5.19.0", features = ["blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "=0.3.2", default-features = false, features = ["NSWorkspace", "NSAccessibility"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_UI_WindowsAndMessaging"] }

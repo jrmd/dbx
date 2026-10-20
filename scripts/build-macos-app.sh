@@ -11,7 +11,25 @@ SIGNING_MODE="${DBX_SIGNING_MODE:-local}"
 KEYCHAIN="${DBX_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 CARGO_BIN="${CARGO:-cargo}"
 
-readonly BINARY_PATH="$ROOT_DIR/target/release/dbx"
+# Cargo profile. Direct invocation builds the shipping `release` profile; `make`
+# sets DBX_CARGO_PROFILE=release-local for routine local builds.
+CARGO_PROFILE="${DBX_CARGO_PROFILE:-release}"
+[[ "$CARGO_PROFILE" =~ ^[A-Za-z0-9_-]+$ ]] || { printf 'DBX: invalid DBX_CARGO_PROFILE: %s\n' "$CARGO_PROFILE" >&2; exit 1; }
+case "$CARGO_PROFILE" in
+release) CARGO_PROFILE_ARGS=(--release) ;;
+*) CARGO_PROFILE_ARGS=(--profile "$CARGO_PROFILE") ;;
+esac
+# Cargo writes dev and test to debug/ and bench to release/; custom profiles use their own name.
+case "$CARGO_PROFILE" in
+dev | test) CARGO_PROFILE_DIR=debug ;;
+bench) CARGO_PROFILE_DIR=release ;;
+*) CARGO_PROFILE_DIR="$CARGO_PROFILE" ;;
+esac
+# CARGO_TARGET_DIR is relative to the directory cargo runs in, which is ROOT_DIR.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+[[ "$TARGET_DIR" == /* ]] || TARGET_DIR="$ROOT_DIR/$TARGET_DIR"
+BINARY_PATH="$TARGET_DIR/$CARGO_PROFILE_DIR/dbx"
+
 readonly INFO_PLIST="$ROOT_DIR/packaging/macos/Info.plist"
 readonly LOGO_SVG="$ROOT_DIR/logo.svg"
 readonly LOGO_PNG="$ROOT_DIR/logo.png"
@@ -207,9 +225,9 @@ build_icon() {
 }
 
 build_bundle() {
-	log "building release binary"
-	(cd "$ROOT_DIR" && "$CARGO_BIN" build --locked --release --package dbx-ui)
-	[[ -x "$BINARY_PATH" ]] || die "release binary was not produced: $BINARY_PATH"
+	log "building $CARGO_PROFILE binary"
+	(cd "$ROOT_DIR" && "$CARGO_BIN" build --locked "${CARGO_PROFILE_ARGS[@]}" --package dbx-ui)
+	[[ -x "$BINARY_PATH" ]] || die "$CARGO_PROFILE binary was not produced: $BINARY_PATH"
 
 	mkdir -p "$APP_DIR/Contents/MacOS"
 	mkdir -p "$APP_DIR/Contents/Resources"

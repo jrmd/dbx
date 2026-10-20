@@ -5,10 +5,22 @@ LINUX_APP_SCRIPT := scripts/build-linux-app.sh
 MACOS_APP := target/macos/DBX.app
 INSTALL_DIR ?= /Applications
 
+# Routine local targets use the faster `release-local` Cargo profile. Shipping
+# targets (linux-build, linux-package, linux-appimage) stay on `release`.
+# Override either with DBX_CARGO_PROFILE=<profile>, e.g. `make run DBX_CARGO_PROFILE=dev`.
+# Captured before the local default is applied so packaging only follows an
+# explicit override.
+DBX_PACKAGE_PROFILE := $(or $(DBX_CARGO_PROFILE),release)
+DBX_CARGO_PROFILE ?= release-local
+export DBX_CARGO_PROFILE
+
+linux-build linux-package linux-appimage: DBX_CARGO_PROFILE := $(DBX_PACKAGE_PROFILE)
+
 .PHONY: build run install macos-build macos-run linux-build linux-run linux-package linux-appimage cargo-build cargo-run
 
 # Local Mac workflow. The helper creates a stable, self-signed development
 # identity once, packages the Rust binary as DBX.app, signs it, and launches it.
+# Uses $(DBX_CARGO_PROFILE) (release-local by default).
 build:
 	bash $(MACOS_APP_SCRIPT) build
 
@@ -40,8 +52,9 @@ linux-run:
 	bash $(LINUX_APP_SCRIPT) run
 
 # Keep the raw Cargo entry points available for non-Mac development and tests.
+# For a production binary run `cargo build --locked --release --package dbx-ui`.
 cargo-build:
-	cargo build --release --package dbx-ui
+	cargo build --locked --profile $(DBX_CARGO_PROFILE) --package dbx-ui
 
 cargo-run:
-	cargo run --release --package dbx-ui
+	cargo run --locked --profile $(DBX_CARGO_PROFILE) --package dbx-ui

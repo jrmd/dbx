@@ -10,13 +10,20 @@ Follow the platform prerequisites in [README](README.md#build-from-source).
 Use Rust 1.97 or newer and the checked-in Cargo.lock:
 
 ```sh
-cargo run --locked --release -p dbx-ui
+make cargo-run
 cargo fmt --all -- --check
 cargo test --locked --profile ci --workspace
 cargo clippy --locked --profile ci --workspace --all-targets -- -D warnings
 python3 scripts/test-macos-release.py
+python3 scripts/test-build-profiles.py
 python3 scripts/test-release-notes.py
 ```
+
+`make cargo-run`, `make run` (Mac) and `make linux-run` use the faster `release-local`
+profile. Its first build is a full compile; the benefit is warm incremental rebuilds.
+Before shipping or benchmarking, build the production profile with
+`cargo build --locked --release -p dbx-ui`; release scripts and `make linux-appimage`
+already do. Override with `DBX_CARGO_PROFILE=<profile>`.
 
 Start with focused tests while iterating. The full build includes native database
 and GPUI dependencies and can take substantial time on a fresh checkout.

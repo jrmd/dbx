@@ -57,6 +57,7 @@ jobs:
           cargo test --locked --release --workspace
           cargo clippy --locked --release --workspace --all-targets -- -D warnings
           python3 scripts/test-macos-release.py
+          python3 scripts/test-build-profiles.py
           python3 scripts/test-release-notes.py
       - name: Linux package
         if: runner.os == 'Linux'

@@ -6,6 +6,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'Makefile'
       - 'crates/**'
       - 'vendor/**'
       - 'scripts/**'
@@ -16,6 +17,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'Makefile'
       - 'crates/**'
       - 'vendor/**'
       - 'scripts/**'
@@ -55,5 +57,7 @@ jobs:
         run: cargo test --locked --profile ci --workspace
       - name: Test macOS release packaging
         run: python3 scripts/test-macos-release.py
+      - name: Test local and shipping build profiles
+        run: python3 scripts/test-build-profiles.py
       - name: Test release notes
         run: python3 scripts/test-release-notes.py

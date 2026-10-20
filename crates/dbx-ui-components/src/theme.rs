@@ -322,7 +322,7 @@ pub fn ui_px(value: f32) -> gpui::Pixels {
 
 /// Set the appearance preference used by DBX's semantic primitives.
 /// Serialises tests that change or depend on the process-wide appearance.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn appearance_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock()

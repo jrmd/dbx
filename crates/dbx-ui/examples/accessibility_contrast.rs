@@ -1,10 +1,6 @@
 //! Render DBX's actual controls on glass over controlled black/white pixels.
 //! This harness has no profiles, vault, database connections or user settings.
-#[allow(dead_code)]
-#[path = "../src/assets.rs"]
-mod assets;
-#[path = "../src/theme.rs"]
-mod theme;
+use dbx_ui_components::{assets, theme};
 
 use gpui::{
     App, AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window,

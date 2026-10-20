@@ -37,7 +37,7 @@ class ReleaseTests(unittest.TestCase):
         shutil.copy(Path(__file__).with_name("release-macos.sh"), self.root / "scripts")
         (self.root / "Cargo.toml").write_text('[workspace.package]\nversion="0.1.0"\n')
         (self.root / "scripts/build-macos-app.sh").write_text(
-            '#!/usr/bin/env bash\nset -eu\nprintf "build\\n" >> "$CALL_LOG"\nmkdir -p "$DBX_APP_DIR/Contents/MacOS"\n')
+            '#!/usr/bin/env bash\nset -eu\nprintf "build\\n" >> "$CALL_LOG"\nprintf "profile=%s\\n" "${DBX_CARGO_PROFILE-unset}" >> "$CALL_LOG"\nmkdir -p "$DBX_APP_DIR/Contents/MacOS"\n')
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for name in ("uname", "openssl", "security", "codesign", "xcrun", "spctl", "ditto", "shasum"):
@@ -73,6 +73,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertLess(calls.index("spctl --assess"), calls.rindex("ditto"))
         self.assertIn("security delete-keychain", calls)
         self.assertFalse(list(self.root.glob("dbx-release.*")))
+
+    def test_release_build_ignores_inherited_local_profile(self):
+        self.environment["DBX_CARGO_PROFILE"] = "release-local"
+        result = self.release("unsigned")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("profile=release\n", (self.root / "calls.log").read_text())
 
     def test_intel_archive_uses_its_own_asset_name(self):
         self.environment["FIXTURE_ARCH"] = "x86_64"

@@ -62,7 +62,7 @@ impl Default for SqlLibrary {
 }
 
 impl SqlLibrary {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn at(root: PathBuf) -> Self {
         Self {
             preferences: root.join(".test-library-preferences.json"),

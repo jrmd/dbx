@@ -1,0 +1,19 @@
+[package]
+name = "dbx-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dbx-core = { path = "../dbx-core" }
+dbx-ui-components = { path = "../dbx-ui-components" }
+gpui.workspace = true
+gpui-component.workspace = true
+serde.workspace = true
+unicode-segmentation.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

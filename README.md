@@ -57,14 +57,11 @@ The first build fetches the GPUI and gpui-component Git dependencies and compile
 ### Linux
 
 ```bash
-# Build and launch the app.
-cargo run --locked --release --package dbx-ui
-
-# Or stage a distributable directory and archive.
-make linux-build
-
-# Build and launch through the packaging helper.
+# Build and launch the app with the fast local profile.
 make linux-run
+
+# Or stage a distributable directory and archive (shipping release profile).
+make linux-build
 
 # Build a single-file AppImage.
 make linux-appimage
@@ -76,7 +73,7 @@ make linux-appimage
 - Desktop metadata and the SVG icon under `target/linux/DBX/usr/share/`
 - `target/linux/DBX-VERSION-linux-x86_64.tar.gz` and its `.sha256` checksum
 
-The archive contains a Linux staging tree. The destination machine still needs compatible system libraries and graphics drivers. The raw Cargo binary is `target/release/dbx`.
+The archive contains a Linux staging tree. The destination machine still needs compatible system libraries and graphics drivers. The shipping Cargo binary is `target/release/dbx`; `make linux-run` and the other local targets below build `target/release-local/dbx`.
 
 `make linux-appimage` also produces `target/linux/DBX-VERSION-linux-x86_64.AppImage` and its checksum. It uses the host's X11/Wayland, xkbcommon, Vulkan driver, and fonts. The first run downloads [appimagetool](https://github.com/AppImage/appimagetool) into `target/linux/tools/`. Build on an older distribution, as the release workflow does on Ubuntu 22.04, so the AppImage runs on systems with older glibc.
 
@@ -170,6 +167,18 @@ make install INSTALL_DIR="$HOME/Applications"
 ```
 
 For terminal logs, use `DBX_FOREGROUND=1 make run`. `make macos-build` and `make macos-run` are aliases for `make build` and `make run`. Prefer this bundle workflow on Mac so rebuilds retain a consistent signing identity. `make cargo-build` and `make cargo-run` are also available for the raw Cargo workflow.
+
+### Local builds and production builds
+
+`make build`, `make run`, `make install`, `make linux-run`, `make cargo-build` and `make cargo-run` use the `release-local` Cargo profile: optimised, with LTO off, parallel code generation and incremental compilation. The first build compiles the native stack into a separate cache; the main saving comes on subsequent builds after an edit. This trades some runtime optimisation and binary size for build speed. The binary lands in `target/release-local/`.
+
+Production binaries use the `release` profile, which is also what the release scripts use directly:
+
+```bash
+cargo build --locked --release --package dbx-ui
+```
+
+`make linux-build`, `make linux-package`, `make linux-appimage`, `scripts/build-macos-app.sh` and `scripts/release-macos.sh` default to `release`. `scripts/release-macos.sh` always pins `release`, ignoring any inherited `DBX_CARGO_PROFILE`. To choose a profile explicitly, set `DBX_CARGO_PROFILE` (for example `make run DBX_CARGO_PROFILE=dev` for an unoptimised `target/debug` build). The helper scripts honour `CARGO_TARGET_DIR`, but not a `build.target-dir` set in Cargo config.
 
 ## Your own Mac signing key
 

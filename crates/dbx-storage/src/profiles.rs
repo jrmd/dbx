@@ -226,7 +226,7 @@ impl Drop for ConnectionProfileDraft {
 }
 
 impl ConnectionProfileDraft {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(name: impl Into<String>, kind: DatabaseKind, url: impl Into<String>) -> Self {
         Self::from_config(name, ConnectionConfig::new(kind, url))
     }
@@ -1170,7 +1170,7 @@ fn add_password(raw: &str, secret: &str, driver: bool) -> ProfileResult<String> 
     Ok(parsed.to_string())
 }
 
-pub(crate) fn sqlite_url(path: &Path) -> String {
+pub fn sqlite_url(path: &Path) -> String {
     if path == Path::new(":memory:") {
         return "sqlite::memory:".into();
     }
