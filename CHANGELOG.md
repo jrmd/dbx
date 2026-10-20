@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.16.1 - 2026-10-20
+
 - Switch binary values between hex, bits, UUID and MySQL swapped UUID directly in row details.
 - Keep overflowing tables' horizontal scrollbar visible so columns remain reachable with a mouse.
 
