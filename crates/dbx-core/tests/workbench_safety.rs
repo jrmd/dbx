@@ -1863,3 +1863,101 @@ async fn postgres_mysql_designer_roundtrip() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires the disposable PostgreSQL fixture via DBX_TEST_POSTGRES_URL"]
+async fn postgres_bulk_table_actions_respect_selection_and_explicit_cascade() {
+    let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("disposable database required");
+    let engine = DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::PostgreSQL, url))
+        .await
+        .unwrap();
+    let schema = format!(
+        "dbx_bulk_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.parent(id INTEGER PRIMARY KEY)"),
+        format!("CREATE TABLE {schema}.child(id INTEGER REFERENCES {schema}.parent)"),
+        format!("CREATE TABLE {schema}.untouched(id INTEGER)"),
+        format!("INSERT INTO {schema}.parent VALUES(1)"),
+        format!("INSERT INTO {schema}.child VALUES(1)"),
+        format!("INSERT INTO {schema}.untouched VALUES(1)"),
+    ] {
+        engine.execute_sql(&sql).await.unwrap();
+    }
+    let parent = TableRef::in_schema(&schema, "parent");
+    let child = TableRef::in_schema(&schema, "child");
+    let selected = [parent.clone(), child.clone()];
+    let restricted = build_truncate_tables(
+        DatabaseKind::PostgreSQL,
+        std::slice::from_ref(&parent),
+        false,
+    )
+    .unwrap();
+    assert!(engine.execute(&restricted[0]).await.is_err());
+    assert_eq!(
+        engine
+            .query_table(&parent, &[], &[], &[], None, QueryOptions::default())
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    let together = build_truncate_tables(DatabaseKind::PostgreSQL, &selected, false).unwrap();
+    engine.execute(&together[0]).await.unwrap();
+    for table in &selected {
+        assert!(
+            engine
+                .query_table(table, &[], &[], &[], None, QueryOptions::default())
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+    engine
+        .execute_sql(&format!("INSERT INTO {schema}.parent VALUES(1)"))
+        .await
+        .unwrap();
+    engine
+        .execute_sql(&format!("INSERT INTO {schema}.child VALUES(1)"))
+        .await
+        .unwrap();
+    let cascade = build_truncate_tables(DatabaseKind::PostgreSQL, &[parent], true).unwrap();
+    engine.execute(&cascade[0]).await.unwrap();
+    assert!(
+        engine
+            .query_table(&child, &[], &[], &[], None, QueryOptions::default())
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    assert_eq!(
+        engine
+            .query_table(
+                &TableRef::in_schema(&schema, "untouched"),
+                &[],
+                &[],
+                &[],
+                None,
+                QueryOptions::default()
+            )
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    let drops = build_drop_tables(DatabaseKind::PostgreSQL, &selected).unwrap();
+    engine.execute(&drops[0]).await.unwrap();
+    engine
+        .execute_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}

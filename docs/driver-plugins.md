@@ -1,12 +1,26 @@
 # Community database drivers
 
-DBX can run explicitly registered local driver programs. In **New connection → Community drivers**, choose **Register trusted driver…**, select a manifest, then select its displayed database name. Enter its connection URL and save/connect normally. The connection form shows the program name and path. Registration does not start the program; opening/testing a connection does.
+DBX can run explicitly registered local driver programs. In **New connection → More → Register community driver…**, select a manifest, then expand **Community drivers** and select its displayed database name. You can also register a driver from inside that section. Enter its connection URL and save/connect normally. The connection form shows the program name and path. Registration does not start the program; opening/testing a connection does.
 
 Drivers run with your operating-system permissions and receive that connection's credentials. Only register programs from authors you trust. DBX copies manifests to its platform config directory under `dbx/drivers`; removing a manifest disables future connections through it. Executables stay at the absolute path provided by the author. Re-registering an existing ID requires removing its previous manifest first.
 
 A driver declares a compatible database family to choose DBX's SQL dialect or document UI. Its own name and URL schemes can describe a new database. Native drivers remain available in the same picker. Community drivers currently use SQL-compatible or MongoDB-compatible families and URLs. Redis, search, and streaming families are unavailable because those workspaces require native interfaces. Native staged grid edits, atomic imports, streaming exports, backup, SSH/socket/cloud-token settings and persistent transaction sessions are unavailable. Each query or execute operation is explicit. Implement unsupported operations as an error response. Local driver registrations and executable paths are machine-specific.
 
 A runnable stdlib-only SQLite adapter and manifest are in [`examples/drivers`](../examples/drivers/). Replace the Python/script absolute paths before registering it; connect with `example-sqlite:///absolute/path/to/database.sqlite`. The example supports metadata, queries and bound parameters and obeys protected SQLite file mode. It limits responses to 100,000 rows even when the caller requests unlimited rows.
+
+## Making a driver
+
+Write a command-line program in any language that can read and write JSON. Use
+the database's client library to implement the operations below, translating its
+metadata and query results into DBX's serialized models. Keep statement parameters
+bound through that library, honour row limits and read-only connections, and return
+an error for unsupported operations.
+
+Package the program with a manifest describing its name, database family,
+executable path and URL schemes. Install any runtime or client-library dependencies
+on the user's machine, then register the manifest in DBX. Registration copies the
+manifest only; it does not download the executable or install dependencies.
+The Python SQLite example is a starting point that needs no third-party packages.
 
 ## Manifest
 

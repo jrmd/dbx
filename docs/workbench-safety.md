@@ -291,3 +291,24 @@ integers as text, writes user strings literally (including strings beginning
 with `=`), and includes a notes sheet describing NULL/empty-text handling.
 Table **Copy as INSERT** reads at most 1,000 rows and labels a limited copy;
 use table export for a complete SQL dump.
+
+## Sidebar table actions
+
+Control-click (or Command-click on macOS) toggles table selection within a
+connection. A plain click selects one table; right-clicking a selected table
+preserves the group, while right-clicking another table selects only that table.
+Search/schema changes remove hidden tables from the selection. Multi-table
+exports open the export dialog with only the selected tables checked.
+
+Delete and truncate confirmations list every selected table. Production
+connections require the exact table name for one table, or the displayed,
+comma-separated qualified names for a group. Save or discard affected staged
+edits before running either action. Execution stops on the first error and
+reports how many tables completed; earlier completed statements are not undone.
+
+PostgreSQL and CockroachDB truncate the selection in one statement, allowing
+foreign keys between selected tables without cascading outside the selection.
+Their confirmations offer an unchecked **Cascade to dependent tables** option;
+enabling it can empty unselected dependent tables as well. Other connectors do
+not offer this option. Open data tabs are refreshed after truncation, including
+potentially affected unselected tabs when cascading is enabled.

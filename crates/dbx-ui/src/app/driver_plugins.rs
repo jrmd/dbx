@@ -124,7 +124,7 @@ impl DriverDraftGuard {
 }
 
 impl DbxApp {
-    fn refresh_driver_registry(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn refresh_driver_registry(&mut self, cx: &mut Context<Self>) {
         if self.driver_registry.loading {
             self.driver_registry.reload_requested = true;
             return;
@@ -154,7 +154,7 @@ impl DbxApp {
         .detach();
         cx.notify();
     }
-    fn register_driver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn register_driver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let guard = DriverDraftGuard::capture(self, cx);
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -280,37 +280,58 @@ impl DbxApp {
             Err(error) => self.show_toast(ToastKind::Error, error.to_string(), cx),
         }
     }
+    pub(super) fn drivers_loading(&self) -> bool {
+        self.driver_registry.loading
+    }
+    pub(super) fn reveal_drivers_folder(&mut self, cx: &mut Context<Self>) {
+        match std::fs::create_dir_all(directory()) {
+            Ok(()) => cx.reveal_path(&directory()),
+            Err(error) => self.show_toast(ToastKind::Error, error.to_string(), cx),
+        }
+    }
+    /// Registered drivers sit behind a disclosure, open once there is one to use.
     pub(super) fn render_driver_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !self.driver_registry.initialized {
             self.refresh_driver_registry(cx);
         }
+        let count = self.driver_registry.entries.len();
+        let open = self
+            .connection_drivers_open
+            .unwrap_or(count > 0 || self.draft.driver_manifest.is_some());
+        let compact = self.compact_layout;
         div().flex().flex_col().gap(crate::theme::ui_px(8.))
-            .child(div().flex().flex_wrap().items_center().gap(crate::theme::ui_px(8.)).child("Community drivers")
-                .child(button("register-driver", "Register trusted driver…", ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| this.register_driver(window, cx))))
-                .child(button("refresh-drivers", "Refresh", ButtonKind::Quiet).disabled(self.driver_registry.loading).on_click(cx.listener(|this, _, _, cx| this.refresh_driver_registry(cx))))
-                .child(button("drivers-folder", "Show drivers folder", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| {
-                    match std::fs::create_dir_all(directory()) { Ok(()) => cx.reveal_path(&directory()), Err(error) => this.show_toast(ToastKind::Error, error.to_string(), cx) }
-                }))))
-            .child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Driver programs run locally with the credentials of connections you open. Register manifests only from authors you trust."))
-            .when(self.driver_registry.loading, |view| view.child("Loading drivers…"))
-            .when_some(self.driver_registry.error.clone(), |view, error| view.child(div().text_color(theme().danger).child(error)))
-            .children(self.driver_registry.entries.iter().enumerate().map(|(index, (path, result))| {
-                let selected = self.draft.driver_manifest.as_ref() == Some(path);
-                let label = result.as_ref().map(|manifest| manifest.name.clone()).unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().into_owned());
-                let mut row = div().flex().items_center().gap(crate::theme::ui_px(8.));
-                match result {
-                    Ok(manifest) => {
-                        let path = path.clone(); let manifest = manifest.clone();
-                        row = row.child(segment(label.clone(), selected).id(("registered-driver", index)).pressable(label.clone()).role(gpui::Role::RadioButton).aria_selected(selected)
-                            .on_click(cx.listener(move |this, _, _, cx| this.select_driver(path.clone(), manifest.clone(), cx))));
+            .child(super::connection::disclosure_header("community-drivers", "Community drivers", Some(count), None, open)
+                .on_click(cx.listener(move |this, _, _, cx| { this.connection_drivers_open = Some(!open); cx.notify(); })))
+            .when(open, |view| view
+                .when(self.driver_registry.loading, |view| view.child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Loading drivers…")))
+                .when_some(self.driver_registry.error.clone(), |view, error| view.child(div().text_size(crate::theme::text_px(11.)).text_color(theme().danger_text).child(error)))
+                .child(div().flex().flex_wrap().gap(crate::theme::ui_px(8.)).children(self.driver_registry.entries.iter().enumerate().map(|(index, (path, result))| {
+                    let selected = self.draft.driver_manifest.as_ref() == Some(path);
+                    let label = result.as_ref().map(|manifest| manifest.name.clone()).unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().into_owned());
+                    let remove = {
+                        let path = path.clone(); let label = label.clone();
+                        button(("remove-driver", index), "Remove…", ButtonKind::Quiet).h(crate::theme::control_height(24.)).text_size(crate::theme::text_px(11.)).accessible_name(format!("Remove driver {label}")).on_click(cx.listener(move |this, _, window, cx| {
+                            this.ask_to_delete(format!("Remove {label}?"), "Removes only this registration. Saved connections using it cannot reconnect until it is registered again. The driver program and database are kept.", ConfirmationAction::RemoveDriver { path: path.clone() }, window, cx);
+                        }))
+                    };
+                    match result {
+                        Ok(manifest) => {
+                            let path = path.clone(); let manifest = manifest.clone();
+                            div().flex().flex_col().items_start().gap(crate::theme::ui_px(4.))
+                                .child(super::connection::picker_tile(("registered-driver", index), manifest.family, label, Some("Community"), selected, compact).role(gpui::Role::RadioButton).aria_selected(selected)
+                                    .on_click(cx.listener(move |this, _, _, cx| this.select_driver(path.clone(), manifest.clone(), cx))))
+                                .child(remove)
+                        }
+                        Err(error) => div().flex().items_center().gap(crate::theme::ui_px(8.))
+                            .child(div().text_size(crate::theme::text_px(11.)).text_color(theme().danger_text).child(format!("{label} · Unavailable: {error}")))
+                            .child(remove),
                     }
-                    Err(error) => row = row.child(div().flex_1().text_color(theme().danger).child(format!("{label} · Unavailable: {error}"))),
-                }
-                let path = path.clone();
-                row.child(button(("remove-driver", index), "Remove…", ButtonKind::Quiet).accessible_name(format!("Remove driver {label}")).on_click(cx.listener(move |this, _, window, cx| {
-                    this.ask_to_delete(format!("Remove {label}?"), "Removes only this registration. Saved connections using it cannot reconnect until it is registered again. The driver program and database are kept.", ConfirmationAction::RemoveDriver { path: path.clone() }, window, cx);
                 })))
-            })).into_any_element()
+                .child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Driver programs run locally with the credentials of connections you open. Register manifests only from authors you trust."))
+                .child(div().flex().flex_wrap().gap(crate::theme::ui_px(8.))
+                    .child(button("register-driver", "Register driver…", ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| this.register_driver(window, cx))))
+                    .child(button("drivers-folder", "Show folder", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| this.reveal_drivers_folder(cx))))))
+            .into_any_element()
     }
 }
 

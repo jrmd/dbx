@@ -427,6 +427,22 @@ mod tests {
                 app.confirm_pending_action(window, cx);
                 assert!(app.confirmation_dialog.is_none());
                 assert!(app.table_confirmation_input.is_none());
+                // A name that confirmed one table must never authorize a batch.
+                let tables = vec![
+                    TableInfo::table("Orders", Some("public".into())),
+                    TableInfo::table("Orders", Some("archive".into())),
+                ];
+                app.confirm_table_actions(TableAction::Truncate, id, tables.clone(), window, cx);
+                let input = app.table_confirmation_input.as_ref().unwrap().1.clone();
+                input.update(cx, |editor, cx| editor.set_text("Orders", cx));
+                app.confirm_pending_action(window, cx);
+                assert!(app.confirmation_dialog.is_some());
+                input.update(cx, |editor, cx| {
+                    editor.set_text(table_action_confirmation_text(&tables), cx)
+                });
+                assert!(app.table_confirmation_matches(cx));
+                app.cancel_confirmation(window, cx);
+                assert!(app.table_confirmation_input.is_none());
             })
         });
     }

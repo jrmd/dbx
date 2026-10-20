@@ -161,6 +161,27 @@ pub(super) fn table_menu_rows(writable: bool) -> Vec<TableMenuRow> {
     ]
 }
 
+fn bulk_table_menu_rows(writable: bool, exportable: bool) -> Vec<TableMenuRow> {
+    use MenuTone::*;
+    use TableMenuCommand::*;
+    let item = |command, label, enabled, tone| TableMenuRow::Item {
+        command,
+        label,
+        enabled,
+        tone,
+    };
+    vec![
+        item(OpenStructure, "Open structures", true, Normal),
+        item(OpenData, "Open data tabs", true, Normal),
+        item(CopyName, "Copy names", true, Normal),
+        TableMenuRow::Separator,
+        item(Export, "Export selected tables…", exportable, Normal),
+        TableMenuRow::Separator,
+        item(Truncate, "Truncate selected tables…", writable, Warning),
+        item(Drop, "Delete selected tables…", writable, Danger),
+    ]
+}
+
 impl DbxApp {
     fn workspace_visible(&self) -> bool {
         !self.settings_open
@@ -210,6 +231,33 @@ impl DbxApp {
             session.sidebar.cursor = Some(table_sidebar_id(table));
             cx.notify();
         }
+    }
+
+    pub(super) fn click_explorer_table(
+        &mut self,
+        session_id: SessionId,
+        table: TableInfo,
+        toggle: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.session_mut(session_id) {
+            let id = table_sidebar_id(&table);
+            if toggle {
+                if !session.sidebar.selected.remove(&id) {
+                    session.sidebar.selected.insert(id.clone());
+                }
+            } else {
+                session.sidebar.selected = BTreeSet::from([id.clone()]);
+            }
+            session.sidebar.cursor = Some(id);
+            session.sidebar.focus.focus(window, cx);
+        }
+        self.table_context_menu = None;
+        if !toggle {
+            self.select_table_for(session_id, table, window, cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn scroll_explorer_accessibly(
@@ -352,8 +400,7 @@ impl DbxApp {
             return;
         };
         if let Some(table) = self.cursor_table(session_id) {
-            self.set_explorer_cursor(session_id, &table, cx);
-            self.select_table_for(session_id, table, window, cx);
+            self.click_explorer_table(session_id, table, false, window, cx);
         }
     }
 
@@ -412,11 +459,33 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let id = table_sidebar_id(&table);
+        if !session.sidebar.selected.contains(&id) {
+            session.sidebar.selected = BTreeSet::from([id.clone()]);
+        }
+        session.sidebar.cursor = Some(id);
+        let tables = session
+            .sidebar
+            .list
+            .visible
+            .iter()
+            .filter(|table| session.sidebar.selected.contains(&table_sidebar_id(table)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let tables = if tables.is_empty() {
+            vec![table.clone()]
+        } else {
+            tables
+        };
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         self.table_context_menu = Some(TableContextMenu {
             session_id,
             table,
+            tables,
             position,
             cursor: None,
             focus,
@@ -479,7 +548,10 @@ impl DbxApp {
                     .engine
                     .as_ref()
                     .is_some_and(|engine| !engine.is_read_only())
-                && menu.table.kind == EntityKind::Table
+                && menu
+                    .tables
+                    .iter()
+                    .all(|table| table.kind == EntityKind::Table)
         });
         let sql = self
             .session(menu.session_id)
@@ -491,6 +563,18 @@ impl DbxApp {
             engine.is_some_and(|engine| QuerySession::supports_isolated_reads(engine));
         let imports =
             engine.is_some_and(|engine| matches!(engine.as_ref(), DatabaseEngine::Sql(_)));
+        if menu.tables.len() > 1 {
+            return bulk_table_menu_rows(
+                writable,
+                sql && self
+                    .session(menu.session_id)
+                    .is_some_and(|session| !session.busy && session.engine.is_some())
+                    && menu
+                        .tables
+                        .iter()
+                        .all(|table| table.kind == EntityKind::Table),
+            );
+        }
         table_menu_rows(writable)
             .into_iter()
             .filter(|row| match row {
@@ -682,6 +766,48 @@ impl DbxApp {
         let session_id = menu.session_id;
         let table = menu.table;
         self.focus_session_explorer(session_id, window, cx);
+        if menu.tables.len() > 1 {
+            match command {
+                TableMenuCommand::CopyName => cx.write_to_clipboard(ClipboardItem::new_string(
+                    menu.tables
+                        .iter()
+                        .map(|table| table_ref_label(&table_ref(table)))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )),
+                TableMenuCommand::OpenData => {
+                    for table in menu.tables {
+                        self.select_table_for(session_id, table, window, cx);
+                    }
+                }
+                TableMenuCommand::OpenStructure => {
+                    for table in menu.tables {
+                        self.open_structure_tab_for(session_id, table, cx);
+                    }
+                }
+                TableMenuCommand::Export => {
+                    self.begin_database_export(session_id, window, cx);
+                    if let Some(dialog) = &mut self.database_export_dialog {
+                        dialog.selected_tables =
+                            menu.tables.iter().map(table_selection_key).collect();
+                    }
+                }
+                TableMenuCommand::Truncate | TableMenuCommand::Drop => self.confirm_table_actions(
+                    if command == TableMenuCommand::Truncate {
+                        TableAction::Truncate
+                    } else {
+                        TableAction::Drop
+                    },
+                    session_id,
+                    menu.tables,
+                    window,
+                    cx,
+                ),
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         match command {
             TableMenuCommand::ColumnStatistics => {
                 self.show_loaded_table_column_statistics(session_id, window, cx)
@@ -770,5 +896,173 @@ impl DbxApp {
         cx: &mut Context<Self>,
     ) {
         self.cycle_secondary_tab(false, window, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn bulk_actions_snapshot_only_selected_visible_tables(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let id = Uuid::new_v4();
+        let tables = vec![
+            TableInfo::table("c", Some("a-b".into())),
+            TableInfo::table("b-c", Some("a".into())),
+            TableInfo::table("untouched", None),
+        ];
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            let mut session = ConnectionSession::new(
+                id,
+                None,
+                "Selection".into(),
+                DatabaseKind::PostgreSQL,
+                None,
+                window,
+                cx,
+            );
+            session.set_tables(tables.clone());
+            session.sidebar.list.visible = tables.clone().into();
+            app.sessions.push(session);
+            app.active_session_id = Some(id);
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.click_explorer_table(id, tables[0].clone(), false, window, cx);
+                app.click_explorer_table(id, tables[1].clone(), true, window, cx);
+                app.open_table_context_menu(
+                    id,
+                    tables[0].clone(),
+                    point(px(0.), px(0.)),
+                    window,
+                    cx,
+                );
+                let selected = &app.table_context_menu.as_ref().unwrap().tables;
+                assert_eq!(
+                    selected.iter().map(table_sidebar_id).collect::<Vec<_>>(),
+                    tables[..2].iter().map(table_sidebar_id).collect::<Vec<_>>()
+                );
+                // Confirmation owns the selection even if later clicks change it.
+                app.confirm_table_actions(TableAction::Drop, id, selected.clone(), window, cx);
+                app.click_explorer_table(id, tables[2].clone(), false, window, cx);
+                let ConfirmationAction::Table {
+                    tables: confirmed,
+                    cascade,
+                    ..
+                } = &app.confirmation_dialog.as_ref().unwrap().action
+                else {
+                    panic!("expected table confirmation")
+                };
+                assert_eq!(confirmed.len(), 2);
+                assert!(!cascade);
+                app.cancel_confirmation(window, cx);
+                // Right-clicking outside the group targets only that row.
+                app.open_table_context_menu(
+                    id,
+                    tables[2].clone(),
+                    point(px(0.), px(0.)),
+                    window,
+                    cx,
+                );
+                assert_eq!(app.table_context_menu.as_ref().unwrap().tables.len(), 1);
+                // A hidden selection cannot leak into a destructive context action.
+                let session = app.session_mut(id).unwrap();
+                session.sidebar.selected = tables.iter().map(table_sidebar_id).collect();
+                session.sidebar.list.visible = vec![tables[0].clone()].into();
+                app.open_table_context_menu(
+                    id,
+                    tables[0].clone(),
+                    point(px(0.), px(0.)),
+                    window,
+                    cx,
+                );
+                assert_eq!(app.table_context_menu.as_ref().unwrap().tables.len(), 1);
+            })
+        });
+    }
+    #[gpui::test]
+    fn bulk_table_mutations_stop_on_error_and_report_partial_completion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        for action in [TableAction::Truncate, TableAction::Drop] {
+            let id = Uuid::new_v4();
+            let (app, cx) = cx.add_window_view(|window, cx| {
+                let mut app = DbxApp::new(window, cx);
+                app.vault_state = Some(VaultState::Unlocked);
+                app.runtime = Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
+                let engine = Arc::new(app.runtime.block_on(DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::SQLite, "sqlite::memory:"))).unwrap());
+                app.runtime.block_on(engine.execute_sql("CREATE TABLE first(id INTEGER); INSERT INTO first VALUES(1); CREATE TABLE untouched(id INTEGER); INSERT INTO untouched VALUES(2)")).unwrap();
+                let mut session = ConnectionSession::new(id, None, "Batch".into(), DatabaseKind::SQLite, None, window, cx);
+                session.set_tables(app.runtime.block_on(engine.list_tables()).unwrap());
+                session.engine = Some(engine);
+                app.sessions.push(session);
+                app.active_session_id = Some(id);
+                app
+            });
+            cx.update(|_, cx| {
+                app.update(cx, |app, cx| {
+                    app.execute_table_actions(
+                        action,
+                        id,
+                        vec![
+                            TableInfo::table("first", None),
+                            TableInfo::table("missing", None),
+                            TableInfo::table("untouched", None),
+                        ],
+                        false,
+                        cx,
+                    );
+                    assert!(app.session(id).unwrap().busy);
+                })
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let runtime = cx.update(|_, cx| app.read(cx).runtime.clone());
+                runtime.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                });
+                cx.run_until_parked();
+                if cx.update(|_, cx| !app.read(cx).session(id).unwrap().busy) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "table action timed out"
+                );
+            }
+            cx.update(|_, cx| {
+                let app = app.read(cx);
+                let session = app.session(id).unwrap();
+                let error = session.error.as_ref().unwrap();
+                assert!(error.contains("completing 1 table"), "{error}");
+                assert!(error.contains("missing"), "{error}");
+                let engine = session.engine.as_ref().unwrap();
+                let untouched = app
+                    .runtime
+                    .block_on(engine.query("SELECT * FROM untouched", QueryOptions::default()))
+                    .unwrap();
+                assert_eq!(
+                    untouched.rows.len(),
+                    1,
+                    "later tables must not execute after a failure"
+                );
+                match action {
+                    TableAction::Drop => {
+                        assert!(!session.tables.iter().any(|table| table.name == "first"))
+                    }
+                    TableAction::Truncate => assert!(
+                        app.runtime
+                            .block_on(engine.query("SELECT * FROM first", QueryOptions::default()))
+                            .unwrap()
+                            .rows
+                            .is_empty()
+                    ),
+                }
+            });
+        }
     }
 }

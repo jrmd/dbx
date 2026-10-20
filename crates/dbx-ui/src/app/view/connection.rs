@@ -1,40 +1,201 @@
+use super::super::connection::{disclosure_header, picker_tile};
 use super::super::*;
-use gpui_component::{checkbox::Checkbox, switch::Switch};
+use crate::popups::DropdownMenu as _;
+use gpui_component::{checkbox::Checkbox, menu::PopupMenuItem, switch::Switch};
 
 const VAULT_TEXT_EDITOR_CONTEXT: &str = "DbxTextEditor VaultGate";
 
+/// A tile on the new-connection grid: an engine, or a hosted service that
+/// connects through one.
+#[derive(Clone, Copy)]
+enum PickerTile {
+    Engine(DatabaseKind),
+    Preset(&'static str, DatabaseKind),
+}
+
 /// The new-connection grid, grouped the way people describe their databases.
-const KIND_GROUPS: [(&str, &[DatabaseKind]); 4] = [
+const KIND_GROUPS: [(&str, &[PickerTile]); 4] = [
     (
         "Relational",
         &[
-            DatabaseKind::PostgreSQL,
-            DatabaseKind::MySQL,
-            DatabaseKind::SQLite,
-            DatabaseKind::CockroachDB,
-            DatabaseKind::DuckDB,
-            DatabaseKind::ClickHouse,
-            DatabaseKind::SqlServer,
-            DatabaseKind::Snowflake,
+            PickerTile::Engine(DatabaseKind::PostgreSQL),
+            PickerTile::Engine(DatabaseKind::MySQL),
+            PickerTile::Engine(DatabaseKind::SQLite),
+            PickerTile::Engine(DatabaseKind::CockroachDB),
+            PickerTile::Engine(DatabaseKind::DuckDB),
+            PickerTile::Engine(DatabaseKind::ClickHouse),
+            PickerTile::Engine(DatabaseKind::SqlServer),
+            PickerTile::Engine(DatabaseKind::Snowflake),
         ],
     ),
     (
         "Document & key-value",
-        &[DatabaseKind::Redis, DatabaseKind::MongoDB],
+        &[
+            PickerTile::Engine(DatabaseKind::Redis),
+            PickerTile::Engine(DatabaseKind::MongoDB),
+        ],
     ),
     (
         "Search & streaming",
-        &[DatabaseKind::Elasticsearch, DatabaseKind::Kafka],
+        &[
+            PickerTile::Engine(DatabaseKind::Elasticsearch),
+            PickerTile::Engine(DatabaseKind::Kafka),
+        ],
     ),
     (
-        "Cloud",
+        "Cloud & hosted",
         &[
-            DatabaseKind::BigQuery,
-            DatabaseKind::Turso,
-            DatabaseKind::CloudflareD1,
+            PickerTile::Engine(DatabaseKind::BigQuery),
+            PickerTile::Engine(DatabaseKind::Turso),
+            PickerTile::Engine(DatabaseKind::CloudflareD1),
+            PickerTile::Preset("Redshift", DatabaseKind::PostgreSQL),
+            PickerTile::Preset("Neon", DatabaseKind::PostgreSQL),
+            PickerTile::Preset("Supabase", DatabaseKind::PostgreSQL),
+            PickerTile::Preset("PlanetScale", DatabaseKind::MySQL),
         ],
     ),
 ];
+
+impl DbxApp {
+    /// A menu of existing folders with an inline form to create one. The
+    /// draft keeps its folder until a new name is confirmed.
+    fn render_folder_control(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let current = self.draft.folder.read(cx).trim().to_owned();
+        let options = self.folder_options(cx);
+        let app = cx.entity().downgrade();
+        let label = if current.is_empty() {
+            "No folder".to_owned()
+        } else {
+            current.clone()
+        };
+        let trigger = button("connection-folder", "", ButtonKind::Quiet)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_left()
+                    .child(label.clone()),
+            )
+            .tooltip(label.clone())
+            .dropdown_caret(true)
+            .w_full()
+            .min_w_0()
+            .h(editor::single_line_input_height(
+                &self.draft.new_folder_editor,
+                cx,
+            ))
+            .rounded(crate::theme::ui_px(5.))
+            .font_weight(FontWeight::NORMAL)
+            .accessible_name(format!("Folder, {label}"))
+            .debug_selector(|| "connection-folder".into())
+            .dropdown_menu(move |menu, _, _| {
+                let none = app.clone();
+                let create = app.clone();
+                let mut menu = menu
+                    .min_w(crate::theme::ui_px(240.))
+                    .scrollable(true)
+                    .max_h(crate::theme::ui_px(280.))
+                    .item(
+                        PopupMenuItem::new("No folder")
+                            .checked(current.is_empty())
+                            .on_click(move |_, _, cx| {
+                                let _ = none.update(cx, |this, cx| this.choose_folder(None, cx));
+                            }),
+                    );
+                if !options.is_empty() {
+                    menu = menu.separator();
+                }
+                for folder in options.iter().cloned() {
+                    let app = app.clone();
+                    let chosen = folder == current;
+                    let name = folder.clone();
+                    menu = menu.item(PopupMenuItem::new(folder).checked(chosen).on_click(
+                        move |_, _, cx| {
+                            let name = name.clone();
+                            let _ = app.update(cx, |this, cx| this.choose_folder(Some(name), cx));
+                        },
+                    ));
+                }
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new("New folder…").on_click(move |_, window, cx| {
+                            let _ = create
+                                .update(cx, |this, cx| this.begin_folder_creation(window, cx));
+                        }),
+                    )
+            });
+        div()
+            .id("connection-folder-control")
+            .track_focus(&self.draft.folder_focus)
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(6.))
+            .child(trigger)
+            .when(self.draft.creating_folder, |view| {
+                let focus = self.draft.new_folder_editor.read(cx).focus_handle();
+                view.child(
+                    div()
+                        .id("connection-new-folder")
+                        .flex()
+                        .flex_col()
+                        .gap(crate::theme::ui_px(6.))
+                        // Return creates the folder; Escape abandons the form.
+                        .on_action(cx.listener(|this, _: &editor::Enter, window, cx| {
+                            this.confirm_folder_creation(window, cx)
+                        }))
+                        .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape"
+                                && !event.keystroke.modifiers.modified()
+                            {
+                                cx.stop_propagation();
+                                this.reset_folder_creation(cx);
+                                this.focus_folder_control(window, cx);
+                                cx.notify();
+                            }
+                        }))
+                        .child(editor::input(
+                            self.draft.new_folder_editor.clone(),
+                            focus,
+                            false,
+                            cx,
+                        ))
+                        .when_some(self.draft.folder_error.clone(), |view, error| {
+                            view.child(
+                                div()
+                                    .id("connection-folder-error")
+                                    .role(gpui::Role::Alert)
+                                    .text_size(crate::theme::text_px(11.))
+                                    .text_color(theme().danger_text)
+                                    .child(error),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(crate::theme::ui_px(6.))
+                                .child(
+                                    button("create-folder", "Create", ButtonKind::Primary)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.confirm_folder_creation(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    button("cancel-folder", "Cancel", ButtonKind::Quiet)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.reset_folder_creation(cx);
+                                            this.focus_folder_control(window, cx);
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+            })
+    }
+}
 
 impl DbxApp {
     pub(super) fn render_connection(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -59,6 +220,7 @@ impl DbxApp {
         let choosing = !editing && self.draft.choosing_kind;
         let kind_picker = choosing.then(|| self.render_kind_picker(cx));
         let transport = self.render_connection_transport(cx);
+        let auth = self.render_connection_auth(cx);
         let protected = self.draft.read_only;
 
         if compact_connection_picker_visible(
@@ -70,6 +232,429 @@ impl DbxApp {
                 .render_compact_connection_picker(saved_connections, selected_profile, cx)
                 .into_any_element();
         }
+
+        let compact = self.compact_layout;
+        let section_title = |title: &'static str| {
+            div()
+                .text_size(crate::theme::text_px(11.))
+                .text_color(theme().text_muted)
+                .child(title)
+        };
+        let field_label = |label: &'static str| {
+            div()
+                .text_size(crate::theme::text_px(11.))
+                .text_color(theme().text_muted)
+                .child(label)
+        };
+        let busy = self.saving_connection || self.credential_hydrating;
+        let more_menu = (choosing).then(|| {
+            let app = cx.entity().downgrade();
+            let saving = self.saving_connection;
+            let loading = self.drivers_loading();
+            button("connection-picker-more", "More", ButtonKind::Quiet)
+                .dropdown_caret(true)
+                .h(crate::theme::control_height(26.))
+                .text_size(crate::theme::text_px(11.))
+                .accessible_name("More connection actions")
+                .debug_selector(|| "connection-picker-more".into())
+                .dropdown_menu(move |menu, _, _| {
+                    let import = app.clone();
+                    let demo = app.clone();
+                    let register = app.clone();
+                    let reveal = app.clone();
+                    let refresh = app.clone();
+                    menu.item(PopupMenuItem::new("Import connections…").on_click(
+                        move |_, window, cx| {
+                            let _ = import
+                                .update(cx, |this, cx| this.open_profile_transfer(2, window, cx));
+                        },
+                    ))
+                    .item(
+                        PopupMenuItem::new(if saving {
+                            "Creating demo…"
+                        } else {
+                            "Try a demo database"
+                        })
+                        .disabled(saving)
+                        .on_click(move |_, window, cx| {
+                            let _ =
+                                demo.update(cx, |this, cx| this.create_demo_connection(window, cx));
+                        }),
+                    )
+                    .separator()
+                    .item(PopupMenuItem::new("Register community driver…").on_click(
+                        move |_, window, cx| {
+                            let _ =
+                                register.update(cx, |this, cx| this.register_driver(window, cx));
+                        },
+                    ))
+                    .item(
+                        PopupMenuItem::new("Show drivers folder").on_click(move |_, _, cx| {
+                            let _ = reveal.update(cx, |this, cx| this.reveal_drivers_folder(cx));
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Refresh drivers")
+                            .disabled(loading)
+                            .on_click(move |_, _, cx| {
+                                let _ =
+                                    refresh.update(cx, |this, cx| this.refresh_driver_registry(cx));
+                            }),
+                    )
+                })
+        });
+        // A saved connection keeps its engine; a new one can go back to the grid.
+        let header = div()
+            .id("connection-form-header")
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(crate::theme::ui_px(12.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::theme::text_px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(if editing {
+                        "Edit connection"
+                    } else {
+                        "New connection"
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(crate::theme::ui_px(8.))
+                    .children(more_menu)
+                    .when(!choosing, |view| {
+                        view.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(crate::theme::ui_px(6.))
+                                .text_size(crate::theme::text_px(12.))
+                                .text_color(theme().text_muted)
+                                .child(database_logo(kind, theme().text_muted))
+                                .child(kind.to_string()),
+                        )
+                    })
+                    .when(!choosing && !editing, |view| {
+                        view.child(
+                            button("change-connection-kind", "Change", ButtonKind::Quiet)
+                                .h(crate::theme::control_height(26.))
+                                .text_size(crate::theme::text_px(11.))
+                                .cursor_pointer()
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.change_connection_kind(cx)),
+                                ),
+                        )
+                    })
+                    .when(editing, |view| {
+                        view.child(
+                            button("duplicate-connection", "Duplicate", ButtonKind::Quiet)
+                                .h(crate::theme::control_height(26.))
+                                .text_size(crate::theme::text_px(11.))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.duplicate_profile(cx))),
+                        )
+                        .child(
+                            button("delete-connection", "Delete…", ButtonKind::Quiet)
+                                .h(crate::theme::control_height(26.))
+                                .text_size(crate::theme::text_px(11.))
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_delete_profile(window, cx)
+                                })),
+                        )
+                    }),
+            );
+        let (auth_in_details, auth_in_string) = if details { (auth, None) } else { (None, auth) };
+        let format_track =
+            (kind.supports_details() && self.draft.driver_manifest.is_none()).then(|| {
+                div().flex().child(
+                    segmented_track()
+                        .id("connection-format")
+                        .role(gpui::Role::RadioGroup)
+                        .aria_label("Connection format")
+                        .child(
+                            segment("Details", details)
+                                .id("connection-details-mode")
+                                .pressable("Connection details")
+                                .role(gpui::Role::RadioButton)
+                                .aria_toggled(if details {
+                                    gpui::accesskit::Toggled::True
+                                } else {
+                                    gpui::accesskit::Toggled::False
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_connection_form_mode(ConnectionFormMode::Details, cx)
+                                })),
+                        )
+                        .child(
+                            segment("Connection string", !details)
+                                .id("connection-string-mode")
+                                .pressable("Connection string")
+                                .role(gpui::Role::RadioButton)
+                                .aria_toggled(if !details {
+                                    gpui::accesskit::Toggled::True
+                                } else {
+                                    gpui::accesskit::Toggled::False
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.set_connection_form_mode(
+                                        ConnectionFormMode::ConnectionString,
+                                        cx,
+                                    )
+                                })),
+                        ),
+                )
+            });
+        let cloud_auth = self.draft.cloud_auth.is_some();
+        let safety = div()
+            .border_t_1()
+            .border_color(theme().hairline)
+            .pt(crate::theme::ui_px(12.))
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(8.))
+            .child(section_title("Safety"))
+            .child(
+                Switch::new("connection-protected")
+                    .label("Protected connection · disable writes")
+                    .checked(protected)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.draft.read_only = *checked;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("connection-capabilities")
+                    .text_size(crate::theme::text_px(11.))
+                    .text_color(theme().text_muted)
+                    .child(if self.draft.driver_manifest.is_some() {
+                        dbx_core::driver_plugin::capabilities(kind, protected).summary()
+                    } else {
+                        kind.capabilities(protected).summary()
+                    }),
+            )
+            .when(protected, |view| {
+                view.child(
+                    div()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child("Use a read-only database account to enforce permissions."),
+                )
+            });
+        let folder_control = self.render_folder_control(cx);
+        let organize = div()
+            .border_t_1()
+            .border_color(theme().hairline)
+            .pt(crate::theme::ui_px(12.))
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(8.))
+            .child(section_title("Organize"))
+            .child(
+                div()
+                    .flex()
+                    .when(compact, |row| row.flex_col())
+                    .gap(crate::theme::ui_px(12.))
+                    .child(
+                        div()
+                            .when(!compact, |field| {
+                                field.w(crate::theme::ui_px(240.)).flex_none()
+                            })
+                            .flex()
+                            .flex_col()
+                            .gap(crate::theme::ui_px(5.))
+                            .child(field_label("Folder (optional)"))
+                            .child(folder_control),
+                    )
+                    .child(div().flex_1().min_w_0().child(tags_editor)),
+            );
+        let form = div()
+            .bg(theme().canvas)
+            .py(crate::theme::ui_px(16.))
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(14.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(crate::theme::ui_px(5.))
+                    .child(field_label("Connection name"))
+                    .child(editor::input(
+                        self.draft.connection_name_editor.clone(),
+                        name_focus,
+                        false,
+                        cx,
+                    )),
+            )
+            .children(format_track)
+            .when(details, |view| {
+                view.child(
+                    div()
+                        .flex()
+                        .gap(crate::theme::ui_px(8.))
+                        .child(div().flex_1().min_w_0().child(field_label("Host")).child(
+                            editor::input(self.draft.host_editor.clone(), host_focus, false, cx),
+                        ))
+                        .child(
+                            div()
+                                .w(crate::theme::ui_px(110.))
+                                .flex_none()
+                                .child(field_label("Port"))
+                                .child(editor::input(
+                                    self.draft.port_editor.clone(),
+                                    port_focus,
+                                    false,
+                                    cx,
+                                )),
+                        ),
+                )
+                .children(auth_in_details)
+                .child(
+                    div()
+                        .flex()
+                        .gap(crate::theme::ui_px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(field_label("Username"))
+                                .child(editor::input(
+                                    self.draft.username_editor.clone(),
+                                    username_focus,
+                                    false,
+                                    cx,
+                                )),
+                        )
+                        // Token authentication has no password to enter.
+                        .when(!cloud_auth, |row| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(field_label("Password"))
+                                    .child(editor::input(
+                                        self.draft.password_editor.clone(),
+                                        password_focus.clone(),
+                                        false,
+                                        cx,
+                                    )),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(crate::theme::ui_px(5.))
+                        .child(field_label(if kind == DatabaseKind::Redis {
+                            "Database index (optional)"
+                        } else {
+                            "Database"
+                        }))
+                        .child(editor::input(
+                            self.draft.database_editor.clone(),
+                            database_focus,
+                            false,
+                            cx,
+                        )),
+                )
+            })
+            .when(!kind.connection_help().is_empty(), |view| {
+                view.child(
+                    div()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child(kind.connection_help()),
+                )
+            })
+            .when(!details, |view| {
+                view.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(crate::theme::ui_px(5.))
+                        .child(field_label(if kind.is_file() {
+                            "Database file or connection string"
+                        } else {
+                            "Connection string"
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(crate::theme::ui_px(8.))
+                                .child(div().flex_1().min_w_0().child(editor::input(
+                                    self.draft.connection_editor.clone(),
+                                    url_focus,
+                                    false,
+                                    cx,
+                                )))
+                                .when(
+                                    self.draft.driver_manifest.is_none() && kind.is_file(),
+                                    |view| {
+                                        view.child(
+                                            button(
+                                                "choose-sqlite-file",
+                                                "Choose file…",
+                                                ButtonKind::Quiet,
+                                            )
+                                            .h(crate::theme::control_height(32.))
+                                            .flex_none()
+                                            .cursor_pointer()
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.choose_sqlite_file(cx)
+                                                }),
+                                            ),
+                                        )
+                                    },
+                                ),
+                        ),
+                )
+                .children(auth_in_string)
+            })
+            .when(
+                matches!(
+                    kind,
+                    DatabaseKind::BigQuery | DatabaseKind::Turso | DatabaseKind::CloudflareD1
+                ),
+                |view| {
+                    view.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(crate::theme::ui_px(5.))
+                            .child(field_label(if kind == DatabaseKind::BigQuery {
+                                "OAuth token (optional; leave blank for Google credentials)"
+                            } else {
+                                "API token"
+                            }))
+                            .child(editor::input(
+                                self.draft.password_editor.clone(),
+                                password_focus,
+                                false,
+                                cx,
+                            )),
+                    )
+                },
+            )
+            .when(
+                self.draft.driver_manifest.is_none() && kind.supports_transport(),
+                |view| view.child(transport),
+            )
+            .child(safety)
+            .child(organize);
 
         div().id(SharedString::from(format!("connection-setup-{kind}-{editing}-{choosing}"))).role(gpui::Role::Pane).aria_label(if choosing {
             "Choose a database for a new connection".to_owned()
@@ -113,41 +698,13 @@ impl DbxApp {
                         .when(self.compact_layout && !self.saved_connections.is_empty(), |view| view.child(
                             div().flex().child(button("back-to-saved-connections", "Saved connections", ButtonKind::Quiet).cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.show_saved_connections(cx))))
                         ))
-                        .child(div().id("connection-form-header").flex().items_center().justify_between().gap(crate::theme::ui_px(12.))
-                            .child(div().text_size(crate::theme::text_px(18.)).font_weight(FontWeight::SEMIBOLD).child(if editing { "Edit connection" } else { "New connection" }))
-                            // A saved connection keeps its engine; a new one can go back to the grid.
-                            .when(!choosing, |view| view.child(div().flex_none().flex().items_center().gap(crate::theme::ui_px(8.))
-                                .child(div().flex().items_center().gap(crate::theme::ui_px(6.)).text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child(database_logo(kind, theme().text_muted)).child(kind.to_string()))
-                                .when(!editing, |view| view.child(button("change-connection-kind", "Change", ButtonKind::Quiet).h(crate::theme::control_height(26.)).text_size(crate::theme::text_px(11.)).cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.change_connection_kind(cx))))))))
-                        .when(editing, |view| view.child(div().flex().gap(crate::theme::ui_px(8.))
-                            .child(button("duplicate-connection", "Duplicate", ButtonKind::Quiet).disabled(self.saving_connection || self.credential_hydrating).on_click(cx.listener(|this, _, _, cx| this.duplicate_profile(cx))))
-                            .child(button("delete-connection", "Delete…", ButtonKind::Quiet).disabled(self.saving_connection || self.credential_hydrating).on_click(cx.listener(|this, _, window, cx| this.request_delete_profile(window, cx))))))
-                        .child(button("import-connections", "Import connections…", ButtonKind::Quiet).on_click(cx.listener(|this, _, window, cx| this.open_profile_transfer(2, window, cx))))
+                        .child(header)
                         .when_some(self.draft.driver_manifest.clone(), |view, path| {
                             let driver = dbx_core::driver_plugin::DriverManifest::read(&path).map(|manifest| format!("Community driver: {} · {}", manifest.name, manifest.executable.display())).unwrap_or_else(|_| "Community driver manifest unavailable".into());
                             view.child(div().text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child(driver))
                         })
                         .children(kind_picker)
-                        .when(!choosing, |view| view.child(div().bg(theme().canvas).py(crate::theme::ui_px(16.)).flex().flex_col().gap(crate::theme::ui_px(12.))
-                            .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Connection name")).child(editor::input(self.draft.connection_name_editor.clone(), name_focus, false, cx)))
-                            .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Folder (optional)"))
-                                .child(editor::input(self.draft.folder_editor.clone(), self.draft.folder_editor.read(cx).focus_handle(), false, cx)))
-                            .child(tags_editor)
-                            .when(kind.supports_details() && self.draft.driver_manifest.is_none(), |view| view.child(div().flex().child(segmented_track().id("connection-format").role(gpui::Role::RadioGroup).aria_label("Connection format")
-                                .child(div().id("connection-details-mode").pressable("Connection details").role(gpui::Role::RadioButton).aria_toggled(if details { gpui::accesskit::Toggled::True } else { gpui::accesskit::Toggled::False }).flex().items_center().gap(crate::theme::ui_px(5.)).px(crate::theme::ui_px(12.)).h(crate::theme::control_height(26.)).rounded_full().when(details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if details { theme().text } else { theme().text_muted }).text_size(crate::theme::text_px(11.)).cursor_pointer().child("Details").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::Details, cx))))
-                                .child(div().id("connection-string-mode").pressable("Connection string").role(gpui::Role::RadioButton).aria_toggled(if !details { gpui::accesskit::Toggled::True } else { gpui::accesskit::Toggled::False }).flex().items_center().gap(crate::theme::ui_px(5.)).px(crate::theme::ui_px(12.)).h(crate::theme::control_height(26.)).rounded_full().when(!details, |view| view.bg(theme().glass_selected).border_1().border_color(theme().hairline).shadow(glass_shadow(3.))).text_color(if !details { theme().text } else { theme().text_muted }).text_size(crate::theme::text_px(11.)).cursor_pointer().child("Connection string").on_click(cx.listener(|this, _, _, cx| this.set_connection_form_mode(ConnectionFormMode::ConnectionString, cx)))))))
-                            .when(details, |view| view
-                                .child(div().flex().gap(crate::theme::ui_px(8.)).child(div().flex_1().min_w_0().child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Host")).child(editor::input(self.draft.host_editor.clone(), host_focus, false, cx))).child(div().w(crate::theme::ui_px(110.)).flex_none().child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Port")).child(editor::input(self.draft.port_editor.clone(), port_focus, false, cx))))
-                                .child(div().flex().gap(crate::theme::ui_px(8.)).child(div().flex_1().min_w_0().child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Username")).child(editor::input(self.draft.username_editor.clone(), username_focus, false, cx))).child(div().flex_1().min_w_0().child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child("Password")).child(editor::input(self.draft.password_editor.clone(), password_focus.clone(), false, cx))))
-                                .child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::Redis { "Database index (optional)" } else { "Database" })).child(editor::input(self.draft.database_editor.clone(), database_focus, false, cx))))
-                            .when(!kind.connection_help().is_empty(), |view| view.child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(kind.connection_help())))
-                            .when(!details, |view| view.child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind.is_file() { "Database file or connection string" } else { "Connection string" })).child(div().flex().items_center().gap(crate::theme::ui_px(8.)).child(div().flex_1().min_w_0().child(editor::input(self.draft.connection_editor.clone(), url_focus, false, cx))).when(self.draft.driver_manifest.is_none() && kind.is_file(), |view| view.child(button("choose-sqlite-file", "Choose file…", ButtonKind::Quiet).h(crate::theme::control_height(32.)).flex_none().cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_sqlite_file(cx))))))))
-                            .when(matches!(kind,DatabaseKind::BigQuery|DatabaseKind::Turso|DatabaseKind::CloudflareD1), |view| view.child(div().flex().flex_col().gap(crate::theme::ui_px(5.)).child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted).child(if kind == DatabaseKind::BigQuery { "OAuth token (optional; leave blank for Google credentials)" } else { "API token" })).child(editor::input(self.draft.password_editor.clone(),password_focus,false, cx))))
-                             .child(Switch::new("connection-protected").label("Protected connection · disable writes").checked(protected).with_size(Size::Small)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| { this.draft.read_only = *checked; cx.notify(); })))
-                            .child(div().id("connection-capabilities").text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child(if self.draft.driver_manifest.is_some() { dbx_core::driver_plugin::capabilities(kind, protected).summary() } else { kind.capabilities(protected).summary() }))
-                            .child(div().text_size(crate::theme::text_px(12.)).text_color(theme().text_muted).child("Use a read-only database account to enforce permissions. Protected mode also blocks accidental writes in DBX."))
-                            .when(self.draft.driver_manifest.is_none() && kind.supports_transport(), |view| view.child(transport))))))
+                        .when(!choosing, |view| view.child(form))))
                 .when(!choosing, |view| view.child(div().flex_none().border_t_1().border_color(theme().border).follow_bottom_corners(RADIUS_PANEL).bg(theme().panel).px(if self.compact_layout { crate::theme::ui_px(14.) } else { crate::theme::ui_px(24.) }).py(crate::theme::ui_px(12.)).flex().items_center().justify_between().gap(crate::theme::ui_px(12.))
                     .child(div().min_w_0().flex_1().when_some(self.error.clone(), |view, error| view.child(crate::accessibility::announcement("connection-error", error.clone(), true).truncate().text_size(crate::theme::text_px(12.)).text_color(theme().danger_text).tooltip(tip(error.clone())).child(error))))
                     .child(div().flex_none().flex().items_center().gap(crate::theme::ui_px(8.))
@@ -161,8 +718,13 @@ impl DbxApp {
     fn render_kind_picker(&mut self, cx: &mut Context<Self>) -> Div {
         let url_focus = self.draft.import_url_editor.read(cx).focus_handle();
         let detected = self.import_url_kind(cx);
+        let url_empty = self.draft.import_url.read(cx).is_empty();
+        let offer_demo = self.saved_connections.is_empty();
+        let saving = self.saving_connection;
+        let compact = self.compact_layout;
         div()
-            .py(crate::theme::ui_px(16.))
+            .pt(crate::theme::ui_px(2.))
+            .pb(crate::theme::ui_px(16.))
             .flex()
             .flex_col()
             .gap(crate::theme::ui_px(18.))
@@ -170,24 +732,44 @@ impl DbxApp {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(crate::theme::ui_px(5.))
-                    .child(
-                        div()
-                            .text_size(crate::theme::text_px(11.))
-                            .text_color(theme().text_muted)
-                            .child("Paste a connection URL or database file path"),
-                    )
+                    .gap(crate::theme::ui_px(6.))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(crate::theme::ui_px(8.))
-                            .child(div().flex_1().min_w_0().child(editor::input(
-                                self.draft.import_url_editor.clone(),
-                                url_focus,
-                                false,
-                                cx,
-                            )))
+                            .child(
+                                // Return in the field continues once the URL is recognised.
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .on_action(cx.listener(|this, _: &editor::Enter, _, cx| {
+                                        this.continue_with_import_url(cx)
+                                    }))
+                                    .child(editor::input(
+                                        self.draft.import_url_editor.clone(),
+                                        url_focus,
+                                        false,
+                                        cx,
+                                    ))
+                                    .when(url_empty, |field| {
+                                        field.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .bottom_0()
+                                                .left(crate::theme::ui_px(9.))
+                                                .right(crate::theme::ui_px(9.))
+                                                .flex()
+                                                .items_center()
+                                                .truncate()
+                                                .text_size(crate::theme::text_px(12.))
+                                                .text_color(theme().text_muted)
+                                                .child("Paste a connection URL or file path"),
+                                        )
+                                    }),
+                            )
                             .child(
                                 button(
                                     "continue-with-url",
@@ -213,73 +795,44 @@ impl DbxApp {
                                     },
                                 ),
                             ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(crate::theme::ui_px(8.))
-                    .child(
-                        button(
-                            "try-demo",
-                            if self.saving_connection {
-                                "Creating demo…"
-                            } else {
-                                "Try a demo database"
-                            },
-                            ButtonKind::Quiet,
-                        )
-                        .debug_selector(|| "try-demo".into())
-                        .disabled(self.saving_connection)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.create_demo_connection(window, cx)
-                        })),
-                    )
-                    .child(
-                        div()
-                            .text_size(crate::theme::text_px(11.))
-                            .text_color(theme().text_muted)
-                            .child("Explore a local SQLite database with sample data."),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(crate::theme::ui_px(8.))
-                    .child(
-                        div()
-                            .text_size(crate::theme::text_px(11.))
-                            .text_color(theme().text_muted)
-                            .child("Cloud presets · use PostgreSQL or MySQL drivers"),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_wrap()
-                            .gap(crate::theme::ui_px(8.))
-                            .children(
-                                ["Redshift", "Neon", "PlanetScale", "Supabase"]
-                                    .into_iter()
-                                    .map(|name| {
-                                        button(
-                                            SharedString::from(format!("preset-{name}")),
-                                            name,
-                                            ButtonKind::Quiet,
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.select_connection_preset(name, cx)
-                                            }),
-                                        )
-                                    }),
-                            ),
+                            .items_center()
+                            .gap_x(crate::theme::ui_px(6.))
+                            .text_size(crate::theme::text_px(11.))
+                            .text_color(theme().text_muted)
+                            .child(match detected {
+                                Some(kind) => format!("Detected {kind}. Press Return to continue."),
+                                None => "Or choose a database below.".into(),
+                            })
+                            .when(offer_demo, |line| {
+                                line.child(
+                                    div()
+                                        .id("try-demo")
+                                        .debug_selector(|| "try-demo".into())
+                                        .pressable("Try a demo database")
+                                        .text_color(theme().accent)
+                                        .rounded(crate::theme::ui_px(3.))
+                                        .when(!saving, |link| {
+                                            link.cursor_pointer()
+                                                .hover(|style| style.underline())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.create_demo_connection(window, cx)
+                                                }))
+                                        })
+                                        .child(if saving {
+                                            "Creating demo…"
+                                        } else {
+                                            "Try a demo database"
+                                        }),
+                                )
+                            }),
                     ),
             )
-            .child(self.render_driver_picker(cx))
-            .children(KIND_GROUPS.into_iter().map(|(title, kinds)| {
+            .children(KIND_GROUPS.into_iter().map(|(title, tiles)| {
                 div()
                     .flex()
                     .flex_col()
@@ -295,45 +848,42 @@ impl DbxApp {
                             .flex()
                             .flex_wrap()
                             .gap(crate::theme::ui_px(8.))
-                            .children(kinds.iter().copied().map(|kind| {
-                                div()
-                                    .id(SharedString::from(format!("engine-{kind}")))
+                            .children(tiles.iter().copied().map(|tile| {
+                                match tile {
+                                    PickerTile::Engine(kind) => picker_tile(
+                                        SharedString::from(format!("engine-{kind}")),
+                                        kind,
+                                        kind.to_string(),
+                                        None,
+                                        false,
+                                        compact,
+                                    )
                                     .debug_selector(move || format!("engine-{kind}"))
-                                    .pressable(kind.to_string())
-                                    .w(crate::theme::ui_px(120.))
-                                    .h(crate::theme::ui_px(72.))
-                                    .rounded(crate::theme::ui_px(RADIUS_PANEL))
-                                    .border_1()
-                                    .border_color(theme().hairline)
-                                    .bg(theme().glass_hover)
-                                    .hover(|style| {
-                                        style
-                                            .bg(theme().accent_soft)
-                                            .border_color(theme().accent.alpha(0.45))
-                                    })
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(crate::theme::ui_px(8.))
-                                    .cursor_pointer()
-                                    .child(
-                                        database_logo(kind, theme().text)
-                                            .size(crate::theme::ui_px(22.)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(crate::theme::text_px(12.))
-                                            .child(kind.to_string()),
-                                    )
-                                    .on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.select_kind(kind, cx)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_kind(kind, cx)
+                                    })),
+                                    PickerTile::Preset(name, kind) => picker_tile(
+                                        SharedString::from(format!("preset-{name}")),
+                                        kind,
+                                        name,
+                                        Some(if kind == DatabaseKind::MySQL {
+                                            "MySQL"
+                                        } else {
+                                            "PostgreSQL"
                                         }),
+                                        false,
+                                        compact,
                                     )
+                                    .debug_selector(move || format!("preset-{name}"))
+                                    .aria_label(format!("{name} ({kind})"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_connection_preset(name, cx)
+                                    })),
+                                }
                             })),
                     )
             }))
+            .child(self.render_driver_picker(cx))
     }
 
     /// Tags are picked here and managed in Settings, so the form stays short.
@@ -392,10 +942,111 @@ impl DbxApp {
             )
     }
 
+    /// Authentication for PostgreSQL and MySQL: a password, or a short-lived
+    /// token the cloud CLI issues on each connect. Community drivers reject it.
+    fn render_connection_auth(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let kind = self.draft.kind;
+        if !matches!(kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL)
+            || self.draft.driver_manifest.is_some()
+        {
+            return None;
+        }
+        let current = self.draft.cloud_auth;
+        let option = |id: &'static str,
+                      label: &'static str,
+                      value: Option<dbx_core::CloudAuthentication>| {
+            let selected = current == value;
+            segment(label, selected)
+                .id(id)
+                .pressable(label)
+                .role(gpui::Role::RadioButton)
+                .aria_toggled(if selected {
+                    gpui::accesskit::Toggled::True
+                } else {
+                    gpui::accesskit::Toggled::False
+                })
+                .on_click(cx.listener(move |this, _, _, cx| this.set_cloud_auth(value, cx)))
+        };
+        let caption = match current {
+            None => None,
+            Some(dbx_core::CloudAuthentication::AwsRdsIam) => Some(
+                "DBX gets a fresh token from the AWS CLI on each connect. Sign in with `aws` first; the username is the IAM database user.",
+            ),
+            Some(dbx_core::CloudAuthentication::AzureEntra) => Some(
+                "DBX gets a fresh token from the Azure CLI on each connect. Sign in with `az login` first.",
+            ),
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(crate::theme::ui_px(6.))
+                .child(
+                    div()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child("Authentication"),
+                )
+                .child(
+                    div().flex().child(
+                        segmented_track()
+                            .id("connection-auth")
+                            .role(gpui::Role::RadioGroup)
+                            .aria_label("Authentication")
+                            .child(option("auth-password", "Password", None))
+                            .child(option(
+                                "auth-aws-iam",
+                                "AWS IAM",
+                                Some(dbx_core::CloudAuthentication::AwsRdsIam),
+                            ))
+                            .when(kind == DatabaseKind::PostgreSQL, |track| {
+                                track.child(option(
+                                    "auth-entra",
+                                    if self.compact_layout {
+                                        "Entra"
+                                    } else {
+                                        "Microsoft Entra"
+                                    },
+                                    Some(dbx_core::CloudAuthentication::AzureEntra),
+                                ))
+                            }),
+                    ),
+                )
+                .children(caption.map(|caption| {
+                    div()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child(caption)
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Unix socket and SSH tunnel, folded away until one is configured.
     fn render_connection_transport(&self, cx: &mut Context<Self>) -> AnyElement {
         let transport = &self.draft.transport;
         let socket_enabled = transport.socket_enabled;
         let ssh_enabled = transport.ssh_enabled;
+        let open = self
+            .connection_network_open
+            .unwrap_or(socket_enabled || ssh_enabled);
+        let detail: SharedString = match (ssh_enabled, socket_enabled) {
+            (true, socket) => {
+                let host = transport.ssh_host.read(cx).trim().to_owned();
+                let ssh = if host.is_empty() {
+                    "SSH tunnel".to_owned()
+                } else {
+                    format!("SSH via {host}")
+                };
+                if socket {
+                    format!("{ssh} · Unix socket").into()
+                } else {
+                    ssh.into()
+                }
+            }
+            (false, true) => "Unix socket".into(),
+            (false, false) => "SSH tunnel, Unix socket".into(),
+        };
         let input = |label: &'static str, entity: Entity<TextEditor>| {
             let focus = entity.read(cx).focus_handle();
             div()
@@ -438,38 +1089,41 @@ impl DbxApp {
         );
         div().debug_selector(|| "connection-transport-form".into()).border_t_1().border_color(theme().hairline).pt(crate::theme::ui_px(12.))
             .flex().flex_col().gap(crate::theme::ui_px(10.))
-            .when(matches!(self.draft.kind, DatabaseKind::PostgreSQL | DatabaseKind::MySQL), |view| view.child(div().flex().gap(crate::theme::ui_px(8.))
-                .child(button("password-auth", "Use password authentication", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| { this.draft.cloud_auth = None; cx.notify(); })))
-                .child(div().text_size(crate::theme::text_px(12.)).child(match self.draft.cloud_auth { Some(dbx_core::CloudAuthentication::AwsRdsIam) => "Authentication: automatic AWS IAM", Some(dbx_core::CloudAuthentication::AzureEntra) => "Authentication: automatic Entra", None => "Authentication: password" }))
-                .child(button("aws-rds-token", "Use automatic AWS IAM", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| this.fetch_cloud_token(dbx_core::CloudAuthentication::AwsRdsIam, cx))))
-                .when(self.draft.kind == DatabaseKind::PostgreSQL, |view| view.child(button("azure-entra-token", "Use automatic Entra", ButtonKind::Quiet).on_click(cx.listener(|this, _, _, cx| this.fetch_cloud_token(dbx_core::CloudAuthentication::AzureEntra, cx)))))))
-            .child(Switch::new("connection-unix-socket").label("Use Unix socket")
-                .checked(socket_enabled).with_size(Size::Small)
-                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                    this.draft.transport.socket_enabled = *checked;
-                    this.error = None;
+            .child(disclosure_header("connection-network", "Network", None, Some(detail), open)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.connection_network_open = Some(!open);
                     cx.notify();
                 })))
-            .when(socket_enabled, |view| view.child(socket).child(
-                div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted)
-                    .child(if ssh_enabled { "Socket on the SSH server. PostgreSQL uses the database port to select its socket." }
-                        else { "Local socket. Host is ignored; PostgreSQL uses the database port to select its socket." })))
-            .child(Switch::new("connection-ssh-tunnel").label("Connect through SSH tunnel")
-                .checked(ssh_enabled).with_size(Size::Small)
-                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                    this.draft.transport.ssh_enabled = *checked;
-                    this.error = None;
-                    cx.notify();
-                })))
-            .when(ssh_enabled, |view| view
-                .child(div().flex().gap(crate::theme::ui_px(8.)).child(host).child(div().w(crate::theme::ui_px(110.)).child(port)))
-                .child(user)
-                .child(div().flex().items_end().gap(crate::theme::ui_px(8.)).child(key)
-                    .child(button("choose-ssh-key", "Choose key…", ButtonKind::Quiet)
-                        .cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_ssh_key(cx)))))
-                .child(jump).child(password)
-                .child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted)
-                    .child("Database host is resolved from the SSH server. Uses your SSH agent or key; load encrypted keys into the agent. Verify a new SSH host in a terminal first.")))
+            .when(open, |view| view
+                .child(Switch::new("connection-unix-socket").label("Use Unix socket")
+                    .checked(socket_enabled).with_size(Size::Small)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.draft.transport.socket_enabled = *checked;
+                        this.error = None;
+                        cx.notify();
+                    })))
+                .when(socket_enabled, |view| view.child(socket).child(
+                    div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted)
+                        .child(if ssh_enabled { "Socket on the SSH server. PostgreSQL uses the database port to select its socket." }
+                            else { "Local socket. Host is ignored; PostgreSQL uses the database port to select its socket." })))
+                .child(Switch::new("connection-ssh-tunnel").label("Connect through SSH tunnel")
+                    .checked(ssh_enabled).with_size(Size::Small)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.draft.transport.ssh_enabled = *checked;
+                        this.error = None;
+                        cx.notify();
+                    })))
+                .when(ssh_enabled, |view| view
+                    .child(div().flex().gap(crate::theme::ui_px(8.)).child(host).child(div().w(crate::theme::ui_px(110.)).child(port)))
+                    .child(user)
+                    .child(div().flex().items_end().gap(crate::theme::ui_px(8.)).child(key)
+                        .child(button("choose-ssh-key", "Choose key…", ButtonKind::Quiet)
+                            .cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.choose_ssh_key(cx)))))
+                    .child(jump).child(password)
+                    .child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted)
+                        .child("Database host is resolved from the SSH server. Uses your SSH agent or key file."))
+                    .child(div().text_size(crate::theme::text_px(11.)).text_color(theme().text_muted)
+                        .child("Load encrypted keys into the agent, and verify a new SSH host in a terminal first."))))
             .into_any_element()
     }
 

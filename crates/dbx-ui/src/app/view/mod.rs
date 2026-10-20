@@ -67,6 +67,8 @@ impl Render for DbxApp {
         {
             let editor = if self.draft.choosing_kind {
                 &self.draft.import_url_editor
+            } else if self.draft.creating_folder {
+                &self.draft.new_folder_editor
             } else {
                 &self.draft.connection_name_editor
             };
@@ -243,6 +245,14 @@ impl Render for DbxApp {
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::open_shortcuts_action))
             .on_action(cx.listener(Self::search_history_action))
+            .on_modifiers_changed(
+                cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, _| {
+                    this.explorer_control_held = event.modifiers.control;
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, _| {
+                this.explorer_control_held = event.modifiers.control;
+            }))
             .on_action(cx.listener(Self::focus_explorer_action))
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))

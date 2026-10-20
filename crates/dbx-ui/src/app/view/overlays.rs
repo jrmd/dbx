@@ -393,6 +393,20 @@ impl DbxApp {
                     .map(|(name, input, _)| (name.clone(), input.clone()))
             })
             .flatten();
+        let cascade = match &dialog.action {
+            ConfirmationAction::Table {
+                action: TableAction::Truncate,
+                session_id,
+                cascade,
+                ..
+            } if self
+                .session(*session_id)
+                .is_some_and(|session| session.kind.supports_truncate_cascade()) =>
+            {
+                Some(*cascade)
+            }
+            _ => None,
+        };
         let tone = dialog.tone;
         let priority = if matches!(dialog.action, ConfirmationAction::LockVault) {
             60
@@ -402,9 +416,15 @@ impl DbxApp {
         let focus = dialog.focus.clone();
         let background = self.modal_is_background(&focus);
         let accessible_title = title.clone();
+        let cascade_warning = "Cascade also permanently removes all rows from dependent tables, even if they are not selected.";
         let accessible_detail = match &sql {
             Some(sql) => format!("{detail}\nSQL: {sql}"),
             None => detail.clone(),
+        };
+        let accessible_detail = if cascade.is_some() {
+            format!("{accessible_detail}\n{cascade_warning}")
+        } else {
+            accessible_detail
         };
         let confirm_kind = match tone {
             ConfirmationTone::Warning => ButtonKind::Primary,
@@ -477,6 +497,36 @@ impl DbxApp {
                                     })),
                             ),
                     )
+                    .when_some(cascade, |dialog, cascade| {
+                        dialog.child(
+                            div()
+                                .px(crate::theme::ui_px(16.))
+                                .pt(crate::theme::ui_px(16.))
+                                .child(
+                                    gpui_component::checkbox::Checkbox::new("truncate-cascade")
+                                        .label("Cascade to dependent tables")
+                                        .checked(cascade)
+                                        .with_size(Size::Small)
+                                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                            if let Some(ConfirmationDialog {
+                                                action: ConfirmationAction::Table { cascade, .. },
+                                                ..
+                                            }) = &mut this.confirmation_dialog
+                                            {
+                                                *cascade = *checked;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .mt(crate::theme::ui_px(6.))
+                                        .text_size(crate::theme::text_px(12.))
+                                        .text_color(theme().warning_text)
+                                        .child(cascade_warning),
+                                ),
+                        )
+                    })
                     .when(!detail.is_empty(), |dialog| {
                         dialog.child(
                             div()
@@ -697,6 +747,11 @@ impl DbxApp {
             return div().into_any_element();
         };
         let rows = self.table_menu_rows_for(&menu);
+        let label = if menu.tables.len() > 1 {
+            format!("{} objects selected", menu.tables.len())
+        } else {
+            table_sidebar_label(&menu.table, None)
+        };
 
         let app = cx.entity().downgrade();
         let items = rows.into_iter().enumerate().map(|(index, row)| match row {
@@ -761,7 +816,7 @@ impl DbxApp {
                     crate::popups::menu_surface(div(), cx)
                         .id("table-context-menu")
                         .role(gpui::Role::Menu)
-                        .aria_label(table_sidebar_label(&menu.table, None))
+                        .aria_label(label.clone())
                         .a11y_synthetic_children({
                             let background = self.modal_is_background(&menu.focus);
                             move |builder| {
@@ -784,7 +839,7 @@ impl DbxApp {
                                 .px_2()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(table_sidebar_label(&menu.table, None)),
+                                .child(label),
                         )
                         .children(items),
                 ),

@@ -690,6 +690,66 @@ pub fn build_truncate_table(kind: DatabaseKind, table: &TableRef) -> Result<SqlS
     Ok(SqlStatement::new(statement, Vec::new()))
 }
 
+/// Build a truncate batch. PostgreSQL-family tables share one statement so
+/// foreign keys within the selection do not require cascading outside it.
+/// Other dialects execute one table at a time; callers must report partial success.
+pub fn build_truncate_tables(
+    kind: DatabaseKind,
+    tables: &[TableRef],
+    cascade: bool,
+) -> Result<Vec<SqlStatement>> {
+    if tables.is_empty() {
+        return Err(DbxError::Parse("Select at least one table".into()));
+    }
+    if cascade && !kind.supports_truncate_cascade() {
+        return Err(DbxError::Unsupported {
+            operation: "TRUNCATE CASCADE".into(),
+            kind,
+        });
+    }
+    if kind.supports_truncate_cascade() {
+        let names = tables
+            .iter()
+            .map(|table| quote_table(kind, table))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        return Ok(vec![SqlStatement::new(
+            format!(
+                "TRUNCATE TABLE {names}{}",
+                if cascade { " CASCADE" } else { "" }
+            ),
+            Vec::new(),
+        )]);
+    }
+    tables
+        .iter()
+        .map(|table| build_truncate_table(kind, table))
+        .collect()
+}
+
+/// Group PostgreSQL-family drops to permit dependencies within the selection.
+/// Dependencies outside it remain protected by the database's default RESTRICT.
+pub fn build_drop_tables(kind: DatabaseKind, tables: &[TableRef]) -> Result<Vec<SqlStatement>> {
+    if tables.is_empty() {
+        return Err(DbxError::Parse("Select at least one table".into()));
+    }
+    if matches!(kind, DatabaseKind::PostgreSQL | DatabaseKind::CockroachDB) {
+        let names = tables
+            .iter()
+            .map(|table| quote_table(kind, table))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        return Ok(vec![SqlStatement::new(
+            format!("DROP TABLE {names}"),
+            Vec::new(),
+        )]);
+    }
+    tables
+        .iter()
+        .map(|table| build_drop_table(kind, table))
+        .collect()
+}
+
 /// Build a statement that drops a table using a safely quoted table
 /// identifier.
 pub fn build_drop_table(kind: DatabaseKind, table: &TableRef) -> Result<SqlStatement> {

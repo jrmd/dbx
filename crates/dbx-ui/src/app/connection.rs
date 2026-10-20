@@ -10,6 +10,157 @@ fn hydration_matches_current_draft(
     selected_profile == expected_profile && current_fields == requested_fields
 }
 
+/// A database, preset or community driver on the new-connection grid.
+pub(super) fn picker_tile(
+    id: impl Into<ElementId>,
+    logo: DatabaseKind,
+    label: impl Into<SharedString>,
+    caption: Option<&'static str>,
+    selected: bool,
+    compact: bool,
+) -> gpui::Stateful<Div> {
+    let label = label.into();
+    let logo_slot = if compact { 22. } else { 24. };
+    let label_height = if compact { 16. } else { 18. };
+    let caption_height = 14.;
+    // Keep tiles equally tall, with room for the largest content stack. Only
+    // render visible rows so justify_center centres tiles without captions too.
+    // UI zoom alone does not account for larger text.
+    let tile_height = crate::theme::ui_px(20. + logo_slot + 6. + 2.)
+        + crate::theme::text_px(label_height + caption_height);
+    div()
+        .id(id)
+        .pressable(label.clone())
+        .w(crate::theme::ui_px(if compact { 104. } else { 120. })
+            * crate::theme::font_scale().max(1.))
+        .h(tile_height)
+        .flex_none()
+        .px(crate::theme::ui_px(6.))
+        .py(crate::theme::ui_px(10.))
+        .rounded(crate::theme::ui_px(RADIUS_PANEL))
+        .border_1()
+        .border_color(if selected {
+            theme().accent.alpha(0.6)
+        } else {
+            theme().hairline
+        })
+        .bg(if selected {
+            theme().accent_soft
+        } else {
+            theme().glass_hover
+        })
+        .hover(|style| {
+            style
+                .bg(theme().accent_soft)
+                .border_color(theme().accent.alpha(0.45))
+        })
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(crate::theme::ui_px(6.))
+        .cursor_pointer()
+        .child(
+            div()
+                .size(crate::theme::ui_px(logo_slot))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    database_logo(logo, theme().text).size(crate::theme::ui_px(if compact {
+                        20.
+                    } else {
+                        22.
+                    })),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(crate::theme::ui_px(2.))
+                .child(
+                    div()
+                        .max_w_full()
+                        .h(crate::theme::text_px(label_height))
+                        .line_height(crate::theme::text_px(label_height))
+                        .truncate()
+                        .text_size(crate::theme::text_px(if compact { 11. } else { 12. }))
+                        .child(label),
+                )
+                .when_some(caption, |text, caption| {
+                    text.child(
+                        div()
+                            .max_w_full()
+                            .h(crate::theme::text_px(caption_height))
+                            .line_height(crate::theme::text_px(caption_height))
+                            .truncate()
+                            .text_size(crate::theme::text_px(10.))
+                            .text_color(theme().text_muted)
+                            .child(caption),
+                    )
+                }),
+        )
+}
+
+/// A full-width row that opens and closes a section. The state is part of the
+/// accessible name because GPUI has no expanded property.
+pub(super) fn disclosure_header(
+    id: impl Into<ElementId>,
+    title: &'static str,
+    count: Option<usize>,
+    detail: Option<SharedString>,
+    open: bool,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .pressable(format!(
+            "{title}, {}",
+            if open { "expanded" } else { "collapsed" }
+        ))
+        .w_full()
+        .h(crate::theme::control_height(28.))
+        .px(crate::theme::ui_px(4.))
+        .rounded(crate::theme::ui_px(RADIUS_PANEL - 2.))
+        .hover(|style| style.bg(theme().glass_hover))
+        .flex()
+        .items_center()
+        .gap(crate::theme::ui_px(8.))
+        .cursor_pointer()
+        .child(
+            div()
+                .flex_none()
+                .text_size(crate::theme::text_px(11.))
+                .text_color(theme().text_muted)
+                .child(title),
+        )
+        .when_some(count.filter(|count| *count > 0), |row, count| {
+            row.child(badge(count.to_string(), theme().text_muted))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(crate::theme::text_px(11.))
+                .text_color(theme().text_muted)
+                .children(detail),
+        )
+        .child(icon(
+            if open {
+                Icon::ChevronUp
+            } else {
+                Icon::ChevronDown
+            },
+            theme().text_muted,
+        ))
+}
+
 impl DbxApp {
     pub(crate) fn can_open_connection_targets(&self) -> bool {
         self.vault_state == Some(VaultState::Unlocked)
@@ -280,17 +431,22 @@ impl DbxApp {
         Ok((kind, visible_url, config))
     }
 
-    pub(super) fn fetch_cloud_token(
+    /// Pick how PostgreSQL/MySQL authenticate. Token providers fetch a fresh
+    /// token on each connect, so no password is kept once one is chosen.
+    pub(super) fn set_cloud_auth(
         &mut self,
-        provider: dbx_core::CloudAuthentication,
+        provider: Option<dbx_core::CloudAuthentication>,
         cx: &mut Context<Self>,
     ) {
-        self.draft.cloud_auth = Some(provider);
-        self.draft.password.update(cx, |password, cx| {
-            password.zeroize();
-            cx.notify();
-        });
-        self.show_toast(ToastKind::Info, "Cloud authentication selected. DBX obtains a fresh token on connect and refreshes credentials before new sessions. Save to keep this choice.", cx);
+        self.draft.cloud_auth = provider;
+        if provider.is_some() {
+            self.draft.password.update(cx, |password, cx| {
+                password.zeroize();
+                cx.notify();
+            });
+        }
+        self.error = None;
+        cx.notify();
     }
 
     fn clear_vault_inputs(&mut self, cx: &mut Context<Self>) {
@@ -748,6 +904,7 @@ impl DbxApp {
         self.table_name_prompt = None;
         self.table_confirmation_input = None;
         self.vault_state = Some(VaultState::Locked);
+        self.reset_folder_creation(cx);
         self.workspace_documents.clear();
         // Use the normal teardown so queries, connection attempts, and tab
         // tasks are cancelled and their database engines are released.
@@ -890,6 +1047,7 @@ impl DbxApp {
         self.draft.driver_manifest = None;
         self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
+        self.reset_folder_creation(cx);
         self.connection_form_focus_pending = true;
         self.hydrate_connection_fields(kind, Self::default_url(kind).to_owned(), cx);
         self.error = None;
@@ -918,6 +1076,7 @@ impl DbxApp {
         self.draft.driver_manifest = None;
         self.draft.cloud_auth = None;
         self.draft.choosing_kind = false;
+        self.reset_folder_creation(cx);
         self.hydrate_connection_fields(kind, url.trim().to_owned(), cx);
         self.error = None;
         cx.notify();
@@ -925,9 +1084,70 @@ impl DbxApp {
 
     pub(super) fn change_connection_kind(&mut self, cx: &mut Context<Self>) {
         self.draft.choosing_kind = true;
+        self.reset_folder_creation(cx);
         self.connection_form_focus_pending = true;
         self.error = None;
         cx.notify();
+    }
+
+    /// Close the inline "New folder" form and discard what was typed, so a
+    /// half-written name never carries over to another draft.
+    pub(super) fn reset_folder_creation(&mut self, cx: &mut Context<Self>) {
+        self.draft.creating_folder = false;
+        self.draft.folder_error = None;
+        self.draft.new_folder.update(cx, |value, cx| {
+            value.clear();
+            cx.notify();
+        });
+    }
+
+    pub(super) fn begin_folder_creation(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_folder_creation(cx);
+        self.draft.creating_folder = true;
+        // Apply focus during the next form render, after the menu restores
+        // its trigger focus and the inline editor joins the focus tree.
+        self.connection_form_focus_pending = true;
+        cx.notify();
+    }
+
+    pub(super) fn choose_folder(&mut self, folder: Option<String>, cx: &mut Context<Self>) {
+        self.draft.folder.update(cx, |value, cx| {
+            *value = folder.unwrap_or_default();
+            cx.notify();
+        });
+        self.reset_folder_creation(cx);
+        cx.notify();
+    }
+
+    /// Folders the draft can choose: those on saved connections plus an
+    /// unsaved current one.
+    pub(super) fn folder_options(&self, cx: &App) -> Vec<String> {
+        folder_options(
+            self.saved_connections
+                .iter()
+                .filter_map(|profile| profile.folder.as_deref()),
+            self.draft.folder.read(cx),
+        )
+    }
+
+    pub(super) fn confirm_folder_creation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let options = self.folder_options(cx);
+        match validate_new_folder(self.draft.new_folder.read(cx), &options) {
+            Ok(folder) => {
+                self.choose_folder(Some(folder), cx);
+                self.focus_folder_control(window, cx);
+            }
+            Err(error) => {
+                self.draft.folder_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn focus_folder_control(&self, window: &mut Window, cx: &mut Context<Self>) {
+        // The wrapper is not a tab stop; its first child is the dropdown.
+        self.draft.folder_focus.focus(window, cx);
+        window.focus_next(cx);
     }
 
     /// A connection carries at most one tag; choosing the current tag again
@@ -1063,6 +1283,8 @@ impl DbxApp {
         let profile_id = profile.id;
         self.draft.selected_profile = Some(profile.id);
         self.draft.choosing_kind = false;
+        self.reset_folder_creation(cx);
+        self.connection_network_open = None;
         self.draft.folder.update(cx, |value, cx| {
             *value = profile.folder.clone().unwrap_or_default();
             cx.notify();
@@ -1741,9 +1963,11 @@ impl DbxApp {
             value.clear();
             cx.notify();
         });
+        self.reset_folder_creation(cx);
         self.draft.choosing_kind = true;
         self.connection_form_focus_pending = true;
         self.settings_open = false;
+        self.connection_network_open = None;
         self.draft.connection_name.update(cx, |name, cx| {
             name.clear();
             cx.notify();
@@ -1774,9 +1998,120 @@ impl DbxApp {
     }
 }
 
+const MAX_FOLDER_CHARS: usize = 80;
+
+/// Existing folders, sorted without regard to case. Spellings that differ
+/// only by case are separate stored values and stay separate options.
+fn folder_options<'a>(saved: impl Iterator<Item = &'a str>, current: &'a str) -> Vec<String> {
+    let mut folders: Vec<String> = Vec::new();
+    for folder in saved.chain(std::iter::once(current.trim())) {
+        if !folder.is_empty() && !folders.iter().any(|known| known == folder) {
+            folders.push(folder.to_owned());
+        }
+    }
+    // The sort is stable, so equal keys keep the order they were first seen.
+    folders.sort_by_cached_key(|folder| folder.to_lowercase());
+    folders
+}
+
+/// The folder a "New folder" entry stands for: trimmed and valid, spelled
+/// like an existing folder when one matches regardless of case.
+fn validate_new_folder(input: &str, existing: &[String]) -> Result<String, String> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("Enter a folder name.".into());
+    }
+    if name.chars().count() > MAX_FOLDER_CHARS {
+        return Err(format!(
+            "Folder names are limited to {MAX_FOLDER_CHARS} characters."
+        ));
+    }
+    if name.chars().any(char::is_control) {
+        return Err("Folder names can’t contain control characters.".into());
+    }
+    let lowered = name.to_lowercase();
+    Ok(existing
+        .iter()
+        .find(|folder| folder.as_str() == name)
+        .or_else(|| {
+            existing
+                .iter()
+                .find(|folder| folder.to_lowercase() == lowered)
+        })
+        .cloned()
+        .unwrap_or_else(|| name.to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn folder_creation_waits_for_confirmation_and_never_leaks_into_another_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        app.update_in(cx, |app, window, cx| {
+            app.draft
+                .folder
+                .update(cx, |value, _| *value = "Prod".into());
+            app.begin_folder_creation(window, cx);
+            app.draft
+                .new_folder
+                .update(cx, |value, _| *value = "  ".into());
+            app.confirm_folder_creation(window, cx);
+            assert!(app.draft.creating_folder && app.draft.folder_error.is_some());
+            assert_eq!(app.draft.folder.read(cx), "Prod");
+            app.draft
+                .new_folder
+                .update(cx, |value, _| *value = " prod ".into());
+            app.confirm_folder_creation(window, cx);
+            assert!(!app.draft.creating_folder && app.draft.folder_error.is_none());
+            assert_eq!(app.draft.folder.read(cx), "Prod");
+            app.begin_folder_creation(window, cx);
+            app.draft
+                .new_folder
+                .update(cx, |value, _| *value = "Draft".into());
+            app.begin_new_connection(cx);
+            assert!(!app.draft.creating_folder);
+            assert!(app.draft.new_folder.read(cx).is_empty());
+            assert!(app.draft.folder.read(cx).is_empty());
+        });
+    }
+
+    #[test]
+    fn folder_options_are_unique_sorted_without_case_and_keep_the_unsaved_current_folder() {
+        let saved = ["work", "Prod", "", "work", "archive", "prod"];
+        assert_eq!(
+            folder_options(saved.into_iter(), "Staging"),
+            ["archive", "Prod", "prod", "Staging", "work"]
+        );
+        assert_eq!(
+            folder_options(saved.into_iter(), "work"),
+            ["archive", "Prod", "prod", "work"]
+        );
+        assert_eq!(folder_options([].into_iter(), "  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn new_folder_names_are_trimmed_validated_and_reuse_existing_spelling() {
+        let existing = vec!["Prod".to_owned(), "prod".to_owned(), "Work".to_owned()];
+        assert_eq!(validate_new_folder("  Team  ", &existing).unwrap(), "Team");
+        assert_eq!(validate_new_folder("work", &existing).unwrap(), "Work");
+        assert_eq!(validate_new_folder("prod", &existing).unwrap(), "prod");
+        assert_eq!(validate_new_folder("PROD", &existing).unwrap(), "Prod");
+        assert!(validate_new_folder("   ", &existing).is_err());
+        assert!(validate_new_folder("bad\u{7}name", &existing).is_err());
+        assert!(validate_new_folder(&"é".repeat(81), &existing).is_err());
+        assert_eq!(
+            validate_new_folder(&"é".repeat(80), &existing)
+                .unwrap()
+                .chars()
+                .count(),
+            80
+        );
+    }
 
     #[gpui::test]
     fn vault_lock_forgets_plugin_file_urls_and_all_secret_editor_histories(

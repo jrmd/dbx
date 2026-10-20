@@ -60,6 +60,7 @@ pub(super) struct SidebarState {
     /// The keyboard cursor, kept as a table identity (`table_sidebar_id`)
     /// because the visible rows are rebuilt as the search or schema changes.
     pub(super) cursor: Option<String>,
+    pub(super) selected: BTreeSet<String>,
     /// Bounds painted for the cursor row and the list, used to place a menu
     /// opened from the keyboard. The id guards against a stale row.
     pub(super) cursor_bounds: CursorBounds,
@@ -129,6 +130,7 @@ impl SidebarState {
             focus: cx.focus_handle().tab_stop(true),
             scroll: UniformListScrollHandle::new(),
             cursor: None,
+            selected: BTreeSet::new(),
             cursor_bounds: Rc::default(),
             list_bounds: Rc::default(),
             _subscriptions: vec![database_subscription, schema_subscription],
@@ -1186,6 +1188,9 @@ impl ConnectionSession {
     }
 
     pub(super) fn set_tables(&mut self, tables: Vec<TableInfo>) {
+        self.sidebar
+            .selected
+            .retain(|id| tables.iter().any(|table| table_sidebar_id(table) == *id));
         self.tables = tables;
         self.tables_revision += 1;
         // A dropped schema would otherwise leave an empty list behind a

@@ -421,8 +421,14 @@ struct ConnectionDraft {
     import_url: Entity<String>,
     import_url_editor: Entity<TextEditor>,
     tag: Option<ConnectionTag>,
+    /// The confirmed folder; only changed by the folder menu.
     folder: Entity<String>,
-    folder_editor: Entity<TextEditor>,
+    folder_focus: FocusHandle,
+    /// The inline "New folder" form is open.
+    creating_folder: bool,
+    new_folder: Entity<String>,
+    new_folder_editor: Entity<TextEditor>,
+    folder_error: Option<String>,
     connection_name: Entity<String>,
     connection_name_editor: Entity<TextEditor>,
     connection_url: Entity<String>,
@@ -572,14 +578,15 @@ impl ConnectionDraft {
     fn new(window: &mut Window, cx: &mut Context<DbxApp>) -> Self {
         let connection_name = cx.new(|_| String::new());
         let folder = cx.new(|_| String::new());
-        let folder_editor = cx.new(|cx| {
-            TextEditor::new(folder.clone(), false, window, cx)
-                .accessibility_label("Connection folder")
+        let new_folder = cx.new(|_| String::new());
+        let new_folder_editor = cx.new(|cx| {
+            TextEditor::new(new_folder.clone(), false, window, cx)
+                .accessibility_label("New folder name")
         });
         let import_url = cx.new(|_| String::new());
         let import_url_editor = cx.new(|cx| {
             TextEditor::new(import_url.clone(), false, window, cx)
-                .accessibility_label("Import connection string")
+                .accessibility_label("Paste a connection URL or file path")
         });
         let fields = ConnectionFields::from_url("sqlite://dbx.db?mode=rwc")
             .expect("default SQLite connection URL is valid");
@@ -625,7 +632,11 @@ impl ConnectionDraft {
             import_url_editor,
             tag: Some(default_tags().remove(3)),
             folder,
-            folder_editor,
+            folder_focus: cx.focus_handle(),
+            creating_folder: false,
+            new_folder,
+            new_folder_editor,
+            folder_error: None,
             connection_name,
             connection_name_editor,
             connection_url,
@@ -649,6 +660,7 @@ impl ConnectionDraft {
 struct TableContextMenu {
     session_id: SessionId,
     table: TableInfo,
+    tables: Vec<TableInfo>,
     position: Point<gpui::Pixels>,
     /// Highlighted item (an index into the menu's rows); `None` until the
     /// keyboard is used, so a right-click doesn't pre-select anything.
@@ -726,7 +738,8 @@ enum ConfirmationAction {
     Table {
         action: TableAction,
         session_id: SessionId,
-        table: TableInfo,
+        tables: Vec<TableInfo>,
+        cascade: bool,
     },
     CommitChanges {
         session_id: SessionId,
@@ -883,7 +896,12 @@ pub struct DbxApp {
     active_session_id: Option<SessionId>,
     connection_picker_open: bool,
     compact_connection_form_open: bool,
+    /// UI-only disclosure state; `None` follows the draft's content.
+    connection_drivers_open: Option<bool>,
+    connection_network_open: Option<bool>,
     table_context_menu: Option<TableContextMenu>,
+    /// Physical Control state, before macOS rewrites Control-click as right-click.
+    explorer_control_held: bool,
     table_name_prompt: Option<table_commands::TableNamePrompt>,
     nonrelational_editor: Option<nonrelational::NonrelationalEditor>,
     nonrelational_generation: u64,
@@ -1070,7 +1088,10 @@ impl DbxApp {
             active_session_id: None,
             connection_picker_open: false,
             compact_connection_form_open,
+            connection_drivers_open: None,
+            connection_network_open: None,
             table_context_menu: None,
+            explorer_control_held: false,
             table_name_prompt: None,
             nonrelational_editor: None,
             nonrelational_generation: 0,
@@ -3535,6 +3556,8 @@ impl DbxApp {
                     Ok(Ok(tables)) => {
                         session.set_tables(tables);
                         session.current_database = Some(database.clone());
+                        session.sidebar.selected.clear();
+                        session.sidebar.cursor = None;
                         session.schema_objects.clear();
                         session.schema_objects_error = None;
                         // Open tables belong to the previous database.
@@ -4376,22 +4399,62 @@ impl DbxApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.confirm_table_actions(action, session_id, vec![table], window, cx);
+    }
+
+    fn confirm_table_actions(
+        &mut self,
+        action: TableAction,
+        session_id: SessionId,
+        tables: Vec<TableInfo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if tables.is_empty() {
+            return;
+        }
         let return_focus = window.focused(cx);
         self.table_context_menu = None;
-        let qualified_name = table_sidebar_label(&table, None);
+        let names = tables
+            .iter()
+            .map(|table| table_sidebar_label(table, None))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let subject = if tables.len() == 1 {
+            names.clone()
+        } else {
+            format!("{} tables", tables.len())
+        };
         let (title, detail, confirm_label) = match action {
             TableAction::Truncate => (
-                format!("Truncate {qualified_name}?"),
-                "Every row in this table will be permanently deleted. The table structure remains."
-                    .to_owned(),
-                "Truncate table",
+                format!("Truncate {subject}?"),
+                format!(
+                    "Every row in the selected tables will be permanently deleted. Table structures remain.\n\n{names}"
+                ),
+                if tables.len() == 1 {
+                    "Truncate table"
+                } else {
+                    "Truncate tables"
+                },
             ),
             TableAction::Drop => (
-                format!("Delete table {qualified_name}?"),
-                "The table, its rows, indexes, and constraints will be permanently removed."
-                    .to_owned(),
-                "Delete table",
+                format!("Delete {subject}?"),
+                format!(
+                    "The selected tables, their rows, indexes, and constraints will be permanently removed.\n\n{names}"
+                ),
+                if tables.len() == 1 {
+                    "Delete table"
+                } else {
+                    "Delete tables"
+                },
             ),
+        };
+        let detail = if tables.len() > 1 {
+            format!(
+                "{detail}\n\nExecution stops on the first error. Tables already completed remain changed."
+            )
+        } else {
+            detail
         };
         self.table_confirmation_input = None;
         if self
@@ -4403,7 +4466,8 @@ impl DbxApp {
                     .accessibility_label("Type the table name to confirm")
             });
             let subscription = cx.observe(&input, |_, _, cx| cx.notify());
-            self.table_confirmation_input = Some((table.name.clone(), input, subscription));
+            self.table_confirmation_input =
+                Some((table_action_confirmation_text(&tables), input, subscription));
         }
         let focus = cx.focus_handle();
         self.confirmation_dialog = Some(ConfirmationDialog {
@@ -4414,7 +4478,8 @@ impl DbxApp {
             action: ConfirmationAction::Table {
                 action,
                 session_id,
-                table,
+                tables,
+                cascade: false,
             },
             focus: focus.clone(),
             return_focus,
@@ -4501,7 +4566,7 @@ impl DbxApp {
     fn table_confirmation_matches(&self, cx: &App) -> bool {
         let Some(ConfirmationDialog {
             action: ConfirmationAction::Table {
-                session_id, table, ..
+                session_id, tables, ..
             },
             ..
         }) = &self.confirmation_dialog
@@ -4516,7 +4581,9 @@ impl DbxApp {
         }
         self.table_confirmation_input
             .as_ref()
-            .is_some_and(|(name, input, _)| name == &table.name && input.read(cx).text(cx) == *name)
+            .is_some_and(|(name, input, _)| {
+                name == &table_action_confirmation_text(tables) && input.read(cx).text(cx) == *name
+            })
     }
 
     fn confirm_pending_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4585,8 +4652,9 @@ impl DbxApp {
             ConfirmationAction::Table {
                 action,
                 session_id,
-                table,
-            } => self.execute_table_action(action, session_id, table, cx),
+                tables,
+                cascade,
+            } => self.execute_table_actions(action, session_id, tables, cascade, cx),
             ConfirmationAction::Quit => {
                 cx.quit();
                 return;
@@ -4640,54 +4708,126 @@ impl DbxApp {
         }
     }
 
-    fn execute_table_action(
+    fn execute_table_actions(
         &mut self,
         action: TableAction,
         session_id: SessionId,
-        table: TableInfo,
+        tables: Vec<TableInfo>,
+        cascade: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some((engine, busy, kind)) = self
-            .session(session_id)
-            .map(|session| (session.engine.clone(), session.busy, session.kind))
-        else {
+        let Some(session) = self.session(session_id) else {
             return;
         };
-        let Some(engine) = engine else {
+        let Some(engine) = session.engine.clone() else {
             return;
         };
-        if busy || !kind.is_sql() || table.kind != EntityKind::Table {
+        if session.busy
+            || engine.is_read_only()
+            || !session.kind.is_sql()
+            || tables.is_empty()
+            || tables.iter().any(|table| table.kind != EntityKind::Table)
+        {
             return;
         }
-        let target_table = table_ref(&table);
-        let action_target = target_table.clone();
-        let runtime = self.runtime.clone();
-        let Some(session) = self.session_mut(session_id) else {
-            return;
+        let targets = tables.iter().map(table_ref).collect::<Vec<_>>();
+        // Cascading can touch any dependent table, including an unselected tab.
+        let affected_tabs = session
+            .secondary_tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                SecondaryTabKind::Data(data) if cascade || targets.contains(&data.table) => {
+                    Some(tab.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for &tab_id in &affected_tabs {
+            if self.pending_edits_block(session_id, tab_id, cx) {
+                return;
+            }
+            if self
+                .data_tab(session_id, tab_id)
+                .is_some_and(|data| data.busy)
+            {
+                self.show_toast(
+                    ToastKind::Info,
+                    "Wait for table work to finish before deleting or truncating",
+                    cx,
+                );
+                return;
+            }
+        }
+        let statements = match action {
+            TableAction::Truncate => {
+                dbx_core::build_truncate_tables(engine.kind(), &targets, cascade)
+            }
+            TableAction::Drop => dbx_core::build_drop_tables(engine.kind(), &targets),
         };
+        let statements = match statements {
+            Ok(statements) => statements,
+            Err(error) => {
+                self.set_error(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let runtime = self.runtime.clone();
+        let session = self.session_mut(session_id).expect("session checked above");
+        for &tab_id in &affected_tabs {
+            if let Some(data) = session.data_tab_mut(tab_id) {
+                data.busy = true;
+            }
+        }
         session.busy = true;
         session.error = None;
-        session.status = match action {
-            TableAction::Truncate => format!("Truncating {}…", table.name),
-            TableAction::Drop => format!("Deleting table {}…", table.name),
-        };
+        session.status = format!(
+            "{} {}…",
+            if action == TableAction::Truncate {
+                "Truncating"
+            } else {
+                "Deleting"
+            },
+            counted(targets.len(), "table", "tables")
+        );
         session.request_generation += 1;
         let generation = session.request_generation;
         let task = runtime.spawn(async move {
-            let outcome = match action {
-                TableAction::Truncate => engine.truncate_table(&action_target).await,
-                TableAction::Drop => engine.drop_table(&action_target).await,
-            }?;
-            let tables = engine.list_tables().await?;
-            Ok::<_, dbx_core::DbxError>((outcome, tables))
+            let grouped = statements.len() == 1;
+            let mut completed = Vec::new();
+            let mut failure = None;
+            for (index, statement) in statements.iter().enumerate() {
+                match engine.execute(statement).await {
+                    Ok(_) => {
+                        if grouped {
+                            completed.extend(targets.iter().cloned());
+                        } else {
+                            completed.push(targets[index].clone());
+                        }
+                    }
+                    Err(error) => {
+                        failure = Some(format!(
+                            "{}: {error}",
+                            if grouped {
+                                "Selected tables".to_owned()
+                            } else {
+                                table_ref_label(&targets[index])
+                            }
+                        ));
+                        break;
+                    }
+                }
+            }
+            // Refresh even after partial failure, without masking mutation results.
+            let refreshed = engine.list_tables().await;
+            (completed, failure, refreshed)
         });
         if let Some(session) = self.session_mut(session_id) {
             session.track_background_task(&task);
         }
         cx.notify();
-
         cx.spawn(async move |this, cx| {
-            let result = task.await?;
+            let result = task.await;
             this.update(cx, |this, cx| {
                 let Some(session) = this.session_mut(session_id) else {
                     return;
@@ -4696,57 +4836,106 @@ impl DbxApp {
                     return;
                 }
                 session.busy = false;
-                let toast = match result {
-                    Ok((outcome, tables)) => {
-                        session.set_tables(tables);
-                        session.error = None;
-                        Some(match action {
-                            TableAction::Truncate => {
-                                if let Some(tab_id) = session.data_tab_for_table(&target_table)
-                                    && let Some(data) =
-                                        find_data_tab_mut(&mut session.secondary_tabs, tab_id)
-                                {
-                                    data.invalidate_request();
-                                    let mut result = data
-                                        .result
-                                        .as_deref()
-                                        .cloned()
-                                        .unwrap_or_else(|| QueryResult::empty(None, 0));
-                                    result.rows.clear();
-                                    result.rows_affected = Some(outcome.rows_affected);
-                                    result.elapsed_ms = outcome.elapsed_ms;
-                                    data.set_result(Some(result), &session.tables, cx);
-                                    data.table_page = 0;
-                                    data.table_has_next_page = false;
-                                    data.result_table = Some(target_table.clone());
-                                    data.selected_row = None;
-                                    data.row_draft = None;
-                                    data.row_draft_subscriptions.clear();
-                                }
-                                format!(
-                                    "Truncated {} · {}",
-                                    table.name,
-                                    counted(outcome.rows_affected, "row", "rows")
-                                )
-                            }
-                            TableAction::Drop => {
-                                session.close_data_tabs_where(|data| data.table == target_table);
-                                session
-                                    .completion_columns
-                                    .remove(&completion_table_key(&target_table));
-                                format!("Deleted table {}", table.name)
-                            }
-                        })
+                for &tab_id in &affected_tabs {
+                    if let Some(data) = session.data_tab_mut(tab_id) {
+                        data.busy = false;
                     }
+                }
+                let (completed, failure, refreshed) = match result {
+                    Ok(result) => result,
                     Err(error) => {
-                        session.error = Some(error.to_string());
-                        None
+                        session.error = Some(format!(
+                            "Table action interrupted; refresh to check the database: {error}"
+                        ));
+                        cx.notify();
+                        return;
                     }
                 };
-                match toast {
-                    Some(message) => this.show_toast(ToastKind::Success, message, cx),
-                    None => cx.notify(),
+                let mut errors = Vec::new();
+                if let Some(error) = failure {
+                    errors.push(format!(
+                        "Stopped after completing {}. {error}",
+                        counted(completed.len(), "table", "tables")
+                    ));
                 }
+                match refreshed {
+                    Ok(tables) => session.set_tables(tables),
+                    Err(error) => errors.push(format!("Could not refresh the table list: {error}")),
+                }
+                let mut reload = Vec::new();
+                let mut close = Vec::new();
+                match action {
+                    TableAction::Drop => {
+                        close = session
+                            .secondary_tabs
+                            .iter()
+                            .filter_map(|tab| match &tab.kind {
+                                SecondaryTabKind::Data(data) if completed.contains(&data.table) => {
+                                    Some(tab.id)
+                                }
+                                SecondaryTabKind::Structure(structure)
+                                    if completed.contains(&structure.table) =>
+                                {
+                                    Some(tab.id)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        session.completion_schema = None;
+                        for target in &completed {
+                            session
+                                .completion_columns
+                                .remove(&completion_table_key(target));
+                        }
+                    }
+                    TableAction::Truncate => {
+                        for tab in &mut session.secondary_tabs {
+                            if let SecondaryTabKind::Data(data) = &mut tab.kind
+                                && (completed.contains(&data.table)
+                                    || (cascade && !completed.is_empty()))
+                            {
+                                data.invalidate_request();
+                                data.set_result(None, &session.tables, cx);
+                                data.table_page = 0;
+                                data.table_has_next_page = false;
+                                data.selected_row = None;
+                                data.row_draft = None;
+                                data.row_draft_subscriptions.clear();
+                                reload.push(tab.id);
+                            }
+                        }
+                    }
+                }
+                session.error = (!errors.is_empty()).then(|| errors.join("\n"));
+                let message = format!(
+                    "{} {}{}",
+                    if action == TableAction::Truncate {
+                        "Truncated"
+                    } else {
+                        "Deleted"
+                    },
+                    counted(completed.len(), "table", "tables"),
+                    if cascade && !completed.is_empty() {
+                        " and dependent tables"
+                    } else {
+                        ""
+                    }
+                );
+                session.status = if errors.is_empty() {
+                    message.clone()
+                } else {
+                    "Table action needs attention".into()
+                };
+                for tab_id in close {
+                    this.close_secondary_tab_for(session_id, tab_id, cx);
+                }
+                for tab_id in reload {
+                    this.refresh_table_for(session_id, tab_id, cx);
+                }
+                if errors.is_empty() {
+                    this.show_toast(ToastKind::Success, message, cx);
+                }
+                cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -5107,11 +5296,25 @@ fn table_sidebar_label(table: &TableInfo, active_schema_filter: Option<&str>) ->
     }
 }
 
+fn table_action_confirmation_text(tables: &[TableInfo]) -> String {
+    if tables.len() == 1 {
+        tables[0].name.clone()
+    } else {
+        tables
+            .iter()
+            .map(|table| table_sidebar_label(table, None))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 fn table_sidebar_id(table: &TableInfo) -> String {
+    // Structured components avoid selecting a different table when a
+    // schema or name contains the separator (e.g. a-b.c versus a.b-c).
     format!(
-        "table-{}-{}",
-        table.schema.as_deref().unwrap_or("<default>"),
-        table.name
+        "table-{}",
+        serde_json::to_string(&(&table.schema, &table.name))
+            .expect("table identity is serializable")
     )
 }
 

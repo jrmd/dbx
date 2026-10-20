@@ -55,6 +55,10 @@ impl DatabaseKind {
         Self::Snowflake,
     ];
 
+    pub const fn supports_truncate_cascade(self) -> bool {
+        matches!(self, Self::PostgreSQL | Self::CockroachDB)
+    }
+
     pub const fn is_sql(self) -> bool {
         matches!(
             self,

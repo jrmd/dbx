@@ -490,13 +490,23 @@ impl DbxApp {
         let Some(session) = self.session_mut(session_id) else {
             return div().into_any_element();
         };
-        session.sidebar.list.refresh(
+        let changed = session.sidebar.list.refresh(
             session.kind,
             &session.tables,
             session.tables_revision,
             session.schema_filter.as_deref(),
             &search,
         );
+        if changed {
+            let visible = session
+                .sidebar
+                .list
+                .visible
+                .iter()
+                .map(table_sidebar_id)
+                .collect::<BTreeSet<_>>();
+            session.sidebar.selected.retain(|id| visible.contains(id));
+        }
         session.sidebar.sync_selectors(
             session.kind,
             &session.databases,
@@ -514,7 +524,7 @@ impl DbxApp {
             schema_select,
             search_editor,
             selected_schema,
-            selected_table,
+            selected_tables,
         )) = self.session(session_id).map(|session| {
             (
                 session.kind,
@@ -526,7 +536,7 @@ impl DbxApp {
                 session.sidebar.schema_select.clone(),
                 session.editors.sidebar_search_editor.clone(),
                 session.schema_filter.clone(),
-                session.active_data_tab().map(|data| data.table.clone()),
+                session.sidebar.selected.clone(),
             )
         })
         else {
@@ -830,7 +840,8 @@ impl DbxApp {
                 div()
                     .id("explorer-list")
                     .role(gpui::Role::ListBox).aria_label("Database objects")
-                    .aria_description(format!("{table_count} objects. Arrow keys move the cursor, Enter opens the object, and the context menu key opens object actions."))
+                    .a11y_synthetic_children(|builder| builder.parent_node().set_multiselectable())
+                    .aria_description(format!("{table_count} objects. Control or Command click toggles selection. Right-click opens actions for selected objects. Arrow keys move the cursor, Enter opens the object, and the context menu key opens object actions."))
                     .on_a11y_action(gpui::AccessibleAction::ScrollDown, { let app = cx.entity(); move |_, window, cx| app.update(cx, |this, cx| this.scroll_explorer_accessibly(session_id, 20, window, cx)) })
                     .on_a11y_action(gpui::AccessibleAction::ScrollUp, { let app = cx.entity(); move |_, window, cx| app.update(cx, |this, cx| this.scroll_explorer_accessibly(session_id, -20, window, cx)) })
                     .key_context("DbxExplorer")
@@ -867,7 +878,7 @@ impl DbxApp {
                                     sidebar_row(
                                         session_id,
                                         table,
-                                        selected_table.as_ref(),
+                                        &selected_tables,
                                         selected_schema.as_deref(),
                                         cursor_id.as_deref(),
                                         &cursor_bounds,
@@ -1409,7 +1420,7 @@ fn sidebar_select(state: &SidebarSelect, name: &'static str) -> impl IntoElement
 fn sidebar_row(
     session_id: SessionId,
     table: &TableInfo,
-    selected_table: Option<&TableRef>,
+    selected_tables: &BTreeSet<String>,
     selected_schema: Option<&str>,
     cursor_id: Option<&str>,
     cursor_bounds: &CursorBounds,
@@ -1418,8 +1429,7 @@ fn sidebar_row(
     let row_id = table_sidebar_id(table);
     let at_cursor = cursor_id == Some(row_id.as_str());
     let cursor_bounds = cursor_bounds.clone();
-    let selected = selected_table
-        .is_some_and(|current| current.name == table.name && current.schema == table.schema);
+    let selected = selected_tables.contains(&row_id);
     let label = table_sidebar_label(table, selected_schema);
     let menu_table = table.clone();
     let table_ref = table.clone();
@@ -1487,13 +1497,33 @@ fn sidebar_row(
                 },
             ))
             .child(div().truncate().child(label))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.set_explorer_cursor(session_id, &table_ref, cx);
-                this.select_table_for(session_id, table_ref.clone(), window, cx);
-            }))
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    let modifiers = event.modifiers();
+                    this.click_explorer_table(
+                        session_id,
+                        table_ref.clone(),
+                        modifiers.control || modifiers.platform,
+                        window,
+                        cx,
+                    );
+                }),
+            )
             .on_aux_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                     if table_click_action(event) == TableClickAction::OpenContextMenu {
+                        // GPUI on macOS rewrites Control-click as a right-click
+                        // and strips Control from both mouse events.
+                        if event.modifiers().control || this.explorer_control_held {
+                            this.click_explorer_table(
+                                session_id,
+                                menu_table.clone(),
+                                true,
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
                         this.set_explorer_cursor(session_id, &menu_table, cx);
                         this.open_table_context_menu(
                             session_id,

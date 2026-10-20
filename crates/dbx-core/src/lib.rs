@@ -60,9 +60,10 @@ pub use script::{
 };
 pub use sql::{
     SqlStatement, build_count, build_create_table, build_delete, build_delete_with_columns,
-    build_drop_table, build_insert, build_insert_with_columns, build_multi_row_insert,
-    build_row_estimate, build_select, build_select_with_columns, build_truncate_table,
-    build_update, build_update_with_columns, quote_identifier, validate_sql_expression,
+    build_drop_table, build_drop_tables, build_insert, build_insert_with_columns,
+    build_multi_row_insert, build_row_estimate, build_select, build_select_with_columns,
+    build_truncate_table, build_truncate_tables, build_update, build_update_with_columns,
+    quote_identifier, validate_sql_expression,
 };
 pub use sqlx_engine::SqlxEngine;
 pub use transfer::{
@@ -622,6 +623,41 @@ mod tests {
             build_drop_table(DatabaseKind::SQLite, &table).unwrap().sql,
             "DROP TABLE \"tenant\".\"audit\"\"events\""
         );
+    }
+
+    #[test]
+    fn bulk_table_actions_quote_every_target_and_require_explicit_cascade() {
+        let tables = [
+            TableRef::in_schema("tenant", "parent"),
+            TableRef::in_schema("tenant", "child\"; DROP TABLE other;--"),
+        ];
+        for kind in [DatabaseKind::PostgreSQL, DatabaseKind::CockroachDB] {
+            let restricted = build_truncate_tables(kind, &tables, false).unwrap();
+            assert_eq!(restricted.len(), 1);
+            assert_eq!(
+                restricted[0].sql,
+                "TRUNCATE TABLE \"tenant\".\"parent\", \"tenant\".\"child\"\"; DROP TABLE other;--\""
+            );
+            let cascade = build_truncate_tables(kind, &tables, true).unwrap();
+            assert_eq!(cascade[0].sql, format!("{} CASCADE", restricted[0].sql));
+            assert_eq!(
+                build_drop_tables(kind, &tables).unwrap()[0].sql,
+                restricted[0].sql.replace("TRUNCATE TABLE", "DROP TABLE")
+            );
+        }
+        for kind in DatabaseKind::ALL {
+            if !kind.supports_truncate_cascade() {
+                assert!(
+                    build_truncate_tables(kind, &tables, true).is_err(),
+                    "{kind:?} must reject unsupported cascading"
+                );
+            }
+            assert!(build_truncate_tables(kind, &[], false).is_err());
+            assert!(build_drop_tables(kind, &[]).is_err());
+        }
+        let sqlite = build_truncate_tables(DatabaseKind::SQLite, &tables, false).unwrap();
+        assert_eq!(sqlite.len(), 2);
+        assert_eq!(sqlite[0].sql, "DELETE FROM \"tenant\".\"parent\"");
     }
 
     #[test]
