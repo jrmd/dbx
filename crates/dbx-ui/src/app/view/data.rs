@@ -1,5 +1,6 @@
 use super::super::*;
 use super::{GRID_MIN_WIDTH, INSPECTOR_MIN_WIDTH, PaneResize};
+use crate::app::value_view::BinaryFormat;
 use crate::diagram::display_type;
 use crate::popups::DropdownMenu as _;
 use gpui_component::ActiveTheme as _;
@@ -1217,7 +1218,75 @@ impl DbxApp {
                     .when(!has_draft, |view| {
                         view.children(static_fields.into_iter().enumerate().map(
                             |(index, (name, data_type, value))| {
-                                let format = binary_formats[index];
+                                let is_bytes = matches!(value, Some(CellValue::Bytes(_)));
+                                let uuid_capable =
+                                    matches!(&value, Some(CellValue::Bytes(bytes)) if bytes.len() == 16);
+                                // The grid's choice applies to every row, but a
+                                // UUID needs 16 bytes: other values read as hex.
+                                let format = match binary_formats[index] {
+                                    BinaryFormat::Uuid | BinaryFormat::UuidSwapped
+                                        if !uuid_capable =>
+                                    {
+                                        BinaryFormat::Hex
+                                    }
+                                    format => format,
+                                };
+                                let format_menu = is_bytes.then(|| {
+                                    let app = cx.entity().downgrade();
+                                    // (menu label, short trigger label): the trigger stays short so it
+                                    // fits a narrow inspector.
+                                    let formats: &[(&str, &str, BinaryFormat)] = if uuid_capable {
+                                        &[
+                                            ("UUID", "UUID", BinaryFormat::Uuid),
+                                            (
+                                                "UUID (MySQL swapped)",
+                                                "MySQL UUID",
+                                                BinaryFormat::UuidSwapped,
+                                            ),
+                                            ("Hex", "Hex", BinaryFormat::Hex),
+                                            ("Bits", "Bits", BinaryFormat::Binary),
+                                        ]
+                                    } else {
+                                        &[
+                                            ("Hex", "Hex", BinaryFormat::Hex),
+                                            ("Bits", "Bits", BinaryFormat::Binary),
+                                        ]
+                                    };
+                                    let (current_name, current_short) = formats
+                                        .iter()
+                                        .find(|(_, _, option)| *option == format)
+                                        .map_or(("Hex", "Hex"), |(name, short, _)| (*name, *short));
+                                    let accessible =
+                                        format!("{name} display format: {current_name}");
+                                    Button::new(SharedString::from(format!(
+                                        "inspector-format-{index}"
+                                    )))
+                                    .label(current_short)
+                                    .dropdown_caret(true)
+                                    .accessible_name(accessible.clone())
+                                    .tooltip(accessible)
+                                    .with_size(Size::XSmall)
+                                    .compact()
+                                    .ghost()
+                                    .dropdown_menu(move |mut menu, _, _| {
+                                        for &(label, _, option) in formats {
+                                            let app = app.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(label)
+                                                    .checked(option == format)
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = app.update(cx, |this, cx| {
+                                                            this.set_binary_format_for(
+                                                                session_id, tab_id, index,
+                                                                option, cx,
+                                                            );
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    })
+                                });
                                 let binary_text = value
                                     .as_ref()
                                     .filter(|value| matches!(value, CellValue::Bytes(_)))
@@ -1233,6 +1302,9 @@ impl DbxApp {
                                     None => "No value".to_owned(),
                                     Some(CellValue::Text(text)) if text.is_empty() => {
                                         "Empty text".to_owned()
+                                    }
+                                    Some(CellValue::Bytes(_)) => {
+                                        binary_text.clone().unwrap_or_default()
                                     }
                                     Some(value) => {
                                         crate::app::value_view::value_clipboard_text(value)
@@ -1256,13 +1328,17 @@ impl DbxApp {
                                             .flex()
                                             .items_center()
                                             .justify_between()
+                                            .gap(crate::theme::ui_px(6.))
                                             .child(
                                                 div()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .text_size(crate::theme::text_px(11.))
                                                     .child(name.clone()),
                                             )
                                             .child(
                                                 div()
+                                                    .flex_none()
                                                     .flex()
                                                     .items_center()
                                                     .gap(crate::theme::ui_px(4.))
@@ -1317,6 +1393,7 @@ impl DbxApp {
                                                     }),
                                             ),
                                     )
+                                    .children(format_menu.map(|menu| div().flex().child(menu)))
                                     .child({
                                         let text =
                                             binary_text.map(|text| (text, None)).or_else(|| {

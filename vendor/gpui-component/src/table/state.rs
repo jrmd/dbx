@@ -8,7 +8,7 @@ use crate::{
     },
     h_flex,
     menu::{ContextMenuExt, PopupMenu},
-    scroll::{ScrollableMask, Scrollbar},
+    scroll::{ScrollableMask, Scrollbar, ScrollbarMode},
     v_flex,
 };
 use gpui::{
@@ -2194,7 +2194,11 @@ where
                 .absolute()
                 .top(self.options.size.table_row_height() * self.header_layout.len().max(1) as f32)
                 .right_0()
-                .bottom_0()
+                .bottom(if self.options.scrollbar_visible.bottom {
+                    Scrollbar::width()
+                } else {
+                    px(0.)
+                })
                 .w(Scrollbar::width())
                 .child(
                     Scrollbar::vertical(&self.vertical_scroll_handle)
@@ -2215,7 +2219,13 @@ where
             .right_0()
             .bottom_0()
             .h(Scrollbar::width())
-            .child(Scrollbar::horizontal(&self.horizontal_scroll_handle).viewport_from_layout())
+            .child(
+                Scrollbar::horizontal(&self.horizontal_scroll_handle)
+                    .viewport_from_layout()
+                    // Keep wide tables reachable with a vertical-wheel mouse,
+                    // including when the OS only shows scrollbars while scrolling.
+                    .mode(ScrollbarMode::Always),
+            )
     }
 }
 
@@ -2290,6 +2300,11 @@ where
             .id("table-inner")
             .size_full()
             .overflow_hidden()
+            // The persistent horizontal scrollbar must not cover the last row
+            // or intercept clicks on its cells.
+            .when(self.options.scrollbar_visible.bottom, |this| {
+                this.pb(Scrollbar::width())
+            })
             .child(self.render_table_header(left_columns_count, window, cx))
             .context_menu({
                 let view = cx.entity().clone();

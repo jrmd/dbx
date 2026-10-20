@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Switch binary values between hex, bits, UUID and MySQL swapped UUID directly in row details.
+- Keep overflowing tables' horizontal scrollbar visible so columns remain reachable with a mouse.
+
 ## 0.16.0 - 2026-10-20
 
 - Select multiple sidebar tables with Control/Command-click and open, copy names, export, truncate or delete the selection. Truncate confirmations offer optional cascading for PostgreSQL and CockroachDB.
