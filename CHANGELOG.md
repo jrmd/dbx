@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.14.0 - 2026-10-20
+
 - Show failed statements as errors without a contradictory success message; preserve database detail, hints and source positions, and offer an editable AI repair request.
 - Accept SQL completions with Tab or Enter and suggest JOIN conditions from foreign keys.
 - Open SQLite from plain paths, home-directory paths, native file selection, dropped files and terminal arguments; new connections land in an empty workspace.
