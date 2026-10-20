@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 0.15.0 - 2026-10-20
+
+- Add optional Touch ID vault unlock on Macs with a suitably signed and provisioned build, while keeping passphrase unlock available.
 - Match context-menu spacing across the workbench, remove the extra row-number column, and let Backspace stage selected-row deletions alongside Delete.
 - Allow selecting and copying part of a row-inspector value; align its row-action buttons and the filter controls, with a compact Add condition button.
 - Choose the query-assistant provider from a menu so its label stays readable at any width or interface size; row-inspector Copy buttons now use a copy icon and briefly confirm with a check and “Copied”.
