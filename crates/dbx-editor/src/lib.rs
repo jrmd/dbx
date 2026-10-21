@@ -3323,20 +3323,27 @@ impl Element for TextEditorText {
 
         // A text selection owns pointer movement until release, including
         // movement outside the input shell and its clipped ancestors.
-        if self.editor.read(cx).is_selecting {
-            let editor = self.editor.downgrade();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase == gpui::DispatchPhase::Bubble {
-                    let _ = editor.update(cx, |editor, cx| editor.on_mouse_move(event, window, cx));
-                }
-            });
-            let editor = self.editor.downgrade();
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                if phase == gpui::DispatchPhase::Bubble && event.button == MouseButton::Left {
-                    let _ = editor.update(cx, |editor, cx| editor.on_mouse_up(event, window, cx));
-                }
-            });
-        }
+        // Register even while idle: mouse-down and the first drag movement
+        // can arrive before another frame is painted.
+        let editor = self.editor.downgrade();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase == gpui::DispatchPhase::Bubble
+                && let Some(editor) = editor.upgrade()
+                && editor.read(cx).is_selecting
+            {
+                editor.update(cx, |editor, cx| editor.on_mouse_move(event, window, cx));
+            }
+        });
+        let editor = self.editor.downgrade();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+            if phase == gpui::DispatchPhase::Bubble
+                && event.button == MouseButton::Left
+                && let Some(editor) = editor.upgrade()
+                && editor.read(cx).is_selecting
+            {
+                editor.update(cx, |editor, cx| editor.on_mouse_up(event, window, cx));
+            }
+        });
         self.editor.update(cx, |editor, _| {
             if let Some(scroll_offset) = state.scroll_offset
                 && editor.scroll_handle.offset() != scroll_offset
@@ -4530,8 +4537,9 @@ mod tests {
                 point(bounds.right() + px(25.), start.y)
             };
             cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
-            cx.update(|window, cx| window.draw(cx).clear(cx));
+            // A fast drag may move before the mouse-down notification paints.
             cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+            editor.read_with(cx, |editor, _| assert!(!editor.selected_range.is_empty()));
             let first_selection = editor.read_with(cx, |editor, _| editor.selected_range.end);
             // Exercise frame callbacks while the pointer is held stationary.
             for _ in 0..5 {
