@@ -2,7 +2,7 @@ use super::super::*;
 use super::PaneResize;
 use crate::app::row_count::{RowCount, approximate, grouped};
 use crate::popups::DropdownMenu as _;
-use gpui_component::menu::PopupMenuItem;
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 
 impl DbxApp {
     pub(super) fn render_workspace(
@@ -407,6 +407,7 @@ impl DbxApp {
                     .into_iter()
                     .map(|(session_id, label, busy, kind, _saved, tag)| {
                         let selected = active_session_id == Some(session_id);
+                        let app = cx.entity().downgrade();
                         connection_tab(kind, label.clone(), selected)
                             .debug_selector(|| "connection-tab".into())
                             .id(SharedString::from(format!("connection-tab-{session_id}")))
@@ -462,6 +463,32 @@ impl DbxApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.activate_session(session_id, cx)
                             }))
+                            .context_menu(move |menu, _, cx| {
+                                let close = app.clone();
+                                let others = app.clone();
+                                let has_others = app.upgrade().is_some_and(|app| {
+                                    app.read(cx)
+                                        .sessions
+                                        .iter()
+                                        .any(|session| session.id != session_id)
+                                });
+                                menu.item(PopupMenuItem::new("Close connection").on_click(
+                                    move |_, _, cx| {
+                                        let _ = close.update(cx, |this, cx| {
+                                            this.close_session(session_id, cx)
+                                        });
+                                    },
+                                ))
+                                .item(
+                                    PopupMenuItem::new("Close other connections")
+                                        .disabled(!has_others)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = others.update(cx, |this, cx| {
+                                                this.close_other_sessions(session_id, cx)
+                                            });
+                                        }),
+                                )
+                            })
                     }),
             )
             // The connection list already offers "new" while it is showing.
@@ -976,6 +1003,7 @@ impl DbxApp {
             .bg(theme().panel)
             .children(tabs.into_iter().map(|(tab_id, label, kind)| {
                 let selected = active_secondary_tab == Some(tab_id);
+                let app = cx.entity().downgrade();
                 document_tab(
                     SharedString::from(format!("document-{tab_id}")),
                     kind,
@@ -1022,6 +1050,34 @@ impl DbxApp {
                         this.activate_secondary_tab_for(session_id, tab_id, window, cx);
                     }
                 }))
+                .context_menu(move |mut menu, _, cx| {
+                    use crate::app::tabs::TabCloseScope;
+                    let Some(session_id) = session_id else {
+                        return menu;
+                    };
+                    for (label, scope) in [
+                        ("Close tab", TabCloseScope::This),
+                        ("Close others", TabCloseScope::Others),
+                        ("Close right", TabCloseScope::Right),
+                    ] {
+                        let enabled = app.upgrade().is_some_and(|app| {
+                            !app.read(cx)
+                                .tabs_to_close(session_id, tab_id, scope)
+                                .is_empty()
+                        });
+                        let app = app.clone();
+                        menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                            move |_, window, cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.request_close_tabs_for(
+                                        session_id, tab_id, scope, window, cx,
+                                    );
+                                });
+                            },
+                        ));
+                    }
+                    menu
+                })
             }))
             .child(
                 glass_icon_button("add-query-document", Icon::Add, false)

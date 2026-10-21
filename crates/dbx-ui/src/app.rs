@@ -732,6 +732,10 @@ enum ConfirmationAction {
         session_id: SessionId,
         tab_id: SecondaryTabId,
     },
+    CloseTabs {
+        session_id: SessionId,
+        tab_ids: Vec<SecondaryTabId>,
+    },
     ClearQueryHistory {
         session_id: SessionId,
     },
@@ -793,6 +797,7 @@ impl ConfirmationAction {
             Self::RunQuery { session_id, .. }
             | Self::AnalyzeQuery { session_id, .. }
             | Self::CloseQuery { session_id, .. }
+            | Self::CloseTabs { session_id, .. }
             | Self::ClearQueryHistory { session_id }
             | Self::Table { session_id, .. }
             | Self::CommitChanges { session_id, .. }
@@ -4603,7 +4608,9 @@ impl DbxApp {
         let return_focus = dialog.return_focus.clone();
         let closes_query = matches!(
             dialog.action,
-            ConfirmationAction::CloseQuery { .. } | ConfirmationAction::DiscardDataTab { .. }
+            ConfirmationAction::CloseQuery { .. }
+                | ConfirmationAction::CloseTabs { .. }
+                | ConfirmationAction::DiscardDataTab { .. }
         );
         match dialog.action {
             ConfirmationAction::AnalyzeQuery {
@@ -4649,6 +4656,13 @@ impl DbxApp {
             }
             ConfirmationAction::CloseQuery { session_id, tab_id } => {
                 self.close_secondary_tab_for(session_id, tab_id, cx);
+                self.focus_active_query_editor_for(session_id, window, cx);
+            }
+            ConfirmationAction::CloseTabs {
+                session_id,
+                tab_ids,
+            } => {
+                self.close_secondary_tabs_for(session_id, tab_ids, cx);
                 self.focus_active_query_editor_for(session_id, window, cx);
             }
             ConfirmationAction::ClearQueryHistory { session_id } => {

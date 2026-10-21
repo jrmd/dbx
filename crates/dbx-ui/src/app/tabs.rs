@@ -1,7 +1,145 @@
 //! Workbench tabs.
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) enum TabCloseScope {
+    This,
+    Others,
+    Right,
+}
+
 impl DbxApp {
+    pub(super) fn tabs_to_close(
+        &self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        scope: TabCloseScope,
+    ) -> Vec<SecondaryTabId> {
+        let Some(session) = self.session(session_id) else {
+            return Vec::new();
+        };
+        let Some(index) = session
+            .secondary_tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+        else {
+            return Vec::new();
+        };
+        session
+            .secondary_tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tab)| {
+                let close = match scope {
+                    TabCloseScope::This => i == index,
+                    TabCloseScope::Others => i != index,
+                    TabCloseScope::Right => i > index,
+                };
+                close.then_some(tab.id)
+            })
+            .collect()
+    }
+
+    pub(super) fn request_close_tabs_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        scope: TabCloseScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_ids = self.tabs_to_close(session_id, tab_id, scope);
+        if tab_ids.is_empty() {
+            return;
+        }
+        if tab_ids.len() == 1 {
+            self.request_close_secondary_tab_for(session_id, tab_ids[0], window, cx);
+            return;
+        }
+        let session = self.session(session_id).unwrap();
+        let mut edited_data = false;
+        let mut edited_queries = false;
+        for tab in &session.secondary_tabs {
+            if !tab_ids.contains(&tab.id) {
+                continue;
+            }
+            match &tab.kind {
+                SecondaryTabKind::Data(data) => edited_data |= data.has_unsaved_cell_work(),
+                SecondaryTabKind::Query(query) => {
+                    let text = query.query_editor.read(cx).text(cx);
+                    edited_queries |=
+                        !text.trim().is_empty() && text != Self::default_query(session.kind);
+                }
+                _ => {}
+            }
+        }
+        if !edited_data && !edited_queries {
+            self.close_secondary_tabs_for(session_id, tab_ids, cx);
+            return;
+        }
+        // Confirm the entire batch before removing anything. Repeated single-tab
+        // requests would overwrite one another's discard confirmations.
+        let focus = cx.focus_handle();
+        self.confirmation_dialog = Some(ConfirmationDialog {
+            title: format!("Close {} tabs?", tab_ids.len()),
+            detail: match (edited_data, edited_queries) {
+                (true, true) => "Uncommitted row changes and open cell edits in these tabs will be discarded. Recently closed queries can be reopened from Query options until you disconnect.",
+                (true, false) => "Uncommitted row changes and open cell edits in these tabs will be discarded.",
+                _ => "Recently closed queries can be reopened from Query options until you disconnect.",
+            }.into(),
+            confirm_label: if edited_data { "Discard and close" } else { "Close tabs" },
+            tone: if edited_data { ConfirmationTone::Danger } else { ConfirmationTone::Warning },
+            action: ConfirmationAction::CloseTabs { session_id, tab_ids },
+            focus: focus.clone(),
+            return_focus: window.focused(cx),
+            sql: None,
+        });
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn close_secondary_tabs_for(
+        &mut self,
+        session_id: SessionId,
+        tab_ids: Vec<SecondaryTabId>,
+        cx: &mut Context<Self>,
+    ) {
+        for tab_id in tab_ids.into_iter().rev() {
+            self.discard_pending_edits_for(session_id, tab_id, cx);
+            self.close_secondary_tab_for(session_id, tab_id, cx);
+        }
+    }
+
+    pub(super) fn close_other_sessions(&mut self, keep: SessionId, cx: &mut Context<Self>) {
+        if self.session(keep).is_none() {
+            return;
+        }
+        let others = self
+            .sessions
+            .iter()
+            .filter(|session| session.id != keep)
+            .collect::<Vec<_>>();
+        if self.vault_state == Some(VaultState::Unlocked)
+            && others.iter().any(|session| {
+                session.secondary_tabs.iter().any(|tab| {
+                matches!(&tab.kind, SecondaryTabKind::Data(data) if data.has_unsaved_cell_work())
+            })
+            })
+        {
+            self.show_toast(
+                ToastKind::Info,
+                "Save or discard cell edits before closing other connections",
+                cx,
+            );
+            return;
+        }
+        let ids = others.iter().map(|session| session.id).collect::<Vec<_>>();
+        for id in ids {
+            self.close_session(id, cx);
+        }
+        self.activate_session(keep, cx);
+    }
+
     pub(super) fn add_query_tab_for(
         &mut self,
         session_id: SessionId,
@@ -1156,5 +1294,151 @@ impl DbxApp {
             .query_editor
             .update(cx, |editor, cx| editor.set_text(text, cx));
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn bulk_tab_close_confirms_before_removing_any_tabs_and_uses_clicked_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let session_id = uuid::Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.sessions.push(ConnectionSession::new(
+                session_id,
+                None,
+                "Tabs".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            ));
+            app.active_session_id = Some(session_id);
+            for _ in 0..4 {
+                app.add_query_tab_for(session_id, window, cx);
+            }
+            app.active_query_tab_mut(session_id)
+                .unwrap()
+                .query_editor
+                .update(cx, |editor, cx| {
+                    editor.set_text("SELECT 42", cx);
+                });
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let ids = app
+                    .session(session_id)
+                    .unwrap()
+                    .secondary_tabs
+                    .iter()
+                    .map(|tab| tab.id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    app.tabs_to_close(session_id, ids[1], TabCloseScope::Right),
+                    ids[2..]
+                );
+                assert!(
+                    app.tabs_to_close(session_id, ids[3], TabCloseScope::Right)
+                        .is_empty()
+                );
+                app.request_close_tabs_for(session_id, ids[1], TabCloseScope::Right, window, cx);
+                assert!(matches!(
+                    app.confirmation_dialog
+                        .as_ref()
+                        .map(|dialog| &dialog.action),
+                    Some(ConfirmationAction::CloseTabs { .. })
+                ));
+                assert_eq!(app.session(session_id).unwrap().secondary_tabs.len(), 4);
+                app.cancel_confirmation(window, cx);
+                assert_eq!(app.session(session_id).unwrap().secondary_tabs.len(), 4);
+                app.request_close_tabs_for(session_id, ids[1], TabCloseScope::Right, window, cx);
+                app.confirm_pending_action(window, cx);
+                let session = app.session(session_id).unwrap();
+                assert_eq!(
+                    session
+                        .secondary_tabs
+                        .iter()
+                        .map(|tab| tab.id)
+                        .collect::<Vec<_>>(),
+                    ids[..2]
+                );
+                assert_eq!(session.active_secondary_tab, Some(ids[1]));
+                assert_eq!(session.closed_queries, vec!["SELECT 42"]);
+                app.request_close_tabs_for(session_id, ids[1], TabCloseScope::Others, window, cx);
+                assert_eq!(app.session(session_id).unwrap().secondary_tabs.len(), 1);
+                assert_eq!(
+                    app.session(session_id).unwrap().secondary_tabs[0].id,
+                    ids[1]
+                );
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn bulk_closing_preserves_dirty_data_until_confirmed(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let keep = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let dirty = uuid::Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(|window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.vault_state = Some(VaultState::Unlocked);
+            for id in [keep, other] {
+                app.sessions.push(ConnectionSession::new(
+                    id,
+                    None,
+                    "Connection".into(),
+                    DatabaseKind::SQLite,
+                    None,
+                    window,
+                    cx,
+                ));
+            }
+            app.active_session_id = Some(other);
+            let mut data = DataTab::new(other, dirty, TableRef::new("items"), true, window, cx);
+            data.pending_edits.insert(
+                (0, 0),
+                MutationValue::Parameter(CellValue::Text("unsaved".into())),
+            );
+            app.session_mut(other)
+                .unwrap()
+                .secondary_tabs
+                .push(SecondaryTab {
+                    id: dirty,
+                    kind: SecondaryTabKind::Data(Box::new(data)),
+                });
+            app.add_query_tab_for(other, window, cx);
+            app.add_query_tab_for(other, window, cx);
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let anchor = app.session(other).unwrap().active_secondary_tab.unwrap();
+                app.close_other_sessions(keep, cx);
+                assert_eq!(app.sessions.len(), 2);
+                assert!(app.data_tab(other, dirty).unwrap().has_pending_edits());
+                app.request_close_tabs_for(other, anchor, TabCloseScope::Others, window, cx);
+                assert_eq!(app.session(other).unwrap().secondary_tabs.len(), 3);
+                assert_eq!(
+                    app.confirmation_dialog.as_ref().unwrap().tone,
+                    ConfirmationTone::Danger
+                );
+                app.cancel_confirmation(window, cx);
+                assert!(app.data_tab(other, dirty).unwrap().has_pending_edits());
+                app.request_close_tabs_for(other, anchor, TabCloseScope::Others, window, cx);
+                app.confirm_pending_action(window, cx);
+                assert_eq!(app.session(other).unwrap().secondary_tabs.len(), 1);
+                assert!(app.data_tab(other, dirty).is_none());
+                app.close_other_sessions(keep, cx);
+                assert_eq!(app.sessions.len(), 1);
+                assert_eq!(app.active_session_id, Some(keep));
+            })
+        });
     }
 }

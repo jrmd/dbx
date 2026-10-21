@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.17.2 - 2026-10-21
+
+- Right-click document tabs to close the tab, other tabs, or tabs to the right; right-click connection tabs to close the connection or other connections. Bulk closing respects unsaved edits.
+
 ## 0.17.1 - 2026-10-21
 
 - Show readable binary columns, including JSON stored in MySQL BLOBs, as UTF-8 text by default. Choose Text, Hex, Bits or UUID in the grid and row details; text edits preserve binary storage.
