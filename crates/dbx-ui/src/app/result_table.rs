@@ -514,6 +514,7 @@ impl ResultTableDelegate {
         if matches!(value, CellValue::Bytes(_)) || field_value_kind(info) == FieldValueKind::Bytes {
             use super::value_view::BinaryFormat;
             for (label, format) in [
+                ("View as text (UTF-8)", BinaryFormat::Text),
                 ("View as binary", BinaryFormat::Binary),
                 ("View as hex / edit hex", BinaryFormat::Hex),
                 ("View as UUID", BinaryFormat::Uuid),
@@ -1065,8 +1066,27 @@ impl ResultTableDelegate {
                     .columns
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, column)| {
-                        Some((index, *layout?.binary_formats.get(&column.name)?))
+                    .map(|(index, column)| {
+                        use super::value_view::BinaryFormat;
+                        let saved =
+                            layout.and_then(|layout| layout.binary_formats.get(&column.name));
+                        let format = saved.copied().unwrap_or_else(|| {
+                            let mut has_bytes = false;
+                            let readable =
+                                result.rows.iter().all(|row| match row.values.get(index) {
+                                    Some(value @ CellValue::Bytes(_)) => {
+                                        has_bytes = true;
+                                        BinaryFormat::utf8_text(value).is_some()
+                                    }
+                                    _ => true,
+                                });
+                            if has_bytes && readable {
+                                BinaryFormat::Text
+                            } else {
+                                BinaryFormat::Hex
+                            }
+                        });
+                        (index, format)
                     })
                     .collect()
             })
@@ -1864,6 +1884,7 @@ impl TableDelegate for ResultTableDelegate {
             {
                 use super::value_view::BinaryFormat;
                 for (label, format) in [
+                    ("View as text (UTF-8)", BinaryFormat::Text),
                     ("View as binary", BinaryFormat::Binary),
                     ("View as hex", BinaryFormat::Hex),
                     ("View as UUID", BinaryFormat::Uuid),
@@ -2462,6 +2483,36 @@ mod tests {
                 .limited_text(&invalid, 4)
                 .contains("1024 bytes")
         );
+    }
+
+    #[test]
+    fn binary_json_defaults_to_text_without_changing_bytes_or_saved_formats() {
+        use super::super::value_view::BinaryFormat;
+        let raw = " {\"label\":\"é\",\"id\":900719925474099312345} ";
+        let bytes = CellValue::Bytes(raw.as_bytes().to_vec());
+        let result = Arc::new(QueryResult {
+            columns: vec![ColumnInfo::result("payload", 0, "BLOB")],
+            rows: vec![
+                RowData::new(vec![CellValue::Null]),
+                RowData::new(vec![bytes.clone()]),
+            ],
+            ..QueryResult::empty(None, 0)
+        });
+        let mut delegate = ResultTableDelegate::default();
+        delegate.set_result(Some(result.clone()), &HashMap::new(), None, &[], &[]);
+        assert_eq!(delegate.binary_format(0), BinaryFormat::Text);
+        assert_eq!(delegate.formatted_value(0, &bytes), raw);
+        assert_eq!(delegate.cell_as_plain_text(1, 0).as_deref(), Some(raw));
+        assert_eq!(delegate.cell_value(1, 0), Some(&bytes));
+        assert_eq!(delegate.binary_format(0).parse(raw).unwrap(), bytes);
+
+        let mut layout = TableLayout::default();
+        layout
+            .binary_formats
+            .insert("payload".into(), BinaryFormat::Hex);
+        delegate.set_result(Some(result), &HashMap::new(), Some(&layout), &[], &[]);
+        assert_eq!(delegate.binary_format(0), BinaryFormat::Hex);
+        assert_eq!(delegate.cell_as_plain_text(1, 0), Some(bytes.to_string()));
     }
 
     fn export_result() -> QueryResult {

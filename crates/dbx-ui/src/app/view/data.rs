@@ -1223,16 +1223,9 @@ impl DbxApp {
                                 let is_bytes = matches!(value, Some(CellValue::Bytes(_)));
                                 let uuid_capable =
                                     matches!(&value, Some(CellValue::Bytes(bytes)) if bytes.len() == 16);
-                                // The grid's choice applies to every row, but a
-                                // UUID needs 16 bytes: other values read as hex.
-                                let format = match binary_formats[index] {
-                                    BinaryFormat::Uuid | BinaryFormat::UuidSwapped
-                                        if !uuid_capable =>
-                                    {
-                                        BinaryFormat::Hex
-                                    }
-                                    format => format,
-                                };
+                                let format = value.as_ref().map_or(binary_formats[index], |value| {
+                                    binary_formats[index].for_edit(value)
+                                });
                                 let format_menu = is_bytes.then(|| {
                                     let app = cx.entity().downgrade();
                                     // (menu label, short trigger label): the trigger stays short so it
@@ -1245,11 +1238,13 @@ impl DbxApp {
                                                 "MySQL UUID",
                                                 BinaryFormat::UuidSwapped,
                                             ),
+                                            ("Text (UTF-8)", "Text", BinaryFormat::Text),
                                             ("Hex", "Hex", BinaryFormat::Hex),
                                             ("Bits", "Bits", BinaryFormat::Binary),
                                         ]
                                     } else {
                                         &[
+                                            ("Text (UTF-8)", "Text", BinaryFormat::Text),
                                             ("Hex", "Hex", BinaryFormat::Hex),
                                             ("Bits", "Bits", BinaryFormat::Binary),
                                         ]
@@ -1397,8 +1392,11 @@ impl DbxApp {
                                     )
                                     .children(format_menu.map(|menu| div().flex().child(menu)))
                                     .child({
-                                        let text =
-                                            binary_text.map(|text| (text, None)).or_else(|| {
+                                        let json = (format == BinaryFormat::Text)
+                                            .then(|| crate::app::value_view::inspector_text(value.as_ref()))
+                                            .flatten();
+                                        let text = json.map(|(text, kind)| (text, Some(kind))).or_else(||
+                                            binary_text.map(|text| (text, None))).or_else(|| {
                                                 crate::app::value_view::inspector_text(
                                                     value.as_ref(),
                                                 )

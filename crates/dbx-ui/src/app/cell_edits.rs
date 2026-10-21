@@ -440,24 +440,13 @@ impl DbxApp {
                     == crate::row_drafts::FieldValueKind::Bytes
             }))
         .then(|| data.data_grid.read(cx).delegate().binary_format(column));
-        let binary_format = binary_format.map(|format| match &value {
-            CellValue::Bytes(bytes)
-                if bytes.len() != 16
-                    && matches!(
-                        format,
-                        value_view::BinaryFormat::Uuid | value_view::BinaryFormat::UuidSwapped
-                    ) =>
-            {
-                value_view::BinaryFormat::Hex
-            }
-            _ => format,
-        });
-        let structured = binary_format.is_none()
-            && (value_view::json_preview(&value).is_some()
-                || data
-                    .table_columns
-                    .get(column)
-                    .is_some_and(|column| column.data_type.to_ascii_lowercase().contains("json")));
+        let binary_format = binary_format.map(|format| format.for_edit(&value));
+        let structured =
+            (binary_format.is_none() || binary_format == Some(value_view::BinaryFormat::Text))
+                && (value_view::json_preview(&value).is_some()
+                    || data.table_columns.get(column).is_some_and(|column| {
+                        column.data_type.to_ascii_lowercase().contains("json")
+                    }));
         let text = match &value {
             CellValue::Null => String::new(),
             value => binary_format
@@ -2157,6 +2146,43 @@ mod tests {
                     Some(&MutationValue::Parameter(CellValue::Bytes(vec![
                         0, 255, 128
                     ])))
+                );
+                app.discard_pending_edits_for(session_id, tab_id, cx);
+
+                let raw = " {\"label\":\"é\",\"id\":900719925474099312345} ";
+                let data = app.data_tab_mut(session_id, tab_id).unwrap();
+                data.stage_cell(
+                    0,
+                    2,
+                    Some(MutationValue::Parameter(CellValue::Bytes(
+                        raw.as_bytes().to_vec(),
+                    ))),
+                );
+                data.sync_cell_edits(cx);
+                data.data_grid.update(cx, |table, _| {
+                    table
+                        .delegate_mut()
+                        .binary_formats
+                        .insert(2, BinaryFormat::Text);
+                });
+                app.begin_cell_edit_for(session_id, tab_id, 0, 2, window, cx);
+                let cell = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap();
+                assert!(cell.structured);
+                assert_eq!(cell.editor.read(cx).text(cx), raw);
+                app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .get(&(0, 2)),
+                    Some(&MutationValue::Parameter(CellValue::Bytes(
+                        raw.as_bytes().to_vec()
+                    )))
                 );
                 app.discard_pending_edits_for(session_id, tab_id, cx);
             })

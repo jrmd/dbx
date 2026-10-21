@@ -4099,13 +4099,8 @@ impl DbxApp {
                         }
                     })
                     .or_else(|| field.original.clone());
-                if matches!(&value, Some(CellValue::Bytes(bytes)) if bytes.len() != 16)
-                    && matches!(
-                        format,
-                        value_view::BinaryFormat::Uuid | value_view::BinaryFormat::UuidSwapped
-                    )
-                {
-                    format = value_view::BinaryFormat::Hex;
+                if let Some(value) = &value {
+                    format = format.for_edit(value);
                 }
                 if field.state == FieldValueState::Value
                     && let Some(value @ CellValue::Bytes(_)) = value

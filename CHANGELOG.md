@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.17.1 - 2026-10-21
+
+- Show readable binary columns, including JSON stored in MySQL BLOBs, as UTF-8 text by default. Choose Text, Hex, Bits or UUID in the grid and row details; text edits preserve binary storage.
+
 ## 0.17.0 - 2026-10-20
 
 - Choose a separate row font and font size for table values and row details in Appearance settings, with a monospace default.

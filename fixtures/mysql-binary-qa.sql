@@ -84,3 +84,23 @@ VALUES
 -- clipboard data must remain complete. Avoid using reference columns as targets.
 -- Binary/UUID view selection must leave text_control as ordinary text.
 -- Tables initially contain 6 UUID rows, 11 edge rows and 3 binary-key rows.
+
+
+-- Readable BLOBs default to Text, including JSON. NULL does not affect detection.
+-- Check the table grid and `SELECT * FROM binary_json_examples`, then open row
+-- details: JSON should be pretty-printed. Copy/edit the payload and switch to
+-- Hex to confirm whitespace, Unicode and large numbers retain their bytes.
+CREATE TABLE IF NOT EXISTS binary_json_examples (
+    id INT PRIMARY KEY,
+    payload BLOB NULL
+);
+INSERT IGNORE INTO binary_json_examples (id, payload) VALUES
+    (1, NULL),
+    (2, _utf8mb4'{"ok":true,"nested":{"roles":["admin"]}}'),
+    (3, _utf8mb4' {"label":"café","id":900719925474099312345} '),
+    (4, _utf8mb4'[1,true,null,"hello"]'),
+    (5, _utf8mb4'null'),
+    (6, X'');
+-- The mixed binary_edge_examples column defaults to Hex. Choose Text from its
+-- cell menu or row-details format menu to read row 8 as JSON and row 11 as text;
+-- non-text bytes still display and edit as Hex.
