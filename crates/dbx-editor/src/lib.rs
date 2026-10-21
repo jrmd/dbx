@@ -348,11 +348,10 @@ pub struct TextEditor {
     /// Lexer tokens, line starts and the measured width, reused across frames
     /// until the text changes.
     paint_cache: std::cell::RefCell<PaintCache>,
-    /// The painted text origin at the start of a pointer selection. A
-    /// selection updates this view on every pointer move; retaining the
-    /// original origin keeps those updates from changing the coordinates used
-    /// to resolve the next character under the pointer.
-    selection_bounds: Option<Bounds<Pixels>>,
+    /// Visible, ancestor-clipped viewport used for pointer selection.
+    last_viewport: Option<Bounds<Pixels>>,
+    selection_pointer: Option<Point<Pixels>>,
+    last_revealed_cursor: std::cell::Cell<Option<usize>>,
     is_selecting: bool,
     undo_history: Vec<EditorSnapshot>,
     redo_history: Vec<EditorSnapshot>,
@@ -407,8 +406,15 @@ impl TextEditor {
                 .map(|range| clamp_range(text, range));
             cx.notify();
         });
-        let focus = cx.on_focus(&focus_handle, window, |_, _, cx| cx.notify());
-        let blur = cx.on_blur(&focus_handle, window, |_, _, cx| cx.notify());
+        let focus = cx.on_focus(&focus_handle, window, |this, _, cx| {
+            this.reveal_requested.set(true);
+            cx.notify();
+        });
+        let blur = cx.on_blur(&focus_handle, window, |this, _, cx| {
+            this.is_selecting = false;
+            this.selection_pointer = None;
+            cx.notify();
+        });
 
         Self {
             value,
@@ -441,7 +447,9 @@ impl TextEditor {
             last_layout: LineLayouts::default(),
             last_bounds: None,
             paint_cache: Default::default(),
-            selection_bounds: None,
+            last_viewport: None,
+            selection_pointer: None,
+            last_revealed_cursor: std::cell::Cell::new(None),
             is_selecting: false,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
@@ -1856,8 +1864,7 @@ impl TextEditor {
 
     fn index_for_mouse_position(&self, position: Point<Pixels>, cx: &App) -> usize {
         let text = self.value.read(cx);
-        let bounds =
-            selection_hit_bounds(self.is_selecting, self.selection_bounds, self.last_bounds);
+        let bounds = self.last_bounds;
         let (Some(bounds), false) = (bounds, self.last_layout.count == 0) else {
             return 0;
         };
@@ -1912,9 +1919,7 @@ impl TextEditor {
             }
         }
         let index = self.index_for_mouse_position(event.position, cx);
-        // Snapshot after resolving the initial click, before the focus and
-        // selection notifications can cause another paint pass.
-        self.selection_bounds = self.last_bounds;
+        self.selection_pointer = Some(event.position);
         self.is_selecting = true;
         self.typing_run = None;
         if event.modifiers.shift {
@@ -1941,7 +1946,7 @@ impl TextEditor {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
-        self.selection_bounds = None;
+        self.selection_pointer = None;
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1951,26 +1956,121 @@ impl TextEditor {
         // platform event is the source of truth for whether a drag is active.
         self.is_selecting = mouse_selection_active(self.is_selecting, event.dragging());
         if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position, cx), cx);
+            self.selection_pointer = Some(event.position);
+            self.select_at_pointer(cx);
+            cx.notify();
         } else {
-            self.selection_bounds = None;
+            self.selection_pointer = None;
             if self.is_code() {
                 self.update_hover(event.position, cx);
             }
         }
     }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Merely passing over a value must not hijack sidebar scrolling.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+        let delta = event.delta.pixel_delta(window.line_height());
+        let current = self.scroll_handle.offset();
+        let maximum = self.scroll_handle.max_offset();
+        let next = point(
+            (current.x
+                + if event.modifiers.shift && delta.x == px(0.) {
+                    delta.y
+                } else {
+                    delta.x
+                })
+            .clamp(-maximum.x, px(0.)),
+            if self.multiline && !event.modifiers.shift {
+                (current.y + delta.y).clamp(-maximum.y, px(0.))
+            } else {
+                current.y
+            },
+        );
+        if next != current {
+            self.scroll_handle.set_offset(next);
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn select_at_pointer(&mut self, cx: &mut Context<Self>) {
+        let (Some(pointer), Some(viewport)) = (self.selection_pointer, self.last_viewport) else {
+            return;
+        };
+        // Hit-test only painted lines. Crossing an edge scrolls incrementally
+        // instead of jumping to an unshaped line or the end of the document.
+        let position = point(
+            pointer
+                .x
+                .clamp(viewport.left(), viewport.right().max(viewport.left())),
+            pointer.y.clamp(
+                viewport.top(),
+                (viewport.bottom() - px(1.)).max(viewport.top()),
+            ),
+        );
+        let index = self.index_for_mouse_position(position, cx);
+        if index != self.cursor_offset_internal() {
+            self.select_to(index, cx);
+        }
+    }
+
+    fn scroll_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.is_selecting {
+            return;
+        }
+        self.select_at_pointer(cx);
+        let (Some(pointer), Some(viewport)) = (self.selection_pointer, self.last_viewport) else {
+            return;
+        };
+        let current = self.scroll_handle.offset();
+        let next = drag_scroll_offset(
+            current,
+            self.scroll_handle.max_offset(),
+            viewport,
+            pointer,
+            self.multiline,
+        );
+        if next != current {
+            self.scroll_handle.set_offset(next);
+            cx.notify();
+        }
+    }
 }
 
-fn selection_hit_bounds(
-    is_selecting: bool,
-    selection_bounds: Option<Bounds<Pixels>>,
-    last_bounds: Option<Bounds<Pixels>>,
-) -> Option<Bounds<Pixels>> {
-    if is_selecting {
-        selection_bounds.or(last_bounds)
-    } else {
-        last_bounds
-    }
+/// Bounded edge scrolling keeps selection predictable even far outside a field.
+fn drag_scroll_offset(
+    current: Point<Pixels>,
+    maximum: Point<Pixels>,
+    viewport: Bounds<Pixels>,
+    pointer: Point<Pixels>,
+    multiline: bool,
+) -> Point<Pixels> {
+    let step = |position: Pixels, start: Pixels, end: Pixels| {
+        if position < start {
+            (start - position).min(px(16.))
+        } else if position > end {
+            (end - position).max(px(-16.))
+        } else {
+            px(0.)
+        }
+    };
+    point(
+        (current.x + step(pointer.x, viewport.left(), viewport.right())).clamp(-maximum.x, px(0.)),
+        if multiline {
+            (current.y + step(pointer.y, viewport.top(), viewport.bottom()))
+                .clamp(-maximum.y, px(0.))
+        } else {
+            current.y
+        },
+    )
 }
 
 fn completion_anchor(
@@ -2445,6 +2545,11 @@ impl Render for TextEditor {
                 .children(self.render_signature_help(window, cx))
                 .children(self.render_hover())
                 .into_any_element()
+        } else if self.row_value {
+            editor
+                .overflow_hidden()
+                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                .into_any_element()
         } else if self.multiline {
             editor.overflow_scroll().into_any_element()
         } else {
@@ -2684,6 +2789,7 @@ struct PrepaintState {
     /// offset in sync instead of waiting for the next frame.
     paint_bounds: Bounds<Pixels>,
     scroll_offset: Option<Point<Pixels>>,
+    viewport: Bounds<Pixels>,
 }
 
 impl IntoElement for TextEditorText {
@@ -2871,8 +2977,9 @@ impl Element for TextEditorText {
         );
         let focused = editor.focus_handle.is_focused(window);
         let reveal = editor.reveal_requested.replace(false);
+        let cursor_changed = editor.last_revealed_cursor.replace(Some(cursor)) != Some(cursor);
         let (paint_bounds, scroll_offset) =
-            if caret_reveal_allowed(focused || reveal, editor.is_selecting) {
+            if caret_reveal_allowed((focused && cursor_changed) || reveal, editor.is_selecting) {
                 let current_offset = editor.scroll_handle.offset();
                 let next_offset = scroll_offset_for_cursor(
                     current_offset,
@@ -3151,6 +3258,7 @@ impl Element for TextEditorText {
             selections,
             paint_bounds,
             scroll_offset,
+            viewport: viewport.intersect(&editor.scroll_handle.bounds()),
         }
     }
 
@@ -3213,6 +3321,22 @@ impl Element for TextEditorText {
             );
         }
 
+        // A text selection owns pointer movement until release, including
+        // movement outside the input shell and its clipped ancestors.
+        if self.editor.read(cx).is_selecting {
+            let editor = self.editor.downgrade();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase == gpui::DispatchPhase::Bubble {
+                    let _ = editor.update(cx, |editor, cx| editor.on_mouse_move(event, window, cx));
+                }
+            });
+            let editor = self.editor.downgrade();
+            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                if phase == gpui::DispatchPhase::Bubble && event.button == MouseButton::Left {
+                    let _ = editor.update(cx, |editor, cx| editor.on_mouse_up(event, window, cx));
+                }
+            });
+        }
         self.editor.update(cx, |editor, _| {
             if let Some(scroll_offset) = state.scroll_offset
                 && editor.scroll_handle.offset() != scroll_offset
@@ -3232,6 +3356,17 @@ impl Element for TextEditorText {
             // does not allocate and clone the layout every frame.
             editor.last_layout = std::mem::take(&mut state.lines);
             editor.last_bounds = Some(state.paint_bounds);
+            editor.last_viewport = Some(state.viewport);
+            if editor.is_selecting
+                && editor
+                    .selection_pointer
+                    .is_some_and(|pointer| !state.viewport.contains(&pointer))
+            {
+                let editor = self.editor.downgrade();
+                window.on_next_frame(move |_, cx| {
+                    let _ = editor.update(cx, |editor, cx| editor.scroll_selection(cx));
+                });
+            }
         });
     }
 }
@@ -3815,17 +3950,6 @@ fn input_with_context(
                 editor.update(cx, |editor, cx| editor.on_mouse_up(event, window, cx));
             }
         })
-        .on_mouse_move({
-            let editor = editor.clone();
-            move |event, window, cx| {
-                // Avoid touching the editor entity for ordinary pointer
-                // motion. A stale selection flag can still be cleared, but
-                // only an active left-button drag may update selection.
-                if editor.read(cx).is_selecting {
-                    editor.update(cx, |editor, cx| editor.on_mouse_move(event, window, cx));
-                }
-            }
-        })
         .child(editor)
 }
 
@@ -4270,6 +4394,182 @@ fn scroll_offset_for_cursor(
 mod tests {
     use super::*;
     use dbx_core::DatabaseKind;
+
+    struct ScrollTestView {
+        editor: Entity<TextEditor>,
+        scroll: ScrollHandle,
+        multiline: bool,
+    }
+
+    impl Render for ScrollTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .id("test-sidebar")
+                    .w(px(240.))
+                    .h(px(160.))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .child(input_with_height(
+                                self.editor.clone(),
+                                self.editor.read(cx).focus_handle(),
+                                self.multiline,
+                                px(80.),
+                                cx,
+                            ))
+                            .child(div().h(px(600.)).flex_none()),
+                    ),
+            )
+        }
+    }
+
+    fn scroll_test_view(
+        multiline: bool,
+        window: &mut Window,
+        cx: &mut Context<ScrollTestView>,
+    ) -> ScrollTestView {
+        let value = cx.new(|_| {
+            if multiline {
+                (0..80)
+                    .map(|n| format!("row {n}: café 🙂 {}\n", "long text ".repeat(12)))
+                    .collect()
+            } else {
+                "café 🙂 long text ".repeat(80)
+            }
+        });
+        let editor = cx.new(|cx| {
+            TextEditor::new(value, multiline, window, cx)
+                .read_only()
+                .row_value()
+        });
+        ScrollTestView {
+            editor,
+            scroll: ScrollHandle::new(),
+            multiline,
+        }
+    }
+
+    #[gpui::test]
+    fn sidebar_wheel_passes_unfocused_values_and_focused_values_keep_their_scroll(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| scroll_test_view(true, window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let editor = view.read_with(cx, |view, _| view.editor.clone());
+        let position = editor.read_with(cx, |editor, _| editor.scroll_handle.bounds().center());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            ..Default::default()
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.scroll.offset().y < px(0.),
+                "wheel over an unfocused value scrolls the sidebar"
+            );
+            assert_eq!(view.editor.read(cx).scroll_handle.offset().y, px(0.));
+        });
+        view.update(cx, |view, cx| {
+            view.scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        });
+        cx.update(|window, cx| editor.read(cx).focus_handle.clone().focus(window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            ..Default::default()
+        });
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.scroll.offset().y, px(0.));
+            assert!(
+                view.editor.read(cx).scroll_handle.offset().y < px(0.),
+                "focused wheel scroll must not snap back to the caret"
+            );
+        });
+        // Once the value reaches its end, let the sidebar continue naturally.
+        editor.update(cx, |editor, cx| {
+            editor
+                .scroll_handle
+                .set_offset(point(px(0.), -editor.scroll_handle.max_offset().y));
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            ..Default::default()
+        });
+        view.read_with(cx, |view, _| assert!(view.scroll.offset().y < px(0.)));
+    }
+
+    #[gpui::test]
+    fn dragging_beyond_a_field_reveals_text_and_stops_on_release(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        for multiline in [false, true] {
+            let (view, cx) =
+                cx.add_window_view(|window, cx| scroll_test_view(multiline, window, cx));
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let editor = view.read_with(cx, |view, _| view.editor.clone());
+            let bounds = editor.read_with(cx, |editor, _| editor.scroll_handle.bounds());
+            let start = point(bounds.left() + px(2.), bounds.top() + px(8.));
+            let outside = if multiline {
+                point(start.x + px(40.), bounds.bottom() + px(25.))
+            } else {
+                point(bounds.right() + px(25.), start.y)
+            };
+            cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+            let first_selection = editor.read_with(cx, |editor, _| editor.selected_range.end);
+            // Exercise frame callbacks while the pointer is held stationary.
+            for _ in 0..5 {
+                cx.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.refresh();
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            let (offset, selection) = editor.read_with(cx, |editor, cx| {
+                let offset = editor.scroll_handle.offset();
+                assert!(if multiline {
+                    offset.y < px(0.)
+                } else {
+                    offset.x < px(0.)
+                });
+                assert!(
+                    editor.selected_range.end > first_selection,
+                    "holding beyond the edge must keep extending the selection"
+                );
+                assert!(editor.text(cx).is_char_boundary(editor.selected_range.end));
+                (offset, editor.selected_range.clone())
+            });
+            cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+            for _ in 0..3 {
+                cx.update(|window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.refresh();
+                });
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            editor.read_with(cx, |editor, _| {
+                assert!(!editor.is_selecting);
+                assert_eq!(editor.scroll_handle.offset(), offset);
+                assert_eq!(editor.selected_range, selection);
+            });
+        }
+    }
 
     #[test]
     fn sql_execution_uses_the_statement_at_the_caret() {

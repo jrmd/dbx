@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.17.3 - 2026-10-21
+
+- Keep sidebar scrolling outside unfocused row-value fields, and reveal hidden text while drag-selecting beyond a field’s edges.
+
 ## 0.17.2 - 2026-10-21
 
 - Right-click document tabs to close the tab, other tabs, or tabs to the right; right-click connection tabs to close the connection or other connections. Bulk closing respects unsaved edits.
