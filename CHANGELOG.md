@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.18.0 - 2026-10-26
 
-- Use an AppKit sidebar and toolbar for Liquid Glass on macOS 26 or later, with native scroll-edge effects and stable opaque tables, editors and forms. Turn it on or off in Settings → Appearance; macOS accessibility preferences take priority.
+- Use an AppKit sidebar and toolbar for Liquid Glass on macOS 26 or later, with native scroll-edge effects and stable opaque tables, editors and forms. Turn it on or off in Settings → Appearance; macOS accessibility preferences take priority. Connection tabs show their tag in its colour, and content panels follow the window's corner radius.
+- Drag connection tabs and document tabs to reorder them; the order is restored with the workspace. Untitled queries keep their numbers when moved.
 
 ## 0.17.3 - 2026-10-21
 
