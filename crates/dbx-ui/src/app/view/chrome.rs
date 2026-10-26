@@ -11,6 +11,8 @@ impl DbxApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let sidebar_visible = !self.sidebar_hidden && !self.inspector_page();
+        #[cfg(target_os = "macos")]
+        let sidebar_visible = sidebar_visible && !self.native_navigation_active();
         div()
             .flex_1()
             .min_h_0()
@@ -33,8 +35,8 @@ impl DbxApp {
                 )
             })
             .child(
-                // The content sheet: the one opaque surface, so data never
-                // competes with whatever is behind the window.
+                // The tab strip reveals the navigation material. render_main
+                // gives every document an opaque content surface beneath it.
                 div()
                     .flex_1()
                     .min_w_0()
@@ -42,10 +44,9 @@ impl DbxApp {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .rounded(crate::theme::ui_px(RADIUS_PANEL))
+                    .rounded(crate::theme::ui_px(crate::theme::sheet_radius()))
                     .border_1()
                     .border_color(theme().hairline)
-                    .bg(theme().canvas)
                     .shadow(glass_shadow(10.))
                     .child(self.render_main(window, cx))
                     .child(self.render_status(cx)),
@@ -117,7 +118,7 @@ impl DbxApp {
             })
     }
 
-    pub(super) fn set_active_pane(
+    pub(in crate::app) fn set_active_pane(
         &mut self,
         pane: Pane,
         window: &mut Window,
@@ -411,6 +412,19 @@ impl DbxApp {
                         connection_tab(kind, label.clone(), selected)
                             .debug_selector(|| "connection-tab".into())
                             .id(SharedString::from(format!("connection-tab-{session_id}")))
+                            .on_drag(
+                                ConnectionTabDrag {
+                                    session_id,
+                                    label: label.clone().into(),
+                                },
+                                |drag, _, _, cx| cx.new(|_| drag.clone()),
+                            )
+                            .drag_over::<ConnectionTabDrag>(|style, _, _, _| {
+                                style.bg(theme().glass_hover)
+                            })
+                            .on_drop(cx.listener(move |this, drag: &ConnectionTabDrag, _, cx| {
+                                this.move_session(drag.session_id, session_id, cx)
+                            }))
                             .pressable(label.clone())
                             .role(gpui::Role::Tab)
                             .aria_selected(selected)
@@ -939,12 +953,21 @@ impl DbxApp {
             .flex()
             .flex_col()
             .child(self.render_tabs(cx))
-            .child(match pane {
-                Pane::Data => self.render_data(window, cx).into_any_element(),
-                Pane::Structure => self.render_structure(window, cx).into_any_element(),
-                Pane::Query => self.render_query(window, cx).into_any_element(),
-                Pane::Diagram => self.render_diagram(window, cx).into_any_element(),
-            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .bg(theme().canvas)
+                    .child(match pane {
+                        Pane::Data => self.render_data(window, cx).into_any_element(),
+                        Pane::Structure => self.render_structure(window, cx).into_any_element(),
+                        Pane::Query => self.render_query(window, cx).into_any_element(),
+                        Pane::Diagram => self.render_diagram(window, cx).into_any_element(),
+                    }),
+            )
     }
 
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -952,7 +975,15 @@ impl DbxApp {
         let (active_secondary_tab, tabs) = self
             .active_session()
             .map(|session| {
-                let mut query_number = 0;
+                let mut query_sequences: Vec<u64> = session
+                    .secondary_tabs
+                    .iter()
+                    .filter_map(|tab| match &tab.kind {
+                        SecondaryTabKind::Query(query) => Some(query.sequence),
+                        _ => None,
+                    })
+                    .collect();
+                query_sequences.sort_unstable();
                 let tabs = session
                     .secondary_tabs
                     .iter()
@@ -960,7 +991,10 @@ impl DbxApp {
                         let (label, kind) = match &tab.kind {
                             SecondaryTabKind::Data(data) => (data.table.name.clone(), Icon::Table),
                             SecondaryTabKind::Query(query) => {
-                                query_number += 1;
+                                let query_number = query_sequences
+                                    .binary_search(&query.sequence)
+                                    .unwrap_or_default()
+                                    + 1;
                                 let name = query.name.read(cx);
                                 (
                                     if name.as_str() == "Untitled" {
@@ -999,8 +1033,8 @@ impl DbxApp {
             .overflow_x_scroll()
             .border_b_1()
             .border_color(theme().border)
-            .follow_top_corners(RADIUS_PANEL)
-            .bg(theme().panel)
+            .follow_top_corners(crate::theme::sheet_radius())
+            .bg(crate::theme::navigation_surface())
             .children(tabs.into_iter().map(|(tab_id, label, kind)| {
                 let selected = active_secondary_tab == Some(tab_id);
                 let app = cx.entity().downgrade();
@@ -1010,6 +1044,30 @@ impl DbxApp {
                     selected,
                     label.clone(),
                 )
+                .when_some(session_id, |tab, session_id| {
+                    tab.on_drag(
+                        DocumentTabDrag {
+                            session_id,
+                            tab_id,
+                            label: label.clone().into(),
+                        },
+                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+                    )
+                    .drag_over::<DocumentTabDrag>(move |style, drag, _, _| {
+                        if drag.session_id == session_id {
+                            style.bg(theme().glass_hover)
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop(cx.listener(
+                        move |this, drag: &DocumentTabDrag, _, cx| {
+                            if drag.session_id == session_id {
+                                this.move_secondary_tab(session_id, drag.tab_id, tab_id, cx)
+                            }
+                        },
+                    ))
+                })
                 .child(label.clone())
                 .child(
                     div()
@@ -1302,7 +1360,7 @@ impl DbxApp {
             .gap(crate::theme::ui_px(12.))
             .border_t_1()
             .border_color(theme().border)
-            .follow_bottom_corners(RADIUS_PANEL)
+            .follow_bottom_corners(crate::theme::sheet_radius())
             .bg(theme().panel)
             .text_size(crate::theme::text_px(11.))
             .text_color(theme().text_muted)
@@ -1434,6 +1492,51 @@ fn document_tab(
                 theme().text_muted
             },
         ))
+}
+
+/// Drag payloads for reordering. Separate types keep a document tab from
+/// highlighting or landing in the connection strip, and vice versa.
+#[derive(Clone)]
+struct ConnectionTabDrag {
+    session_id: SessionId,
+    label: SharedString,
+}
+
+#[derive(Clone)]
+struct DocumentTabDrag {
+    session_id: SessionId,
+    tab_id: SecondaryTabId,
+    label: SharedString,
+}
+
+/// The pill that follows the pointer while a tab is dragged.
+fn tab_drag_ghost(label: SharedString) -> Div {
+    div()
+        .h(crate::theme::control_height(28.))
+        .px(crate::theme::ui_px(12.))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .border_1()
+        .border_color(theme().hairline)
+        .bg(theme().glass_raised)
+        .shadow(glass_shadow(8.))
+        .text_size(crate::theme::text_px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme().text)
+        .child(label)
+}
+
+impl Render for ConnectionTabDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        tab_drag_ghost(self.label.clone())
+    }
+}
+
+impl Render for DocumentTabDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        tab_drag_ghost(self.label.clone())
+    }
 }
 
 /// A circular titlebar control. Close gets a destructive hover.

@@ -1688,11 +1688,7 @@ impl TableDelegate for ResultTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
-        let base = if row_ix.is_multiple_of(2) {
-            theme().canvas
-        } else {
-            theme().grid_alternate
-        };
+        let base = crate::theme::table_row_background(!row_ix.is_multiple_of(2));
         let background = if self.changes.marked.contains(&row_ix) && self.changes.marked.len() > 1 {
             theme().grid_selected
         } else if self.changes.deletes.contains(&row_ix) {

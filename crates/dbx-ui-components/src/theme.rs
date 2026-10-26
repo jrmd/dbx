@@ -269,6 +269,7 @@ static REDUCE_TRANSPARENCY: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static PRODUCTION_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PRODUCTION_PALETTE: std::cell::RefCell<Option<(Theme, bool, Theme)>> = const { std::cell::RefCell::new(None) };
+    static NATIVE_PALETTE: std::cell::RefCell<Option<(Theme, bool, Theme)>> = const { std::cell::RefCell::new(None) };
     static MONO_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static ROW_FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
     static FONT_SIZE: std::cell::Cell<u16> = const { std::cell::Cell::new(12) };
@@ -387,16 +388,41 @@ pub fn set_reduce_transparency(reduce: bool) {
 }
 
 pub fn reduce_transparency() -> bool {
-    // Keep AppKit's whole-window vibrancy out of the data workbench. The
-    // translucent GPUI layers do not map cleanly to native sidebar materials.
-    cfg!(target_os = "macos") || REDUCE_TRANSPARENCY.load(Ordering::Acquire)
+    REDUCE_TRANSPARENCY.load(Ordering::Acquire)
+        || (cfg!(target_os = "macos") && !native_glass_active())
 }
 
-/// The window backdrop that matches the current material setting. Blurred
-/// maps to NSVisualEffectView on macOS and compositor blur on Wayland.
+static NATIVE_GLASS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_native_glass_active(active: bool) {
+    NATIVE_GLASS_ACTIVE.store(active, Ordering::Release);
+}
+
+pub fn native_glass_active() -> bool {
+    NATIVE_GLASS_ACTIVE.load(Ordering::Acquire)
+}
+
+/// macOS 26 rounds toolbar windows to roughly 26pt. Content sheets inset
+/// `GLASS_INSET` from that corner take the remainder so the curves stay
+/// concentric; the solid shell keeps the standard panel radius.
+pub const RADIUS_SHEET_GLASS: f32 = 18.0;
+
+/// Corner radius for the main content sheets that sit in the window corners.
+pub fn sheet_radius() -> f32 {
+    if native_glass_active() {
+        RADIUS_SHEET_GLASS
+    } else {
+        RADIUS_PANEL
+    }
+}
+
+/// AppKit supplies Liquid Glass itself; GPUI must leave its Metal surface
+/// transparent without installing the older NSVisualEffectView blur material.
 pub fn window_background() -> WindowBackgroundAppearance {
     if reduce_transparency() {
         WindowBackgroundAppearance::Opaque
+    } else if native_glass_active() {
+        WindowBackgroundAppearance::Transparent
     } else {
         WindowBackgroundAppearance::Blurred
     }
@@ -404,7 +430,26 @@ pub fn window_background() -> WindowBackgroundAppearance {
 
 /// Return the semantic palette for the current appearance and material.
 pub fn theme() -> Theme {
-    let mut palette = catalog::resolved_theme(is_dark(), reduce_transparency());
+    // Native glass leaves GPUI content opaque, so start from the active theme's
+    // solid variant: flattening the translucent one onto the default canvas
+    // would wash out every preset and custom theme.
+    let mut palette =
+        catalog::resolved_theme(is_dark(), reduce_transparency() || native_glass_active());
+    if native_glass_active() && !reduce_transparency() {
+        let original = palette;
+        let dark = is_dark();
+        palette = NATIVE_PALETTE.with_borrow_mut(|cache| {
+            if let Some((base, was_dark, resolved)) = *cache
+                && base == original
+                && was_dark == dark
+            {
+                return resolved;
+            }
+            palette = native_material_palette(palette, dark);
+            *cache = Some((original, dark, palette));
+            palette
+        });
+    }
     if PRODUCTION_CONTEXT.get() {
         let original = palette;
         let dark = is_dark();
@@ -430,16 +475,78 @@ pub fn theme() -> Theme {
         ] {
             let alpha = surface.a;
             *surface = Rgba {
-                r: surface.r * 0.94 + tint.r * 0.06,
-                g: surface.g * 0.94 + tint.g * 0.06,
-                b: surface.b * 0.94 + tint.b * 0.06,
+                r: surface.r * 0.985 + tint.r * 0.015,
+                g: surface.g * 0.985 + tint.g * 0.015,
+                b: surface.b * 0.985 + tint.b * 0.015,
                 a: alpha,
             };
         }
         catalog::ensure_readable(&mut palette, dark);
+        if native_glass_active() && !reduce_transparency() {
+            catalog::ensure_glass_readable(&mut palette, dark);
+        }
         PRODUCTION_PALETTE.with_borrow_mut(|cache| *cache = Some((original, dark, palette)));
     }
     palette
+}
+
+/// Content surfaces are translucent enough for the blurred native backdrop to
+/// show through, yet dense enough that ink contrast holds on any desktop.
+const NATIVE_CANVAS_ALPHA: f32 = 0.96;
+const NATIVE_PANEL_ALPHA: f32 = 0.97;
+
+/// Keep this independent of global state for palette and contrast regression tests.
+fn native_material_palette(mut palette: Theme, dark: bool) -> Theme {
+    // AppKit blurs the desktop under a clear window; the content surfaces
+    // below are the only wash on top of it.
+    palette.window.a = 0.;
+    let base = if dark {
+        DARK_THEME.canvas
+    } else {
+        LIGHT_THEME.canvas
+    };
+    let opaque_canvas = catalog::composite(palette.canvas, base);
+    palette.canvas = opaque_canvas;
+    palette.canvas.a = NATIVE_CANVAS_ALPHA;
+    for surface in [
+        &mut palette.panel,
+        &mut palette.panel_raised,
+        &mut palette.grid_alternate,
+        &mut palette.grid_active,
+        &mut palette.grid_selected,
+        &mut palette.grid_hover,
+        &mut palette.glass_raised,
+        &mut palette.glass,
+        &mut palette.glass_hover,
+        &mut palette.glass_selected,
+    ] {
+        *surface = catalog::composite(*surface, opaque_canvas);
+    }
+    palette.panel.a = NATIVE_PANEL_ALPHA;
+    // AppKit owns the native glass highlights. Content keeps its own subtle
+    // separators; focus and essential input edges retain their contrast.
+    palette.rim = rgba(0);
+    palette.hairline = rgba(0x00000024);
+    palette.border = rgba(0x00000024);
+    palette.border_strong = rgba(0x00000040);
+    catalog::ensure_glass_readable(&mut palette, dark);
+    palette
+}
+
+/// GPUI navigation inside documents is a stable content surface; AppKit owns glass.
+pub fn navigation_surface() -> Rgba {
+    let palette = theme();
+    palette.panel
+}
+
+/// Data stays on stable content colours in every material mode.
+pub fn table_row_background(alternate: bool) -> Rgba {
+    let palette = theme();
+    if alternate {
+        palette.grid_alternate
+    } else {
+        palette.canvas
+    }
 }
 
 /// Returns whether the active environment changed, for component theme sync.
@@ -495,7 +602,7 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     component.colors.table = palette.canvas.into();
     component.colors.table_active = palette.grid_active.into();
     component.colors.table_active_border = palette.focus_ring.into();
-    component.colors.table_even = palette.grid_alternate.into();
+    component.colors.table_even = table_row_background(true).into();
     component.colors.table_head = palette.panel_raised.into();
     component.colors.table_head_foreground = palette.text.into();
     component.colors.table_foot = palette.panel.into();
@@ -680,6 +787,19 @@ pub fn tip(
 /// cues that make a translucent layer read as a physical sheet of glass.
 pub fn glass_shadow(elevation: f32) -> Vec<BoxShadow> {
     let theme = theme();
+    let rim = BoxShadow {
+        color: theme.rim.into(),
+        offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
+        blur_radius: crate::theme::ui_px(0.),
+        spread_radius: crate::theme::ui_px(0.),
+        inset: true,
+    };
+    // GPUI's outer shadow also paints underneath a pane. That dark fill shows
+    // through translucent content and masks the native backdrop. AppKit owns
+    // the window shadow and edge highlights; avoid a second painted rim.
+    if native_glass_active() && !reduce_transparency() {
+        return vec![];
+    }
     vec![
         BoxShadow {
             color: theme.shadow.into(),
@@ -688,13 +808,7 @@ pub fn glass_shadow(elevation: f32) -> Vec<BoxShadow> {
             spread_radius: crate::theme::ui_px(0.),
             inset: false,
         },
-        BoxShadow {
-            color: theme.rim.into(),
-            offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
-            blur_radius: crate::theme::ui_px(0.),
-            spread_radius: crate::theme::ui_px(0.),
-            inset: true,
-        },
+        rim,
     ]
 }
 
@@ -1152,7 +1266,11 @@ pub fn button(
 
     match kind {
         ButtonKind::Primary => button.primary().shadow(vec![BoxShadow {
-            color: rgba(0xffffff33).into(),
+            color: if native_glass_active() && !reduce_transparency() {
+                rgba(0).into()
+            } else {
+                rgba(0xffffff33).into()
+            },
             offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
             blur_radius: crate::theme::ui_px(0.),
             spread_radius: crate::theme::ui_px(0.),

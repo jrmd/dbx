@@ -15,6 +15,16 @@ use super::*;
 
 impl Render for DbxApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_os = "macos")]
+        self.native_glass.mark_dirty();
+        #[cfg(target_os = "macos")]
+        let (native_navigation, native_left, native_top) = (
+            self.native_navigation_active(),
+            self.native_glass.left_inset,
+            self.native_glass.top_inset,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (native_navigation, native_left, native_top) = (false, 0., 0.);
         let production = self.workspace_screen_drawn()
             && self
                 .active_session()
@@ -284,14 +294,25 @@ impl Render for DbxApp {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .child(self.render_topbar(window, cx))
+                    .when(native_navigation, |view| {
+                        // The same gutter separates the content from the
+                        // floating native sidebar or, once it collapses (the
+                        // inset drops to zero), from the window edge.
+                        let gap = crate::theme::ui_px(GLASS_INSET).as_f32();
+                        view.pt(px(native_top)).pl(px(native_left + gap))
+                    })
+                    .when(!native_navigation, |view| {
+                        view.child(self.render_topbar(window, cx))
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()
                             .flex()
-                            .when(connected, |view| view.child(self.render_app_rail(cx)))
+                            .when(connected && !native_navigation, |view| {
+                                view.child(self.render_app_rail(cx))
+                            })
                             .when(!connected, |view| view.pl(crate::theme::ui_px(GLASS_INSET)))
                             .child(content),
                     ),

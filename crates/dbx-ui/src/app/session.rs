@@ -377,6 +377,9 @@ pub(super) struct QueryTab {
     pub(super) plan: Option<QueryResult>,
     pub(super) plan_baseline: Option<QueryResult>,
     pub(super) name: Entity<String>,
+    /// Creation order. Untitled queries are numbered by it rather than by tab
+    /// position, so dragging tabs never swaps their "Query N" labels.
+    pub(super) sequence: u64,
     pub(super) name_editor: Entity<TextEditor>,
     pub(super) console: Option<Arc<QuerySession>>,
     pub(super) cancellation: Option<QueryCancellation>,
@@ -505,7 +508,10 @@ impl QueryTab {
                 this.on_query_grid_event(session_id, tab_id, event, cx)
             });
 
+        static NEXT_QUERY_SEQUENCE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         Self {
+            sequence: NEXT_QUERY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name,
             timeout_secs: 60,
             plan_pending: false,

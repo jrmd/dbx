@@ -692,7 +692,7 @@ impl DbxApp {
                             connection_group_row(folder, row.into_any_element())
                         }))),
             ))
-            .child(div().flex_1().min_w_0().flex().flex_col().overflow_hidden().rounded(crate::theme::ui_px(RADIUS_PANEL)).border_1().border_color(theme().hairline).bg(theme().canvas).shadow(glass_shadow(10.))
+            .child(div().flex_1().min_w_0().flex().flex_col().overflow_hidden().rounded(crate::theme::ui_px(crate::theme::sheet_radius())).border_1().border_color(theme().hairline).bg(theme().canvas).shadow(glass_shadow(10.))
                 .child(div().id("connection-form-scroll").flex_1().min_h_0().overflow_y_scroll().p(if self.compact_layout { crate::theme::ui_px(14.) } else { crate::theme::ui_px(24.) }).flex().justify_center().items_start()
                     .child(div().w_full().min_w_0().max_w(crate::theme::ui_px(720.)).flex().flex_col().gap(crate::theme::ui_px(14.))
                         .when(self.compact_layout && !self.saved_connections.is_empty(), |view| view.child(
@@ -705,7 +705,7 @@ impl DbxApp {
                         })
                         .children(kind_picker)
                         .when(!choosing, |view| view.child(form))))
-                .when(!choosing, |view| view.child(div().flex_none().border_t_1().border_color(theme().border).follow_bottom_corners(RADIUS_PANEL).bg(theme().panel).px(if self.compact_layout { crate::theme::ui_px(14.) } else { crate::theme::ui_px(24.) }).py(crate::theme::ui_px(12.)).flex().items_center().justify_between().gap(crate::theme::ui_px(12.))
+                .when(!choosing, |view| view.child(div().flex_none().border_t_1().border_color(theme().border).follow_bottom_corners(crate::theme::sheet_radius()).bg(theme().panel).px(if self.compact_layout { crate::theme::ui_px(14.) } else { crate::theme::ui_px(24.) }).py(crate::theme::ui_px(12.)).flex().items_center().justify_between().gap(crate::theme::ui_px(12.))
                     .child(div().min_w_0().flex_1().when_some(self.error.clone(), |view, error| view.child(crate::accessibility::announcement("connection-error", error.clone(), true).truncate().text_size(crate::theme::text_px(12.)).text_color(theme().danger_text).tooltip(tip(error.clone())).child(error))))
                     .child(div().flex_none().flex().items_center().gap(crate::theme::ui_px(8.))
                         .child(button("test-connection", if self.testing_connection { "Cancel test" } else if self.credential_hydrating { "Loading password…" } else { "Test connection" }, ButtonKind::Quiet).disabled(self.credential_hydrating && !self.testing_connection).when(!self.credential_hydrating || self.testing_connection, |button| button.cursor_pointer().on_click(cx.listener(|this, _, _, cx| if this.testing_connection { this.cancel_connection_test(cx) } else { this.test_connection(cx) }))))

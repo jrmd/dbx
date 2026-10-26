@@ -322,6 +322,10 @@ impl DbxApp {
 
     /// Down arrow in the search box continues into the list.
     pub(super) fn focus_explorer_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self.native_glass.focus_explorer() {
+            return;
+        }
         let Some(session_id) = self.active_session_id else {
             return;
         };

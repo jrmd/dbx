@@ -353,6 +353,8 @@ pub struct TextEditor {
     selection_pointer: Option<Point<Pixels>>,
     last_revealed_cursor: std::cell::Cell<Option<usize>>,
     is_selecting: bool,
+    /// A trackpad wheel gesture that began over this editor owns its scroll.
+    wheel_gesture: bool,
     undo_history: Vec<EditorSnapshot>,
     redo_history: Vec<EditorSnapshot>,
     /// Where the current run of typed word characters ends. Continuing the
@@ -451,6 +453,7 @@ impl TextEditor {
             selection_pointer: None,
             last_revealed_cursor: std::cell::Cell::new(None),
             is_selecting: false,
+            wheel_gesture: false,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             typing_run: None,
@@ -595,6 +598,14 @@ impl TextEditor {
     }
 
     /// The focus handle used by GPUI to route keyboard and IME input.
+    /// Logical scroll geometry for a native host's scroll-edge effects.
+    pub fn scroll_geometry(&self) -> (f32, f32) {
+        (
+            (-self.scroll_handle.offset().y).as_f32(),
+            self.scroll_handle.max_offset().y.as_f32(),
+        )
+    }
+
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
@@ -1973,8 +1984,23 @@ impl TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Merely passing over a value must not hijack sidebar scrolling.
-        if !self.focus_handle.is_focused(window) {
+        // Wheel events only reach us while hovered. A trackpad gesture must
+        // also have *started* here: otherwise a sidebar scroll that slides this
+        // value under a stationary pointer would be hijacked mid-gesture.
+        // Discrete mouse wheels have no phases, so hovering is enough.
+        match event.touch_phase {
+            gpui::TouchPhase::Started => self.wheel_gesture = true,
+            gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => {
+                let owned = self.wheel_gesture;
+                self.wheel_gesture = false;
+                if !owned {
+                    return;
+                }
+            }
+            gpui::TouchPhase::Moved => {}
+        }
+        let discrete = matches!(event.delta, gpui::ScrollDelta::Lines(_));
+        if !discrete && !self.wheel_gesture {
             return;
         }
         let delta = event.delta.pixel_delta(window.line_height());
@@ -4462,9 +4488,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn sidebar_wheel_passes_unfocused_values_and_focused_values_keep_their_scroll(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn hovered_values_scroll_only_for_gestures_that_start_over_them(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| scroll_test_view(true, window, cx));
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -4478,7 +4502,7 @@ mod tests {
         view.read_with(cx, |view, cx| {
             assert!(
                 view.scroll.offset().y < px(0.),
-                "wheel over an unfocused value scrolls the sidebar"
+                "a gesture that began elsewhere keeps scrolling the sidebar"
             );
             assert_eq!(view.editor.read(cx).scroll_handle.offset().y, px(0.));
         });
@@ -4486,11 +4510,12 @@ mod tests {
             view.scroll.set_offset(point(px(0.), px(0.)));
             cx.notify();
         });
-        cx.update(|window, cx| editor.read(cx).focus_handle.clone().focus(window, cx));
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        // No focus needed: a gesture starting over the value scrolls it.
         cx.simulate_event(gpui::ScrollWheelEvent {
             position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
+            touch_phase: gpui::TouchPhase::Started,
             ..Default::default()
         });
         cx.update(|window, cx| {

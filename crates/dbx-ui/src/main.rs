@@ -4,6 +4,8 @@ mod diagram;
 #[allow(dead_code)]
 mod filters;
 mod keybindings;
+#[cfg(target_os = "macos")]
+mod native_glass;
 mod popups;
 mod result_export;
 #[allow(dead_code)]
@@ -379,6 +381,23 @@ fn main() {
                 app
             })
             .expect("open DBX window");
+        #[cfg(target_os = "macos")]
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(33))
+                    .await;
+                if main_window
+                    .update(cx, |app, window, cx| {
+                        app.refresh_native_navigation(window, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |cx| {
             loop {
                 cx.background_executor()
@@ -386,6 +405,8 @@ fn main() {
                     .await;
                 if main_window
                     .update(cx, |app, window, cx| {
+                        #[cfg(target_os = "macos")]
+                        app.refresh_system_material(window, cx);
                         if app.can_open_connection_targets()
                             && let Some(target) = open_targets
                                 .lock()

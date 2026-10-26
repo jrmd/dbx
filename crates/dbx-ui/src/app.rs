@@ -13,6 +13,8 @@ use crate::accessibility::SelectAccessibility as _;
 mod agents;
 mod cell_edits;
 mod designer;
+#[cfg(target_os = "macos")]
+mod native_navigation;
 mod query_actions;
 mod schema_objects;
 mod session;
@@ -105,9 +107,9 @@ use crate::{
         Appearance, ButtonAccessibility as _, ButtonKind, FollowCorners, GLASS_INSET, Icon,
         Pressable as _, RADIUS_CONTROL, RADIUS_GLASS, RADIUS_PANEL, appearance, badge, button,
         connection_tab, database_logo, glass, glass_icon_button, glass_raised, glass_shadow, icon,
-        panel_header, reduce_transparency, segment, segmented_track, set_appearance,
-        set_reduce_transparency, set_system_appearance, settings_group, settings_row,
-        settings_switch, shortcut, sync_component_theme, theme, tip, window_background,
+        panel_header, segment, segmented_track, set_appearance, set_reduce_transparency,
+        set_system_appearance, settings_group, settings_row, settings_switch, shortcut,
+        sync_component_theme, theme, tip, window_background,
     },
     vault::{VaultError, VaultState},
 };
@@ -930,6 +932,8 @@ pub struct DbxApp {
     theme_preferences: crate::theme::catalog::ThemePreferences,
     theme_editor: Option<theme_settings::ThemeEditor>,
     reduce_transparency: bool,
+    #[cfg(target_os = "macos")]
+    native_glass: crate::native_glass::NativeGlass,
     ui_scale: u16,
     editor_scale: u16,
     font_family: Option<String>,
@@ -1124,7 +1128,11 @@ impl DbxApp {
                 .map(|s| s.theme.clone())
                 .unwrap_or_default(),
             theme_editor: None,
-            reduce_transparency: reduce_transparency(),
+            reduce_transparency: saved_settings
+                .as_ref()
+                .is_some_and(|s| s.reduce_transparency),
+            #[cfg(target_os = "macos")]
+            native_glass: crate::native_glass::NativeGlass::default(),
             ui_scale: saved_settings
                 .as_ref()
                 .map_or(100, |settings| settings.ui_scale.clamp(100, 200)),
@@ -1211,6 +1219,7 @@ impl DbxApp {
             })
             .detach();
         }
+        this.apply_material(window, cx);
         this
     }
 
@@ -1512,10 +1521,24 @@ impl DbxApp {
     /// window backdrop and gpui-component.
     pub(crate) fn apply_material(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         set_system_appearance(window.appearance());
+        #[cfg(target_os = "macos")]
+        crate::theme::set_native_glass_active(self.native_glass.apply(
+            window,
+            !self.reduce_transparency,
+            crate::theme::is_dark(),
+        ));
         window.set_background_appearance(window_background());
         sync_component_theme(Some(window), cx);
         self.refresh_theme_color_input(window, cx);
         cx.refresh_windows();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn refresh_system_material(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.native_glass.accessibility_changed() {
+            self.apply_material(window, cx);
+            cx.notify();
+        }
     }
 
     fn persist_settings(&mut self, cx: &mut Context<Self>) {

@@ -38,6 +38,42 @@ Run the launcher first to create `target/ui-test`. These tests perform CRUD agai
 
 ## Native checks
 
+### Mac Liquid Glass
+
+On macOS 26 or later, open Settings → Appearance and toggle Liquid Glass. Check
+the window against a colourful desktop in light and dark mode, including an
+explicit DBX appearance that differs from macOS. The native Explorer and
+toolbar should reveal the material; document tabs and settings belong to the
+opaque content layer. Tables, SQL editors,
+forms and settings content must stay opaque and stable as the desktop changes.
+Check text, alternating rows, selection, focus and open menus
+for readability. Pay particular attention to muted metadata, SQL comments,
+inactive tabs and status text over bright and dark backgrounds. Pane edges,
+row separators and buttons should have no painted white rims; keyboard focus
+and input outlines must remain visible. Turning glass off must make the surfaces solid immediately.
+Restart and verify both saved
+choices. Toggle macOS Reduce Transparency and Increase Contrast while DBX is
+open: either preference should make the window solid within a second without
+changing the saved Liquid Glass switch. Restore both preferences afterwards.
+Also check typing, menus, window dragging, resizing, fullscreen and closing
+after repeatedly toggling glass. On macOS versions before 26, verify the
+explanatory setting and solid fallback without a crash.
+
+Build with Xcode 26 / Swift 6.2 or newer for the native shell; older compilers
+build the solid fallback. Run `scripts/test-native-shell.sh` to exercise real
+AppKit lifecycle, repeated toggles, selection events, AccessKit-root retention,
+scroll coordinate alignment and restoration without a database or visible window.
+
+Use an Explorer with more rows than fit onscreen. Scroll underneath its search
+accessory and check Apple's native edge treatment, then independently scroll
+the grid, a long SQL editor and Settings. Search, clear search, change schema or
+database, select several tables and open the context menu. Confirm read-only and
+view capabilities still gate mutations. Test individual connection tabs (including closing an inactive connection), refresh,
+new query, sidebar toggle and keyboard focus (`Cmd-Shift-E` / Return). Open a
+destructive-action confirmation and cancel it: the native controls must be
+blocked while the modal is open and restored afterwards. Verify screen-reader
+access to both native navigation and GPUI content after toggling several times. Lock the vault and verify app toolbar controls are absent, not merely disabled; unlock and verify the tabs return. Check for a colour seam across the titlebar above the split.
+
 Create the vault, reject a mismatched confirmation, then unlock it again after restarting DBX. Save the Docker passwords through the form and reconnect after relaunch without re-entering them. Check Data, Query, Structure, foreign-key navigation, row editing, filters, and tab switching in dark and light appearances. Use both a narrow and wide window. Inspect the actual data cells as well as connection success: unit/build results alone do not prove native rendering.
 
 `DBX_UI_TEST_SKIP_BUILD=1 scripts/run-ui-test.sh` reuses a binary already built for this checkout. For Linux X11 automation, launch with `env -u WAYLAND_DISPLAY`; otherwise the launcher uses the desktop's normal backend. macOS window behavior still requires a Mac.

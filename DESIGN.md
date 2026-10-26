@@ -115,7 +115,7 @@ The interface is intentionally native and dense. Surfaces are layered only enoug
 - Persistent context: a 48px app rail, 46px unified titlebar, 30px status bar, and visible explorer/inspector panes; the DBX logo anchors the disconnected titlebar and the vault gate.
 - Deliberate density: 11–12px operational text, 26–30px controls, and four-pixel spacing increments.
 - Blue is an interaction locator, not a decorative fill; it marks active navigation and primary commit actions.
-- Chrome is glass, content is paper: navigation floats on a translucent material over the desktop, while data always sits on one opaque content sheet.
+- With native Liquid Glass enabled, navigation reveals the adaptive material while documents, tables, editors and forms remain opaque. Selection, focus and transient overlays keep stronger contrast. Solid mode uses opaque surfaces throughout.
 
 ## Colors
 
@@ -152,7 +152,7 @@ menus, scrollbars, controls, and focus states.
 - **Light:** Cool Paper (`light-canvas`) holds the workspace, white (`light-panel`) carries panes, Pale Utility (`light-panel-raised`) distinguishes controls, and Blue-Slate dividers preserve the pane hierarchy.
 - **Parity:** blue still means action/location, green still means health, amber still means caution, and red still means destructive. Grid alternation, focus visibility, editor syntax, overlays, and disabled states must be checked in both appearances.
 - **System:** the default. DBX follows the operating system's light/dark setting live.
-- **Control:** the titlebar Appearance menu offers System, Light, and Dark plus **Reduce transparency**; every choice applies immediately and persists.
+- **Control:** Settings → Appearance offers System, Light, and Dark plus **Liquid Glass** on macOS or **Reduce transparency** elsewhere; every choice applies immediately and persists.
 
 ### Primary
 
@@ -206,15 +206,17 @@ At widths below 1180px, DBX enters its narrow-workspace behavior and removes the
 
 ## Elevation & Depth
 
-DBX uses a Liquid Glass material hierarchy with exactly three layers:
+DBX separates navigation from content following [Apple's Materials guidance](https://developer.apple.com/design/human-interface-guidelines/materials):
 
-1. **Backdrop** (`window`): a translucent tint over a blurred desktop (`NSVisualEffectView` on macOS, compositor blur on Wayland). The titlebar, rail, and connection tabs sit directly on it. The tint is denser off macOS, where compositors may not blur.
-2. **Floating glass** (`glass`, `RADIUS_GLASS`, inset 8px): the explorer and saved-connection sidebars. Glass carries a hairline border, a soft ambient shadow, and a one-pixel **specular rim** (an inset top highlight) that makes the layer read as a physical sheet.
-3. **Content sheet** (`canvas`, `RADIUS_PANEL`): the single opaque surface holding tabs, grids, editors, forms, and the status bar. Data never competes with the desktop.
+1. **Native navigation** (macOS 26+, Liquid Glass on): `NSToolbar` owns the toolbar controls and their glass groups. A sidebar-behaviour `NSSplitViewItem` owns the Explorer glass; an `NSTableView` uses native vibrant labels and selection. Its search, database/schema filters and actions live in a top-aligned `NSSplitViewItemAccessoryViewController`. Do not add an `NSVisualEffectView` or a second glass layer inside it.
+2. **Scroll edges**: AppKit's `NSScrollView` supplies the automatic edge effects under the toolbar and Explorer accessory. The Explorer scrolls natively. The main host mirrors the active GPUI grid/editor/settings scroll range and offset into a native scroll view while pinning the existing renderer to window coordinates, preserving virtualized content, hit testing, IME and accessibility geometry. Internal GPUI document controls remain fixed content; they do not become native floating accessories.
+3. **Content sheet** (`canvas`, `RADIUS_PANEL`): grids, editors, forms, document tabs, settings and status bars use opaque surfaces, including imported translucent themes. Table striping, selection and staged-change colours belong to the content palette and do not sample the desktop. No painted white rims or extra glass shadows.
 
-Transient layers (menus, popovers, dialogs, the vault gate) use the denser `glass_raised` material with a deeper shadow. **Reduce transparency** swaps every material for an opaque equivalent and switches the window to an opaque backdrop; contrast tests assert text legibility on those fallbacks.
+Turning **Liquid Glass** off, or enabling macOS Reduce Transparency or Increase Contrast, restores the GPUI shell with solid surfaces. The saved app preference survives OS accessibility changes. Older macOS versions and builds made with older Swift SDKs use the solid fallback. Other platforms retain their existing material handling.
 
-**The Earned Separation Rule.** Inside the content sheet, depth stays tonal and border-led. Glass belongs to chrome and transient layers, never to rows, cells, or form fields.
+**The Earned Separation Rule.** Inside the content sheet, depth stays tonal and border-led. Rows, cells and fields do not receive Liquid Glass effects. The content split adjusts its safe area and uses AppKit’s `NSBackgroundExtensionView` to extend the content colours beneath the toolbar and sidebar, avoiding unrelated desktop and opaque backdrops at the split. Connection tabs stay individually visible with close actions. Explorer actions use equal 32px targets without nested bezels or a redundant menu arrow. The locked vault hides the app toolbar entirely. Native labels use AppKit semantic colours and vibrancy; custom content text and syntax retain their contrast correction. Essential focus and input boundaries remain distinct from decorative separators.
+
+**Hosting contract.** `native/NativeShell.swift` owns native views through a retained, main-thread-only handle. Rust sends state snapshots and drains queued intents; no delegate re-enters GPUI. Existing handlers validate session identity, capabilities and destructive confirmations. GPUI's original content root is retained with its AccessKit adapter, and its logical canvas stays aligned with the whole window even inside the clipped main split. Main-scroller geometry is a projection of GPUI state, not a second scroll owner. Modals temporarily collapse the native sidebar and disable native actions, then restore it. Detaching restores the original content root, toolbar, appearance and sizing. See [Apple's AppKit guidance](https://developer.apple.com/videos/play/wwdc2025/310/).
 
 ## Shapes
 
@@ -328,6 +330,6 @@ form retains its state. All changes continue through the SQL review workflow.
 
 ### Native desktop chrome
 
-The 46px unified titlebar spans the window and is transparent over the backdrop. The whole empty stretch is a drag area: double-click zooms and right-click opens the compositor window menu. macOS keeps native traffic lights (inset 16px) with reserved leading space. Elsewhere DBX draws circular minimize, maximize/restore, and close controls, showing only those the compositor supports. Client-decorated windows get invisible edge and corner resize handles. Connection tabs are capsules; the selected one lifts into a glass pill. When connected, a sidebar toggle sits beside the window identity.
+With native Liquid Glass enabled, AppKit supplies the titlebar, toolbar controls, connection tabs and sidebar toggle. Otherwise the 46px GPUI titlebar spans the window and is transparent over the backdrop. The whole empty stretch is a drag area: double-click zooms and right-click opens the compositor window menu. macOS keeps native traffic lights (inset 16px) with reserved leading space. Elsewhere DBX draws circular minimize, maximize/restore, and close controls, showing only those the compositor supports. Client-decorated windows get invisible edge and corner resize handles. Connection tabs are capsules; the selected one lifts into a glass pill. When connected, a sidebar toggle sits beside the window identity.
 
 Standard shortcuts use ⌘ on macOS and Ctrl elsewhere: New Connection (N), New Query (T), Close Tab (W; on Data it closes the connection), Toggle Explorer (B), Refresh (R, F5), and next/previous connection (Ctrl-Tab / Ctrl-Shift-Tab, ⌘⇧] / ⌘⇧[). Escape backs out of the connection picker to the open connection. macOS gets a full menu bar (DBX, File, Edit, View, Query, Window) wired to the same actions. If focus is lost (for example, a focused tab closes), the root view reclaims it so shortcuts keep working.

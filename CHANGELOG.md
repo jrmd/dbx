@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use an AppKit sidebar and toolbar for Liquid Glass on macOS 26 or later, with native scroll-edge effects and stable opaque tables, editors and forms. Turn it on or off in Settings → Appearance; macOS accessibility preferences take priority.
+
 ## 0.17.3 - 2026-10-21
 
 - Keep sidebar scrolling outside unfocused row-value fields, and reveal hidden text while drag-selecting beyond a field’s edges.

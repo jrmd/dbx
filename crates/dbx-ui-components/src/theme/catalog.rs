@@ -308,8 +308,51 @@ pub(super) fn ensure_readable(p: &mut Theme, dark: bool) {
         composite(p.panel, p.canvas),
         composite(p.panel_raised, p.canvas),
     ];
+    ensure_readable_on(p, dark, &surfaces, &surfaces[..1], 3.);
+}
+
+/// Resolve ink against the composited material, including the least favorable
+/// desktop brightness. Opaque-palette contrast is insufficient for glass.
+pub(super) fn ensure_glass_readable(p: &mut Theme, dark: bool) {
+    let backdrop = if dark { rgb(0xffffff) } else { rgb(0) };
+    let window = composite(p.window, backdrop);
+    let canvas = composite(p.canvas, window);
+    let glass = composite(p.glass, window);
+    // The clear window is never a text surface: content always sits on canvas.
+    let surfaces = [
+        canvas,
+        glass,
+        composite(p.glass_hover, glass),
+        composite(p.glass_selected, glass),
+        composite(p.panel, canvas),
+        composite(p.panel_raised, canvas),
+        composite(p.glass_raised, window),
+    ];
+    // Selected rows are tinted with the accent itself, so accent-coloured ink
+    // can never clear them without being bleached toward black or white. Only
+    // body text is held to them.
+    let selected = [
+        canvas,
+        composite(p.grid_active, canvas),
+        composite(p.grid_selected, canvas),
+    ];
+    // SQL belongs to the stable content layer, not the glass navigation layer.
+    let syntax_surfaces = [canvas, composite(p.panel, canvas)];
+    ensure_readable_on(p, dark, &surfaces, &syntax_surfaces, 4.5);
     let ink = if dark { rgb(0xffffff) } else { rgb(0) };
-    p.text = readable(p.text, ink, &surfaces, 4.5);
+    p.text = readable(p.text, ink, &selected, 4.5);
+    p.text_muted = readable(p.text_muted, p.text, &selected, 4.5);
+}
+
+fn ensure_readable_on(
+    p: &mut Theme,
+    dark: bool,
+    surfaces: &[Rgba],
+    syntax_surfaces: &[Rgba],
+    syntax_minimum: f32,
+) {
+    let ink = if dark { rgb(0xffffff) } else { rgb(0) };
+    p.text = readable(p.text, ink, surfaces, 4.5);
     for color in [
         &mut p.text_muted,
         &mut p.accent_text,
@@ -317,12 +360,12 @@ pub(super) fn ensure_readable(p: &mut Theme, dark: bool) {
         &mut p.warning_text,
         &mut p.success_text,
     ] {
-        *color = readable(*color, p.text, &surfaces, 4.5);
+        *color = readable(*color, p.text, surfaces, 4.5);
     }
     // Control edges are non-text UI: 3:1, as for the presets. Themes that
     // mark inputs with a fill and a transparent border still get an edge.
     for color in [&mut p.input_border, &mut p.focus_ring] {
-        *color = readable(*color, p.text, &surfaces, 3.);
+        *color = readable(*color, p.text, surfaces, 3.);
     }
     for color in [
         &mut p.sql_keyword,
@@ -333,7 +376,7 @@ pub(super) fn ensure_readable(p: &mut Theme, dark: bool) {
         &mut p.sql_identifier,
         &mut p.sql_type,
     ] {
-        *color = readable(*color, p.text, &surfaces[..1], 3.);
+        *color = readable(*color, p.text, syntax_surfaces, syntax_minimum);
     }
 }
 
@@ -1100,4 +1143,85 @@ fn import_vscode(value: &serde_json::Value, fallback_name: &str) -> Result<Impor
             Appearance::Light
         }),
     })
+}
+
+#[cfg(test)]
+mod glass_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn secondary_and_syntax_ink_survives_changing_glass_backdrops() {
+        for dark in [false, true] {
+            let palette = super::super::native_material_palette(
+                preset_theme(Preset::Default, dark, false),
+                dark,
+            );
+            for backdrop in [rgb(0), rgb(0x808080), rgb(0xffffff)] {
+                let window = composite(palette.window, backdrop);
+                let canvas = composite(palette.canvas, window);
+                let glass = composite(palette.glass, window);
+                for surface in [canvas, glass, composite(palette.glass_selected, glass)] {
+                    for ink in [
+                        palette.text,
+                        palette.text_muted,
+                        palette.accent_text,
+                        palette.danger_text,
+                        palette.success_text,
+                        palette.warning_text,
+                    ] {
+                        assert!(contrast(ink, surface) >= 4.5, "dark={dark}");
+                    }
+                    for edge in [palette.input_border, palette.focus_ring] {
+                        assert!(contrast(edge, surface) >= 3., "dark={dark}");
+                    }
+                }
+                for ink in [palette.text, palette.text_muted] {
+                    assert!(
+                        contrast(ink, composite(palette.grid_active, canvas)) >= 4.5,
+                        "dark={dark}"
+                    );
+                }
+                for surface in [canvas, palette.panel] {
+                    for ink in [
+                        palette.sql_comment,
+                        palette.sql_keyword,
+                        palette.sql_string,
+                        palette.sql_number,
+                    ] {
+                        assert!(contrast(ink, surface) >= 4.5, "dark={dark}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_content_is_translucent_but_dense_and_data_stays_opaque() {
+        for preset in Preset::ALL {
+            for dark in [false, true] {
+                let mut source = preset_theme(preset, dark, false);
+                // Imported themes may supply translucent content tokens too.
+                source.canvas.a = 0.15;
+                source.panel.a = 0.2;
+                source.grid_alternate.a = 0.1;
+                let palette = super::super::native_material_palette(source, dark);
+                assert_eq!(palette.canvas.a, super::super::NATIVE_CANVAS_ALPHA);
+                assert_eq!(palette.panel.a, super::super::NATIVE_PANEL_ALPHA);
+                for surface in [
+                    palette.panel_raised,
+                    palette.grid_alternate,
+                    palette.grid_active,
+                    palette.grid_hover,
+                    palette.grid_selected,
+                    palette.glass_raised,
+                ] {
+                    assert_eq!(surface.a, 1., "{preset:?}, dark={dark}");
+                    assert_eq!(
+                        composite(surface, rgb(0)),
+                        composite(surface, rgb(0xffffff))
+                    );
+                }
+            }
+        }
+    }
 }

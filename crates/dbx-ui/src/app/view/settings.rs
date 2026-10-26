@@ -42,6 +42,9 @@ impl DbxApp {
             crate::theme::ui_px(28.)
         };
         let selected = self.settings_section;
+        // GPUI clips overflow to a rectangle, so each filled region rounds its
+        // own outer corners to sit inside the card's 1px border.
+        let inner_radius = crate::theme::ui_px(crate::theme::sheet_radius() - 1.);
         let title = SETTINGS_SECTIONS
             .iter()
             .find(|(section, ..)| *section == selected)
@@ -64,6 +67,9 @@ impl DbxApp {
             .tooltip(tip("Back to workspace"))
             .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)));
         let header = div()
+            .bg(crate::theme::navigation_surface())
+            .rounded_tr(inner_radius)
+            .when(compact, |view| view.rounded_tl(inner_radius))
             .flex_none()
             .h(crate::theme::control_height(52.))
             .px(padding)
@@ -119,10 +125,9 @@ impl DbxApp {
                     .min_w_0()
                     .flex()
                     .overflow_hidden()
-                    .rounded(crate::theme::ui_px(RADIUS_PANEL))
+                    .rounded(crate::theme::ui_px(crate::theme::sheet_radius()))
                     .border_1()
                     .border_color(theme().hairline)
-                    .bg(theme().canvas)
                     .shadow(glass_shadow(10.))
                     .when(!compact, |view| {
                         view.child(self.render_settings_sidebar(cx))
@@ -137,6 +142,9 @@ impl DbxApp {
                             .child(
                                 div()
                                     .id("settings-scroll")
+                                    .bg(theme().canvas)
+                                    .rounded_br(inner_radius)
+                                    .when(compact, |view| view.rounded_bl(inner_radius))
                                     .track_scroll(&self.settings_scroll)
                                     .flex_1()
                                     .min_h_0()
@@ -162,6 +170,8 @@ impl DbxApp {
         let selected = self.settings_section;
         div()
             .id("settings-sections")
+            .bg(crate::theme::navigation_surface())
+            .rounded_l(crate::theme::ui_px(crate::theme::sheet_radius() - 1.))
             .role(gpui::Role::TabList)
             .aria_label("Settings sections")
             .w(crate::theme::ui_px(208.))
@@ -530,7 +540,35 @@ impl DbxApp {
                             cx.notify();
                         }))
                 }))).into_any_element());
-        if !cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        {
+            let supported = crate::native_glass::supported();
+            let detail = if !supported {
+                "Requires macOS 26 or later and a build with native glass support. Solid surfaces are in use."
+            } else if self.native_glass.system_reduces_transparency() {
+                "Paused by macOS Reduce Transparency or Increase Contrast. Your choice is saved."
+            } else {
+                "Native glass for navigation, with solid tables, editors and forms for readability."
+            };
+            behaviour.push(
+                settings_row(
+                    "Liquid Glass",
+                    Some(detail.into()),
+                    settings_switch(
+                        "settings-liquid-glass",
+                        "Liquid Glass",
+                        !self.reduce_transparency,
+                    )
+                    .debug_selector(|| "settings-liquid-glass".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_reduce_transparency(window, cx)
+                    })),
+                )
+                .into_any_element(),
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             behaviour.push(
                 settings_row(
                     "Reduce transparency",

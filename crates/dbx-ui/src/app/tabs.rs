@@ -8,7 +8,68 @@ pub(super) enum TabCloseScope {
     Right,
 }
 
+/// Moves `from` into `to`'s slot: dropping on a tab to the right lands after
+/// it, to the left before it, matching browser tab strips.
+pub(super) fn move_to_slot<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= items.len() || to >= items.len() {
+        return false;
+    }
+    let item = items.remove(from);
+    items.insert(to, item);
+    true
+}
+
 impl DbxApp {
+    /// Reorders a connection tab. Order is part of the startup workspace.
+    pub(super) fn move_session(
+        &mut self,
+        session_id: SessionId,
+        target: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let from = self
+            .sessions
+            .iter()
+            .position(|session| session.id == session_id);
+        let to = self
+            .sessions
+            .iter()
+            .position(|session| session.id == target);
+        if let (Some(from), Some(to)) = (from, to)
+            && move_to_slot(&mut self.sessions, from, to)
+        {
+            self.persist_startup_workspace(cx);
+            cx.notify();
+        }
+    }
+
+    /// Reorders a document tab within its own connection.
+    pub(super) fn move_secondary_tab(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        target: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let from = session
+            .secondary_tabs
+            .iter()
+            .position(|tab| tab.id == tab_id);
+        let to = session
+            .secondary_tabs
+            .iter()
+            .position(|tab| tab.id == target);
+        if let (Some(from), Some(to)) = (from, to)
+            && move_to_slot(&mut session.secondary_tabs, from, to)
+        {
+            self.persist_startup_workspace(cx);
+            cx.notify();
+        }
+    }
+
     pub(super) fn tabs_to_close(
         &self,
         session_id: SessionId,
@@ -1300,6 +1361,26 @@ impl DbxApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_a_tab_takes_the_target_slot_in_either_direction() {
+        let mut tabs = vec!['a', 'b', 'c', 'd'];
+        assert!(move_to_slot(&mut tabs, 0, 2));
+        assert_eq!(
+            tabs,
+            ['b', 'c', 'a', 'd'],
+            "rightward drops land after the target"
+        );
+        assert!(move_to_slot(&mut tabs, 3, 0));
+        assert_eq!(
+            tabs,
+            ['d', 'b', 'c', 'a'],
+            "leftward drops land before the target"
+        );
+        assert!(!move_to_slot(&mut tabs, 1, 1));
+        assert!(!move_to_slot(&mut tabs, 0, 9));
+        assert_eq!(tabs, ['d', 'b', 'c', 'a']);
+    }
 
     #[gpui::test]
     fn bulk_tab_close_confirms_before_removing_any_tabs_and_uses_clicked_order(
