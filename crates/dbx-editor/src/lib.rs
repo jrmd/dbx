@@ -353,8 +353,6 @@ pub struct TextEditor {
     selection_pointer: Option<Point<Pixels>>,
     last_revealed_cursor: std::cell::Cell<Option<usize>>,
     is_selecting: bool,
-    /// A trackpad wheel gesture that began over this editor owns its scroll.
-    wheel_gesture: bool,
     undo_history: Vec<EditorSnapshot>,
     redo_history: Vec<EditorSnapshot>,
     /// Where the current run of typed word characters ends. Continuing the
@@ -453,7 +451,6 @@ impl TextEditor {
             selection_pointer: None,
             last_revealed_cursor: std::cell::Cell::new(None),
             is_selecting: false,
-            wheel_gesture: false,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             typing_run: None,
@@ -1984,37 +1981,19 @@ impl TextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Wheel events only reach us while hovered. A trackpad gesture must
-        // also have *started* here: otherwise a sidebar scroll that slides this
-        // value under a stationary pointer would be hijacked mid-gesture.
-        // Discrete mouse wheels have no phases, so hovering is enough.
-        match event.touch_phase {
-            gpui::TouchPhase::Started => self.wheel_gesture = true,
-            gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled => {
-                let owned = self.wheel_gesture;
-                self.wheel_gesture = false;
-                if !owned {
-                    return;
-                }
-            }
-            gpui::TouchPhase::Moved => {}
-        }
-        let discrete = matches!(event.delta, gpui::ScrollDelta::Lines(_));
-        if !discrete && !self.wheel_gesture {
+        // The capture-phase observer has already decided which scroll area
+        // owns this gesture. A value that does not own it lets the sidebar
+        // scroll, even though it is now under the pointer.
+        let owner = cx.try_global::<WheelLatch>().map(|latch| latch.target);
+        if owner != Some(WheelTarget::Editor(cx.entity_id())) {
             return;
         }
-        let delta = event.delta.pixel_delta(window.line_height());
+        let delta = self.wheel_delta(event, window);
         let current = self.scroll_handle.offset();
         let maximum = self.scroll_handle.max_offset();
         let next = point(
-            (current.x
-                + if event.modifiers.shift && delta.x == px(0.) {
-                    delta.y
-                } else {
-                    delta.x
-                })
-            .clamp(-maximum.x, px(0.)),
-            if self.multiline && !event.modifiers.shift {
+            (current.x + delta.x).clamp(-maximum.x, px(0.)),
+            if self.multiline {
                 (current.y + delta.y).clamp(-maximum.y, px(0.))
             } else {
                 current.y
@@ -2022,8 +2001,43 @@ impl TextEditor {
         );
         if next != current {
             self.scroll_handle.set_offset(next);
-            cx.stop_propagation();
             cx.notify();
+        }
+        // An owned gesture stays here at the value's edge; like native scroll
+        // views, only a new gesture chains to the sidebar.
+        cx.stop_propagation();
+    }
+
+    /// The wheel delta, with Shift turning vertical wheels horizontal.
+    fn wheel_delta(&self, event: &gpui::ScrollWheelEvent, window: &Window) -> Point<Pixels> {
+        let delta = event.delta.pixel_delta(window.line_height());
+        point(
+            if event.modifiers.shift && delta.x == px(0.) {
+                delta.y
+            } else {
+                delta.x
+            },
+            if event.modifiers.shift {
+                px(0.)
+            } else {
+                delta.y
+            },
+        )
+    }
+
+    /// Whether a gesture moving by `delta` should start scrolling this value.
+    /// Only the dominant axis counts, so a slightly diagonal vertical swipe
+    /// over a single-line value still scrolls the sidebar.
+    fn claims_wheel(&self, delta: Point<Pixels>) -> bool {
+        let current = self.scroll_handle.offset();
+        let maximum = self.scroll_handle.max_offset();
+        let movable = |delta: Pixels, offset: Pixels, maximum: Pixels| {
+            (delta < px(0.) && offset > -maximum) || (delta > px(0.) && offset < px(0.))
+        };
+        if delta.x.abs() > delta.y.abs() {
+            movable(delta.x, current.x, maximum.x)
+        } else {
+            self.multiline && movable(delta.y, current.y, maximum.y)
         }
     }
 
@@ -2067,6 +2081,98 @@ impl TextEditor {
         if next != current {
             self.scroll_handle.set_offset(next);
             cx.notify();
+        }
+    }
+}
+
+/// Silence after which the next wheel event starts a new gesture. Trackpads
+/// also mark starts explicitly, and their momentum arrives every frame.
+const WHEEL_GESTURE_IDLE: std::time::Duration = std::time::Duration::from_millis(400);
+/// Moving the pointer ends a gesture, but only once the wheel has paused this
+/// long, so a hand nudging the mouse mid-spin does not retarget it.
+const WHEEL_MOVE_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+/// Every row value observes every wheel event; anything identical arriving
+/// this close together is the same event reaching another observer.
+const WHEEL_SAME_DISPATCH: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Which scroll area owns the current wheel gesture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WheelTarget {
+    /// The gesture has not moved yet; whatever is under the pointer when it
+    /// does takes it.
+    #[default]
+    Undecided,
+    /// Something other than a row value, typically the surrounding sidebar.
+    Outer,
+    Editor(gpui::EntityId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WheelSample {
+    at: std::time::Instant,
+    position: Point<Pixels>,
+    delta: (bool, Point<f32>),
+    phase: gpui::TouchPhase,
+}
+
+/// Latches each wheel gesture to the scroll area it started over, as native
+/// scroll views and browsers do. Without this, a sidebar scroll that slides a
+/// value under a stationary pointer would be hijacked by that value mid-flight.
+#[derive(Default)]
+struct WheelLatch {
+    last: Option<WheelSample>,
+    target: WheelTarget,
+}
+
+impl gpui::Global for WheelLatch {}
+
+impl WheelLatch {
+    fn observe(&mut self, event: &gpui::ScrollWheelEvent, now: std::time::Instant) {
+        let sample = WheelSample {
+            at: now,
+            position: event.position,
+            delta: match event.delta {
+                gpui::ScrollDelta::Pixels(delta) => (true, point(delta.x.into(), delta.y.into())),
+                gpui::ScrollDelta::Lines(delta) => (false, delta),
+            },
+            phase: event.touch_phase,
+        };
+        let fresh = match self.last {
+            Some(last)
+                if last.position == sample.position
+                    && last.delta == sample.delta
+                    && last.phase == sample.phase
+                    && now.duration_since(last.at) < WHEEL_SAME_DISPATCH =>
+            {
+                return;
+            }
+            _ if sample.phase == gpui::TouchPhase::Started => true,
+            None => true,
+            Some(last) => {
+                let idle = now.duration_since(last.at);
+                idle > WHEEL_GESTURE_IDLE
+                    || (idle > WHEEL_MOVE_GRACE && last.position != sample.position)
+            }
+        };
+        if fresh {
+            self.target = WheelTarget::Undecided;
+        } else if self.target == WheelTarget::Undecided
+            && self.last.is_some_and(|last| last.delta.1 != point(0., 0.))
+        {
+            // The gesture moved with no value under the pointer to claim it.
+            self.target = WheelTarget::Outer;
+        }
+        self.last = Some(sample);
+    }
+
+    /// Offers an undecided, moving gesture to the value under the pointer.
+    fn claim(&mut self, editor: gpui::EntityId, delta: Point<Pixels>, scrollable: bool) {
+        if self.target == WheelTarget::Undecided && delta != point(px(0.), px(0.)) {
+            self.target = if scrollable {
+                WheelTarget::Editor(editor)
+            } else {
+                WheelTarget::Outer
+            };
         }
     }
 }
@@ -2816,6 +2922,8 @@ struct PrepaintState {
     paint_bounds: Bounds<Pixels>,
     scroll_offset: Option<Point<Pixels>>,
     viewport: Bounds<Pixels>,
+    /// A row value's visible area, for deciding which wheel gestures it owns.
+    wheel_hitbox: Option<gpui::Hitbox>,
 }
 
 impl IntoElement for TextEditorText {
@@ -3275,6 +3383,10 @@ impl Element for TextEditorText {
                 window.scale_factor(),
             );
         }
+        let viewport = viewport.intersect(&editor.scroll_handle.bounds());
+        let wheel_hitbox = editor
+            .row_value
+            .then(|| window.insert_hitbox(viewport, gpui::HitboxBehavior::Normal));
         PrepaintState {
             lines,
             decorations,
@@ -3284,7 +3396,8 @@ impl Element for TextEditorText {
             selections,
             paint_bounds,
             scroll_offset,
-            viewport: viewport.intersect(&editor.scroll_handle.bounds()),
+            viewport,
+            wheel_hitbox,
         }
     }
 
@@ -3370,6 +3483,31 @@ impl Element for TextEditorText {
                 editor.update(cx, |editor, cx| editor.on_mouse_up(event, window, cx));
             }
         });
+        // Observe every wheel event in the window, not just those over this
+        // value, so a gesture that began elsewhere is recognised when it
+        // slides this value under the pointer.
+        if let Some(hitbox) = state.wheel_hitbox.take() {
+            let editor = self.editor.downgrade();
+            window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                if phase != gpui::DispatchPhase::Capture {
+                    return;
+                }
+                let Some(editor) = editor.upgrade() else {
+                    return;
+                };
+                cx.default_global::<WheelLatch>()
+                    .observe(event, std::time::Instant::now());
+                if hitbox.should_handle_scroll(window) {
+                    let (delta, scrollable) = {
+                        let editor = editor.read(cx);
+                        let delta = editor.wheel_delta(event, window);
+                        (delta, editor.claims_wheel(delta))
+                    };
+                    cx.default_global::<WheelLatch>()
+                        .claim(editor.entity_id(), delta, scrollable);
+                }
+            });
+        }
         self.editor.update(cx, |editor, _| {
             if let Some(scroll_offset) = state.scroll_offset
                 && editor.scroll_handle.offset() != scroll_offset
@@ -4487,63 +4625,157 @@ mod tests {
         }
     }
 
+    fn wheel(
+        cx: &mut gpui::VisualTestContext,
+        position: Point<Pixels>,
+        delta: Point<Pixels>,
+        touch_phase: gpui::TouchPhase,
+    ) {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(delta),
+            touch_phase,
+            ..Default::default()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn offsets(
+        view: &Entity<ScrollTestView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (Point<Pixels>, Point<Pixels>) {
+        view.read_with(cx, |view, cx| {
+            (
+                view.scroll.offset(),
+                view.editor.read(cx).scroll_handle.offset(),
+            )
+        })
+    }
+
     #[gpui::test]
-    fn hovered_values_scroll_only_for_gestures_that_start_over_them(cx: &mut gpui::TestAppContext) {
+    fn wheel_gestures_stay_with_the_area_they_started_over(cx: &mut gpui::TestAppContext) {
+        use gpui::TouchPhase::{Ended, Moved, Started};
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| scroll_test_view(true, window, cx));
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let editor = view.read_with(cx, |view, _| view.editor.clone());
-        let position = editor.read_with(cx, |editor, _| editor.scroll_handle.bounds().center());
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position,
-            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
-            ..Default::default()
-        });
-        view.read_with(cx, |view, cx| {
-            assert!(
-                view.scroll.offset().y < px(0.),
-                "a gesture that began elsewhere keeps scrolling the sidebar"
-            );
-            assert_eq!(view.editor.read(cx).scroll_handle.offset().y, px(0.));
-        });
+        let pointer = editor.read_with(cx, |editor, _| editor.scroll_handle.bounds().center());
+        // The value sits above the viewport with its own text scrolled midway.
         view.update(cx, |view, cx| {
-            view.scroll.set_offset(point(px(0.), px(0.)));
-            cx.notify();
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        // No focus needed: a gesture starting over the value scrolls it.
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position,
-            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
-            touch_phase: gpui::TouchPhase::Started,
-            ..Default::default()
-        });
-        cx.update(|window, cx| {
-            window.simulate_next_frame(cx);
-            window.refresh();
-        });
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        view.read_with(cx, |view, cx| {
-            assert_eq!(view.scroll.offset().y, px(0.));
-            assert!(
-                view.editor.read(cx).scroll_handle.offset().y < px(0.),
-                "focused wheel scroll must not snap back to the caret"
-            );
-        });
-        // Once the value reaches its end, let the sidebar continue naturally.
-        editor.update(cx, |editor, cx| {
-            editor
+            view.scroll.set_offset(point(px(0.), px(-100.)));
+            view.editor
+                .read(cx)
                 .scroll_handle
-                .set_offset(point(px(0.), -editor.scroll_handle.max_offset().y));
+                .set_offset(point(px(0.), px(-100.)));
             cx.notify();
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_event(gpui::ScrollWheelEvent {
-            position,
-            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-40.))),
-            ..Default::default()
+
+        // Scrolling the sidebar slides the value under the stationary pointer;
+        // the gesture keeps scrolling the sidebar.
+        wheel(cx, pointer, point(px(0.), px(30.)), Started);
+        for _ in 0..3 {
+            wheel(cx, pointer, point(px(0.), px(30.)), Moved);
+        }
+        let (sidebar, value) = offsets(&view, cx);
+        assert_eq!(sidebar.y, px(0.), "the sidebar scrolls to its top");
+        assert_eq!(
+            value.y,
+            px(-100.),
+            "the value under the pointer is untouched"
+        );
+
+        // A new gesture over the value scrolls it without focusing it, and
+        // keeps it through momentum and at its edge.
+        wheel(cx, pointer, point(px(0.), px(30.)), Started);
+        assert_eq!(offsets(&view, cx).1.y, px(-70.));
+        wheel(cx, pointer, point(px(0.), px(0.)), Ended);
+        wheel(cx, pointer, point(px(0.), px(-4000.)), Moved);
+        let (sidebar, value) = offsets(&view, cx);
+        assert_eq!(sidebar.y, px(0.));
+        let maximum = editor.read_with(cx, |editor, _| editor.scroll_handle.max_offset());
+        assert_eq!(value.y, -maximum.y, "momentum stays with the value");
+        wheel(cx, pointer, point(px(0.), px(-40.)), Moved);
+        assert_eq!(
+            offsets(&view, cx).0.y,
+            px(0.),
+            "an owned gesture does not chain at the value's edge"
+        );
+
+        // From the value's end, the next gesture chains to the sidebar.
+        wheel(cx, pointer, point(px(0.), px(-40.)), Started);
+        let (sidebar, value) = offsets(&view, cx);
+        assert!(sidebar.y < px(0.));
+        assert_eq!(value.y, -maximum.y);
+    }
+
+    #[gpui::test]
+    fn single_line_values_take_only_horizontal_gestures(cx: &mut gpui::TestAppContext) {
+        use gpui::TouchPhase::Started;
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| scroll_test_view(false, window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let pointer = view.read_with(cx, |view, cx| {
+            view.editor.read(cx).scroll_handle.bounds().center()
         });
-        view.read_with(cx, |view, _| assert!(view.scroll.offset().y < px(0.)));
+        // A vertical swipe with a little sideways drift scrolls the sidebar.
+        wheel(cx, pointer, point(px(-3.), px(-40.)), Started);
+        let (sidebar, value) = offsets(&view, cx);
+        assert!(sidebar.y < px(0.));
+        assert_eq!(value.x, px(0.));
+
+        let pointer = view.read_with(cx, |view, cx| {
+            view.editor.read(cx).scroll_handle.bounds().center()
+        });
+        wheel(cx, pointer, point(px(-40.), px(-3.)), Started);
+        let (after, value) = offsets(&view, cx);
+        assert_eq!(after, sidebar);
+        assert_eq!(value, point(px(-40.), px(0.)));
+    }
+
+    #[test]
+    fn wheel_latch_ends_gestures_on_pause_or_pointer_movement() {
+        use gpui::TouchPhase::Moved;
+        use std::time::{Duration, Instant};
+        let editor = gpui::EntityId::from(1_u64);
+        let event = |x: f32| gpui::ScrollWheelEvent {
+            position: point(px(x), px(10.)),
+            delta: gpui::ScrollDelta::Lines(point(0., -1.)),
+            touch_phase: Moved,
+            ..Default::default()
+        };
+        let delta = point(px(0.), px(-20.));
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut latch = WheelLatch::default();
+
+        // A mouse wheel has no phases: its first tick starts a gesture, and
+        // a value under the pointer takes it.
+        latch.observe(&event(10.), at(0));
+        latch.claim(editor, delta, true);
+        assert_eq!(latch.target, WheelTarget::Editor(editor));
+        // The same event reaching a second observer changes nothing.
+        latch.observe(&event(10.), at(0));
+        assert_eq!(latch.target, WheelTarget::Editor(editor));
+
+        // Steady ticks continue the gesture, even with a quick hand nudge.
+        latch.observe(&event(10.), at(150));
+        latch.observe(&event(14.), at(200));
+        latch.claim(gpui::EntityId::from(2_u64), delta, true);
+        assert_eq!(latch.target, WheelTarget::Editor(editor));
+
+        // Moving the pointer after a short pause starts a new gesture.
+        latch.observe(&event(40.), at(450));
+        assert_eq!(latch.target, WheelTarget::Undecided);
+        // Nothing claims it, so the sidebar keeps it from the next tick on.
+        latch.observe(&event(40.), at(500));
+        latch.claim(editor, delta, true);
+        assert_eq!(latch.target, WheelTarget::Outer);
+
+        // A longer pause starts a new gesture where the pointer rests.
+        latch.observe(&event(40.), at(1_000));
+        latch.claim(editor, delta, true);
+        assert_eq!(latch.target, WheelTarget::Editor(editor));
     }
 
     #[gpui::test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1 - 2026-10-27
+
+- Scroll row-value fields by hovering them, no click needed. Each scroll gesture stays with the area it started over: a sidebar scroll keeps going when a field slides under the pointer, and a field scroll (including trackpad momentum) doesn't spill into the sidebar at the field's edge. A new gesture, a pause of 0.4 s, or moving the mouse retargets the scroll.
+
 ## 0.18.0 - 2026-10-26
 
 - Use an AppKit sidebar and toolbar for Liquid Glass on macOS 26 or later, with native scroll-edge effects and stable opaque tables, editors and forms. Turn it on or off in Settings → Appearance; macOS accessibility preferences take priority. Connection tabs show their tag in its colour, and content panels follow the window's corner radius.
