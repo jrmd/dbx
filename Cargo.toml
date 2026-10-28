@@ -10,7 +10,7 @@ resolver = "2"
 exclude = ["vendor/gpui-component", "vendor/accesskit_atspi_common", "vendor/accesskit_unix"]
 
 [workspace.package]
-version = "0.18.1"
+version = "0.18.2"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"

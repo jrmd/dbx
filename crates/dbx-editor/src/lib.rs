@@ -2678,9 +2678,30 @@ impl Render for TextEditor {
                 .children(self.render_hover())
                 .into_any_element()
         } else if self.row_value {
-            editor
+            let field = editor
                 .overflow_hidden()
-                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel));
+            if !self.multiline {
+                return field.into_any_element();
+            }
+            // The wheel latch still owns wheel scrolling; the overlay only
+            // shows where the value is, hides when it fits, and drags.
+            div()
+                .relative()
+                .size_full()
+                .min_w_0()
+                .child(field)
+                .child(
+                    div().absolute().inset_0().child(
+                        gpui_component::scroll::Scrollbar::new(&self.scroll_handle)
+                            .id(gpui::SharedString::from(format!(
+                                "dbx-text-editor-scrollbar-{:?}",
+                                cx.entity().entity_id()
+                            )))
+                            .axis(gpui_component::scroll::ScrollbarAxis::Both)
+                            .viewport_from_layout(),
+                    ),
+                )
                 .into_any_element()
         } else if self.multiline {
             editor.overflow_scroll().into_any_element()
@@ -4707,6 +4728,31 @@ mod tests {
         let (sidebar, value) = offsets(&view, cx);
         assert!(sidebar.y < px(0.));
         assert_eq!(value.y, -maximum.y);
+    }
+
+    #[gpui::test]
+    fn multiline_values_show_a_scrollbar_that_scrolls_them(cx: &mut gpui::TestAppContext) {
+        use gpui::TouchPhase::Started;
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| scroll_test_view(true, window, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let editor = view.read_with(cx, |view, _| view.editor.clone());
+        let bounds = editor.read_with(cx, |editor, _| editor.scroll_handle.bounds());
+        // Wheel scrolling reveals the bar.
+        wheel(cx, bounds.center(), point(px(0.), px(-20.)), Started);
+        assert_eq!(offsets(&view, cx).1.y, px(-20.));
+
+        // Pressing near the bottom of its track jumps the value there.
+        let track = point(bounds.right() - px(3.), bounds.bottom() - px(12.));
+        cx.simulate_mouse_down(track, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(track, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (sidebar, value) = offsets(&view, cx);
+        assert_eq!(sidebar.y, px(0.));
+        assert!(
+            value.y < px(-200.),
+            "the track scrolls the value: {value:?}"
+        );
     }
 
     #[gpui::test]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.2 - 2026-10-28
+
+- Show a draggable scrollbar for multiline row values, making long values easier to navigate.
+
 ## 0.18.1 - 2026-10-27
 
 - Scroll row-value fields by hovering them, no click needed. Each scroll gesture stays with the area it started over: a sidebar scroll keeps going when a field slides under the pointer, and a field scroll (including trackpad momentum) doesn't spill into the sidebar at the field's edge. A new gesture, a pause of 0.4 s, or moving the mouse retargets the scroll.
