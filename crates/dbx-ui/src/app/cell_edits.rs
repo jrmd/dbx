@@ -117,6 +117,8 @@ pub(super) struct CellEditor {
     pub(super) column: usize,
     pub(super) editor: Entity<TextEditor>,
     pub(super) structured: bool,
+    /// Edited in the expanded panel, so newlines survive and Enter inserts one.
+    pub(super) multiline: bool,
     pub(super) bulk_rows: Vec<usize>,
     binary_format: Option<value_view::BinaryFormat>,
     _blur: Subscription,
@@ -455,6 +457,7 @@ impl DbxApp {
                     value_view::json_preview(value).unwrap_or_else(|| field_editor_text(value))
                 }),
         };
+        let multiline = structured || text.contains(['\n', '\r']);
         let column_name = data
             .table_columns
             .get(column)
@@ -464,7 +467,7 @@ impl DbxApp {
         let editor = cx.new(|cx| {
             TextEditor::new_with_language(
                 value,
-                structured,
+                multiline,
                 if structured {
                     EditorLanguage::Json
                 } else {
@@ -484,7 +487,12 @@ impl DbxApp {
         });
         let focus = editor.read(cx).focus_handle();
         let blur = cx.on_blur(&focus, window, move |this, window, cx| {
-            if !structured {
+            // Promotion to the expanded editor can happen after this was set up.
+            let expanded = this
+                .data_tab(session_id, tab_id)
+                .and_then(|data| data.cell_editor.as_ref())
+                .is_some_and(|cell| cell.multiline);
+            if !expanded {
                 this.commit_cell_edit_for(session_id, tab_id, None, window, cx);
             }
         });
@@ -496,12 +504,46 @@ impl DbxApp {
             column,
             editor: editor.clone(),
             structured,
+            multiline,
             bulk_rows: Vec::new(),
             binary_format,
             _blur: blur,
         });
         data.sync_cell_edits(cx);
         editor.update(cx, |editor, cx| editor.select_all_text(cx));
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Shift/Alt-Enter in an inline cell editor: move to the expanded editor
+    /// and add a line break at the cursor.
+    pub(super) fn insert_cell_newline_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cell) = self
+            .data_tab_mut(session_id, tab_id)
+            .and_then(|data| data.cell_editor.as_mut())
+        else {
+            return;
+        };
+        // Binary editors hold hex or base64, which a line break would corrupt.
+        if cell
+            .binary_format
+            .is_some_and(|format| format != value_view::BinaryFormat::Text)
+        {
+            return;
+        }
+        cell.multiline = true;
+        let editor = cell.editor.clone();
+        let focus = editor.read(cx).focus_handle();
+        editor.update(cx, |editor, cx| {
+            editor.set_multiline(cx);
+            editor.insert_newline(cx);
+        });
         focus.focus(window, cx);
         cx.notify();
     }

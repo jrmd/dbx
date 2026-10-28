@@ -130,6 +130,29 @@ const AUTO_WIDTH_SAMPLE_ROWS: usize = 200;
 /// keeps huge values from being shaped or copied every frame.
 const CELL_TEXT_LIMIT: usize = 300;
 
+/// Grid rows are one line tall, so line breaks show as a visible marker
+/// instead of stacking the value's lines on top of each other.
+fn flatten_lines(text: String) -> String {
+    if !text.contains(['\n', '\r']) {
+        return text;
+    }
+    let mut flat = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                flat.push('↵');
+            }
+            '\n' => flat.push('↵'),
+            character => flat.push(character),
+        }
+    }
+    flat
+}
+
 /// Single-line display text for a cell, capped at `CELL_TEXT_LIMIT` characters.
 fn cell_display_text(value: &CellValue) -> String {
     let full;
@@ -149,10 +172,10 @@ fn cell_display_text(value: &CellValue) -> String {
             full.as_str()
         }
     };
-    match text.char_indices().nth(CELL_TEXT_LIMIT) {
+    flatten_lines(match text.char_indices().nth(CELL_TEXT_LIMIT) {
         Some((end, _)) => format!("{}…", &text[..end]),
         None => text.to_owned(),
-    }
+    })
 }
 
 fn rendered_cell_text(text: SharedString, json: bool) -> gpui::StyledText {
@@ -441,7 +464,7 @@ impl ResultTableDelegate {
             } else {
                 CELL_TEXT_LIMIT / 2
             };
-            format.limited_text(value, limit)
+            flatten_lines(format.limited_text(value, limit))
         } else {
             cell_display_text(value)
         }

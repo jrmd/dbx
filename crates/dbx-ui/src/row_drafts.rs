@@ -448,9 +448,15 @@ impl FieldRow {
                     .row_value()
                     .accessibility_label(column.name.clone())
             } else {
-                TextEditor::new(value.clone(), false, window, editor_cx)
-                    .row_value()
-                    .accessibility_label(column.name.clone())
+                // Text may hold line breaks, so Enter inserts one.
+                TextEditor::new(
+                    value.clone(),
+                    value_kind == FieldValueKind::Text,
+                    window,
+                    editor_cx,
+                )
+                .row_value()
+                .accessibility_label(column.name.clone())
             }
         });
         let sql_editor = cx.new(|editor_cx| {

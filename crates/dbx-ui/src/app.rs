@@ -175,6 +175,7 @@ gpui::actions!(
         ApplyFilters,
         CommitCellEdit,
         CommitCellEditNext,
+        InsertCellNewline,
         CommitCellEditPrevious,
         CancelCellEdit,
         SetCellNull,

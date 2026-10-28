@@ -184,6 +184,8 @@ fn main() {
             KeyBinding::new("ctrl-shift-z", app::RedoGridEdits, Some("DbxDataGrid")),
             KeyBinding::new("enter", app::ApplyFilters, Some("DbxFilters")),
             KeyBinding::new("enter", app::CommitCellEdit, Some("DbxCellEditor")),
+            KeyBinding::new("shift-enter", app::InsertCellNewline, Some("DbxCellEditor")),
+            KeyBinding::new("alt-enter", app::InsertCellNewline, Some("DbxCellEditor")),
             KeyBinding::new(
                 "enter",
                 app::SubmitQueryParameters,

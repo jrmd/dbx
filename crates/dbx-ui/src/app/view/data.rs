@@ -598,6 +598,9 @@ impl DbxApp {
             .on_action(cx.listener(move |this, _: &CommitCellEdit, window, cx| {
                 this.commit_cell_edit_for(session_id, tab_id, None, window, cx)
             }))
+            .on_action(cx.listener(move |this, _: &InsertCellNewline, window, cx| {
+                this.insert_cell_newline_for(session_id, tab_id, window, cx)
+            }))
             .on_action(
                 cx.listener(move |this, _: &CommitCellEditNext, window, cx| {
                     this.commit_cell_edit_for(session_id, tab_id, Some(true), window, cx)
@@ -617,10 +620,15 @@ impl DbxApp {
             .when_some(
                 self.data_tab(session_id, tab_id)
                     .and_then(|data| data.cell_editor.as_ref())
-                    .filter(|cell| cell.structured)
-                    .map(|cell| cell.editor.clone()),
-                |view, editor| {
+                    .filter(|cell| cell.multiline)
+                    .map(|cell| (cell.editor.clone(), cell.structured)),
+                |view, (editor, structured)| {
                     let focus = editor.read(cx).focus_handle();
+                    let title = if structured {
+                        "JSON editor"
+                    } else {
+                        "Text editor"
+                    };
                     view.child(
                         div()
                             .flex_none()
@@ -630,7 +638,7 @@ impl DbxApp {
                             .flex_col()
                             .gap(crate::theme::ui_px(6.))
                             .child(
-                                div().flex().justify_between().child("JSON editor").child(
+                                div().flex().justify_between().child(title).child(
                                     div()
                                         .flex()
                                         .gap(crate::theme::ui_px(6.))
@@ -896,7 +904,7 @@ impl DbxApp {
                                 field.enum_selector.clone(),
                                 field.boolean_selector.clone(),
                                 field.state_selector.clone(),
-                                field.value_kind() == FieldValueKind::Json,
+                                field.value_kind(),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1072,8 +1080,29 @@ impl DbxApp {
                             enum_selector,
                             boolean_selector,
                             state_selector,
-                            is_json,
+                            value_kind,
                         )| {
+                            let is_json = value_kind == FieldValueKind::Json;
+                            let is_multiline = is_json || value_kind == FieldValueKind::Text;
+                            let field_height = if is_json {
+                                multiline_height
+                            } else if is_multiline {
+                                let lines = field_editor
+                                    .read(cx)
+                                    .value_entity()
+                                    .read(cx)
+                                    .split('\n')
+                                    .count()
+                                    .max(1);
+                                // GPUI's default line height, plus the field's padding
+                                // and border; never shorter than a single-line field.
+                                (crate::theme::row_text_px(12.) * 1.618 * lines as f32
+                                    + crate::theme::ui_px(22.))
+                                .max(editor::single_line_input_height(&field_editor, cx))
+                                .min(multiline_height)
+                            } else {
+                                crate::theme::ui_px(32.)
+                            };
                             let field_focus = field_editor.read(cx).focus_handle();
                             let sql_focus = sql_editor.read(cx).focus_handle();
                             let is_enum = enum_selector.is_some();
@@ -1111,12 +1140,8 @@ impl DbxApp {
                                         editor::input_with_height(
                                             field_editor,
                                             field_focus,
-                                            is_json,
-                                            if is_json {
-                                                multiline_height
-                                            } else {
-                                                crate::theme::ui_px(32.)
-                                            },
+                                            is_multiline,
+                                            field_height,
                                             cx,
                                         )
                                         .debug_selector(move || format!("row-value-{field_id}")),

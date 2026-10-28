@@ -490,6 +490,14 @@ impl TextEditor {
         self
     }
 
+    /// Let a single-line field grow into a multiline one, keeping its text and cursor.
+    pub fn set_multiline(&mut self, cx: &mut Context<Self>) {
+        if !self.multiline {
+            self.multiline = true;
+            cx.notify();
+        }
+    }
+
     /// Make the editor a selectable, copyable view of its value.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
