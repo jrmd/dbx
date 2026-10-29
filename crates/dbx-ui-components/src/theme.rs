@@ -623,7 +623,7 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     // The workspace already paints the translucent canvas behind the grid;
     // a second canvas fill would make that material effectively opaque.
     component.colors.table = if native_glass_active() && !reduce_transparency() {
-        gpui::transparent_black().into()
+        gpui::transparent_black()
     } else {
         palette.canvas.into()
     };
