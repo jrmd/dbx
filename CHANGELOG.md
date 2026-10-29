@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.19.2 - 2026-10-29
+
+- Use native macOS context menus throughout the Liquid Glass workspace, including document tabs, tab groups and result rows.
+- Improve connection-tab contrast in light mode, show each database's own logo, and make the selected connection easier to identify.
+- Refine document tabs and rounded tab groups, and let the desktop backdrop show subtly through the workspace while keeping table rows readable.
+- Match the new-connection button to the toolbar and improve the appearance of floating panels in Liquid Glass mode.
+
 ## 0.19.1 - 2026-10-29
 
 - Open the vault in a compact centred window, then expand and centre the workspace after unlocking.
