@@ -639,7 +639,7 @@ impl DbxApp {
                 }
             }
         });
-        glass(div(), RADIUS_GLASS, 8.).id(SharedString::from(format!("database-explorer-{session_id}"))).role(gpui::Role::Region).aria_label("Database explorer")
+        glass(div(), crate::theme::navigation_radius(), 8.).id(SharedString::from(format!("database-explorer-{session_id}"))).role(gpui::Role::Region).aria_label("Database explorer")
             .w(px(self.explorer_width()))
             .flex_none()
             .flex()

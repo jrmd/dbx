@@ -318,6 +318,8 @@ pub struct TextEditor {
     /// the value programmatically with [`Self::set_text`].
     read_only: bool,
     row_value: bool,
+    /// Show the line-number gutter on a multiline row-value editor (SQL always has one).
+    line_numbers: bool,
     accessibility_label: SharedString,
     accessible_text: std::rc::Rc<std::cell::RefCell<accessibility::AccessibleText>>,
     /// UTF-8 byte ranges at grapheme boundaries.
@@ -424,6 +426,7 @@ impl TextEditor {
             password: false,
             read_only: false,
             row_value: false,
+            line_numbers: false,
             accessibility_label: match language {
                 EditorLanguage::Sql(_) => "SQL query",
                 EditorLanguage::Redis => "Redis command",
@@ -506,6 +509,17 @@ impl TextEditor {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Show line numbers beside a multiline row-value editor (JSON and long text).
+    pub fn line_numbers(mut self) -> Self {
+        self.line_numbers = true;
+        self
+    }
+
+    /// Whether a line-number gutter is drawn beside the text.
+    fn has_gutter(&self) -> bool {
+        self.is_code() || (self.multiline && self.line_numbers)
     }
 
     /// Use the row-value font, including for JSON, and follow preference changes.
@@ -2694,22 +2708,29 @@ impl Render for TextEditor {
             }
             // The wheel latch still owns wheel scrolling; the overlay only
             // shows where the value is, hides when it fits, and drags.
+            let body = div().relative().size_full().min_w_0().child(field).child(
+                div().absolute().inset_0().child(
+                    gpui_component::scroll::Scrollbar::new(&self.scroll_handle)
+                        .id(gpui::SharedString::from(format!(
+                            "dbx-text-editor-scrollbar-{:?}",
+                            cx.entity().entity_id()
+                        )))
+                        .axis(gpui_component::scroll::ScrollbarAxis::Both)
+                        .viewport_from_layout(),
+                ),
+            );
+            if !self.line_numbers {
+                return body.into_any_element();
+            }
             div()
-                .relative()
+                .flex()
                 .size_full()
+                .when_some(code_font, |view, family| view.font_family(family))
                 .min_w_0()
-                .child(field)
-                .child(
-                    div().absolute().inset_0().child(
-                        gpui_component::scroll::Scrollbar::new(&self.scroll_handle)
-                            .id(gpui::SharedString::from(format!(
-                                "dbx-text-editor-scrollbar-{:?}",
-                                cx.entity().entity_id()
-                            )))
-                            .axis(gpui_component::scroll::ScrollbarAxis::Both)
-                            .viewport_from_layout(),
-                    ),
-                )
+                .child(LineNumberGutter {
+                    editor: cx.entity(),
+                })
+                .child(body.flex_1().w_0())
                 .into_any_element()
         } else if self.multiline {
             editor.overflow_scroll().into_any_element()
@@ -3544,7 +3565,7 @@ impl Element for TextEditorText {
                 editor.scroll_handle.set_offset(scroll_offset);
                 // The line-number gutter painted earlier this frame with the
                 // old offset.
-                if editor.is_code() {
+                if editor.has_gutter() {
                     // A refresh during painting is cleared at the end of the
                     // current draw. Schedule the follow-up after this frame so
                     // the gutter repaints with the committed offset.

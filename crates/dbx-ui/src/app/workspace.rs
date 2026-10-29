@@ -115,11 +115,15 @@ impl DbxApp {
         else {
             return;
         };
+        let generation = self.vault_generation;
         let task = self.runtime.spawn_blocking(move || store.load_startup());
         cx.spawn_in(window, async move |this, cx| {
             let document = task.await?;
             this.update_in(cx, |this, window, cx| {
-                if this.vault_state != Some(VaultState::Unlocked) || !this.sessions.is_empty() {
+                if this.vault_generation != generation
+                    || this.vault_state != Some(VaultState::Unlocked)
+                    || !this.sessions.is_empty()
+                {
                     return;
                 }
                 let document = match document {

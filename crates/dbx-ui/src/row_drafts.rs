@@ -163,6 +163,72 @@ pub fn field_value_kind(column: &ColumnInfo) -> FieldValueKind {
     }
 }
 
+/// Longer VARCHAR/CHAR values open the popover editor instead of an inline
+/// cell edit. 200 characters is roughly two wrapped lines in a 100px grid
+/// column at the default text size, past which an inline field can't show the
+/// value or its caret context; a typical name, URL or code stays below it.
+pub const LARGE_TEXT_CHARS: usize = 200;
+
+/// Where a value is edited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditSurface {
+    /// The ordinary single-line cell (or sidebar) field.
+    Inline,
+    /// The popover editor, with JSON line numbers and Format.
+    Json,
+    /// The popover editor for long or multi-line text.
+    Text,
+}
+
+impl EditSurface {
+    pub fn is_popover(self) -> bool {
+        self != Self::Inline
+    }
+}
+
+/// Whether a column type holds unbounded text (TEXT, MEDIUMTEXT, CLOB, ...)
+/// rather than a bounded VARCHAR/CHAR. Arrays of text stay inline.
+pub fn is_text_like_type(data_type: &str) -> bool {
+    let data_type = data_type.trim().to_ascii_lowercase();
+    if data_type.ends_with("[]") {
+        return false;
+    }
+    let base = data_type
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .find(|word| !word.is_empty())
+        .unwrap_or_default();
+    matches!(
+        base,
+        "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "citext" | "clob" | "nclob"
+    ) || data_type.contains("large object")
+}
+
+/// The one rule for grid double-click and the row inspector: JSON values and
+/// JSON-typed columns, TEXT-like columns, and any text that contains a line
+/// break or exceeds [`LARGE_TEXT_CHARS`] use the popover; everything else
+/// (short VARCHAR/CHAR, numbers, dates, NULL in a VARCHAR) edits inline.
+/// Binary columns follow the VARCHAR rule on the text of their current
+/// display format (UTF-8 text, hex, UUID, bits), so a large BLOB expands.
+/// `value` is the current text (None for NULL); `json_value` says it parses
+/// as a JSON document, including UTF-8 bytes.
+pub fn edit_surface(data_type: &str, value: Option<&str>, json_value: bool) -> EditSurface {
+    if json_value || data_type.to_ascii_lowercase().contains("json") {
+        return EditSurface::Json;
+    }
+    if is_text_like_type(data_type) {
+        return EditSurface::Text;
+    }
+    match value {
+        Some(text)
+            if !data_type.trim().to_ascii_lowercase().ends_with("[]")
+                && (text.contains(['\n', '\r']) || text.chars().count() > LARGE_TEXT_CHARS) =>
+        {
+            EditSurface::Text
+        }
+        _ => EditSurface::Inline,
+    }
+}
+
 /// A typed value parsing failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FieldValueError {
@@ -446,6 +512,7 @@ impl FieldRow {
             if value_kind == FieldValueKind::Json {
                 TextEditor::new_json(value.clone(), window, editor_cx)
                     .row_value()
+                    .line_numbers()
                     .accessibility_label(column.name.clone())
             } else {
                 // Text may hold line breaks, so Enter inserts one.
@@ -1127,6 +1194,62 @@ pub fn extract_insert_values(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edit_surface_classifies_columns_and_values() {
+        use super::{EditSurface::*, LARGE_TEXT_CHARS, edit_surface};
+        let long = "x".repeat(LARGE_TEXT_CHARS + 1);
+        let limit = "x".repeat(LARGE_TEXT_CHARS);
+        // TEXT-like types always use the popover, even empty or NULL.
+        for text_type in [
+            "TEXT",
+            "text",
+            "MEDIUMTEXT",
+            "LONGTEXT",
+            "TINYTEXT",
+            "citext",
+            "CLOB",
+            "NCLOB",
+            "character large object",
+        ] {
+            assert_eq!(
+                edit_surface(text_type, Some("hi"), false),
+                Text,
+                "{text_type}"
+            );
+            assert_eq!(edit_surface(text_type, None, false), Text, "{text_type}");
+        }
+        // Short VARCHAR/CHAR stay inline; NULL too.
+        for short in ["VARCHAR(255)", "character varying", "char(3)", "varchar"] {
+            assert_eq!(edit_surface(short, Some("hello"), false), Inline, "{short}");
+            assert_eq!(edit_surface(short, Some(&limit), false), Inline, "{short}");
+            assert_eq!(edit_surface(short, None, false), Inline, "{short}");
+            // ... unless the value is large or has a line break.
+            assert_eq!(edit_surface(short, Some(&long), false), Text, "{short}");
+            assert_eq!(edit_surface(short, Some("a\nb"), false), Text, "{short}");
+            assert_eq!(edit_surface(short, Some("a\rb"), false), Text, "{short}");
+        }
+        // JSON by type or by value.
+        assert_eq!(edit_surface("jsonb", None, false), Json);
+        assert_eq!(edit_surface("JSON", Some("{}"), true), Json);
+        assert_eq!(edit_surface("TEXT", Some("{\"a\":1}"), true), Json);
+        // Numbers, arrays and binary never move to the popover on length alone.
+        assert_eq!(edit_surface("integer", Some("42"), false), Inline);
+        assert_eq!(edit_surface("text[]", Some(&long), false), Inline);
+        // Binary columns expand when their displayed text is large.
+        for blob in ["BLOB", "LONGBLOB", "bytea", "VARBINARY(512)", "binary(16)"] {
+            assert_eq!(
+                edit_surface(blob, Some("deadbeef"), false),
+                Inline,
+                "{blob}"
+            );
+            assert_eq!(edit_surface(blob, Some(&long), false), Text, "{blob}");
+            assert_eq!(edit_surface(blob, Some("a\nb"), false), Text, "{blob}");
+            assert_eq!(edit_surface(blob, Some("{\"a\":1}"), true), Json, "{blob}");
+            assert_eq!(edit_surface(blob, None, false), Inline, "{blob}");
+        }
+        assert!(!is_text_like_type("varchar(10)"));
+    }
+
     use super::*;
 
     fn column(name: &str, data_type: &str, nullable: bool) -> ColumnInfo {

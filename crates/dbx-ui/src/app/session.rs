@@ -881,6 +881,8 @@ pub(super) struct DataTab {
     pub(super) inspector_copy_generation: u64,
     pub(super) draft_mode: DraftMode,
     pub(super) row_draft: Option<RowDraftModel>,
+    /// The expanded value editor opened from the inspector.
+    pub(super) field_popover: Option<super::cell_edits::FieldPopover>,
     pub(super) row_draft_subscriptions: Vec<Subscription>,
     pub(super) suppress_next_grid_selection_event: bool,
     pub(super) busy: bool,
@@ -954,6 +956,7 @@ impl DataTab {
             inspector_copy_generation: 0,
             draft_mode: DraftMode::Update,
             row_draft: None,
+            field_popover: None,
             row_draft_subscriptions: Vec::new(),
             suppress_next_grid_selection_event: false,
             busy: false,
@@ -1020,6 +1023,7 @@ impl DataTab {
         self.edit_history = Default::default();
         self.selected_row = None;
         self.inspector_copied = None;
+        self.field_popover = None;
         self.marked_rows.clear();
         self.mark_anchor = None;
         self.draft_insert = None;

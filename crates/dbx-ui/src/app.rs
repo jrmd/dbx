@@ -178,6 +178,8 @@ gpui::actions!(
         InsertCellNewline,
         CommitCellEditPrevious,
         CancelCellEdit,
+        CancelValuePopover,
+        StageValuePopover,
         SetCellNull,
         CommitChanges,
         DeleteRows,
@@ -873,6 +875,7 @@ pub struct DbxApp {
     draft: ConnectionDraft,
     vault_editors: VaultEditors,
     vault_state: Option<VaultState>,
+    window_vault_unlocked: bool,
     vault_busy: bool,
     /// Whether a passphrase unlock also trusts this device, keeping the vault
     /// key in the system keychain so later launches skip the passphrase.
@@ -1072,6 +1075,7 @@ impl DbxApp {
             draft,
             vault_editors,
             vault_state,
+            window_vault_unlocked: false,
             vault_busy: false,
             remember_device: saved_settings
                 .as_ref()
@@ -5668,12 +5672,20 @@ mod tests {
                     cx,
                 );
                 app.save_named_query_for(session_id, cx);
+                app.startup_recovery_started = true;
+                let generation = app.vault_generation;
                 app.lock_vault(cx);
                 assert!(app.sessions.is_empty());
                 assert!(app.workspace_documents.is_empty());
+                assert!(!app.startup_recovery_started);
+                assert!(app.vault_generation > generation);
             })
         });
         vault.unlock("draft recovery passphrase").unwrap();
+        let startup = workspace.load_startup().unwrap();
+        assert_eq!(startup.connections.len(), 1);
+        assert_eq!(startup.connections[0].profile_id, profile_id);
+        assert_eq!(startup.active, Some(0));
         let recovered = workspace.load(&key).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(recovered.saved.len(), 1);

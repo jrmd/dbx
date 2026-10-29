@@ -10,7 +10,7 @@ use dbx_core::{MutationValue, RowChange};
 use super::result_table::GridChanges;
 use super::*;
 use crate::editor::EditorLanguage;
-use crate::row_drafts::{field_editor_text, parse_field_value};
+use crate::row_drafts::{EditSurface, edit_surface, field_editor_text, parse_field_value};
 
 /// The combined context lets the cell's Enter/Tab/Escape bindings sit at the
 /// editor's own dispatch depth.
@@ -119,9 +119,56 @@ pub(super) struct CellEditor {
     pub(super) structured: bool,
     /// Edited in the expanded panel, so newlines survive and Enter inserts one.
     pub(super) multiline: bool,
+    /// Text when the editor opened, so a backdrop click can tell whether
+    /// anything would be lost.
+    pub(super) original: String,
+    /// Tracks the popover container for the modal focus trap.
+    pub(super) popover_focus: FocusHandle,
     pub(super) bulk_rows: Vec<usize>,
-    binary_format: Option<value_view::BinaryFormat>,
+    pub(super) binary_format: Option<value_view::BinaryFormat>,
+    /// JSON exactly as it was before the popover pretty-printed it. Staging
+    /// the same document leaves the cell untouched, byte for byte.
+    json_source: Option<String>,
     _blur: Subscription,
+}
+
+/// Which inspector value the popover edits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FieldTarget {
+    /// A field of the open row draft.
+    Draft(crate::row_drafts::FieldId),
+    /// A column of the selected row, shown read-only.
+    Static(usize),
+}
+
+/// The popover opened from the row inspector's expand button.
+pub(super) struct FieldPopover {
+    pub(super) target: FieldTarget,
+    pub(super) surface: EditSurface,
+    pub(super) editor: Entity<TextEditor>,
+    pub(super) original: String,
+    pub(super) title: String,
+    pub(super) data_type: String,
+    /// The binary display format shown in the header, for blob values.
+    pub(super) tag: Option<&'static str>,
+    pub(super) focus: FocusHandle,
+}
+
+/// Short header tag for a binary value's display format.
+pub(super) fn binary_tag(format: value_view::BinaryFormat) -> &'static str {
+    use value_view::BinaryFormat::*;
+    match format {
+        Text => "Text",
+        Hex => "Hex",
+        Binary => "Bits",
+        Uuid | UuidSwapped => "UUID",
+    }
+}
+
+impl FieldPopover {
+    pub(super) fn read_only(&self) -> bool {
+        matches!(self.target, FieldTarget::Static(_))
+    }
 }
 
 /// Counts for the changes bar.
@@ -443,12 +490,11 @@ impl DbxApp {
             }))
         .then(|| data.data_grid.read(cx).delegate().binary_format(column));
         let binary_format = binary_format.map(|format| format.for_edit(&value));
-        let structured =
-            (binary_format.is_none() || binary_format == Some(value_view::BinaryFormat::Text))
-                && (value_view::json_preview(&value).is_some()
-                    || data.table_columns.get(column).is_some_and(|column| {
-                        column.data_type.to_ascii_lowercase().contains("json")
-                    }));
+        let data_type = data
+            .table_columns
+            .get(column)
+            .map(|column| column.data_type.clone())
+            .unwrap_or_default();
         let text = match &value {
             CellValue::Null => String::new(),
             value => binary_format
@@ -457,7 +503,25 @@ impl DbxApp {
                     value_view::json_preview(value).unwrap_or_else(|| field_editor_text(value))
                 }),
         };
-        let multiline = structured || text.contains(['\n', '\r']);
+        // UTF-8 JSON is JSON whatever carries it; other binary formats are not.
+        let json_value = (binary_format.is_none()
+            || binary_format == Some(value_view::BinaryFormat::Text))
+            && value_view::json_preview(&value).is_some();
+        let surface = edit_surface(
+            &data_type,
+            (value != CellValue::Null).then_some(text.as_str()),
+            json_value,
+        );
+        let structured = surface == EditSurface::Json
+            && (binary_format.is_none() || binary_format == Some(value_view::BinaryFormat::Text));
+        // JSON opens formatted, however the driver returned it (bytes, text).
+        let json_source = structured.then(|| text.clone());
+        let text = if structured {
+            value_view::pretty_json_text(text)
+        } else {
+            text
+        };
+        let multiline = surface.is_popover() || text.contains(['\n', '\r']);
         let column_name = data
             .table_columns
             .get(column)
@@ -477,6 +541,7 @@ impl DbxApp {
                 cx,
             )
             .row_value()
+            .line_numbers()
             .accessibility_label(format!(
                 "{column_name}, row {}{}",
                 row + 1,
@@ -505,12 +570,22 @@ impl DbxApp {
             editor: editor.clone(),
             structured,
             multiline,
+            original: editor.read(cx).text(cx),
+            popover_focus: cx.focus_handle(),
             bulk_rows: Vec::new(),
             binary_format,
+            json_source,
             _blur: blur,
         });
         data.sync_cell_edits(cx);
-        editor.update(cx, |editor, cx| editor.select_all_text(cx));
+        editor.update(cx, |editor, cx| {
+            // The popover opens at the top of the value; inline cells select it all.
+            if multiline {
+                editor.move_cursor_to(0, cx);
+            } else {
+                editor.select_all_text(cx);
+            }
+        });
         focus.focus(window, cx);
         cx.notify();
     }
@@ -589,14 +664,31 @@ impl DbxApp {
         // An emptied cell that showed NULL (or a new row's default) keeps it
         // instead of becoming an empty string the user never typed.
         let unchanged_empty = bulk_rows.is_empty() && text.is_empty() && was_null;
-        if structured
-            && !unchanged_empty
-            && let Err(error) = serde_json::from_str::<serde_json::Value>(&text)
-        {
-            self.show_toast(ToastKind::Error, format!("Invalid JSON: {error}"), cx);
-            return;
+        let json_source = cell.json_source.clone();
+        let mut text = text;
+        // JSON opens pretty-printed. The same document as before is no change
+        // (formatting alone is never staged), and JSON that was compact is
+        // written back compactly.
+        let mut unchanged_json = false;
+        if structured && !unchanged_empty {
+            let document = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(document) => document,
+                Err(error) => {
+                    self.show_toast(ToastKind::Error, format!("Invalid JSON: {error}"), cx);
+                    return;
+                }
+            };
+            if let Some(source) = json_source {
+                unchanged_json = serde_json::from_str::<serde_json::Value>(&source)
+                    .is_ok_and(|source| source == document);
+                if !source.contains('\n')
+                    && let Ok(compact) = serde_json::to_string(&document)
+                {
+                    text = compact;
+                }
+            }
         }
-        let staged = if unchanged_empty {
+        let staged = if unchanged_json || unchanged_empty {
             None
         } else {
             match binary_format.map_or_else(
@@ -642,6 +734,315 @@ impl DbxApp {
             }
         }
         cx.notify();
+    }
+
+    /// The data tab whose value popover (if any) is showing.
+    pub(super) fn popover_tab(&self) -> Option<(SessionId, SecondaryTabId)> {
+        let session_id = self.active_session_id()?;
+        let tab_id = self.session(session_id)?.active_data_tab_id()?;
+        Some((session_id, tab_id))
+    }
+
+    /// Focus handle of the open value popover, for the modal focus trap.
+    pub(super) fn value_popover_focus(&self) -> Option<FocusHandle> {
+        let (session_id, tab_id) = self.popover_tab()?;
+        let data = self.data_tab(session_id, tab_id)?;
+        if let Some(popover) = &data.field_popover {
+            return Some(popover.focus.clone());
+        }
+        data.cell_editor
+            .as_ref()
+            .filter(|cell| cell.multiline)
+            .map(|cell| cell.popover_focus.clone())
+    }
+
+    /// Open the inspector's expanded editor for one value. Draft fields edit
+    /// the draft; read-only detail rows view the value.
+    pub(super) fn open_field_popover_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        target: FieldTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.data_tab(session_id, tab_id) else {
+            return;
+        };
+        if data.field_popover.is_some() || data.cell_editor.is_some() {
+            return;
+        }
+        let tag: Option<&'static str>;
+        let (title, data_type, text, surface) = match target {
+            FieldTarget::Draft(id) => {
+                let Some(field) = data
+                    .row_draft
+                    .as_ref()
+                    .and_then(|draft| draft.fields().iter().find(|field| field.id == id))
+                else {
+                    return;
+                };
+                if field.state != crate::row_drafts::FieldValueState::Value {
+                    return;
+                }
+                let text = field.editor.read(cx).text(cx);
+                let json_text = field
+                    .binary_format
+                    .is_none_or(|format| format == value_view::BinaryFormat::Text)
+                    && value_view::json_preview(&CellValue::Text(text.clone())).is_some();
+                let surface = if field.value_kind() == crate::row_drafts::FieldValueKind::Json {
+                    EditSurface::Json
+                } else {
+                    edit_surface(&field.column.data_type, Some(&text), json_text)
+                };
+                tag = field
+                    .binary_format
+                    .filter(|_| surface != EditSurface::Json)
+                    .map(binary_tag);
+                let text = if surface == EditSurface::Json {
+                    value_view::pretty_json_text(text)
+                } else {
+                    text
+                };
+                (
+                    field.column.name.clone(),
+                    field.column.data_type.clone(),
+                    text,
+                    surface,
+                )
+            }
+            FieldTarget::Static(index) => {
+                let (Some(row), Some(result)) = (data.selected_row, data.result.as_ref()) else {
+                    return;
+                };
+                let Some(column) = result.columns.get(index) else {
+                    return;
+                };
+                let value = data.shown_value(row, index);
+                let format = value
+                    .as_ref()
+                    .filter(|value| matches!(value, CellValue::Bytes(_)))
+                    .map(|value| {
+                        data.data_grid
+                            .read(cx)
+                            .delegate()
+                            .binary_format(index)
+                            .for_edit(value)
+                    });
+                let json = if format.is_none_or(|format| format == value_view::BinaryFormat::Text) {
+                    value.as_ref().and_then(value_view::json_preview)
+                } else {
+                    None
+                };
+                let text = match (&json, &value, format) {
+                    (Some(json), _, _) => json.clone(),
+                    (None, Some(value), Some(format)) => format.editor_text(value),
+                    (None, Some(value), None) => value_view::value_clipboard_text(value),
+                    (None, None, _) => String::new(),
+                };
+                let surface = if json.is_some() {
+                    EditSurface::Json
+                } else {
+                    EditSurface::Text
+                };
+                tag = format.filter(|_| json.is_none()).map(binary_tag);
+                let declared = data
+                    .table_columns
+                    .iter()
+                    .find(|candidate| candidate.name == column.name)
+                    .map_or_else(|| column.data_type.clone(), |c| c.data_type.clone());
+                (column.name.clone(), declared, text, surface)
+            }
+        };
+        let read_only = matches!(target, FieldTarget::Static(_));
+        let language = if surface == EditSurface::Json {
+            EditorLanguage::Json
+        } else {
+            EditorLanguage::PlainText
+        };
+        let label = format!("{title} value");
+        let value = cx.new(|_| text.clone());
+        let editor = cx.new(|cx| {
+            let editor = TextEditor::new_with_language(value, true, language, window, cx)
+                .row_value()
+                .line_numbers()
+                .accessibility_label(label);
+            if read_only {
+                editor.read_only()
+            } else {
+                editor
+            }
+        });
+        let focus = cx.focus_handle();
+        editor.read(cx).focus_handle().focus(window, cx);
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
+            return;
+        };
+        data.field_popover = Some(FieldPopover {
+            target,
+            surface,
+            editor,
+            original: text,
+            title,
+            data_type,
+            tag,
+            focus,
+        });
+        cx.notify();
+    }
+
+    /// Close the inspector popover and return to the inspector.
+    pub(super) fn close_field_popover_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.data_tab_mut(session_id, tab_id) else {
+            return;
+        };
+        if data.field_popover.take().is_none() {
+            return;
+        }
+        data.inspector_focus.clone().focus(window, cx);
+        cx.notify();
+    }
+
+    /// Write the popover text back into the draft field, exactly as typing in
+    /// the sidebar would, and close. Invalid JSON keeps the popover open.
+    pub(super) fn stage_field_popover_for(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(popover) = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.field_popover.as_ref())
+        else {
+            return;
+        };
+        let FieldTarget::Draft(id) = popover.target else {
+            // Read-only: "Close".
+            self.close_field_popover_for(session_id, tab_id, window, cx);
+            return;
+        };
+        let text = popover.editor.read(cx).text(cx);
+        let document = if popover.surface == EditSurface::Json {
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(document) => Some(document),
+                Err(error) => {
+                    self.show_toast(ToastKind::Error, format!("Invalid JSON: {error}"), cx);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let field = self
+            .data_tab(session_id, tab_id)
+            .and_then(|data| data.row_draft.as_ref())
+            .and_then(|draft| draft.fields().iter().find(|field| field.id == id));
+        // Binary fields parse with their display format, as the inline path does.
+        if let Some(format) = field.and_then(|field| field.binary_format)
+            && let Err(error) = format.parse(&text)
+        {
+            self.show_toast(ToastKind::Error, error.to_string(), cx);
+            return;
+        }
+        let field_editor = field.map(|field| field.editor.clone());
+        if let Some(field_editor) = field_editor {
+            let current = field_editor.read(cx).text(cx);
+            // The popover opened pretty-printed; reformatting alone leaves
+            // the draft as it was.
+            let reformatted_only = document.is_some_and(|document| {
+                serde_json::from_str::<serde_json::Value>(&current)
+                    .is_ok_and(|current| current == document)
+            });
+            if !reformatted_only {
+                field_editor.update(cx, |editor, cx| editor.set_text(text, cx));
+            }
+        }
+        self.close_field_popover_for(session_id, tab_id, window, cx);
+    }
+
+    /// Cancel whichever popover is open.
+    pub(super) fn cancel_value_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((session_id, tab_id)) = self.popover_tab() else {
+            return;
+        };
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.field_popover.is_some())
+        {
+            self.close_field_popover_for(session_id, tab_id, window, cx);
+        } else {
+            self.cancel_cell_edit_for(session_id, tab_id, window, cx);
+        }
+    }
+
+    /// Stage (or, for a read-only value, close) whichever popover is open.
+    pub(super) fn stage_value_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((session_id, tab_id)) = self.popover_tab() else {
+            return;
+        };
+        if self
+            .data_tab(session_id, tab_id)
+            .is_some_and(|data| data.field_popover.is_some())
+        {
+            self.stage_field_popover_for(session_id, tab_id, window, cx);
+        } else {
+            self.commit_cell_edit_for(session_id, tab_id, None, window, cx);
+        }
+    }
+
+    /// A click on the scrim closes the popover only when nothing was edited,
+    /// so a stray click never discards work.
+    pub(super) fn value_popover_backdrop_click(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((session_id, tab_id)) = self.popover_tab() else {
+            return;
+        };
+        let Some(data) = self.data_tab(session_id, tab_id) else {
+            return;
+        };
+        let unchanged = match (&data.field_popover, &data.cell_editor) {
+            (Some(popover), _) => popover.editor.read(cx).text(cx) == popover.original,
+            (None, Some(cell)) => cell.editor.read(cx).text(cx) == cell.original,
+            _ => return,
+        };
+        if unchanged {
+            self.cancel_value_popover(window, cx);
+        }
+    }
+
+    /// Pretty-print the popover's JSON in place. Invalid JSON is reported and
+    /// left untouched.
+    pub(super) fn format_value_popover(&mut self, cx: &mut Context<Self>) {
+        let Some((session_id, tab_id)) = self.popover_tab() else {
+            return;
+        };
+        let Some(data) = self.data_tab(session_id, tab_id) else {
+            return;
+        };
+        let editor = match (&data.field_popover, &data.cell_editor) {
+            (Some(popover), _) if !popover.read_only() => popover.editor.clone(),
+            (None, Some(cell)) if cell.multiline && cell.structured => cell.editor.clone(),
+            _ => return,
+        };
+        let text = editor.read(cx).text(cx);
+        match serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| error.to_string())
+            .and_then(|value| serde_json::to_string_pretty(&value).map_err(|e| e.to_string()))
+        {
+            Ok(pretty) => editor.update(cx, |editor, cx| editor.set_text(pretty, cx)),
+            Err(error) => self.show_toast(ToastKind::Error, format!("Invalid JSON: {error}"), cx),
+        }
     }
 
     pub(super) fn cancel_cell_edit_for(
@@ -1519,7 +1920,7 @@ mod tests {
             app.runtime = Arc::new(tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap());
             app.vault_state = Some(VaultState::Unlocked);
             let engine = Arc::new(app.runtime.block_on(DatabaseEngine::connect(ConnectionConfig::new(DatabaseKind::SQLite, "sqlite::memory:"))).unwrap());
-            app.runtime.block_on(engine.execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT, count INTEGER NOT NULL); INSERT INTO items VALUES(1,'one',10),(2,'two',20)")).unwrap();
+            app.runtime.block_on(engine.execute_sql("CREATE TABLE items(id INTEGER PRIMARY KEY, label VARCHAR(40), count INTEGER NOT NULL); INSERT INTO items VALUES(1,'one',10),(2,'two',20)")).unwrap();
             let result = app.runtime.block_on(engine.query("SELECT * FROM items", QueryOptions::default())).unwrap();
             let mut session = ConnectionSession::new(session_id, None, "Bulk".into(), DatabaseKind::SQLite, None, window, cx);
             session.tables = vec![TableInfo::table("items", None)];
@@ -1709,6 +2110,8 @@ mod tests {
             })
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        // The popover opens with the caret at the top; replace the value explicitly.
+        editor.update(cx, |editor, cx| editor.select_all_text(cx));
         cx.simulate_input("{invalid");
         assert_eq!(
             editor.read_with(cx, |editor, cx| editor.text(cx)),
@@ -1826,7 +2229,7 @@ mod tests {
                 DatabaseKind::SQLite,
                 format!("sqlite://{}?mode=rwc", directory.path().join("rows.sqlite").display()),
             ))).unwrap());
-            app.runtime.block_on(engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO items VALUES (1, 'one'), (2, 'two'), (3, 'three')")).unwrap();
+            app.runtime.block_on(engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, name VARCHAR(40)); INSERT INTO items VALUES (1, 'one'), (2, 'two'), (3, 'three')")).unwrap();
             let result = app.runtime.block_on(engine.query("SELECT * FROM items ORDER BY id", QueryOptions::default())).unwrap();
             let columns = app.runtime.block_on(engine.describe_table(&TableRef::new("items"))).unwrap();
             let mut session = ConnectionSession::new(session_id, None, "Changeset test".into(), DatabaseKind::SQLite, None, window, cx);
@@ -1949,7 +2352,7 @@ mod tests {
                 DatabaseKind::SQLite,
                 format!("sqlite://{}?mode=rwc", directory.path().join("rows.sqlite").display()),
             ))).unwrap());
-            app.runtime.block_on(engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO items VALUES (1, 'original'), (2, 'second')")).unwrap();
+            app.runtime.block_on(engine.execute_sql("CREATE TABLE items (id INTEGER PRIMARY KEY, name VARCHAR(40)); INSERT INTO items VALUES (1, 'original'), (2, 'second')")).unwrap();
             let result = app.runtime.block_on(engine.query("SELECT * FROM items ORDER BY id", QueryOptions::default())).unwrap();
             let columns = app.runtime.block_on(engine.describe_table(&TableRef::new("items"))).unwrap();
             let mut session = ConnectionSession::new(session_id, None, "Persistence test".into(), DatabaseKind::SQLite, None, window, cx);
@@ -2047,6 +2450,374 @@ mod tests {
     }
 
     #[gpui::test]
+    fn value_popover_opens_by_column_type_and_stages_or_cancels(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let long = "x".repeat(300);
+        let long_for_fixture = long.clone();
+        let (app, cx) = cx.add_window_view(move |window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            app.vault_state = Some(VaultState::Unlocked);
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Popover test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            session.engine = Some(Arc::new(
+                app.runtime
+                    .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                        DatabaseKind::SQLite,
+                        "sqlite::memory:",
+                    )))
+                    .unwrap(),
+            ));
+            session.tables = vec![TableInfo::table("items", None)];
+            let mut id = ColumnInfo::result("id", 0, "INTEGER");
+            id.primary_key = true;
+            id.nullable = false;
+            let columns = vec![
+                id,
+                ColumnInfo::result("short", 1, "VARCHAR(40)"),
+                ColumnInfo::result("long", 2, "VARCHAR(400)"),
+                ColumnInfo::result("notes", 3, "TEXT"),
+                ColumnInfo::result("doc", 4, "JSON"),
+                ColumnInfo::result("blob", 5, "LONGBLOB"),
+            ];
+            let mut data =
+                DataTab::new(session_id, tab_id, TableRef::new("items"), true, window, cx);
+            data.table_columns = columns.clone();
+            data.result_table = Some(data.table.clone());
+            data.set_result(
+                Some(QueryResult {
+                    columns,
+                    rows: vec![RowData::new(vec![
+                        CellValue::Integer(1),
+                        CellValue::Text("hi".into()),
+                        CellValue::Text(long_for_fixture),
+                        CellValue::Text("note".into()),
+                        CellValue::Text("{\"a\":1}".into()),
+                        CellValue::Bytes(vec![0xab; 150]),
+                    ])],
+                    ..QueryResult::empty(None, 0)
+                }),
+                &session.tables,
+                cx,
+            );
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Data(Box::new(data)),
+            });
+            session.active_secondary_tab = Some(tab_id);
+            session.pane = Pane::Data;
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let multiline = |app: &DbxApp| {
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .cell_editor
+                        .as_ref()
+                        .map(|cell| cell.multiline)
+                };
+                // A short VARCHAR stays an inline edit.
+                app.begin_cell_edit_for(session_id, tab_id, 0, 1, window, cx);
+                assert_eq!(multiline(app), Some(false));
+                assert!(app.value_popover_focus().is_none());
+                app.cancel_cell_edit_for(session_id, tab_id, window, cx);
+
+                // A long VARCHAR opens the popover; Cancel discards.
+                app.begin_cell_edit_for(session_id, tab_id, 0, 2, window, cx);
+                assert_eq!(multiline(app), Some(true));
+                assert!(app.value_popover_focus().is_some());
+                app.cancel_value_popover(window, cx);
+                assert_eq!(multiline(app), None);
+                assert!(
+                    !app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .has_pending_edits()
+                );
+
+                // TEXT opens it; backdrop click only closes an unchanged editor.
+                app.begin_cell_edit_for(session_id, tab_id, 0, 3, window, cx);
+                assert_eq!(multiline(app), Some(true));
+                app.value_popover_backdrop_click(window, cx);
+                assert_eq!(multiline(app), None);
+                app.begin_cell_edit_for(session_id, tab_id, 0, 3, window, cx);
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| editor.set_text("edited\nlines", cx));
+                app.value_popover_backdrop_click(window, cx);
+                assert_eq!(multiline(app), Some(true), "edits survive a stray click");
+                app.stage_value_popover(window, cx);
+                assert_eq!(multiline(app), None);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .get(&(0, 3)),
+                    Some(&MutationValue::Parameter(CellValue::Text(
+                        "edited\nlines".into()
+                    )))
+                );
+
+                // JSON opens pretty-printed; staging it unchanged stages nothing.
+                app.begin_cell_edit_for(session_id, tab_id, 0, 4, window, cx);
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                assert_eq!(editor.read(cx).text(cx), "{\n  \"a\": 1\n}");
+                app.stage_value_popover(window, cx);
+                assert_eq!(multiline(app), None);
+                assert!(
+                    !app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .contains_key(&(0, 4)),
+                    "formatting alone is not a change"
+                );
+
+                // JSON: invalid text keeps the popover open, Format fixes layout.
+                app.begin_cell_edit_for(session_id, tab_id, 0, 4, window, cx);
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| editor.set_text("{oops", cx));
+                app.stage_value_popover(window, cx);
+                assert_eq!(multiline(app), Some(true));
+                app.format_value_popover(cx);
+                assert_eq!(editor.read(cx).text(cx), "{oops");
+                editor.update(cx, |editor, cx| editor.set_text("{\"b\":[1,2]}", cx));
+                app.format_value_popover(cx);
+                assert!(editor.read(cx).text(cx).contains('\n'));
+                app.stage_value_popover(window, cx);
+                assert_eq!(multiline(app), None);
+                // Stored compactly as text, so it is written back compactly.
+                match app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .pending_edits
+                    .get(&(0, 4))
+                {
+                    Some(MutationValue::Parameter(value)) => {
+                        assert!(!value.to_string().contains('\n'), "{value}");
+                    }
+                    other => panic!("expected a staged JSON value, got {other:?}"),
+                }
+                app.discard_pending_edits_for(session_id, tab_id, cx);
+
+                // A large BLOB expands in its display format (hex); input is
+                // parsed with that format and bad hex keeps the popover open.
+                app.begin_cell_edit_for(session_id, tab_id, 0, 5, window, cx);
+                assert_eq!(multiline(app), Some(true));
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .cell_editor
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| editor.set_text("zz", cx));
+                app.stage_value_popover(window, cx);
+                assert_eq!(multiline(app), Some(true));
+                editor.update(cx, |editor, cx| editor.set_text("00ff", cx));
+                app.stage_value_popover(window, cx);
+                assert_eq!(multiline(app), None);
+                assert_eq!(
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .pending_edits
+                        .get(&(0, 5)),
+                    Some(&MutationValue::Parameter(CellValue::Bytes(vec![0, 255])))
+                );
+                app.discard_pending_edits_for(session_id, tab_id, cx);
+                let _ = &long;
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn inspector_popover_edits_the_draft_or_views_read_only(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let session_id = Uuid::new_v4();
+        let tab_id = Uuid::new_v4();
+        let (app, cx) = cx.add_window_view(move |window, cx| {
+            let mut app = DbxApp::new(window, cx);
+            app.runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            app.vault_state = Some(VaultState::Unlocked);
+            let mut session = ConnectionSession::new(
+                session_id,
+                None,
+                "Popover test".into(),
+                DatabaseKind::SQLite,
+                None,
+                window,
+                cx,
+            );
+            session.engine = Some(Arc::new(
+                app.runtime
+                    .block_on(DatabaseEngine::connect(ConnectionConfig::new(
+                        DatabaseKind::SQLite,
+                        "sqlite::memory:",
+                    )))
+                    .unwrap(),
+            ));
+            session.tables = vec![TableInfo::table("items", None)];
+            let mut id = ColumnInfo::result("id", 0, "INTEGER");
+            id.primary_key = true;
+            id.nullable = false;
+            let columns = vec![id, ColumnInfo::result("doc", 1, "JSON")];
+            let mut data =
+                DataTab::new(session_id, tab_id, TableRef::new("items"), true, window, cx);
+            data.table_columns = columns.clone();
+            data.result_table = Some(data.table.clone());
+            data.set_result(
+                Some(QueryResult {
+                    columns,
+                    rows: vec![RowData::new(vec![
+                        CellValue::Integer(1),
+                        CellValue::Text("{\"a\":1}".into()),
+                    ])],
+                    ..QueryResult::empty(None, 0)
+                }),
+                &session.tables,
+                cx,
+            );
+            session.secondary_tabs.push(SecondaryTab {
+                id: tab_id,
+                kind: SecondaryTabKind::Data(Box::new(data)),
+            });
+            session.active_secondary_tab = Some(tab_id);
+            session.pane = Pane::Data;
+            app.sessions = vec![session];
+            app.active_session_id = Some(session_id);
+            app
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                use super::cell_edits::FieldTarget;
+                app.select_row_for(session_id, tab_id, 0, cx);
+                let open = |app: &DbxApp| {
+                    app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .field_popover
+                        .is_some()
+                };
+                // Read-only detail row: opens, stages nothing, Close closes.
+                app.open_field_popover_for(session_id, tab_id, FieldTarget::Static(1), window, cx);
+                assert!(open(app));
+                assert!(app.value_popover_focus().is_some());
+                let editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .field_popover
+                    .as_ref()
+                    .unwrap();
+                assert!(editor.read_only());
+                app.stage_value_popover(window, cx);
+                assert!(!open(app));
+                assert!(
+                    !app.data_tab(session_id, tab_id)
+                        .unwrap()
+                        .has_pending_edits()
+                );
+
+                // Draft field: Cancel leaves the draft alone, Stage writes it.
+                app.begin_edit_selected_for(session_id, tab_id, window, cx);
+                let (field_id, field_editor) = {
+                    let data = app.data_tab(session_id, tab_id).unwrap();
+                    let field = &data.row_draft.as_ref().unwrap().fields()[1];
+                    (field.id, field.editor.clone())
+                };
+                let before = field_editor.read(cx).text(cx);
+                app.open_field_popover_for(
+                    session_id,
+                    tab_id,
+                    FieldTarget::Draft(field_id),
+                    window,
+                    cx,
+                );
+                assert!(open(app));
+                let popover_editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .field_popover
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                // The draft's JSON opens pretty-printed.
+                assert_eq!(
+                    popover_editor.read(cx).text(cx),
+                    value_view::pretty_json_text(before.clone())
+                );
+                popover_editor.update(cx, |editor, cx| editor.set_text("{\"changed\":true}", cx));
+                app.cancel_value_popover(window, cx);
+                assert!(!open(app));
+                assert_eq!(field_editor.read(cx).text(cx), before);
+
+                app.open_field_popover_for(
+                    session_id,
+                    tab_id,
+                    FieldTarget::Draft(field_id),
+                    window,
+                    cx,
+                );
+                let popover_editor = app
+                    .data_tab(session_id, tab_id)
+                    .unwrap()
+                    .field_popover
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .clone();
+                popover_editor.update(cx, |editor, cx| editor.set_text("{nope", cx));
+                app.stage_value_popover(window, cx);
+                assert!(open(app), "invalid JSON keeps the popover open");
+                popover_editor.update(cx, |editor, cx| editor.set_text("{\"changed\":true}", cx));
+                app.stage_value_popover(window, cx);
+                assert!(!open(app));
+                assert_eq!(field_editor.read(cx).text(cx), "{\"changed\":true}");
+            })
+        });
+    }
+
+    #[gpui::test]
     fn inline_edits_stage_validate_block_navigation_and_discard(cx: &mut gpui::TestAppContext) {
         use gpui::EntityInputHandler;
 
@@ -2085,7 +2856,7 @@ mod tests {
             id.nullable = false;
             let columns = vec![
                 id,
-                ColumnInfo::result("name", 1, "TEXT"),
+                ColumnInfo::result("name", 1, "VARCHAR(40)"),
                 ColumnInfo::result("payload", 2, "BLOB"),
             ];
             let mut data =
@@ -2215,7 +2986,12 @@ mod tests {
                     .as_ref()
                     .unwrap();
                 assert!(cell.structured);
-                assert_eq!(cell.editor.read(cx).text(cx), raw);
+                // Shown pretty-printed; committing it unchanged keeps the
+                // staged bytes exactly.
+                assert_eq!(
+                    cell.editor.read(cx).text(cx),
+                    "{\n  \"label\": \"é\",\n  \"id\": 900719925474099312345\n}"
+                );
                 app.commit_cell_edit_for(session_id, tab_id, None, window, cx);
                 assert_eq!(
                     app.data_tab(session_id, tab_id)

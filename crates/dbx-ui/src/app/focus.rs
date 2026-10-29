@@ -48,6 +48,7 @@ impl DbxApp {
         traps.extend(self.confirmation_dialog.as_ref().map(|d| d.focus.clone()));
         if self.workspace_screen_drawn() {
             traps.extend(self.mutation_error_dialog.as_ref().map(|d| d.focus.clone()));
+            traps.extend(self.value_popover_focus());
         }
         traps.extend(self.data_import_dialog.as_ref().map(|d| d.focus.clone()));
         traps.extend(

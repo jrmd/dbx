@@ -11,6 +11,7 @@ use std::{
 };
 
 unsafe extern "C" {
+    fn dbx_center_window(view: *mut c_void, width: f64, height: f64);
     fn dbx_native_shell_supported() -> bool;
     fn dbx_native_shell_create(view: *mut c_void) -> *mut c_void;
     fn dbx_native_shell_destroy(shell: *mut c_void);
@@ -28,6 +29,21 @@ pub(crate) struct NativeGlass {
     last_system_check: Option<Instant>,
     pub(crate) left_inset: f32,
     pub(crate) top_inset: f32,
+}
+
+pub(crate) fn center_window(window: &Window, width: f32, height: f32) -> bool {
+    if MainThreadMarker::new().is_none() {
+        return false;
+    }
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return false;
+    };
+    // SAFETY: GPUI owns the live view and this runs on the main thread.
+    unsafe { dbx_center_window(handle.ns_view.as_ptr(), width as f64, height as f64) };
+    true
 }
 
 pub(crate) fn supported() -> bool {

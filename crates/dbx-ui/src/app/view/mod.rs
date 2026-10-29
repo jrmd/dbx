@@ -70,6 +70,18 @@ impl Render for DbxApp {
         self.reclaim_stray_focus(window, cx);
         self.ensure_modal_focus(window, cx);
         let unlocked = self.vault_state == Some(VaultState::Unlocked);
+        if self.window_vault_unlocked != unlocked {
+            self.window_vault_unlocked = unlocked;
+            if let Some(handle) = window.window_handle().downcast::<DbxApp>() {
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |app, window, _| {
+                        if (app.vault_state == Some(VaultState::Unlocked)) == unlocked {
+                            crate::window_geometry::apply(window, unlocked);
+                        }
+                    });
+                });
+            }
+        }
         if std::mem::take(&mut self.connection_form_focus_pending)
             && unlocked
             && !self.settings_open
@@ -326,6 +338,7 @@ impl Render for DbxApp {
                 view.child(self.render_table_context_menu(window, cx))
                     .child(self.render_database_export_dialog(window, cx))
                     .child(self.render_mutation_error_dialog(cx))
+                    .child(self.render_value_popover(cx))
             })
             .when(unlocked, |view| {
                 view.child(self.render_nonrelational_editor(cx))

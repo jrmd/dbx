@@ -416,6 +416,18 @@ pub fn sheet_radius() -> f32 {
     }
 }
 
+/// Corner radius of the floating navigation panels (explorer, connection list)
+/// that sit beside the content sheet. The solid shell uses the sheet's own
+/// radius so neighbouring panels match; Liquid Glass keeps the floating-glass
+/// radius.
+pub fn navigation_radius() -> f32 {
+    if native_glass_active() {
+        RADIUS_GLASS
+    } else {
+        sheet_radius()
+    }
+}
+
 /// AppKit supplies Liquid Glass itself; GPUI must leave its Metal surface
 /// transparent without installing the older NSVisualEffectView blur material.
 pub fn window_background() -> WindowBackgroundAppearance {
@@ -879,6 +891,7 @@ pub enum Icon {
     Appearance,
     Lock,
     Fingerprint,
+    Expand,
     Sparkles,
     Trash,
     Pencil,
@@ -913,6 +926,7 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
         Icon::Appearance => assets::ICON_APPEARANCE,
         Icon::Lock => assets::ICON_LOCK,
         Icon::Fingerprint => assets::ICON_FINGERPRINT,
+        Icon::Expand => assets::ICON_EXPAND,
         Icon::Sparkles => assets::ICON_SPARKLES,
         Icon::Trash => assets::ICON_TRASH,
         Icon::Pencil => assets::ICON_PENCIL,
@@ -1134,6 +1148,7 @@ impl Icon {
             Self::Appearance => "Appearance",
             Self::Lock => "Lock vault",
             Self::Fingerprint => "Touch ID",
+            Self::Expand => "Expand",
             Self::Sparkles => "Query assistant",
             Self::Trash => "Delete",
             Self::Pencil => "Edit",

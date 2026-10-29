@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- With Liquid Glass on, opening a modal such as the value editor no longer makes the native Explorer sidebar vanish; it stays in place under the scrim tint (fading, or instant with Reduce Motion).
+- Large BLOB/binary values expand in the value popover, in their current display format (text, hex, UUID or bits) or as formatted JSON.
+- With Liquid Glass off, the Explorer and connection-list panels use the same corner radius as the content sheet and Settings panel.
+- Edit JSON, TEXT and long text values in a centred popover instead of a docked panel. Double-click a JSON or TEXT cell, or a VARCHAR/CHAR value that contains a line break or exceeds 200 characters; the editor has line numbers, JSON gets a Format action, Escape cancels, Cmd/Ctrl+Enter stages, and a stray backdrop click never discards edits. Short VARCHAR values still edit inline.
+- The row inspector shows line numbers for JSON fields and an Expand button on JSON, TEXT and long text fields that opens the same popover. For an open row edit it updates the draft; for a read-only row it shows the value with Copy and Close.
 - Make opt-in Touch ID vault unlock available in signed Mac builds by embedding a Developer ID provisioning profile; builds without a profile are unchanged.
 - Redesign the vault unlock screen: Touch ID becomes the primary action with the passphrase as a fallback, Touch ID is turned on in Settings → Connections → Vault and prompts once when DBX opens (it can be combined with automatic unlock, which runs first), and status messages no longer shift the layout.
 

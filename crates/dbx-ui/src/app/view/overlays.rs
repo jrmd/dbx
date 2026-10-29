@@ -622,6 +622,262 @@ impl DbxApp {
         deferred(overlay).with_priority(priority).into_any_element()
     }
 
+    /// The expanded value editor: a centred popover over the workbench for
+    /// JSON and long text, opened from a grid cell or the row inspector.
+    pub(super) fn render_value_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some((session_id, tab_id)) = self.popover_tab() else {
+            return div().into_any_element();
+        };
+        // Drop an inspector popover whose field or row no longer exists.
+        if let Some(data) = self.data_tab_mut(session_id, tab_id)
+            && let Some(popover) = &data.field_popover
+        {
+            let alive = match popover.target {
+                cell_edits::FieldTarget::Draft(id) => data
+                    .row_draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.fields().iter().any(|field| field.id == id)),
+                cell_edits::FieldTarget::Static(_) => data.selected_row.is_some(),
+            };
+            if !alive {
+                data.field_popover = None;
+            }
+        }
+        let Some(data) = self.data_tab(session_id, tab_id) else {
+            return div().into_any_element();
+        };
+        let (title, data_type, surface, editor, read_only, focus, tag) =
+            if let Some(popover) = &data.field_popover {
+                (
+                    popover.title.clone(),
+                    popover.data_type.clone(),
+                    popover.surface,
+                    popover.editor.clone(),
+                    popover.read_only(),
+                    popover.focus.clone(),
+                    popover.tag,
+                )
+            } else if let Some(cell) = data.cell_editor.as_ref().filter(|cell| cell.multiline) {
+                let column = data.table_columns.get(cell.column);
+                (
+                    column.map_or_else(
+                        || format!("Column {}", cell.column + 1),
+                        |column| column.name.clone(),
+                    ),
+                    column
+                        .map(|column| column.data_type.clone())
+                        .unwrap_or_default(),
+                    if cell.structured {
+                        crate::row_drafts::EditSurface::Json
+                    } else {
+                        crate::row_drafts::EditSurface::Text
+                    },
+                    cell.editor.clone(),
+                    false,
+                    cell.popover_focus.clone(),
+                    if cell.structured {
+                        None
+                    } else {
+                        cell.binary_format.map(cell_edits::binary_tag)
+                    },
+                )
+            } else {
+                return div().into_any_element();
+            };
+        let is_json = surface == crate::row_drafts::EditSurface::Json;
+        let tag_label = if is_json {
+            "JSON"
+        } else {
+            tag.unwrap_or("Text")
+        };
+        let background = self.modal_is_background(&focus);
+        let editor_focus = editor.read(cx).focus_handle();
+        let accessible_title = format!("{title} {}", if is_json { "JSON" } else { "text" });
+        let copy_editor = editor.clone();
+
+        let overlay = div()
+            .occlude()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .id("value-popover-overlay")
+            .absolute()
+            // The native sidebar stays visible above GPUI, so centre in the
+            // area to its right rather than under it.
+            .pl(px(if crate::theme::native_glass_active() {
+                self.native_glass.left_inset
+            } else {
+                0.
+            }))
+            .top(crate::theme::ui_px(0.))
+            .right(crate::theme::ui_px(0.))
+            .bottom(crate::theme::ui_px(0.))
+            .left(crate::theme::ui_px(0.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme().overlay)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.value_popover_backdrop_click(window, cx)),
+            )
+            .child(
+                div()
+                    .id("value-popover")
+                    .key_context("DbxValuePopover")
+                    .debug_selector(|| "value-popover".into())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_action(cx.listener(|this, _: &CancelValuePopover, window, cx| {
+                        this.cancel_value_popover(window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &StageValuePopover, window, cx| {
+                        this.stage_value_popover(window, cx)
+                    }))
+                    .w(relative(0.7))
+                    .min_w(crate::theme::ui_px(480.))
+                    .max_w(relative(0.95))
+                    .h(relative(0.7))
+                    .min_h(crate::theme::ui_px(320.))
+                    .max_h(relative(0.9))
+                    .flex()
+                    .flex_col()
+                    .rounded(crate::theme::ui_px(RADIUS_GLASS))
+                    .border_1()
+                    .border_color(theme().hairline)
+                    .bg(theme().glass_raised)
+                    .shadow(glass_shadow(28.))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(12.))
+                            .border_b_1()
+                            .border_color(theme().border)
+                            .flex()
+                            .items_center()
+                            .gap(crate::theme::ui_px(8.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::theme::text_px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme().text)
+                                    .child(title.clone()),
+                            )
+                            .when(
+                                !crate::diagram::display_type(&data_type)
+                                    .eq_ignore_ascii_case(tag_label),
+                                |view| {
+                                    view.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(crate::theme::text_px(11.))
+                                            .text_color(theme().text_muted)
+                                            .child(crate::diagram::display_type(&data_type)),
+                                    )
+                                },
+                            )
+                            .child(badge(tag_label, theme().text_muted))
+                            .when(read_only, |view| {
+                                view.child(badge("Read-only", theme().text_muted))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "json-cell-editor".into())
+                            .flex_1()
+                            .min_h_0()
+                            .p(crate::theme::ui_px(12.))
+                            .flex()
+                            .flex_col()
+                            .child(editor::input_fill(editor, editor_focus, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(crate::theme::ui_px(16.))
+                            .py(crate::theme::ui_px(12.))
+                            .border_t_1()
+                            .border_color(theme().border)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(crate::theme::ui_px(8.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(8.))
+                                    .child(if is_json && !read_only {
+                                        button("format-json-edit", "Format", ButtonKind::Quiet)
+                                            .debug_selector(|| "format-json-edit".into())
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.format_value_popover(cx)
+                                            }))
+                                            .into_any_element()
+                                    } else if read_only {
+                                        button("copy-value-popover", "Copy", ButtonKind::Quiet)
+                                            .cursor_pointer()
+                                            .on_click(move |_, _, cx| {
+                                                let text = copy_editor.read(cx).text(cx);
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(text),
+                                                );
+                                            })
+                                            .into_any_element()
+                                    } else {
+                                        div().into_any_element()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(8.))
+                                    .when(!read_only, |view| {
+                                        view.child(
+                                            button("cancel-json-edit", "Cancel", ButtonKind::Quiet)
+                                                .debug_selector(|| "cancel-json-edit".into())
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.cancel_value_popover(window, cx)
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        button(
+                                            "stage-json-edit",
+                                            if read_only { "Close" } else { "Stage change" },
+                                            ButtonKind::Primary,
+                                        )
+                                        .debug_selector(|| "stage-json-edit".into())
+                                        .cursor_pointer()
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.stage_value_popover(window, cx)
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .focus_trap("value-popover-focus-trap", &focus)
+                    .accessible_dialog(
+                        "value-popover",
+                        accessible_title,
+                        if read_only {
+                            "Read-only value. Escape closes."
+                        } else {
+                            "Press Command-Return to stage the change, Escape to cancel."
+                        },
+                        background,
+                        true,
+                    ),
+            );
+
+        deferred(overlay).with_priority(45).into_any_element()
+    }
+
     pub(super) fn render_mutation_error_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(dialog) = self.mutation_error_dialog.as_ref() else {
             return div().into_any_element();

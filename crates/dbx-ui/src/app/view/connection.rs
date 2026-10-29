@@ -664,7 +664,7 @@ impl DbxApp {
             format!("New {kind} connection")
         }).flex_1().min_w_0().min_h_0().flex().gap(crate::theme::ui_px(GLASS_INSET)).pr(crate::theme::ui_px(GLASS_INSET)).pb(crate::theme::ui_px(GLASS_INSET))
             .when(!self.compact_layout, |view| view.child(
-                glass(div(), RADIUS_GLASS, 8.).w(crate::theme::ui_px(264.)).flex_none().overflow_hidden()
+                glass(div(), crate::theme::navigation_radius(), 8.).w(crate::theme::ui_px(264.)).flex_none().overflow_hidden()
                     .flex().flex_col()
                     .child(div().h(crate::theme::control_height(48.)).flex_none().pl(crate::theme::ui_px(16.)).pr(crate::theme::ui_px(10.)).flex().items_center().justify_between().border_b_1().border_color(theme().hairline)
                         .child(div().flex().items_center().gap(crate::theme::ui_px(8.)).child(div().text_size(crate::theme::text_px(13.)).font_weight(FontWeight::SEMIBOLD).child("Connections")).when(!saved_connections.is_empty(), |view| view.child(badge(saved_connections.len().to_string(), theme().text_muted))))

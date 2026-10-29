@@ -1,5 +1,21 @@
 import AppKit
 
+@_cdecl("dbx_center_window")
+func dbx_center_window(_ view: UnsafeMutableRawPointer, _ width: Double, _ height: Double) {
+    let renderer = Unmanaged<NSView>.fromOpaque(view).takeUnretainedValue()
+    // GPUI's resize callback updates its window through the app context. Run
+    // outside the Rust window update that requested this change, or that
+    // callback cannot borrow the context and the drawable keeps its old size.
+    DispatchQueue.main.async { [weak renderer] in
+        guard let window = renderer?.window, let screen = window.screen ?? NSScreen.main else { return }
+        let visible = screen.visibleFrame
+        let size = NSSize(width: min(width, visible.width), height: min(height, visible.height))
+        let frame = NSRect(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2,
+                           width: size.width, height: size.height)
+        window.setFrame(frame, display: true)
+    }
+}
+
 // AppKit owns navigation, accessibility, vibrancy and scroll-edge rendering.
 // The ABI passes snapshots and queued intents; it never calls Rust reentrantly
 // from layout or a delegate (GPUI may already hold its window/entity locks).
@@ -18,6 +34,16 @@ private final class ContentScrollHost: NSScrollView {
 }
 
 @available(macOS 26.0, *)
+/// A tint laid over native views while a GPUI modal is open. It swallows
+/// pointer events so the dimmed sidebar cannot be clicked.
+private final class ModalDimView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { isHidden ? nil : super.hitTest(point) }
+    override func mouseDown(with event: NSEvent) {}
+    override func rightMouseDown(with event: NSEvent) {}
+    override func scrollWheel(with event: NSEvent) {}
+    override var acceptsFirstResponder: Bool { false }
+}
+
 private final class ScrollDocument: NSView {
     override var isFlipped: Bool { true }
 }
@@ -121,6 +147,9 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
     var lastGeometry: [Double] = []
     var lastData: Data?
     var modal = false
+    // Native views draw above GPUI, so a modal's scrim cannot dim the sidebar.
+    // This tint, in the scrim's own colour, stands in for it and also blocks clicks.
+    let dim = ModalDimView()
     var scrollOffset = 0.0
     var scrollMaximum = 0.0
     var observer: NSObjectProtocol?
@@ -273,6 +302,43 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
         window.makeFirstResponder(renderer)
     }
 
+    /// Dim the sidebar under a modal instead of collapsing it. Fades over
+    /// ~0.18s, or switches instantly when Reduce Motion is on.
+    func updateDim(animated: Bool) {
+        guard let host = split.splitView.arrangedSubviews.first else { return }
+        if dim.superview !== host {
+            dim.removeFromSuperview()
+            dim.frame = host.bounds
+            dim.autoresizingMask = [.width, .height]
+            dim.wantsLayer = true
+            dim.alphaValue = 0
+            dim.isHidden = true
+            dim.setAccessibilityElement(false)
+            host.addSubview(dim, positioned: .above, relativeTo: nil)
+        }
+        let scrim = (model["scrim"] as? [Double]) ?? [0, 0, 0, 0.5]
+        if scrim.count == 4 {
+            dim.layer?.backgroundColor = NSColor(
+                srgbRed: CGFloat(scrim[0]), green: CGFloat(scrim[1]), blue: CGFloat(scrim[2]), alpha: CGFloat(scrim[3])).cgColor
+        }
+        dim.layer?.cornerRadius = host.layer?.cornerRadius ?? 0
+        dim.layer?.cornerCurve = .continuous
+        let target: CGFloat = modal && !sidebarItem.isCollapsed ? 1 : 0
+        if target > 0 { dim.isHidden = false }
+        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if animated && !reduce {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.18
+                dim.animator().alphaValue = target
+            }, completionHandler: { [weak self] in
+                if let self, self.dim.alphaValue == 0 { self.dim.isHidden = true }
+            })
+        } else {
+            dim.alphaValue = target
+            dim.isHidden = target == 0
+        }
+    }
+
     func layoutRenderer() {
         guard let window, let root = window.contentView else { return }
         // GPUI's platform input, IME and accessibility use window coordinates.
@@ -291,7 +357,11 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
         }
         let frame = mainDocument.convert(root.bounds, from: root)
         if originalContent.frame != frame { originalContent.frame = frame }
-        if renderer.frame != originalContent.bounds { renderer.frame = originalContent.bounds }
+        let rendererBounds = originalContent.bounds
+        if renderer.frame.origin != rendererBounds.origin { renderer.setFrameOrigin(rendererBounds.origin) }
+        // GPUI updates its Metal drawable and emits its resize callback from
+        // setFrameSize; assigning frame directly can bypass that override.
+        if renderer.frame.size != rendererBounds.size { renderer.setFrameSize(rendererBounds.size) }
         let visible = root.convert(mainHost.bounds, from: mainHost)
         let top = max(0, root.bounds.height - window.contentLayoutRect.maxY)
         // With background extension enabled, the content's frame reaches
@@ -541,6 +611,7 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
         let wasModal = modal
         modal = next["modal"] as? Bool ?? false
         if modal && !wasModal { window?.makeFirstResponder(renderer) }
+        updateDim(animated: modal != wasModal)
         let dark = next["dark"] as? Bool ?? false
         // Set only when changed: a window appearance notification can make GPUI
         // re-enter material resolution on its next frame.

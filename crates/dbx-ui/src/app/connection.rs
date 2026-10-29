@@ -999,6 +999,10 @@ impl DbxApp {
         self.tab_group_edit = None;
         self.table_confirmation_input = None;
         self.vault_state = Some(VaultState::Locked);
+        // Invalidate any recovery still loading from before the lock and
+        // restore the saved workspace again after the next successful unlock.
+        self.vault_generation = self.vault_generation.saturating_add(1);
+        self.startup_recovery_started = false;
         // A manual lock never re-prompts automatically.
         self.touch_id_launch_prompt_pending = false;
         self.reset_folder_creation(cx);

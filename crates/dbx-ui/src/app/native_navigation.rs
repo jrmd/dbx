@@ -284,8 +284,7 @@ impl DbxApp {
         let visible = self.workspace_screen_drawn()
             && connected
             && !self.sidebar_hidden
-            && !self.inspector_page()
-            && self.modal_traps().is_empty();
+            && !self.inspector_page();
         let mut rows = Vec::new();
         let mut selected = Vec::new();
         let mut schemas = Vec::new();
@@ -402,6 +401,10 @@ impl DbxApp {
                 explorer_menu.push(json!({"command": command, "label": label, "enabled": enabled}));
             }
         }
+        let scrim = {
+            let color = theme().overlay;
+            [color.r, color.g, color.b, color.a]
+        };
         self.native_glass.sync(&json!({
             "session": self.active_session_id,
             "connections": if unlocked { self.sessions.iter().map(|session| {
@@ -416,7 +419,7 @@ impl DbxApp {
             // explorer, so the toggle would only flip hidden state there.
             "canToggleSidebar": connected && self.workspace_screen_drawn() && !self.inspector_page(),
             "canCreateTable": session.is_some_and(|session| session.kind.is_sql() && !session.busy && session.engine.as_ref().is_some_and(|engine| !engine.is_read_only())),
-            "modal": !self.modal_traps().is_empty(), "dark": crate::theme::is_dark(), "systemAppearance": self.appearance == Appearance::System,
+            "modal": !self.modal_traps().is_empty(), "scrim": scrim, "dark": crate::theme::is_dark(), "systemAppearance": self.appearance == Appearance::System,
             "rows": rows, "selected": selected, "schemas": schemas, "databases": databases,
             "schema": session.and_then(|session| session.schema_filter.as_deref()).unwrap_or(ALL_SCHEMAS_LABEL),
             "database": session.and_then(|session| session.current_database.as_deref()),

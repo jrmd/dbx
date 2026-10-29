@@ -13,6 +13,7 @@ fn row_field_heading(
     name: String,
     metadata: String,
     state_control: Option<AnyElement>,
+    expand: Option<AnyElement>,
 ) -> Div {
     let label_selector = SharedString::from(format!("row-field-label-{field_id}"));
     let state_selector = SharedString::from(format!("row-field-state-{field_id}"));
@@ -41,6 +42,7 @@ fn row_field_heading(
                         .child(metadata),
                 ),
         )
+        .when_some(expand, |view, button| view.child(button))
         .when_some(state_control, |view, control| {
             view.child(
                 div()
@@ -51,6 +53,24 @@ fn row_field_heading(
                     .child(control),
             )
         })
+}
+
+/// The small "expand" icon button beside an inspector field's name.
+fn expand_button(
+    id: SharedString,
+    name: &str,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let label = format!("Expand {name}");
+    Button::new(id)
+        .with_size(Size::XSmall)
+        .compact()
+        .ghost()
+        .accessible_name(label.clone())
+        .tooltip(label)
+        .child(icon(Icon::Expand, theme().text_muted))
+        .on_click(on_click)
+        .into_any_element()
 }
 
 impl DbxApp {
@@ -617,68 +637,6 @@ impl DbxApp {
             .on_action(cx.listener(move |this, _: &SetCellNull, window, cx| {
                 this.set_cell_null_for(session_id, tab_id, window, cx)
             }))
-            .when_some(
-                self.data_tab(session_id, tab_id)
-                    .and_then(|data| data.cell_editor.as_ref())
-                    .filter(|cell| cell.multiline)
-                    .map(|cell| (cell.editor.clone(), cell.structured)),
-                |view, (editor, structured)| {
-                    let focus = editor.read(cx).focus_handle();
-                    let title = if structured {
-                        "JSON editor"
-                    } else {
-                        "Text editor"
-                    };
-                    view.child(
-                        div()
-                            .flex_none()
-                            .h(crate::theme::ui_px(260.))
-                            .p(crate::theme::ui_px(10.))
-                            .flex()
-                            .flex_col()
-                            .gap(crate::theme::ui_px(6.))
-                            .child(
-                                div().flex().justify_between().child(title).child(
-                                    div()
-                                        .flex()
-                                        .gap(crate::theme::ui_px(6.))
-                                        .child(
-                                            button("cancel-json-edit", "Cancel", ButtonKind::Quiet)
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.cancel_cell_edit_for(
-                                                            session_id, tab_id, window, cx,
-                                                        )
-                                                    },
-                                                )),
-                                        )
-                                        .child(
-                                            button(
-                                                "stage-json-edit",
-                                                "Stage change",
-                                                ButtonKind::Primary,
-                                            )
-                                            .debug_selector(|| "stage-json-edit".into())
-                                            .on_click(
-                                                cx.listener(move |this, _, window, cx| {
-                                                    this.commit_cell_edit_for(
-                                                        session_id, tab_id, None, window, cx,
-                                                    )
-                                                }),
-                                            ),
-                                        ),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .debug_selector(|| "json-cell-editor".into())
-                                    .flex_1()
-                                    .min_h_0()
-                                    .child(editor::input_fill(editor, focus, cx)),
-                            ),
-                    )
-                },
-            )
             .on_action(cx.listener(move |this, _: &editor::Undo, _, cx| {
                 this.undo_grid_edits_for(session_id, tab_id, false, cx)
             }))
@@ -905,6 +863,9 @@ impl DbxApp {
                                 field.boolean_selector.clone(),
                                 field.state_selector.clone(),
                                 field.value_kind(),
+                                field
+                                    .binary_format
+                                    .is_none_or(|format| format == BinaryFormat::Text),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -921,7 +882,15 @@ impl DbxApp {
                             .map(|(index, column)| {
                                 (
                                     column.name.clone(),
-                                    column.data_type.clone(),
+                                    // Drivers report runtime types ("text" for any
+                                    // string); the declared type tells TEXT from VARCHAR.
+                                    data.table_columns
+                                        .iter()
+                                        .find(|candidate| candidate.name == column.name)
+                                        .map_or_else(
+                                            || column.data_type.clone(),
+                                            |declared| declared.data_type.clone(),
+                                        ),
                                     data.shown_value(row, index),
                                 )
                             })
@@ -1081,6 +1050,7 @@ impl DbxApp {
                             boolean_selector,
                             state_selector,
                             value_kind,
+                            binary_draft_is_text,
                         )| {
                             let is_json = value_kind == FieldValueKind::Json;
                             let is_multiline = is_json || value_kind == FieldValueKind::Text;
@@ -1103,6 +1073,36 @@ impl DbxApp {
                             } else {
                                 crate::theme::ui_px(32.)
                             };
+                            let expandable = state == FieldValueState::Value
+                                && (is_json || {
+                                    let text = field_editor.read(cx).text(cx);
+                                    let json_bytes = binary_draft_is_text
+                                        && crate::app::value_view::json_preview(
+                                            &CellValue::Text(text.clone()),
+                                        )
+                                        .is_some();
+                                    crate::row_drafts::edit_surface(
+                                        &data_type,
+                                        Some(&text),
+                                        json_bytes,
+                                    )
+                                    .is_popover()
+                                });
+                            let expand_button = expandable.then(|| {
+                                expand_button(
+                                    SharedString::from(format!("inspector-expand-{field_id}")),
+                                    &name,
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.open_field_popover_for(
+                                            session_id,
+                                            tab_id,
+                                            crate::app::cell_edits::FieldTarget::Draft(field_id),
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                                )
+                            });
                             let field_focus = field_editor.read(cx).focus_handle();
                             let sql_focus = sql_editor.read(cx).focus_handle();
                             let is_enum = enum_selector.is_some();
@@ -1209,6 +1209,7 @@ impl DbxApp {
                                         if primary_key { " · primary key" } else { "" }
                                     ),
                                     state_control,
+                                    expand_button,
                                 ))
                                 .when(state == FieldValueState::Value, |view| {
                                     view.child(value_control)
@@ -1333,6 +1334,40 @@ impl DbxApp {
                                     }
                                 };
                                 let copy_name = format!("Copy {name} value");
+                                let expand_button = value
+                                    .as_ref()
+                                    .filter(|value| {
+                                        let bytes = matches!(value, CellValue::Bytes(_));
+                                        let json = (!bytes || format == BinaryFormat::Text)
+                                            && crate::app::value_view::json_preview(value)
+                                                .is_some();
+                                        let text = if bytes {
+                                            format.editor_text(value)
+                                        } else {
+                                            crate::app::value_view::value_clipboard_text(value)
+                                        };
+                                        crate::row_drafts::edit_surface(&data_type, Some(&text), json)
+                                            .is_popover()
+                                    })
+                                    .map(|_| {
+                                        expand_button(
+                                            SharedString::from(format!(
+                                                "inspector-expand-static-{index}"
+                                            )),
+                                            &name,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.open_field_popover_for(
+                                                    session_id,
+                                                    tab_id,
+                                                    crate::app::cell_edits::FieldTarget::Static(
+                                                        index,
+                                                    ),
+                                                    window,
+                                                    cx,
+                                                )
+                                            }),
+                                        )
+                                    });
                                 div()
                                     .id(SharedString::from(format!("row-detail-{tab_id}-{index}")))
                                     .role(gpui::Role::Group)
@@ -1370,6 +1405,9 @@ impl DbxApp {
                                                             .text_color(theme().text_muted)
                                                             .child(display_type(&data_type)),
                                                     )
+                                                    .when_some(expand_button, |view, button| {
+                                                        view.child(button)
+                                                    })
                                                     .when_some(copy_text, |view, text| {
                                                         let copied = copied_field == Some(index);
                                                         let name = if copied {
@@ -2414,10 +2452,17 @@ fn read_only_value(
         cx,
         |window, cx| {
             let value = cx.new(|_| String::new());
-            editor::TextEditor::new_with_language(value, multiline, language, window, cx)
-                .read_only()
-                .row_value()
-                .accessibility_label(label)
+            let editor =
+                editor::TextEditor::new_with_language(value, multiline, language, window, cx)
+                    .read_only()
+                    .row_value()
+                    .accessibility_label(label);
+            // Line numbers help in JSON; text stays plain in the narrow sidebar.
+            if language == editor::EditorLanguage::Json {
+                editor.line_numbers()
+            } else {
+                editor
+            }
         },
     );
     if *field.read(cx).value_entity().read(cx) != text {

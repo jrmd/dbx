@@ -12,6 +12,7 @@ mod result_export;
 mod row_drafts;
 mod settings;
 mod updater;
+mod window_geometry;
 
 // The extracted crates keep their historical module paths, so `crate::theme`,
 // `crate::editor`, `crate::vault`, ... resolve exactly as before the split.
@@ -24,7 +25,7 @@ use dbx_ui_components::{accessibility, assets, motion, theme};
 
 use app::DbxApp;
 use gpui::{
-    App, AppContext, Bounds, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, TitlebarOptions,
+    App, AppContext, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, TitlebarOptions,
     WindowBounds, WindowDecorations, WindowOptions, point, px, size,
 };
 
@@ -32,13 +33,10 @@ gpui::actions!(dbx_ui, [Quit, Minimize, Zoom]);
 
 const APP_NAME: &str = "DBX";
 
-fn dbx_window_options() -> WindowOptions {
+fn dbx_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-            point(px(80.0), px(80.0)),
-            size(px(1440.0), px(900.0)),
-        ))),
-        window_min_size: Some(size(px(960.0), px(640.0))),
+        window_bounds: Some(WindowBounds::Windowed(window_geometry::initial_bounds(cx))),
+        window_min_size: Some(size(px(480.0), px(500.0))),
         // GPUI's macOS backend only includes AppKit's resizable style mask when
         // a titlebar configuration is present. Preserve native traffic lights;
         // the shared titlebar reserves their leading space on macOS.
@@ -203,6 +201,13 @@ fn main() {
                 Some("DbxCellEditor"),
             ),
             KeyBinding::new("escape", app::CancelCellEdit, Some("DbxCellEditor")),
+            KeyBinding::new("escape", app::CancelValuePopover, Some("DbxValuePopover")),
+            KeyBinding::new("cmd-enter", app::StageValuePopover, Some("DbxValuePopover")),
+            KeyBinding::new(
+                "ctrl-enter",
+                app::StageValuePopover,
+                Some("DbxValuePopover"),
+            ),
             KeyBinding::new(
                 "cmd-shift-backspace",
                 app::SetCellNull,
@@ -367,7 +372,7 @@ fn main() {
         .detach();
         cx.set_menus(app_menus());
         let main_window = cx
-            .open_window(dbx_window_options(), |window, cx| {
+            .open_window(dbx_window_options(cx), |window, cx| {
                 window.set_window_title(if config::override_directory().is_some() {
                     "DBX — isolated profile"
                 } else {

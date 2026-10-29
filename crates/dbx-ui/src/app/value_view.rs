@@ -12,20 +12,34 @@ const TEXT_PREVIEW_CHARS: usize = 20_000;
 
 /// Pretty JSON for JSON values and for text or UTF-8 bytes holding an object or array.
 pub(super) fn json_preview(value: &CellValue) -> Option<String> {
-    let document = |text: &str| {
-        let trimmed = text.trim_start();
-        if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
-            return None;
-        }
-        serde_json::from_str(text).ok()
-    };
-    let parsed = match value {
-        CellValue::Json(value) => value.clone(),
-        CellValue::Text(text) => document(text)?,
-        CellValue::Bytes(bytes) => document(std::str::from_utf8(bytes).ok()?)?,
-        _ => return None,
-    };
-    serde_json::to_string_pretty(&parsed).ok()
+    serde_json::to_string_pretty(&cell_json_document(value)?).ok()
+}
+
+/// A JSON object or array in `text`, if it is one.
+fn json_document(text: &str) -> Option<serde_json::Value> {
+    let trimmed = text.trim_start();
+    if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+        return None;
+    }
+    serde_json::from_str(text).ok()
+}
+
+/// Pretty-print a JSON object or array for editing; anything else, including
+/// invalid JSON, comes back unchanged.
+pub(super) fn pretty_json_text(text: String) -> String {
+    json_document(&text)
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or(text)
+}
+
+/// The JSON document a loaded cell holds, however the driver returned it.
+pub(super) fn cell_json_document(value: &CellValue) -> Option<serde_json::Value> {
+    match value {
+        CellValue::Json(value) => Some(value.clone()),
+        CellValue::Text(text) => json_document(text),
+        CellValue::Bytes(bytes) => json_document(std::str::from_utf8(bytes).ok()?),
+        _ => None,
+    }
 }
 
 /// A classic offset/hex/ASCII dump of the first bytes.
@@ -239,6 +253,22 @@ pub(super) fn value_clipboard_text(value: &CellValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_is_pretty_printed_for_editing_without_reordering() {
+        assert_eq!(
+            pretty_json_text(r#"{"b":1,"a":[1.50,2]}"#.into()),
+            "{\n  \"b\": 1,\n  \"a\": [\n    1.50,\n    2\n  ]\n}"
+        );
+        // Scalars and invalid JSON are left exactly as they are.
+        for text in ["42", "\"hello\"", "{oops", ""] {
+            assert_eq!(pretty_json_text(text.into()), text);
+        }
+        assert_eq!(
+            cell_json_document(&CellValue::Bytes(br#"{"a":1}"#.to_vec())),
+            Some(serde_json::json!({"a": 1}))
+        );
+    }
 
     #[test]
     fn binary_formats_round_trip_and_validate_without_swapping_implicitly() {
