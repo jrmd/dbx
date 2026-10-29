@@ -884,6 +884,8 @@ pub struct DbxApp {
     /// Set until the first Touch ID probe after launch completes; the unlock
     /// prompt may be raised automatically once, never again.
     touch_id_launch_prompt_pending: bool,
+    /// The first probe after launch has reported.
+    touch_id_probed: bool,
     saving_connection: bool,
     vault_generation: u64,
     credential_hydrating: bool,
@@ -1073,7 +1075,7 @@ impl DbxApp {
             vault_busy: false,
             remember_device: saved_settings
                 .as_ref()
-                .is_none_or(|settings| settings.remember_device && !settings.touch_id_enabled),
+                .is_none_or(|settings| settings.remember_device),
             touch_id_enabled: saved_settings
                 .as_ref()
                 .is_some_and(|settings| settings.touch_id_enabled),
@@ -1081,6 +1083,7 @@ impl DbxApp {
             touch_id_enrolled: false,
             touch_id_probe_generation: 0,
             touch_id_launch_prompt_pending: true,
+            touch_id_probed: false,
             saving_connection: false,
             vault_generation: 0,
             credential_hydrating: false,
@@ -5450,7 +5453,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn touch_id_preference_excludes_silent_unlock(cx: &mut gpui::TestAppContext) {
+    fn touch_id_and_silent_unlock_are_independent(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (app, cx) = cx.add_window_view(DbxApp::new);
         cx.update(|_, cx| {
@@ -5459,19 +5462,16 @@ mod tests {
                 app.remember_device = true;
                 app.apply_touch_id_preference(true, cx);
                 assert!(app.touch_id_enabled);
-                assert!(!app.remember_device);
-                app.toggle_remember_device(cx);
-                assert!(!app.remember_device);
+                assert!(app.remember_device);
                 let saved = app.settings_store.as_ref().unwrap().load().unwrap();
                 assert!(saved.touch_id_enabled);
-                assert!(!saved.remember_device);
+                assert!(saved.remember_device);
 
-                // Removing a fingerprint or losing the sensor must not trap
-                // the user in a preference they can no longer turn off.
+                // Turning one off leaves the other alone.
                 app.apply_touch_id_preference(false, cx);
-                assert!(!app.touch_id_enabled);
+                assert!(!app.touch_id_enabled && app.remember_device);
                 let saved = app.settings_store.as_ref().unwrap().load().unwrap();
-                assert!(!saved.touch_id_enabled);
+                assert!(!saved.touch_id_enabled && saved.remember_device);
             });
         });
     }
@@ -5516,17 +5516,17 @@ mod tests {
                     app.touch_id_enabled = true;
                     app.touch_id_available = true;
                     app.touch_id_enrolled = true;
+                    app.touch_id_probed = true;
                     app.vault_busy = false;
                 };
                 assert!(app.touch_id_launch_prompt_pending);
                 // Every guard blocks the attempt, and still uses up the launch prompt.
-                let guards: [fn(&mut DbxApp); 6] = [
+                let guards: [fn(&mut DbxApp); 5] = [
                     |a| a.vault_state = Some(VaultState::Uninitialized),
                     |a| a.vault_state = Some(VaultState::Unlocked),
                     |a| a.touch_id_enabled = false,
                     |a| a.touch_id_available = false,
                     |a| a.touch_id_enrolled = false,
-                    |a| a.vault_busy = true,
                 ];
                 for block in guards {
                     app.touch_id_launch_prompt_pending = true;
@@ -5534,6 +5534,18 @@ mod tests {
                     block(app);
                     assert!(!app.maybe_auto_prompt_touch_id(cx));
                     assert!(!app.touch_id_launch_prompt_pending);
+                }
+                // The launch device unlock in flight, or a probe not yet reported,
+                // only makes it wait: the launch prompt is not used up.
+                for wait in [
+                    (|a: &mut DbxApp| a.vault_busy = true) as fn(&mut DbxApp),
+                    |a| a.touch_id_probed = false,
+                ] {
+                    app.touch_id_launch_prompt_pending = true;
+                    ready(app);
+                    wait(app);
+                    assert!(!app.maybe_auto_prompt_touch_id(cx));
+                    assert!(app.touch_id_launch_prompt_pending);
                 }
                 // Typing a passphrase blocks it too.
                 app.touch_id_launch_prompt_pending = true;
@@ -5556,6 +5568,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn launch_device_unlock_runs_before_the_touch_id_fallback(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.vault_state = Some(VaultState::Locked);
+                app.touch_id_enabled = true;
+                app.remember_device = true;
+                // Both options on: device unlock still runs at launch.
+                assert!(app.wants_device_unlock());
+                app.remember_device = false;
+                assert!(!app.wants_device_unlock());
+                app.remember_device = true;
+                app.vault_state = Some(VaultState::Unlocked);
+                assert!(!app.wants_device_unlock());
+
+                // A failed device unlock falls back to the Touch ID prompt.
+                app.vault_state = Some(VaultState::Locked);
+                app.touch_id_available = true;
+                app.touch_id_enrolled = true;
+                app.touch_id_probed = true;
+                app.touch_id_launch_prompt_pending = true;
+                app.vault_busy = true;
+                assert!(!app.maybe_auto_prompt_touch_id(cx)); // probe waits
+                assert!(app.touch_id_launch_prompt_pending);
+                app.finish_device_unlock(false, cx);
+                assert!(!app.vault_busy);
+                assert!(!app.touch_id_launch_prompt_pending);
+
+                // A successful one clears the pending prompt for good.
+                app.vault_state = Some(VaultState::Locked);
+                app.touch_id_launch_prompt_pending = true;
+                app.vault_busy = true;
+                app.finish_device_unlock(true, cx);
+                assert_eq!(app.vault_state, Some(VaultState::Unlocked));
+                assert!(!app.touch_id_launch_prompt_pending);
+                app.vault_state = Some(VaultState::Locked); // later manual lock
+                assert!(!app.maybe_auto_prompt_touch_id(cx));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn touch_id_requires_explicit_ready_locked_state(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (app, cx) = cx.add_window_view(DbxApp::new);
@@ -5563,9 +5618,7 @@ mod tests {
             app.update(cx, |app, cx| {
                 app.vault_state = Some(VaultState::Locked);
                 app.touch_id_enabled = true;
-                app.remember_device = true; // Inconsistent legacy preferences.
-                app.try_device_unlock(cx);
-                assert!(!app.vault_busy);
+                app.remember_device = true;
                 app.touch_id_available = false;
                 app.touch_id_enrolled = true;
                 app.unlock_with_touch_id(cx);

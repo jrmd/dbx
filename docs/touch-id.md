@@ -15,12 +15,15 @@ The passphrase remains available. Cancelling Touch ID leaves the vault locked.
 Changing the enrolled fingerprints can invalidate the saved key; unlock with
 the passphrase and DBX enrols again, or turn Touch ID off and on in Settings.
 
-Touch ID and **Unlock automatically on this device** are separate options.
-Automatic unlock lives in **Settings → Connections → Vault**; changing it
-updates the system keychain immediately while the vault is unlocked.
-Enabling Touch ID switches off automatic unlock. Before enrolling the protected
-key, DBX removes its ordinary remembered key; if removal fails, enrollment fails
-and a toast reports it.
+Touch ID and **Unlock automatically on this device** are independent options,
+both in **Settings → Connections → Vault**; changing either updates the system
+keychain immediately while the vault is unlocked. With both on, DBX tries
+automatic unlock first when it opens. If that succeeds there is no Touch ID
+prompt; if it fails or has no key, DBX falls back to the once-per-launch Touch ID
+prompt. After a manual lock, only Touch ID (or the passphrase) unlocks; automatic
+unlock does not run again. The trade-off: automatic unlock keeps a key in the
+login Keychain that this signed app can read without a fingerprint, so Touch ID
+alone is the stricter choice.
 
 ## Key protection
 
@@ -125,9 +128,11 @@ On an appropriately provisioned build with enrolled Touch ID, verify:
    and confirm it does not return until you press **Unlock with Touch ID**.
    Lock manually and confirm no prompt appears.
 5. Turn Touch ID off in Settings; confirm the protected item
-   is removed and automatic unlock remains off unless separately selected.
+   is removed and automatic unlock is unaffected.
 6. Confirm missing/invalidated items and unavailable biometrics return to the
    passphrase path without unlocking.
+7. With both options on, relaunch: it should unlock silently with no Touch ID
+   prompt; clear the remembered key and relaunch to see the Touch ID fallback.
 
 The native setup, unlock, failure, and appearance flows can also be checked
 without biometric hardware; see [isolated desktop QA](desktop-qa.md).
