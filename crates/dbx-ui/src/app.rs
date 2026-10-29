@@ -881,6 +881,9 @@ pub struct DbxApp {
     touch_id_available: bool,
     touch_id_enrolled: bool,
     touch_id_probe_generation: u64,
+    /// Set until the first Touch ID probe after launch completes; the unlock
+    /// prompt may be raised automatically once, never again.
+    touch_id_launch_prompt_pending: bool,
     saving_connection: bool,
     vault_generation: u64,
     credential_hydrating: bool,
@@ -1077,6 +1080,7 @@ impl DbxApp {
             touch_id_available: false,
             touch_id_enrolled: false,
             touch_id_probe_generation: 0,
+            touch_id_launch_prompt_pending: true,
             saving_connection: false,
             vault_generation: 0,
             credential_hydrating: false,
@@ -5497,6 +5501,56 @@ mod tests {
                 app.touch_id_available = true;
                 app.set_touch_id_from_settings(true, cx);
                 assert!(!app.touch_id_enabled && !app.vault_busy);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn touch_id_auto_prompt_happens_at_most_once_per_launch(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let ready = |app: &mut DbxApp| {
+                    app.vault_state = Some(VaultState::Locked);
+                    app.touch_id_enabled = true;
+                    app.touch_id_available = true;
+                    app.touch_id_enrolled = true;
+                    app.vault_busy = false;
+                };
+                assert!(app.touch_id_launch_prompt_pending);
+                // Every guard blocks the attempt, and still uses up the launch prompt.
+                let guards: [fn(&mut DbxApp); 6] = [
+                    |a| a.vault_state = Some(VaultState::Uninitialized),
+                    |a| a.vault_state = Some(VaultState::Unlocked),
+                    |a| a.touch_id_enabled = false,
+                    |a| a.touch_id_available = false,
+                    |a| a.touch_id_enrolled = false,
+                    |a| a.vault_busy = true,
+                ];
+                for block in guards {
+                    app.touch_id_launch_prompt_pending = true;
+                    ready(app);
+                    block(app);
+                    assert!(!app.maybe_auto_prompt_touch_id(cx));
+                    assert!(!app.touch_id_launch_prompt_pending);
+                }
+                // Typing a passphrase blocks it too.
+                app.touch_id_launch_prompt_pending = true;
+                ready(app);
+                app.vault_editors
+                    .passphrase
+                    .update(cx, |text, _| *text = "typing".into());
+                assert!(!app.maybe_auto_prompt_touch_id(cx));
+                app.vault_editors
+                    .passphrase
+                    .update(cx, |text, _| text.clear());
+                // Ready: the first probe prompts, later probes do not.
+                app.touch_id_launch_prompt_pending = true;
+                ready(app);
+                assert!(app.maybe_auto_prompt_touch_id(cx));
+                ready(app);
+                assert!(!app.maybe_auto_prompt_touch_id(cx));
             });
         });
     }

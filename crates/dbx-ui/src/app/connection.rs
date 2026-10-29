@@ -500,6 +500,7 @@ impl DbxApp {
                 }
                 this.touch_id_available = available;
                 this.touch_id_enrolled = enrolled;
+                this.maybe_auto_prompt_touch_id(cx);
                 cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
@@ -581,6 +582,26 @@ impl DbxApp {
             Ok::<(), anyhow::Error>(())
         })
         .detach();
+    }
+
+    /// Raise the Touch ID prompt once per launch, when the first probe reports
+    /// it ready. Later probes (after a manual lock, a cancel or a failure) never
+    /// prompt on their own. Returns whether an attempt was started.
+    pub(super) fn maybe_auto_prompt_touch_id(&mut self, cx: &mut Context<Self>) -> bool {
+        if !std::mem::take(&mut self.touch_id_launch_prompt_pending) {
+            return false;
+        }
+        let typing = !self.vault_editors.passphrase.read(cx).is_empty();
+        let ready = self.vault_state == Some(VaultState::Locked)
+            && self.touch_id_enabled
+            && self.touch_id_available
+            && self.touch_id_enrolled
+            && !self.vault_busy
+            && !typing;
+        if ready {
+            self.unlock_with_touch_id(cx);
+        }
+        ready
     }
 
     pub(super) fn unlock_with_touch_id(&mut self, cx: &mut Context<Self>) {
