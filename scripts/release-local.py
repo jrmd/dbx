@@ -211,7 +211,7 @@ def publish(version, tag):
         raise ValueError("The draft release could not be read.")
     require_draft(info)
     names = [name for name in manifest_files(version) if name != "release-notes.md"]
-    # Linux assets may already be present when a release is resumed after CI ran.
+    # Linux assets may already be present when a draft is resumed after CI ran.
     allowed = set(names) | {item for name in linux_asset_names(version) for item in (name, name + ".sha256")}
     if set(asset["name"] for asset in info["assets"]) - allowed:
         raise ValueError("Draft contains unexpected assets; inspect it before retrying.")
@@ -234,12 +234,12 @@ def publish(version, tag):
     require_draft(final_info)
     if not verify_remote_tag(tag, commit):
         raise ValueError("The remote tag disappeared during upload; refusing to publish.")
-    # The workflow adds the Linux packages, verifies the complete set, and
-    # publishes. Dispatching only after verification means it never sees an
-    # unverified Mac upload.
+    # Mac ships first: the verified Mac build goes out now, and CI attaches the
+    # Linux packages to the published release when they are ready.
+    run("gh", "release", "edit", tag, "--repo", REPO, "--draft=false", "--latest")
     run("gh", "workflow", "run", "linux-release.yml", "--repo", REPO, "--ref", tag)
-    print(f"Mac assets uploaded to the draft; CI is building Linux and will publish {tag}.\n"
-          f"Watch: https://github.com/{REPO}/actions/workflows/linux-release.yml")
+    print(f"Published https://github.com/{REPO}/releases/tag/{tag}\n"
+          f"CI is building Linux and will add it: https://github.com/{REPO}/actions/workflows/linux-release.yml")
 
 
 def main():

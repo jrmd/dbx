@@ -1,8 +1,8 @@
 name: Linux release
 
 on:
-  # Dispatched on the version tag by `make release-publish` once the Mac build
-  # is uploaded to the draft release. Re-run it on the tag to retry.
+  # Dispatched on the version tag by `make release-publish` after the Mac build
+  # is published. Adds the Linux packages to that release. Re-run it to retry.
   workflow_dispatch:
 
 permissions:
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      - name: Require a stable version tag with a draft Mac release
+      - name: Require a stable version tag with a Mac release
         env:
           RELEASE_REF_TYPE: ${{ github.ref_type }}
         run: |
@@ -46,10 +46,9 @@ jobs:
               ['gh', 'api', '--paginate', '--slurp', 'repos/' + os.environ['GH_REPO'] + '/releases?per_page=100']))
           release = next((r for page in releases for r in page if r['tag_name'] == tag), None)
           assert release, f'No release for {tag}; run make release-publish first.'
-          assert release['draft'], f'{tag} is already published; published assets are never overwritten.'
           names = {a['name'] for a in release['assets']}
           for suffix in ('', '.sha256'):
-              assert f'DBX-{version}-macos-arm64.zip{suffix}' in names, 'The draft is missing the Mac build.'
+              assert f'DBX-{version}-macos-arm64.zip{suffix}' in names, 'The release is missing the Mac build.'
           PYTHON
       - uses: ./.github/actions/prepare-rust-build
       - name: Validate
@@ -59,16 +58,19 @@ jobs:
           cargo clippy --locked --release --workspace --all-targets -- -D warnings
       - name: Linux packages
         run: bash scripts/build-linux-app.sh appimage
-      - name: Upload Linux packages and publish
+      - name: Upload Linux packages
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
           (cd target/linux && sha256sum -c DBX-*-linux-x86_64.tar.gz.sha256 DBX-*-linux-x86_64.AppImage.sha256)
           linux=("target/linux/DBX-$version-linux-x86_64.tar.gz" "target/linux/DBX-$version-linux-x86_64.AppImage")
           gh release upload "$RELEASE_TAG" "${linux[@]}" "${linux[@]/%/.sha256}" --clobber
-          # Check the bytes GitHub holds before exposing the release to updaters.
+          # Check the bytes GitHub holds, Mac and Linux together.
           mkdir verify
           gh release download "$RELEASE_TAG" --dir verify
           test "$(ls verify | wc -l)" -eq 6
           (cd verify && sha256sum -c ./*.sha256)
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          # Mac normally published already; only publish a still-draft release.
+          if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true ]; then
+            gh release edit "$RELEASE_TAG" --draft=false --latest
+          fi

@@ -131,9 +131,9 @@ Certificates and trusted SSH host keys are still required. See the
 
 Maintainer releases build the signed, notarized macOS bundle locally on an
 Apple Silicon Mac with `make release`. `make release-publish` pushes the tag,
-uploads and verifies the Mac assets in a draft release, then dispatches the
-Linux release workflow: CI builds the x86_64 archive and AppImage, verifies the
-complete asset set, and publishes the release. Intel Macs are not supported.
+uploads and verifies the Mac assets in a draft release, publishes it, then
+dispatches the Linux release workflow: CI builds the x86_64 archive and
+AppImage and adds them to the published release. Intel Macs are not supported.
 Fast CI and database checks remain automatic; tag pushes do not launch builds.
 Run `make release-doctor` to check setup and see the
 [release guide](docs/macos-release.md) for signing credentials and commands.

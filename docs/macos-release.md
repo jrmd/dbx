@@ -3,7 +3,7 @@
 Normal releases are split across two machines. The **Apple Silicon Mac** builds,
 signs, and notarizes macOS locally. GitHub Actions
 ([linux-release.yml](../.github/workflows/linux-release.yml)) builds Linux x86_64
-on Ubuntu 22.04, adds it to the draft release, and publishes. Intel Macs are not
+on Ubuntu 22.04 and adds it to the release after the Mac build has shipped. Intel Macs are not
 supported.
 
 ## Set up this Mac once
@@ -52,9 +52,10 @@ distribution identity, and notarization access before compilation.
 4. Inspect `target/releases/vVERSION/`, extract the Mac ZIP, and smoke-test the
    signed app.
 5. Run `make release-publish`. This pushes the selected tag if needed, uploads
-   the Mac assets to a draft release, downloads and verifies them, then
-   dispatches the Linux release workflow on the tag. CI builds and validates
-   Linux, uploads its assets, checks all six, and publishes the release as latest.
+   the Mac assets to a draft release, downloads and verifies them, publishes the
+   release as latest (Mac first), then dispatches the Linux release workflow on
+   the tag. CI builds and validates Linux, uploads its assets to the published
+   release, and checks all six.
 
 ```bash
 # After committing the version bump and creating its local tag:
@@ -77,9 +78,9 @@ required; `DBX_NOTARY_TIMEOUT` defaults to `30m`.
 
 The Linux workflow must exist on the default branch of GitHub before it can be
 dispatched, so push `main` before the first `make release-publish` that uses it.
-It refuses mismatched tags, prereleases, and published releases, then runs
+It refuses mismatched tags and prereleases, and requires the Mac build on the release, then runs
 formatting, tests, and strict Clippy before packaging. If it fails, the release
-stays a draft; fix the cause and re-run **Linux release** on the tag from the
+stays Mac-only; fix the cause and re-run **Linux release** on the tag from the
 Actions tab (or `gh workflow run linux-release.yml --ref vVERSION`).
 
 Publication refuses mismatched remote tags, changed or incomplete local

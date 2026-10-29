@@ -154,13 +154,14 @@ class LocalReleaseTests(unittest.TestCase):
     def assert_not_published(self):
         self.assertFalse(any("--draft=false" in call for call in self.calls))
 
-    def test_linux_ci_is_dispatched_only_after_download_verification(self):
+    def test_mac_publishes_first_then_linux_ci_is_dispatched(self):
         self.publish()
+        self.assertIn("--draft=false", self.calls[-2])
+        self.assertIn("--latest", self.calls[-2])
         self.assertEqual(self.calls[-1][:3], ("gh", "workflow", "run"))
         self.assertIn("linux-release.yml", self.calls[-1])
         self.assertIn("v1.2.3", self.calls[-1])
-        self.assertTrue(any(call[:3] == ("gh", "release", "download") for call in self.calls[:-1]))
-        self.assert_not_published()
+        self.assertTrue(any(call[:3] == ("gh", "release", "download") for call in self.calls[:-2]))
         self.assertFalse(any(call[:2] == ("git", "push") for call in self.calls))
 
     def test_missing_remote_tag_is_pushed_explicitly(self):
