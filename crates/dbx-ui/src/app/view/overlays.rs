@@ -694,6 +694,14 @@ impl DbxApp {
         let editor_focus = editor.read(cx).focus_handle();
         let accessible_title = format!("{title} {}", if is_json { "JSON" } else { "text" });
         let copy_editor = editor.clone();
+        #[cfg(target_os = "macos")]
+        let sidebar_inset = if crate::theme::native_glass_active() {
+            self.native_glass.left_inset
+        } else {
+            0.
+        };
+        #[cfg(not(target_os = "macos"))]
+        let sidebar_inset = 0.;
 
         let overlay = div()
             .occlude()
@@ -702,11 +710,7 @@ impl DbxApp {
             .absolute()
             // The native sidebar stays visible above GPUI, so centre in the
             // area to its right rather than under it.
-            .pl(px(if crate::theme::native_glass_active() {
-                self.native_glass.left_inset
-            } else {
-                0.
-            }))
+            .pl(px(sidebar_inset))
             .top(crate::theme::ui_px(0.))
             .right(crate::theme::ui_px(0.))
             .bottom(crate::theme::ui_px(0.))
