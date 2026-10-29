@@ -5,7 +5,11 @@ data-protection Keychain entitlement, **Settings → Connections → Vault** off
 **Unlock with Touch ID** while the vault is unlocked. Turning it on enrols this
 vault immediately; turning it off removes the saved key immediately. Once
 enabled, the lock screen offers **Unlock with Touch ID** as its primary action.
-Launching DBX does not request biometric authentication automatically.
+When DBX opens with Touch ID enabled and ready, it raises the Touch ID prompt
+once, after the first availability check reports the saved key is usable. It
+does not prompt again after a manual lock, a cancel, a failure or a later
+check, nor while a passphrase is being typed. Cancelling leaves the lock screen
+as is; use **Unlock with Touch ID** to retry.
 
 The passphrase remains available. Cancelling Touch ID leaves the vault locked.
 Changing the enrolled fingerprints can invalidate the saved key; unlock with
@@ -117,7 +121,9 @@ On an appropriately provisioned build with enrolled Touch ID, verify:
 1. Turn on Touch ID in Settings → Connections → Vault, lock, and unlock with Touch ID.
 2. Lock again and confirm a new authentication is required.
 3. Cancel the prompt and unlock using the passphrase.
-4. Relaunch and confirm no authentication prompt appears until requested.
+4. Relaunch and confirm the Touch ID prompt appears once at launch; cancel it
+   and confirm it does not return until you press **Unlock with Touch ID**.
+   Lock manually and confirm no prompt appears.
 5. Turn Touch ID off in Settings; confirm the protected item
    is removed and automatic unlock remains off unless separately selected.
 6. Confirm missing/invalidated items and unavailable biometrics return to the
