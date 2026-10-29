@@ -1,19 +1,15 @@
 # Local releases and macOS signing
 
-Normal releases are built on the maintainer's **Apple Silicon Mac**. macOS is
-built natively; Linux x86_64 is built in an Ubuntu 22.04 Docker container on the
-same machine. Intel Macs are not supported. GitHub hosts the downloads, but
-normal release builds use no GitHub Actions minutes.
+Normal releases are split across two machines. The **Apple Silicon Mac** builds,
+signs, and notarizes macOS locally. GitHub Actions
+([linux-release.yml](../.github/workflows/linux-release.yml)) builds Linux x86_64
+on Ubuntu 22.04, adds it to the draft release, and publishes. Intel Macs are not
+supported.
 
 ## Set up this Mac once
 
 Install Xcode with Metal tools, Rust with `rustfmt` and `clippy`, CMake, Python
-3.11+, Docker Desktop, and an authenticated `gh`. Keep Docker running. The
-Enable **Use Rosetta for x86_64/amd64 emulation on Apple Silicon** in Docker
-Desktop's General settings (with the Apple Virtualization framework). The
-QEMU emulator can crash when starting Rust; the release preflight checks the
-Linux compiler before starting either platform's compilation. See
-[Docker's settings documentation](https://docs.docker.com/desktop/settings-and-maintenance/settings/).
+3.11+, and an authenticated `gh`.
 The release launcher finds a suitable Python on PATH or in mise, so Apple's default
 Python 3.9 does not need replacing. `DBX_PYTHON=/absolute/path/to/python3` selects
 an explicit interpreter.
@@ -43,7 +39,7 @@ profile; they do not need exported passwords or CI certificate secrets.
 `DBX_NOTARY_PROFILE`, `DBX_NOTARY_KEYCHAIN`, `DBX_KEYCHAIN`, and
 `DBX_SIGNING_NAME` can select another saved profile, Keychain, or signing
 identity. `APPLE_TEAM_ID` optionally restricts identity selection to a team.
-The doctor checks Docker, GitHub authentication, Metal, Rust components, the
+The doctor checks GitHub authentication, Metal, Rust components, the
 distribution identity, and notarization access before compilation.
 
 ## Build and publish locally
@@ -56,8 +52,9 @@ distribution identity, and notarization access before compilation.
 4. Inspect `target/releases/vVERSION/`, extract the Mac ZIP, and smoke-test the
    signed app.
 5. Run `make release-publish`. This pushes the selected tag if needed, uploads
-   all six assets to a draft, downloads and verifies them, and publishes the
-   complete release as latest.
+   the Mac assets to a draft release, downloads and verifies them, then
+   dispatches the Linux release workflow on the tag. CI builds and validates
+   Linux, uploads its assets, checks all six, and publishes the release as latest.
 
 ```bash
 # After committing the version bump and creating its local tag:
@@ -67,27 +64,23 @@ make release-publish
 
 `make release` does not upload, push, or publish. It builds a frozen snapshot of
 the tagged commit, runs workspace tests and strict Clippy in the shipping
-profile on both platforms, and checks formatting and release helpers. It signs,
+profile, and checks formatting and release helpers. It signs,
 notarizes, staples, and verifies the Mac bundle, including the signed updater
 installation test. All checks must pass before it writes a release manifest.
 The manifest binds the artifacts and release notes to the exact tag and commit.
 
-Both platforms build concurrently. Logs are
-`target/releases/vVERSION/macos-build.log` and `linux-build.log`. macOS reuses
+The log is `target/releases/vVERSION/macos-build.log`. macOS reuses
 `target/release-macos-cache/release`, isolated from concurrent development
-builds; Linux keeps Cargo downloads and compilation artifacts in the
-Docker volumes `dbx-release-linux-registry`, `dbx-release-linux-git`, and
-`dbx-release-linux-target`. Do not prune these volumes if you want to retain the
-cache. The Linux image uses the Mac's exact stable Rust version and Ubuntu 22.04
-for glibc compatibility. Linux defaults to two compilation jobs to fit a modest
-Docker VM; increase `DBX_LINUX_BUILD_JOBS` only with enough VM memory.
-
-The first release populates both caches and may take a long time. Linux uses
-x86_64 emulation on Apple Silicon; the packager extracts appimagetool's SquashFS
-before invoking it because Rosetta rejects the AppImage runtime's ELF header.
-Persistent caches avoid rebuilding unchanged dependencies, but this is not a
-guarantee of faster cold builds. Apple's notarization service is still
+builds. Persistent caches avoid rebuilding unchanged dependencies, but this is
+not a guarantee of faster cold builds. Apple's notarization service is still
 required; `DBX_NOTARY_TIMEOUT` defaults to `30m`.
+
+The Linux workflow must exist on the default branch of GitHub before it can be
+dispatched, so push `main` before the first `make release-publish` that uses it.
+It refuses mismatched tags, prereleases, and published releases, then runs
+formatting, tests, and strict Clippy before packaging. If it fails, the release
+stays a draft; fix the cause and re-run **Linux release** on the tag from the
+Actions tab (or `gh workflow run linux-release.yml --ref vVERSION`).
 
 Publication refuses mismatched remote tags, changed or incomplete local
 artifacts, and already-published releases. If an upload fails, fix the problem
@@ -215,7 +208,7 @@ the signed updater installation check always run for each release.
 ## Local verification
 
 ```bash
-bash -n scripts/build-macos-app.sh scripts/release-macos.sh scripts/release-local.sh scripts/release-linux-container.sh
+bash -n scripts/build-macos-app.sh scripts/release-macos.sh scripts/release-local.sh
 python3 scripts/test-macos-release.py
 python3 scripts/test-local-release.py
 python3 scripts/test-build-profiles.py

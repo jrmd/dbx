@@ -129,12 +129,12 @@ certificate verification. Native PostgreSQL tools use libpq host/hostaddr separa
 Certificates and trusted SSH host keys are still required. See the
 [task guide](docs/user-guide.md) and [capability matrix](docs/capability-matrix.md).
 
-Maintainer releases are built locally on an Apple Silicon Mac: `make release`
-builds signed, notarized macOS bundles plus Linux x86_64 packages in an Ubuntu
-22.04 Docker container, with persistent build caches. `make release-publish`
-uploads and verifies all assets before publishing the complete release. Intel
-Macs are not supported. Fast CI and database checks remain automatic; hosted
-release workflows are manual fallbacks and tag pushes do not launch builds.
+Maintainer releases build the signed, notarized macOS bundle locally on an
+Apple Silicon Mac with `make release`. `make release-publish` pushes the tag,
+uploads and verifies the Mac assets in a draft release, then dispatches the
+Linux release workflow: CI builds the x86_64 archive and AppImage, verifies the
+complete asset set, and publishes the release. Intel Macs are not supported.
+Fast CI and database checks remain automatic; tag pushes do not launch builds.
 Run `make release-doctor` to check setup and see the
 [release guide](docs/macos-release.md) for signing credentials and commands.
 

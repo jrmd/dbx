@@ -154,11 +154,13 @@ class LocalReleaseTests(unittest.TestCase):
     def assert_not_published(self):
         self.assertFalse(any("--draft=false" in call for call in self.calls))
 
-    def test_publish_happens_only_after_download_verification(self):
+    def test_linux_ci_is_dispatched_only_after_download_verification(self):
         self.publish()
-        self.assertIn("--draft=false", self.calls[-1])
-        self.assertIn("--latest", self.calls[-1])
+        self.assertEqual(self.calls[-1][:3], ("gh", "workflow", "run"))
+        self.assertIn("linux-release.yml", self.calls[-1])
+        self.assertIn("v1.2.3", self.calls[-1])
         self.assertTrue(any(call[:3] == ("gh", "release", "download") for call in self.calls[:-1]))
+        self.assert_not_published()
         self.assertFalse(any(call[:2] == ("git", "push") for call in self.calls))
 
     def test_missing_remote_tag_is_pushed_explicitly(self):
@@ -183,6 +185,26 @@ class LocalReleaseTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             self.publish()
         self.assert_not_published()
+        self.assertFalse(any(call[:3] == ("gh", "workflow", "run") for call in self.calls))
+
+    def test_unexpected_draft_assets_rejected_but_linux_assets_allowed(self):
+        assets = lambda *names: json.dumps({"draft": True, "assets": [{"name": n} for n in names]})
+        linux = [item for n in release.linux_asset_names("1.2.3") for item in (n, n + ".sha256")]
+        for names, error in (((*linux, "stray.zip"), "unexpected assets"), (tuple(linux), None)):
+            with self.subTest(names=names):
+                self.calls.clear()
+                base = self.fake_run
+                def fake(*args, _base=base, _names=names, **kwargs):
+                    return assets(*_names) if tuple(map(str, args))[:2] == ("gh", "api") else _base(*args, **kwargs)
+                with patch.object(release, "run", fake), patch("builtins.print"):
+                    if error:
+                        with self.assertRaisesRegex(ValueError, error):
+                            release.publish("1.2.3", "v1.2.3")
+                    else:
+                        release.publish("1.2.3", "v1.2.3")
+
+    def test_release_contains_only_the_mac_build(self):
+        self.assertEqual(release.asset_names("1.2.3"), ["DBX-1.2.3-macos-arm64.zip"])
 
     def test_corrupt_download_stays_draft(self):
         self.corrupt_download = True

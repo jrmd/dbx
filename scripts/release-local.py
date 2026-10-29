@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Build and publish DBX releases on an Apple Silicon Mac."""
+"""Build the macOS release locally; CI builds Linux and publishes the release."""
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -51,11 +50,10 @@ def doctor():
     problems = []
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         problems.append("Use an Apple Silicon Mac for the macOS arm64 release.")
-    for command in ("git", "cargo", "rustc", "docker", "gh", "xcrun", "cmake"):
+    for command in ("git", "cargo", "rustc", "gh", "xcrun", "cmake"):
         if not shutil.which(command):
             problems.append(f"Missing command: {command}")
     checks = [
-        ("Docker engine", ("docker", "info", "--format", "{{.Architecture}}")),
         ("GitHub login", ("gh", "auth", "status")),
         ("Metal compiler", ("xcrun", "--find", "metal")),
         ("Rust formatting component", ("cargo", "fmt", "--version")),
@@ -69,29 +67,16 @@ def doctor():
         except (OSError, subprocess.CalledProcessError) as error:
             detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
             problems.append(f"{label}: {detail}")
-    try:
-        rust = run("rustc", "--version", capture=True).split()[1]
-        image = f"dbx-release-linux:rust-{rust}"
-        exists = subprocess.run(["docker", "image", "inspect", image], cwd=ROOT,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        if exists:
-            run("docker", "run", "--rm", "--ulimit", "core=0", "--platform", "linux/amd64",
-                image, "rustc", "--version", capture=True)
-            print("OK: Linux x86_64 compiler", flush=True)
-        else:
-            print("Linux build image will be prepared by make release.", flush=True)
-    except (OSError, subprocess.CalledProcessError) as error:
-        problems.append(f"Linux compiler preflight failed; enable Docker's Rosetta emulation: {error}")
     if problems:
         raise ValueError("\n".join(problems))
 
 
 def asset_names(version):
-    return [
-        f"DBX-{version}-macos-arm64.zip",
-        f"DBX-{version}-linux-x86_64.tar.gz",
-        f"DBX-{version}-linux-x86_64.AppImage",
-    ]
+    return [f"DBX-{version}-macos-arm64.zip"]
+
+
+def linux_asset_names(version):
+    return [f"DBX-{version}-linux-x86_64.tar.gz", f"DBX-{version}-linux-x86_64.AppImage"]
 
 
 def digest(path):
@@ -143,34 +128,17 @@ def build(version, tag):
         run("git", "archive", "--format=tar", "--output", archive, commit)
         run("tar", "-xf", archive, "-C", source)
         archive.unlink()
-        # Docker must not have to create a nested mountpoint in a read-only bind.
-        (source / "target").mkdir(exist_ok=True)
         run("python3", "scripts/release-notes.py", tag, "--output", output / "release-notes.md", cwd=source)
         for test in ("test-macos-release.py", "test-build-profiles.py", "test-release-notes.py", "test-local-release.py"):
             run("python3", source / "scripts" / test, cwd=source)
-        # Fail on emulator/toolchain problems before starting expensive native builds.
-        image = f"dbx-release-linux:rust-{rust}"
-        linux_log = output / "linux-build.log"
-        print(f"Preparing Linux compiler; log: {linux_log}", flush=True)
+        logfile = output / "macos-build.log"
+        print(f"Building macOS; log: {logfile}", flush=True)
+        env = os.environ.copy()
+        # A dedicated persistent cache prevents simultaneous development
+        # builds from replacing the binary between compilation and signing.
+        env.update(CARGO_TARGET_DIR=str(ROOT / "target/release-macos-cache"), DBX_CARGO_PROFILE="release")
+        env.pop("CARGO_BUILD_TARGET", None)
         try:
-            with linux_log.open("w") as log:
-                run("docker", "build", "--platform", "linux/amd64", "--build-arg", f"RUST_VERSION={rust}",
-                    "-f", source / "packaging/linux/release.Dockerfile", "-t", image,
-                    source / "packaging/linux", log=log)
-                run("docker", "run", "--rm", "--ulimit", "core=0", "--platform", "linux/amd64",
-                    image, "rustc", "--version", log=log)
-        except subprocess.CalledProcessError as error:
-            raise ValueError(f"Linux compiler setup failed; inspect {linux_log}. "
-                             "Enable Rosetta emulation in Docker Desktop on Apple Silicon.") from error
-
-        def mac():
-            logfile = output / "macos-build.log"
-            print(f"Building macOS; log: {logfile}", flush=True)
-            env = os.environ.copy()
-            # A dedicated persistent cache prevents simultaneous development
-            # builds from replacing the binary between compilation and signing.
-            env.update(CARGO_TARGET_DIR=str(ROOT / "target/release-macos-cache"), DBX_CARGO_PROFILE="release")
-            env.pop("CARGO_BUILD_TARGET", None)
             with logfile.open("w") as log:
                 run("cargo", "fmt", "--all", "--", "--check", cwd=source, env=env, log=log)
                 run("cargo", "test", "--locked", "--release", "--workspace", cwd=source, env=env, log=log)
@@ -181,49 +149,18 @@ def build(version, tag):
                 run("cargo", "test", "--locked", "--release", "-p", "dbx-ui",
                     "signed_macos_archive_installs_and_preserves_app_on_rejection",
                     "--", "--ignored", "--nocapture", cwd=source, env=env, log=log)
-            for suffix in ("", ".sha256"):
-                shutil.copy2(source / "target/macos" / (asset_names(version)[0] + suffix), output)
-            print("macOS build and signed updater verification passed.", flush=True)
-
-        def linux():
-            logfile = output / "linux-build.log"
-            print(f"Building Linux x86_64; log: {logfile}", flush=True)
-            jobs = os.environ.get("DBX_LINUX_BUILD_JOBS", "2")
-            if not jobs.isdigit() or int(jobs) < 1:
-                raise ValueError("DBX_LINUX_BUILD_JOBS must be a positive integer.")
-            # Dedicated cache volumes live on the VM's Linux filesystem.
-            with logfile.open("a") as log:
-                run("docker", "run", "--rm", "--ulimit", "core=0", "--platform", "linux/amd64",
-                    "--mount", f"type=bind,source={source},target=/src,readonly",
-                    "--mount", "type=volume,source=dbx-release-linux-target,target=/src/target,volume-nocopy",
-                    "--mount", "type=volume,source=dbx-release-linux-registry,target=/opt/cargo/registry",
-                    "--mount", "type=volume,source=dbx-release-linux-git,target=/opt/cargo/git",
-                    "--mount", f"type=bind,source={output},target=/out",
-                    "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"CMAKE_BUILD_PARALLEL_LEVEL={jobs}",
-                    "-e", "CARGO_TARGET_DIR=/src/target", "-e", "DBX_CARGO_PROFILE=release",
-                    "-e", "DBX_EXTRACT_APPIMAGETOOL=1",
-                    "-e", f"DBX_LINUX_ARCHIVE=/out/{asset_names(version)[1]}",
-                    "-e", f"DBX_APPIMAGE=/out/{asset_names(version)[2]}",
-                    image, "bash", "scripts/release-linux-container.sh", log=log)
-            print("Linux build and validation passed.", flush=True)
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(mac), executor.submit(linux)]
-            failures = []
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as error:
-                    failures.append(str(error))
-            if failures:
-                raise ValueError(f"Build failed; inspect {output}/*-build.log.\n" + "\n".join(failures))
+        except subprocess.CalledProcessError as error:
+            raise ValueError(f"Build failed; inspect {logfile}.") from error
+        for suffix in ("", ".sha256"):
+            shutil.copy2(source / "target/macos" / (asset_names(version)[0] + suffix), output)
+        print("macOS build and signed updater verification passed.", flush=True)
         verify_assets(output, version)
         manifest = {
             "format": 1, "tag": tag, "commit": commit, "rust": rust,
             "sha256": {name: digest(output / name) for name in manifest_files(version)},
         }
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(f"Verified release ready in {output}\nSmoke-test the Mac app, then run: make release-publish TAG={tag}")
+    print(f"Verified release ready in {output}\nSmoke-test the Mac app, then run: make release-publish TAG={tag}\nPublishing uploads the Mac build; CI then builds Linux and publishes the release.")
 
 
 def release_info(tag):
@@ -274,14 +211,17 @@ def publish(version, tag):
         raise ValueError("The draft release could not be read.")
     require_draft(info)
     names = [name for name in manifest_files(version) if name != "release-notes.md"]
-    if set(asset["name"] for asset in info["assets"]) - set(names):
+    # Linux assets may already be present when a release is resumed after CI ran.
+    allowed = set(names) | {item for name in linux_asset_names(version) for item in (name, name + ".sha256")}
+    if set(asset["name"] for asset in info["assets"]) - allowed:
         raise ValueError("Draft contains unexpected assets; inspect it before retrying.")
     run("gh", "release", "edit", tag, "--repo", REPO, "--notes-file", output / "release-notes.md")
     run("gh", "release", "upload", tag, *(output / name for name in names),
         "--repo", REPO, "--clobber")
     # Verify the bytes GitHub actually received before exposing the release to updaters.
     with tempfile.TemporaryDirectory(prefix=".download-", dir=RELEASES) as temporary:
-        run("gh", "release", "download", tag, "--repo", REPO, "--dir", temporary)
+        run("gh", "release", "download", tag, "--repo", REPO, "--dir", temporary,
+            *(arg for name in names for arg in ("--pattern", name)))
         downloaded = Path(temporary)
         if set(path.name for path in downloaded.iterdir()) != set(names):
             raise ValueError("Uploaded release asset set does not match the build.")
@@ -294,8 +234,12 @@ def publish(version, tag):
     require_draft(final_info)
     if not verify_remote_tag(tag, commit):
         raise ValueError("The remote tag disappeared during upload; refusing to publish.")
-    run("gh", "release", "edit", tag, "--repo", REPO, "--draft=false", "--latest")
-    print(f"Published https://github.com/{REPO}/releases/tag/{tag}")
+    # The workflow adds the Linux packages, verifies the complete set, and
+    # publishes. Dispatching only after verification means it never sees an
+    # unverified Mac upload.
+    run("gh", "workflow", "run", "linux-release.yml", "--repo", REPO, "--ref", tag)
+    print(f"Mac assets uploaded to the draft; CI is building Linux and will publish {tag}.\n"
+          f"Watch: https://github.com/{REPO}/actions/workflows/linux-release.yml")
 
 
 def main():

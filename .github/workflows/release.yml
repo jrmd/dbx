@@ -1,7 +1,8 @@
 name: Release (manual hosted fallback)
 
 on:
-  # Normal releases are built on the maintainer's Mac with `make release`.
+  # Normal releases: Mac built locally with `make release`, Linux by linux-release.yml.
+  # This workflow builds and publishes everything on hosted runners instead.
   workflow_dispatch:
 
 permissions:

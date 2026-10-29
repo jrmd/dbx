@@ -1,0 +1,74 @@
+name: Linux release
+
+on:
+  # Dispatched on the version tag by `make release-publish` once the Mac build
+  # is uploaded to the draft release. Re-run it on the tag to retry.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Require a stable version tag with a draft Mac release
+        env:
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, subprocess, tomllib
+          version = tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version']
+          tag = os.environ['RELEASE_TAG']
+          assert os.environ['RELEASE_REF_TYPE'] == 'tag', 'Run this workflow on a version tag.'
+          assert tag == 'v' + version, 'Tag must match the workspace version.'
+          assert '-' not in version, 'This workflow publishes stable releases only.'
+          releases = json.loads(subprocess.check_output(
+              ['gh', 'api', '--paginate', '--slurp', 'repos/' + os.environ['GH_REPO'] + '/releases?per_page=100']))
+          release = next((r for page in releases for r in page if r['tag_name'] == tag), None)
+          assert release, f'No release for {tag}; run make release-publish first.'
+          assert release['draft'], f'{tag} is already published; published assets are never overwritten.'
+          names = {a['name'] for a in release['assets']}
+          for suffix in ('', '.sha256'):
+              assert f'DBX-{version}-macos-arm64.zip{suffix}' in names, 'The draft is missing the Mac build.'
+          PYTHON
+      - uses: ./.github/actions/prepare-rust-build
+      - name: Validate
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --release --workspace
+          cargo clippy --locked --release --workspace --all-targets -- -D warnings
+      - name: Linux packages
+        run: bash scripts/build-linux-app.sh appimage
+      - name: Upload Linux packages and publish
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          (cd target/linux && sha256sum -c DBX-*-linux-x86_64.tar.gz.sha256 DBX-*-linux-x86_64.AppImage.sha256)
+          linux=("target/linux/DBX-$version-linux-x86_64.tar.gz" "target/linux/DBX-$version-linux-x86_64.AppImage")
+          gh release upload "$RELEASE_TAG" "${linux[@]}" "${linux[@]/%/.sha256}" --clobber
+          # Check the bytes GitHub holds before exposing the release to updaters.
+          mkdir verify
+          gh release download "$RELEASE_TAG" --dir verify
+          test "$(ls verify | wc -l)" -eq 6
+          (cd verify && sha256sum -c ./*.sha256)
+          gh release edit "$RELEASE_TAG" --draft=false --latest
