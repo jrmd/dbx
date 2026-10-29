@@ -13,6 +13,8 @@ version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"
 export DBX_VERSION="$version"
 # Distributions always use the shipping profile, whatever the caller exported.
 export DBX_CARGO_PROFILE=release
+# Never pick up the developer-machine default profile; only the secret below applies.
+export DBX_NO_PROVISIONING_PROFILE=1
 export DBX_APP_DIR="$root/target/macos/DBX.app"
 mkdir -p target/macos
 temporary=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/dbx-release.XXXXXX")
@@ -29,6 +31,11 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ $mode == signed ]]; then
+  # Optional: a Developer ID provisioning profile enables Touch ID vault unlock.
+  if [[ -n ${APPLE_PROVISIONING_PROFILE_BASE64:-} ]]; then
+    printf '%s' "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$temporary/embedded.provisionprofile"
+    export DBX_PROVISIONING_PROFILE="$temporary/embedded.provisionprofile"
+  fi
   for name in APPLE_CERTIFICATE_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
     [[ -n ${!name:-} ]] || { echo "Missing GitHub secret: $name" >&2; exit 1; }
   done
@@ -86,11 +93,37 @@ else
   export DBX_SIGNING_NAME=- DBX_SIGNING_MODE=local
 fi
 
+# A profile is only meaningful with a distribution signature.
+if [[ -n ${DBX_PROVISIONING_PROFILE:-} && $mode != unsigned ]]; then
+  [[ -s $DBX_PROVISIONING_PROFILE ]] || { echo "Provisioning profile is missing or empty: $DBX_PROVISIONING_PROFILE" >&2; exit 1; }
+fi
 bash scripts/build-macos-app.sh build
 if [[ $mode != unsigned ]]; then
   codesign -dv --verbose=4 "$DBX_APP_DIR" 2> "$temporary/signature.txt"
   grep -Fqx "TeamIdentifier=$APPLE_TEAM_ID" "$temporary/signature.txt"
   grep -Fq 'Authority=Developer ID Application:' "$temporary/signature.txt"
+  if [[ -n ${DBX_PROVISIONING_PROFILE:-} ]]; then
+    # The signed app must carry the validated profile and the entitlements Touch ID relies on.
+    [[ -f $DBX_APP_DIR/Contents/embedded.provisionprofile ]] || { echo 'Provisioning profile was not embedded.' >&2; exit 1; }
+    cmp -s "$DBX_PROVISIONING_PROFILE" "$DBX_APP_DIR/Contents/embedded.provisionprofile" || {
+      echo 'Embedded provisioning profile differs from the validated profile.' >&2; exit 1; }
+    codesign -d --entitlements :- "$DBX_APP_DIR" > "$temporary/entitlements.plist" 2>/dev/null
+    python3 -I - "$temporary/entitlements.plist" "$APPLE_TEAM_ID.${DBX_BUNDLE_ID:-dev.jrmd.dbx}" <<'PY'
+import plistlib, sys
+path, expected = sys.argv[1:3]
+try:
+    with open(path, "rb") as f:
+        entitlements = plistlib.load(f)
+except Exception as error:
+    sys.exit("Signed entitlements are unreadable: %s" % error)
+if entitlements.get("com.apple.application-identifier") != expected:
+    sys.exit("Signed application-identifier is not %s." % expected)
+groups = entitlements.get("keychain-access-groups")
+# Touch ID stores its key in the default (first) access group.
+if not isinstance(groups, list) or not groups or groups[0] != expected:
+    sys.exit("First signed keychain-access-groups entry must be %s." % expected)
+PY
+  fi
   ditto -c -k --keepParent "$DBX_APP_DIR" "$temporary/submission.zip"
   # A timeout or rejected submission stops the job before any release artifact is uploaded.
   xcrun notarytool submit "$temporary/submission.zip" "${notary_args[@]}" \

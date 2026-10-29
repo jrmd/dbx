@@ -1476,6 +1476,8 @@ impl DbxApp {
             "Saved connection passwords can’t be read on this device."
         } else if creating {
             "Choose a passphrase to protect saved connection passwords."
+        } else if show_touch_id_unlock {
+            "Use Touch ID to unlock saved connections."
         } else {
             "Enter your passphrase to unlock saved connections."
         };
@@ -1484,31 +1486,136 @@ impl DbxApp {
             Some(submit_label.into())
         } else if creating {
             Some("At least 12 characters. If it’s lost, saved passwords can’t be recovered.".into())
-        } else if show_touch_id_unlock {
-            Some("Use Touch ID or enter your passphrase".into())
         } else if touch_id_enabled && !touch_id_available {
             Some("Touch ID isn’t available right now. Enter your passphrase.".into())
         } else {
             None
         };
 
-        let use_touch_id = Checkbox::new("vault-use-touch-id")
-            .label("Use Touch ID")
-            .checked(touch_id_enabled)
+        // An opt-in setting: the checkbox names it and a caption explains it.
+        // Kept visible while enabled so it can be turned off even when the
+        // sensor is unavailable (lid closed, no keyboard).
+        let use_touch_id = div()
+            .w(field_width)
+            .max_w_full()
+            .flex()
+            .flex_col()
+            .gap(crate::theme::ui_px(4.))
+            .px(crate::theme::ui_px(14.))
+            .py(crate::theme::ui_px(10.))
+            .rounded(crate::theme::ui_px(12.))
+            .border_1()
+            .border_color(theme().hairline)
+            .bg(theme().glass_hover)
+            .child(
+                Checkbox::new("vault-use-touch-id")
+                    .label("Use Touch ID")
+                    .checked(touch_id_enabled)
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_touch_id(cx))),
+            )
+            .child(
+                div()
+                    .pl(crate::theme::ui_px(24.))
+                    .text_size(crate::theme::text_px(11.))
+                    .text_color(theme().text_muted)
+                    .child("Unlock with your fingerprint instead of typing your passphrase"),
+            );
+        // Once Touch ID is enabled and ready, the setting shrinks to a quiet
+        // link with the same toggle behaviour (takes effect on the next
+        // passphrase unlock).
+        let turn_off_touch_id = Button::new("vault-use-touch-id")
+            .debug_selector(|| "vault-use-touch-id".into())
+            .ghost()
+            .with_size(Size::XSmall)
+            .accessible_name("Turn off Touch ID")
+            .text_size(crate::theme::text_px(11.))
+            .text_color(theme().text_muted)
+            .child("Turn off Touch ID")
+            .when(busy, |button| button.disabled(true))
+            .when(!busy, |button| {
+                button
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_touch_id(cx)))
+            });
+        // The prominent path when Touch ID is ready: a full-width primary pill.
+        let touch_id_unlock = Button::new("vault-touch-id-unlock")
+            .debug_selector(|| "vault-touch-id-unlock".into())
             .with_size(Size::Small)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_touch_id(cx)));
-        let touch_id_unlock = button(
-            "vault-touch-id-unlock",
-            "Unlock with Touch ID",
-            ButtonKind::Quiet,
-        )
-        .debug_selector(|| "vault-touch-id-unlock".into())
-        .when(busy, |button| button.disabled(true))
-        .when(!busy, |button| {
-            button
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| this.unlock_with_touch_id(cx)))
-        });
+            .accessible_name("Unlock with Touch ID")
+            .primary()
+            .w(field_width)
+            .max_w_full()
+            .h(crate::theme::control_height(36.))
+            .flex_none()
+            .rounded_full()
+            .border_1()
+            .border_color(theme().accent)
+            .bg(theme().accent)
+            .text_color(theme().accent_foreground)
+            .text_size(crate::theme::text_px(13.))
+            .font_weight(FontWeight::MEDIUM)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(crate::theme::ui_px(8.))
+                    .child(
+                        icon(Icon::Fingerprint, theme().accent_foreground)
+                            .size(crate::theme::ui_px(18.)),
+                    )
+                    .child("Unlock with Touch ID"),
+            )
+            .when(busy, |button| button.disabled(true).opacity(0.45))
+            .when(!busy, |button| {
+                button
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.unlock_with_touch_id(cx)))
+            });
+        // "or use your passphrase" separates the primary and secondary paths.
+        let or_divider = div()
+            .w(field_width)
+            .max_w_full()
+            .flex()
+            .items_center()
+            .gap(crate::theme::ui_px(10.))
+            .child(
+                div()
+                    .flex_1()
+                    .h(crate::theme::ui_px(1.))
+                    .bg(theme().hairline),
+            )
+            .child(caption("or use your passphrase".into()))
+            .child(
+                div()
+                    .flex_1()
+                    .h(crate::theme::ui_px(1.))
+                    .bg(theme().hairline),
+            );
+        // One status slot directly under the field. It reserves a single
+        // line, so a short hint or error never moves the controls.
+        let status = div()
+            .mt(crate::theme::ui_px(8.))
+            .w(field_width)
+            .max_w_full()
+            .min_h(crate::theme::text_px(16.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .child(match self.error.clone() {
+                Some(error) => {
+                    crate::accessibility::announcement("vault-error", error.clone(), true)
+                        .text_center()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().danger_text)
+                        .child(error)
+                        .into_any_element()
+                }
+                None => hint
+                    .map(|hint| caption(hint).into_any_element())
+                    .unwrap_or_else(|| div().into_any_element()),
+            });
 
         div().id("vault-gate").role(gpui::Role::Pane)
             .aria_label(if creating { "Create DBX Vault" } else { "Unlock DBX Vault" })
@@ -1553,29 +1660,17 @@ impl DbxApp {
                 )
                 .child(div().mt(crate::theme::ui_px(4.)).max_w(crate::theme::ui_px(300.)).child(caption(subtitle.into())))
                 .when(!unavailable, |view| view
-                    .child(div().mt(crate::theme::ui_px(22.)).w_full().flex().justify_center().child(fields))
-                    .when_some(hint, |view, hint| view.child(div().mt(crate::theme::ui_px(10.)).max_w(field_width).child(caption(hint))))
-                    .when_some(self.error.clone(), |view, error| view.child(
-                        crate::accessibility::announcement("vault-error", error.clone(), true)
-                            .mt(crate::theme::ui_px(6.))
-                            .max_w(field_width)
-                            .text_center()
-                            .text_size(crate::theme::text_px(11.))
-                            .text_color(theme().danger_text)
-                            .child(error),
-                    ))
-                    .when(show_touch_id_unlock, |view| view.child(div().mt(crate::theme::ui_px(16.)).child(touch_id_unlock)))
+                    .child(div().mt(crate::theme::ui_px(22.)).w_full().flex().flex_col().items_center().gap(crate::theme::ui_px(14.))
+                        .when(show_touch_id_unlock, |view| view.child(touch_id_unlock).child(or_divider))
+                        .child(fields))
+                    .child(status)
                     .when(touch_id_available || touch_id_enabled, |view| view.child(
-                        div()
-                            .mt(crate::theme::ui_px(20.))
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .gap(crate::theme::ui_px(8.))
-                            // Stay visible while enabled so it can be turned off even
-                            // when the sensor is unavailable (lid closed, no keyboard).
-                            .child(use_touch_id),
-                    )))
+                        div().mt(crate::theme::ui_px(if show_touch_id_unlock { 4. } else { 12. }))
+                            .child(if show_touch_id_unlock {
+                                turn_off_touch_id.into_any_element()
+                            } else {
+                                use_touch_id.into_any_element()
+                            }))))
                 .when(unavailable, |view| view.when_some(self.error.clone(), |view, error| view.child(
                     crate::accessibility::announcement("vault-error", error.clone(), true)
                         .mt(crate::theme::ui_px(10.))

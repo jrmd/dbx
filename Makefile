@@ -35,7 +35,10 @@ release-publish:
 # with an installed Developer ID Application or Apple Development certificate
 # (found automatically; it fails if none or several match), and launches it.
 # DBX_SIGNING_MODE=local opts in to a self-signed identity; DBX_SIGNING_NAME=-
-# opts in to ad-hoc signing. Uses $(DBX_CARGO_PROFILE) (release-local by default).
+# opts in to ad-hoc signing. With a Developer ID identity and the default bundle
+# ID it also embeds ~/Library/Developer/DBX/dbx-developer-id.provisionprofile when
+# that file exists (enables Touch ID); DBX_NO_PROVISIONING_PROFILE=1 opts out.
+# Uses $(DBX_CARGO_PROFILE) (release-local by default).
 build:
 	bash $(MACOS_APP_SCRIPT) build
 

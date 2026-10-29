@@ -42,6 +42,23 @@ identity. `APPLE_TEAM_ID` optionally restricts identity selection to a team.
 The doctor checks GitHub authentication, Metal, Rust components, the
 distribution identity, and notarization access before compilation.
 
+## Provisioning profile for Touch ID (optional)
+
+Touch ID vault unlock requires a Developer ID provisioning profile for
+`dev.jrmd.dbx` under team `DQG6RVCCWV`. Without one, releases still build and
+sign as before but hide Touch ID. Register the explicit App ID, create the
+**Developer ID** profile, and download it as described in
+[Touch ID](touch-id.md#one-time-apple-setup).
+
+- Local releases: `export DBX_PROVISIONING_PROFILE=/path/to/DBX.provisionprofile`
+  before `make release`.
+- GitHub Actions: `base64 -i DBX.provisionprofile | gh secret set APPLE_PROVISIONING_PROFILE_BASE64`
+  (used by the macOS release candidate and hosted release workflows).
+
+The build validates the profile against the signing team, bundle ID and expiry,
+embeds it, and signs with the keychain entitlements. After signing, the release
+script confirms the signed `application-identifier` and first `keychain-access-groups` entry equal `TEAM.dev.jrmd.dbx`, and that the embedded profile is the validated one, before notarizing.
+
 ## Build and publish locally
 
 1. Update the workspace version, lockfile, and versioned changelog entry.

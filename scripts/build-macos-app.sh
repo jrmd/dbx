@@ -18,6 +18,16 @@ LOCAL_IDENTITY_NAME="DBX Local Development"
 # The codesign --sign argument (a fingerprint, or "-") and a label for logs.
 SIGNING_IDENTITY=""
 SIGNING_LABEL=""
+# Optional DBX_PROVISIONING_PROFILE=<.provisionprofile>: embed it and sign with the
+# keychain entitlements Touch ID needs. An explicit value is validated strictly.
+# When it is unset, the default profile below is used only if it exists, the
+# identity is Developer ID Application and the bundle ID is the default. Set
+# DBX_PROVISIONING_PROFILE= (empty) or DBX_NO_PROVISIONING_PROFILE=1 to opt out.
+PROVISIONING_PROFILE="${DBX_PROVISIONING_PROFILE:-}"
+readonly DEFAULT_BUNDLE_ID="dev.jrmd.dbx"
+readonly DEFAULT_PROVISIONING_PROFILE="$HOME/Library/Developer/DBX/dbx-developer-id.provisionprofile"
+PROVISION_DIR=""
+PROVISION_ENTITLEMENTS=""
 KEYCHAIN="${DBX_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 CARGO_BIN="${CARGO:-cargo}"
 
@@ -41,6 +51,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 BINARY_PATH="$TARGET_DIR/$CARGO_PROFILE_DIR/dbx"
 
 readonly INFO_PLIST="$ROOT_DIR/packaging/macos/Info.plist"
+readonly ENTITLEMENTS_TEMPLATE="$ROOT_DIR/packaging/macos/DBX.entitlements"
 readonly LOGO_SVG="$ROOT_DIR/logo.svg"
 readonly LOGO_PNG="$ROOT_DIR/logo.png"
 
@@ -275,6 +286,119 @@ resolve_signing_identity() {
 	no_apple_identity
 }
 
+cleanup_provisioning() {
+	[[ -z "$PROVISION_DIR" ]] || rm -rf -- "$PROVISION_DIR"
+}
+
+# Validate DBX_PROVISIONING_PROFILE against the signing identity and bundle ID,
+# then render the entitlements from the profile's own team and app ID. Runs
+# before the build so a bad profile fails fast.
+prepare_provisioning() {
+	if [[ -z "${DBX_PROVISIONING_PROFILE+set}" && -z "${DBX_NO_PROVISIONING_PROFILE:-}" \
+		&& "$SIGNING_LABEL" == "Developer ID Application: "* && "$BUNDLE_ID" == "$DEFAULT_BUNDLE_ID" \
+		&& -f "$DEFAULT_PROVISIONING_PROFILE" ]]; then
+		PROVISIONING_PROFILE="$DEFAULT_PROVISIONING_PROFILE"
+	fi
+	[[ -n "$PROVISIONING_PROFILE" ]] || return 0
+	local decoded team label_team
+	[[ -f "$PROVISIONING_PROFILE" ]] || die "provisioning profile not found: $PROVISIONING_PROFILE"
+	[[ "$SIGNING_IDENTITY" != "-" ]] || die "a provisioning profile cannot be used with ad-hoc signing; sign with a Developer ID Application identity"
+	[[ "$SIGNING_MODE" != "local" ]] || die "a provisioning profile cannot be used with a self-signed local identity; use a Developer ID Application identity"
+	[[ -f "$ENTITLEMENTS_TEMPLATE" ]] || die "missing entitlements template: $ENTITLEMENTS_TEMPLATE"
+	PROVISION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dbx-provision.XXXXXX")"
+	trap cleanup_provisioning EXIT
+
+	decoded="$PROVISION_DIR/profile.plist"
+	security cms -D -i "$PROVISIONING_PROFILE" >"$decoded" 2>/dev/null \
+		|| die "could not decode provisioning profile: $PROVISIONING_PROFILE"
+
+	# Profiles are Developer ID distribution profiles, so the identity must be a
+	# Developer ID Application certificate whose "(TEAMID)" suffix names the team.
+	[[ "$SIGNING_LABEL" == "Developer ID Application: "*"("*")" ]] \
+		|| die "a provisioning profile requires a 'Developer ID Application: ... (TEAMID)' identity; '$SIGNING_LABEL' is not one"
+	label_team="${SIGNING_LABEL##*(}"
+	label_team="${label_team%)}"
+	[[ "$label_team" =~ ^[A-Z0-9]+$ ]] || die "could not determine the team ID from '$SIGNING_LABEL'"
+	[[ "$BUNDLE_ID" =~ ^[A-Za-z0-9.-]+$ ]] || die "bundle ID contains characters unsuitable for entitlements: $BUNDLE_ID"
+	require_command plutil
+
+	team="$(python3 -I - "$decoded" "$BUNDLE_ID" "$label_team" "$SIGNING_IDENTITY" <<'PY'
+import datetime, hashlib, plistlib, sys
+
+path, bundle_id, expected_team, fingerprint = sys.argv[1:5]
+
+def fail(message):
+    sys.exit("provisioning profile rejected: " + message)
+
+try:
+    with open(path, "rb") as f:
+        profile = plistlib.load(f)
+except Exception as error:
+    fail("not a readable profile (%s)" % error)
+
+teams = profile.get("TeamIdentifier") or []
+entitlements = profile.get("Entitlements") or {}
+app_id = entitlements.get("com.apple.application-identifier") or ""
+if not teams or "." not in app_id:
+    fail("missing TeamIdentifier or com.apple.application-identifier")
+team = teams[0]
+if app_id.split(".", 1)[0] != team:
+    fail("application-identifier %s does not belong to team %s" % (app_id, team))
+if expected_team and team != expected_team:
+    fail("profile team %s does not match signing identity team %s" % (team, expected_team))
+
+# Developer ID profiles list no devices; development and ad hoc profiles do.
+if "ProvisionedDevices" in profile:
+    fail("profile is bound to specific devices; a Developer ID distribution profile is required")
+platform = profile.get("Platform") or []
+if not any(p in ("OSX", "macOS") for p in platform):
+    fail("profile is not a macOS profile (Platform=%s)" % list(platform))
+# The signing certificate must be one the profile was issued for.
+certs = profile.get("DeveloperCertificates") or []
+digests = {hashlib.sha1(bytes(c)).hexdigest().upper() for c in certs}
+if fingerprint.upper() not in digests:
+    fail("signing certificate %s is not in the profile's DeveloperCertificates" % fingerprint.upper())
+
+full_id = team + "." + bundle_id
+if app_id.endswith("*"):
+    matches = full_id.startswith(app_id[:-1])
+else:
+    matches = app_id == full_id
+if not matches:
+    fail("application-identifier %s does not match %s" % (app_id, full_id))
+
+expires = profile.get("ExpirationDate")
+if expires is None:
+    fail("missing ExpirationDate")
+if expires.tzinfo is not None:
+    expires = expires.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+if expires <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None):
+    fail("expired on %s" % expires.isoformat())
+
+groups = entitlements.get("keychain-access-groups")
+if not groups:
+    fail("keychain-access-groups is not allowed by this profile")
+def allows(group):
+    return group == full_id or (group.endswith("*") and full_id.startswith(group[:-1]))
+if not any(allows(group) for group in groups):
+    fail("keychain-access-groups %s does not allow %s" % (list(groups), full_id))
+
+print(team)
+PY
+)" || die "invalid provisioning profile: $PROVISIONING_PROFILE"
+	[[ -n "$team" ]] || die "could not read the team from $PROVISIONING_PROFILE"
+
+	local rendered
+	rendered="$(<"$ENTITLEMENTS_TEMPLATE")"
+	rendered="${rendered//'$(TEAM)'/$team}"
+	rendered="${rendered//'$(BUNDLE_ID)'/$BUNDLE_ID}"
+	PROVISION_ENTITLEMENTS="$PROVISION_DIR/DBX.entitlements"
+	printf '%s\n' "$rendered" >"$PROVISION_ENTITLEMENTS"
+	plutil -convert xml1 "$PROVISION_ENTITLEMENTS" || die "could not normalise the rendered entitlements"
+	plutil -lint "$PROVISION_ENTITLEMENTS" >/dev/null || die "rendered entitlements are not a valid property list"
+	log "using provisioning profile $PROVISIONING_PROFILE for $team.$BUNDLE_ID"
+}
+
 render_icon_png() {
 	local output="$1"
 	local size="$2"
@@ -359,14 +483,23 @@ sign_bundle() {
 	if [[ "$SIGNING_MODE" == "developer-id" ]]; then
 		sign_options+=(--timestamp)
 	fi
+	local main_options=("${sign_options[@]}") bundle_options=("${sign_options[@]}")
+	if [[ -n "$PROVISION_ENTITLEMENTS" ]]; then
+		cp "$PROVISIONING_PROFILE" "$APP_DIR/Contents/embedded.provisionprofile"
+		main_options+=(--entitlements "$PROVISION_ENTITLEMENTS")
+		bundle_options+=(--entitlements "$PROVISION_ENTITLEMENTS")
+	else
+		# Never leave a profile from an earlier build in an unprovisioned bundle.
+		rm -f "$APP_DIR/Contents/embedded.provisionprofile"
+	fi
 	log "signing $APP_DIR with $SIGNING_LABEL"
 
 	# Sign nested code first. Do not use --deep for signing.
-	codesign "${sign_options[@]}" \
+	codesign "${main_options[@]}" \
 		--sign "$identity" \
 		--identifier "$BUNDLE_ID" \
 		"$APP_DIR/Contents/MacOS/dbx"
-	codesign "${sign_options[@]}" \
+	codesign "${bundle_options[@]}" \
 		--sign "$identity" \
 		--identifier "$BUNDLE_ID" \
 		"$APP_DIR"
@@ -376,8 +509,10 @@ sign_bundle() {
 build_app() {
 	# Fail on a missing or ambiguous identity before the long cargo build.
 	resolve_signing_identity
+	prepare_provisioning
 	build_bundle
 	sign_bundle
+	cleanup_provisioning
 	log "ready: $APP_DIR"
 }
 
