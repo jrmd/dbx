@@ -475,16 +475,140 @@ impl ResultTableDelegate {
         &self.order
     }
 
-    /// Filter, copy, hide and pin actions for the right-clicked cell's column.
+    /// The right-clicked cell's clipboard text, honoring its binary format.
+    /// Multi-row selections copy one tab-delimited value per row.
+    fn cell_copy_text(&self, row_ix: usize, column: usize) -> Option<String> {
+        let result = self.result.as_ref()?;
+        let value = self.cell_value(row_ix, column)?;
+        let rows = self.menu_rows(row_ix);
+        if rows.len() > 1 {
+            let values = rows
+                .iter()
+                .map(|row| result.rows.get(*row)?.values.get(column).cloned())
+                .collect::<Option<Vec<_>>>()?;
+            Some(
+                values
+                    .iter()
+                    .map(|value| {
+                        let value = if matches!(value, CellValue::Bytes(_)) {
+                            CellValue::Text(self.binary_format(column).editor_text(value))
+                        } else {
+                            value.clone()
+                        };
+                        delimited_row(std::slice::from_ref(&value), '\t')
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        } else {
+            Some(self.binary_format(column).editor_text(value))
+        }
+    }
+
+    /// The selected rows rendered as Markdown, for the Copy submenu.
+    fn markdown_selection(&self, rows: &[usize]) -> Option<String> {
+        self.result.as_ref().and_then(|result| {
+            let selected = QueryResult {
+                columns: result.columns.clone(),
+                rows: rows
+                    .iter()
+                    .map(|row| result.rows.get(*row).cloned())
+                    .collect::<Option<Vec<_>>>()?,
+                rows_affected: None,
+                truncated: false,
+                elapsed_ms: result.elapsed_ms,
+            };
+            Some(crate::result_export::markdown(&selected))
+        })
+    }
+
+    /// The "View as ▸" submenu for a binary cell: one checked entry per format.
+    /// Data tabs persist the choice through the app; query tabs only re-render
+    /// this grid.
+    fn view_as_submenu(
+        &self,
+        column: usize,
+        ctx: &CellMenuContext,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> PopupMenuItem {
+        use super::value_view::BinaryFormat;
+        let current = self.binary_format(column);
+        let table = cx.entity().downgrade();
+        let CellMenuContext {
+            app,
+            session_id,
+            tab_id,
+            is_data,
+        } = ctx;
+        let app = app.clone();
+        let session_id = *session_id;
+        let tab_id = *tab_id;
+        let is_data = *is_data;
+        let hex_label = if is_data {
+            "View as hex / edit hex"
+        } else {
+            "View as hex"
+        };
+        let formats = [
+            ("View as text (UTF-8)", BinaryFormat::Text),
+            ("View as binary", BinaryFormat::Binary),
+            (hex_label, BinaryFormat::Hex),
+            ("View as UUID", BinaryFormat::Uuid),
+            ("View as UUID (MySQL swapped)", BinaryFormat::UuidSwapped),
+        ];
+        PopupMenuItem::submenu(
+            "View as",
+            PopupMenu::build(window, cx, move |menu, _, _| {
+                let mut menu = menu;
+                for (label, format) in formats {
+                    let app = app.clone();
+                    let table = table.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(current == format)
+                            .on_click(move |_, _, cx| {
+                                if is_data {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.set_binary_format_for(
+                                            session_id, tab_id, column, format, cx,
+                                        );
+                                    });
+                                } else {
+                                    let _ = table.update(cx, |table, cx| {
+                                        let delegate = table.delegate_mut();
+                                        delegate.binary_formats.insert(column, format);
+                                        delegate.cell_text.fill(None);
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    );
+                }
+                menu
+            }),
+        )
+    }
+
+    /// Filter, view, bulk-edit, pin and hide actions for the right-clicked
+    /// cell's column. Copy actions live in the shared "Copy ▸" submenu.
     fn column_menu(
         &self,
         mut menu: PopupMenu,
-        app: &WeakEntity<DbxApp>,
-        session_id: SessionId,
-        tab_id: SecondaryTabId,
+        ctx: &CellMenuContext,
         (row_ix, column): (usize, usize),
-        cx: &App,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
+        let CellMenuContext {
+            app,
+            session_id,
+            tab_id,
+            ..
+        } = ctx;
+        let app = app.clone();
+        let session_id = *session_id;
+        let tab_id = *tab_id;
         let Some(result) = self.result.as_deref() else {
             return menu;
         };
@@ -497,63 +621,8 @@ impl ResultTableDelegate {
         let null = *value == CellValue::Null;
         let rows = self.menu_rows(row_ix);
         let multiple = rows.len() > 1;
-        let copy = if multiple {
-            self.result.as_ref().and_then(|result| {
-                let values = rows
-                    .iter()
-                    .map(|row| result.rows.get(*row)?.values.get(column).cloned())
-                    .collect::<Option<Vec<_>>>()?;
-                Some(
-                    values
-                        .iter()
-                        .map(|value| {
-                            let value = if matches!(value, CellValue::Bytes(_)) {
-                                CellValue::Text(self.binary_format(column).editor_text(value))
-                            } else {
-                                value.clone()
-                            };
-                            delimited_row(std::slice::from_ref(&value), '\t')
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-            })
-        } else {
-            Some(self.binary_format(column).editor_text(value))
-        };
-        menu = menu.item(
-            PopupMenuItem::new(if multiple {
-                format!("Copy {} cells", rows.len())
-            } else {
-                "Copy cell".into()
-            })
-            .disabled(copy.is_none())
-            .on_click(move |_, _, cx| {
-                if let Some(copy) = &copy {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                }
-            }),
-        );
         if matches!(value, CellValue::Bytes(_)) || field_value_kind(info) == FieldValueKind::Bytes {
-            use super::value_view::BinaryFormat;
-            for (label, format) in [
-                ("View as text (UTF-8)", BinaryFormat::Text),
-                ("View as binary", BinaryFormat::Binary),
-                ("View as hex / edit hex", BinaryFormat::Hex),
-                ("View as UUID", BinaryFormat::Uuid),
-                ("View as UUID (MySQL swapped)", BinaryFormat::UuidSwapped),
-            ] {
-                let app = app.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(label)
-                        .checked(self.binary_format(column) == format)
-                        .on_click(move |_, _, cx| {
-                            let _ = app.update(cx, |this, cx| {
-                                this.set_binary_format_for(session_id, tab_id, column, format, cx);
-                            });
-                        }),
-                );
-            }
+            menu = menu.item(self.view_as_submenu(column, ctx, window, cx));
         }
         let filters: &[(&str, FilterOperator)] = if null {
             &[
@@ -1297,6 +1366,32 @@ fn delimited_row(values: &[CellValue], delimiter: char) -> String {
     output
 }
 
+/// What a cell's context menu needs from the app: the owning session and tab,
+/// and whether they belong to a data tab (query tabs only re-render the grid).
+struct CellMenuContext {
+    app: WeakEntity<DbxApp>,
+    session_id: SessionId,
+    tab_id: SecondaryTabId,
+    is_data: bool,
+}
+
+/// Clipboard rows for the "Copy ▸" submenu: one item per (label, text) format.
+fn copy_format_items(
+    mut menu: PopupMenu,
+    formats: Vec<(&'static str, Option<String>)>,
+) -> PopupMenu {
+    for (label, text) in formats {
+        menu = menu.item(PopupMenuItem::new(label).disabled(text.is_none()).on_click(
+            move |_, _, cx| {
+                if let Some(text) = &text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }
+            },
+        ));
+    }
+    menu
+}
+
 fn delimited_result(result: &QueryResult, delimiter: char) -> String {
     let mut output = String::new();
     append_delimited_text_row(
@@ -1866,63 +1961,42 @@ impl TableDelegate for ResultTableDelegate {
         let mut menu = menu;
         let rows = self.menu_rows(row_ix);
         let multiple = rows.len() > 1;
-        for (label, text) in [
+        let selection_copies = vec![
             ("Copy as JSON", self.rows_as_json(&rows)),
             ("Copy as TSV", self.rows_as_tsv(&rows)),
-            (
-                "Copy as Markdown",
-                self.result.as_ref().and_then(|result| {
-                    let selected = QueryResult {
-                        columns: result.columns.clone(),
-                        rows: rows
-                            .iter()
-                            .map(|row| result.rows.get(*row).cloned())
-                            .collect::<Option<Vec<_>>>()?,
-                        rows_affected: None,
-                        truncated: false,
-                        elapsed_ms: result.elapsed_ms,
-                    };
-                    Some(crate::result_export::markdown(&selected))
-                }),
-            ),
-        ] {
-            menu = menu.item(PopupMenuItem::new(label).disabled(text.is_none()).on_click(
-                move |_, _, cx| {
-                    if let Some(text) = &text {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                    }
-                },
-            ));
-        }
+            ("Copy as Markdown", self.markdown_selection(&rows)),
+        ];
         let Some((app, session_id, tab_id, is_data)) = self.row_actions.clone() else {
-            return menu;
+            // No workspace actions: still offer the selection's copy formats.
+            return menu.item(PopupMenuItem::submenu(
+                "Copy",
+                PopupMenu::build(window, cx, move |menu, _, _| {
+                    copy_format_items(menu, selection_copies)
+                }),
+            ));
         };
+        // The cell copy joins the Copy submenu; the remaining column actions
+        // (view, filter, bulk edit, pin/hide) stay at the top level.
+        let column = self
+            .context_column
+            .filter(|_| is_data && row_ix < self.loaded_rows());
+        let cell_copy = column.map(|column| (column, self.cell_copy_text(row_ix, column)));
         if !is_data {
+            // Query results: copy formats plus the binary view switcher only.
+            let copy_menu = PopupMenu::build(window, cx, move |menu, _, _| {
+                copy_format_items(menu, selection_copies)
+            });
+            menu = menu.item(PopupMenuItem::submenu("Copy", copy_menu));
             if let Some(column) = self.context_column
                 && matches!(self.cell_value(row_ix, column), Some(CellValue::Bytes(_)))
             {
-                use super::value_view::BinaryFormat;
-                for (label, format) in [
-                    ("View as text (UTF-8)", BinaryFormat::Text),
-                    ("View as binary", BinaryFormat::Binary),
-                    ("View as hex", BinaryFormat::Hex),
-                    ("View as UUID", BinaryFormat::Uuid),
-                    ("View as UUID (MySQL swapped)", BinaryFormat::UuidSwapped),
-                ] {
-                    let table = cx.entity().downgrade();
-                    menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .checked(self.binary_format(column) == format)
-                            .on_click(move |_, _, cx| {
-                                let _ = table.update(cx, |table, cx| {
-                                    let delegate = table.delegate_mut();
-                                    delegate.binary_formats.insert(column, format);
-                                    delegate.cell_text.fill(None);
-                                    cx.notify();
-                                });
-                            }),
-                    );
-                }
+                let ctx = CellMenuContext {
+                    app: app.clone(),
+                    session_id,
+                    tab_id,
+                    is_data: false,
+                };
+                menu = menu.item(self.view_as_submenu(column, &ctx, window, cx));
             }
             return menu;
         }
@@ -1949,62 +2023,6 @@ impl TableDelegate for ResultTableDelegate {
             })
         });
         let has_result = self.result.is_some();
-        let copy_app = app.clone();
-        let export_app = app.clone();
-        menu = menu
-            .separator()
-            .label("Loaded rows · staged edits excluded")
-            .item(
-                PopupMenuItem::new("Copy all loaded rows as Markdown")
-                    .disabled(!has_result)
-                    .on_click(move |_, _, cx| {
-                        let app = copy_app.clone();
-                        cx.defer(move |cx| {
-                            let _ = app.update(cx, |this, cx| {
-                                this.copy_data_markdown_for(session_id, tab_id, cx);
-                            });
-                        });
-                    }),
-            )
-            .item(PopupMenuItem::submenu(
-                "Export XLSX…",
-                PopupMenu::build(window, cx, move |menu, _, _| {
-                    let loaded = export_app.clone();
-                    let full = export_app.clone();
-                    menu.label("Loaded rows · staged edits excluded")
-                        .item(
-                            PopupMenuItem::new("Loaded rows only…")
-                                .disabled(!has_result)
-                                .on_click(move |_, _, cx| {
-                                    let app = loaded.clone();
-                                    cx.defer(move |cx| {
-                                        let _ = app.update(cx, |this, cx| {
-                                            this.export_data_xlsx_for(session_id, tab_id, cx);
-                                        });
-                                    });
-                                }),
-                        )
-                        .when(supports_full_export, |menu| {
-                            menu.separator()
-                                .label("Full table · filters and staged edits excluded")
-                                .item(
-                                    PopupMenuItem::new("All table rows…")
-                                        .disabled(!full_export)
-                                        .on_click(move |_, _, cx| {
-                                            let app = full.clone();
-                                            cx.defer(move |cx| {
-                                                let _ = app.update(cx, |this, cx| {
-                                                    this.export_full_table_xlsx_for(
-                                                        session_id, tab_id, cx,
-                                                    );
-                                                });
-                                            });
-                                        }),
-                                )
-                        })
-                }),
-            ))
-            .separator();
         let sql = app.upgrade().and_then(|app| {
             let owner = app.read(cx);
             let kind = owner.session(session_id)?.kind;
@@ -2028,22 +2046,108 @@ impl TableDelegate for ResultTableDelegate {
                 .collect::<Option<Vec<_>>>()
                 .map(|statements| statements.join("\n"))
         });
-        menu = menu.when(supports_sql, |menu| {
-            menu.item(
-                PopupMenuItem::new("Copy as SQL")
-                    .disabled(sql.is_none())
-                    .on_click(move |_, _, cx| {
-                        if let Some(sql) = &sql {
-                            cx.write_to_clipboard(ClipboardItem::new_string(sql.clone()));
+        // Copy ▸ groups every clipboard action: the selection's formats, the
+        // right-clicked cell, SQL inserts, and the whole loaded result.
+        let copy_menu = {
+            let rows_len = rows.len();
+            let cell_copy = cell_copy.clone();
+            let sql = sql.clone();
+            let copy_app = app.clone();
+            PopupMenu::build(window, cx, move |menu, _, _| {
+                let mut menu = copy_format_items(menu, selection_copies);
+                if let Some((_, copy)) = &cell_copy {
+                    let copy = copy.clone();
+                    menu = menu.separator().item(
+                        PopupMenuItem::new(if multiple {
+                            format!("Copy {rows_len} cells")
+                        } else {
+                            "Copy cell".into()
+                        })
+                        .disabled(copy.is_none())
+                        .on_click(move |_, _, cx| {
+                            if let Some(copy) = &copy {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                            }
+                        }),
+                    );
+                }
+                if supports_sql {
+                    let sql = sql.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new("Copy as SQL")
+                            .disabled(sql.is_none())
+                            .on_click(move |_, _, cx| {
+                                if let Some(sql) = &sql {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(sql.clone()));
+                                }
+                            }),
+                    );
+                }
+                menu = menu
+                    .separator()
+                    .label("Loaded rows · staged edits excluded")
+                    .item(
+                        PopupMenuItem::new("Copy all loaded rows as Markdown")
+                            .disabled(!has_result)
+                            .on_click(move |_, _, cx| {
+                                let app = copy_app.clone();
+                                cx.defer(move |cx| {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.copy_data_markdown_for(session_id, tab_id, cx);
+                                    });
+                                });
+                            }),
+                    );
+                menu
+            })
+        };
+        menu = menu.item(PopupMenuItem::submenu("Copy", copy_menu));
+        // Export ▸ keeps the two XLSX scopes in one place.
+        let export_app = app.clone();
+        let export_menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let mut menu = menu.label("Loaded rows · staged edits excluded").item(
+                PopupMenuItem::new("Loaded rows as XLSX…")
+                    .disabled(!has_result)
+                    .on_click({
+                        let app = export_app.clone();
+                        move |_, _, cx| {
+                            let app = app.clone();
+                            cx.defer(move |cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.export_data_xlsx_for(session_id, tab_id, cx);
+                                });
+                            });
                         }
                     }),
-            )
-            .separator()
+            );
+            if supports_full_export {
+                menu = menu
+                    .separator()
+                    .label("Full table · filters and staged edits excluded")
+                    .item(
+                        PopupMenuItem::new("All table rows as XLSX…")
+                            .disabled(!full_export)
+                            .on_click(move |_, _, cx| {
+                                let app = export_app.clone();
+                                cx.defer(move |cx| {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.export_full_table_xlsx_for(session_id, tab_id, cx);
+                                    });
+                                });
+                            }),
+                    );
+            }
+            menu
         });
-        if let Some(column) = self.context_column
-            && row_ix < self.loaded_rows()
-        {
-            menu = self.column_menu(menu, &app, session_id, tab_id, (row_ix, column), cx);
+        menu = menu.item(PopupMenuItem::submenu("Export", export_menu));
+        if let Some(column) = column {
+            let ctx = CellMenuContext {
+                app: app.clone(),
+                session_id,
+                tab_id,
+                is_data: true,
+            };
+            menu = self.column_menu(menu, &ctx, (row_ix, column), window, cx);
         }
         let result_snapshot = self.result.clone();
         let insert_snapshot = self.changes.inserts.clone();
@@ -2658,7 +2762,9 @@ mod tests {
         cx.simulate_mouse_down(row.center(), MouseButton::Right, Default::default());
         cx.simulate_mouse_up(row.center(), MouseButton::Right, Default::default());
         cx.update(|window, cx| window.draw(cx).clear(cx));
-        cx.simulate_keystrokes("down enter");
+        // The first entry is the "Copy ▸" submenu: open it, then confirm its
+        // first item (Copy as JSON).
+        cx.simulate_keystrokes("down right enter");
         let json: serde_json::Value = serde_json::from_str(
             &cx.update(|_, cx| cx.read_from_clipboard().unwrap().text().unwrap()),
         )

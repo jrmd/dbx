@@ -3,6 +3,7 @@
 use super::*;
 use crate::workspace::SavedQuery;
 use explorer::{TableMenuRow, table_menu_rows};
+use gpui::AssetSource;
 use serde_json::{Value, json};
 
 impl DbxApp {
@@ -17,6 +18,28 @@ impl DbxApp {
     ) {
         for command in self.native_glass.drain() {
             let kind = command["kind"].as_str().unwrap_or_default();
+            if kind == "nativeContextMenu" {
+                if let Some(id) = command["menuID"].as_u64() {
+                    let path = if self.modal_traps().is_empty() {
+                        command["path"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|index| {
+                                index.as_u64().and_then(|index| usize::try_from(index).ok())
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    // Menu callbacks often update DbxApp itself. Run after this
+                    // navigation update releases its entity borrow.
+                    window.defer(cx, move |window, cx| {
+                        gpui_component::menu::complete_native_context_menu(id, &path, window, cx);
+                    });
+                }
+                continue;
+            }
             if kind == "geometry" {
                 self.native_glass.left_inset = command["left"].as_f64().unwrap_or(0.) as f32;
                 self.native_glass.top_inset = command["top"].as_f64().unwrap_or(52.) as f32;
@@ -88,7 +111,15 @@ impl DbxApp {
                         continue;
                     };
                     match kind {
-                        "closeOtherConnections" => self.close_other_sessions(id, cx),
+                        "closeOtherConnections" => {
+                            let target = command["id"]
+                                .as_str()
+                                .and_then(|value| Uuid::parse_str(value).ok())
+                                .unwrap_or(id);
+                            if self.session(target).is_some() {
+                                self.close_other_sessions(target, cx);
+                            }
+                        }
                         "search" => {
                             if let Some(session) = self.session(id) {
                                 session.editors.sidebar_search.update(cx, |search, cx| {
@@ -412,6 +443,7 @@ impl DbxApp {
                 // and draws the tag as the same outlined pill GPUI tabs use.
                 let tag = session.tag.as_ref().map(|tag| json!({"name": tag.name, "color": tag.color}));
                 json!({"id": session.id, "name": session.name, "busy": session.busy, "tag": tag,
+                    "logo": native_engine_logo(session.kind), "engine": session.kind.to_string(),
                     "label": format!("{}{}{}", session.name, if session.busy { " · working" } else { "" }, session.tag.as_ref().map(|tag| format!(" · {}", tag.name)).unwrap_or_default())})
             }).collect::<Vec<_>>() } else { Vec::new() },
             "connected": connected, "unlocked": unlocked, "sidebar": visible,
@@ -428,6 +460,22 @@ impl DbxApp {
     }
 }
 
+/// Use the same embedded engine marks as the GPUI connection tabs.
+fn native_engine_logo(kind: dbx_core::DatabaseKind) -> &'static str {
+    let path = dbx_ui_components::theme::database_logo_path(kind);
+    let bytes = dbx_ui_components::assets::Assets
+        .load(path)
+        .expect("embedded database logo")
+        .expect("database logo exists");
+    // All embedded SVGs are static UTF-8 assets.
+    match bytes {
+        std::borrow::Cow::Borrowed(bytes) => {
+            std::str::from_utf8(bytes).expect("UTF-8 database logo")
+        }
+        std::borrow::Cow::Owned(_) => unreachable!("database logos are embedded"),
+    }
+}
+
 fn native_object_id(object: &dbx_core::SchemaObject) -> String {
     format!(
         "object:{:?}:{}:{}",
@@ -435,4 +483,92 @@ fn native_object_id(object: &dbx_core::SchemaObject) -> String {
         object.schema.as_deref().unwrap_or_default(),
         object.name
     )
+}
+
+#[cfg(test)]
+mod native_logo_tests {
+    use super::*;
+
+    #[test]
+    fn every_database_kind_has_an_embedded_svg_logo() {
+        for kind in dbx_core::DatabaseKind::ALL {
+            assert!(
+                native_engine_logo(kind).contains("<svg"),
+                "missing logo for {kind}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn native_context_menu_preserves_submenu_actions_and_cancellation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui_component::menu::{
+            PopupMenu, PopupMenuItem, complete_native_context_menu,
+            install_native_context_presenter, present_native_context_menu,
+        };
+        use std::{
+            cell::Cell,
+            rc::Rc,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static ID: AtomicU64 = AtomicU64::new(0);
+        fn capture(
+            id: u64,
+            items: &serde_json::Value,
+            _: gpui::Point<gpui::Pixels>,
+            _: &mut Window,
+            _: &mut App,
+        ) -> bool {
+            assert_eq!(items[0]["label"], "Copy");
+            assert_eq!(items[0]["children"][0]["label"], "JSON");
+            assert_eq!(items[0]["children"][1]["enabled"], false);
+            ID.store(id, Ordering::SeqCst);
+            true
+        }
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            install_native_context_presenter(capture, cx);
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| DbxApp::new(window, cx));
+        let calls = Rc::new(Cell::new(0));
+        cx.update(|window, cx| {
+            let calls_for_menu = calls.clone();
+            let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                let child =
+                    PopupMenu::build(window, cx, move |child, _, _| {
+                        child
+                            .item(PopupMenuItem::new("JSON").on_click(move |_, _, _| {
+                                calls_for_menu.set(calls_for_menu.get() + 1)
+                            }))
+                            .item(PopupMenuItem::new("Disabled").disabled(true))
+                    });
+                menu.item(PopupMenuItem::submenu("Copy", child))
+            });
+            assert!(present_native_context_menu(
+                menu.clone(),
+                point(px(10.), px(10.)),
+                window,
+                cx
+            ));
+            complete_native_context_menu(ID.load(Ordering::SeqCst), &[0, 1], window, cx);
+            assert_eq!(calls.get(), 0);
+            assert!(present_native_context_menu(
+                menu.clone(),
+                point(px(10.), px(10.)),
+                window,
+                cx
+            ));
+            complete_native_context_menu(ID.load(Ordering::SeqCst), &[], window, cx);
+            assert_eq!(calls.get(), 0);
+            assert!(present_native_context_menu(
+                menu,
+                point(px(10.), px(10.)),
+                window,
+                cx
+            ));
+            complete_native_context_menu(ID.load(Ordering::SeqCst), &[0, 0], window, cx);
+            assert_eq!(calls.get(), 1);
+        });
+    }
 }

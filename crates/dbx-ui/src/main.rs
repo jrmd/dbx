@@ -153,6 +153,11 @@ fn main() {
     });
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        #[cfg(target_os = "macos")]
+        gpui_component::menu::install_native_context_presenter(
+            native_glass::present_context_menu,
+            cx,
+        );
         let settings = settings::SettingsStore::new()
             .and_then(|store| store.load())
             .unwrap_or_else(|error| {

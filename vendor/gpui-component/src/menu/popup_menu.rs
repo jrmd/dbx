@@ -52,6 +52,7 @@ pub enum PopupMenuItem {
         checked: bool,
         action: Option<Box<dyn Action>>,
         render: Box<dyn Fn(&mut Window, &mut App) -> AnyElement + 'static>,
+        native_label: Option<SharedString>,
         handler: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
     },
     /// A submenu item that opens another popup menu.
@@ -94,8 +95,17 @@ impl PopupMenuItem {
             checked: false,
             action: None,
             render: Box::new(move |window, cx| builder(window, cx).into_any_element()),
+            native_label: None,
             handler: None,
         }
+    }
+
+    /// Accessible text for an element item when projected to a native menu.
+    pub fn native_label(mut self, label: impl Into<SharedString>) -> Self {
+        if let PopupMenuItem::ElementItem { native_label, .. } = &mut self {
+            *native_label = Some(label.into());
+        }
+        self
     }
 
     /// Create a new submenu item that opens another popup menu.
@@ -812,6 +822,89 @@ impl PopupMenu {
         None
     }
 
+    /// Serializable native menu, preserving indices for actions and submenus.
+    pub(crate) fn native_items(&self, cx: &App) -> Option<serde_json::Value> {
+        let mut items = Vec::new();
+        for (index, item) in self.menu_items.iter().enumerate() {
+            let entry = match item {
+                PopupMenuItem::Separator => serde_json::json!({"separator": true}),
+                PopupMenuItem::Label(label) => {
+                    serde_json::json!({"label": label.as_ref(), "enabled": false})
+                }
+                // Action-backed items need GPUI's painted focus path to dispatch.
+                // Keep those menus on the GPUI path until that can be preserved.
+                PopupMenuItem::Item {
+                    action: Some(_), ..
+                }
+                | PopupMenuItem::ElementItem {
+                    action: Some(_), ..
+                } => return None,
+                PopupMenuItem::Item {
+                    label,
+                    disabled,
+                    checked,
+                    ..
+                } => {
+                    serde_json::json!({"label": label.as_ref(), "enabled": !disabled, "checked": checked, "index": index})
+                }
+                PopupMenuItem::ElementItem {
+                    native_label,
+                    disabled,
+                    checked,
+                    ..
+                } => {
+                    serde_json::json!({"label": native_label.as_ref()?.as_ref(), "enabled": !disabled, "checked": checked, "index": index})
+                }
+                PopupMenuItem::Submenu {
+                    label,
+                    disabled,
+                    menu,
+                    ..
+                } => {
+                    serde_json::json!({"label": label.as_ref(), "enabled": !disabled, "index": index, "children": menu.read(cx).native_items(cx)?})
+                }
+            };
+            items.push(entry);
+        }
+        Some(serde_json::Value::Array(items))
+    }
+
+    pub(crate) fn activate_native(
+        menu: Entity<Self>,
+        path: &[usize],
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some((&index, rest)) = path.split_first() else {
+            return;
+        };
+        if rest.is_empty() {
+            menu.update(cx, |menu, cx| {
+                if menu
+                    .menu_items
+                    .get(index)
+                    .is_some_and(PopupMenuItem::is_clickable)
+                {
+                    menu.on_click(index, window, cx);
+                }
+            });
+        } else if let Some(child) =
+            menu.read(cx)
+                .menu_items
+                .get(index)
+                .and_then(|item| match item {
+                    PopupMenuItem::Submenu {
+                        menu,
+                        disabled: false,
+                        ..
+                    } => Some(menu.clone()),
+                    _ => None,
+                })
+        {
+            Self::activate_native(child, rest, window, cx);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.menu_items.is_empty()
     }
@@ -1186,6 +1279,7 @@ impl PopupMenu {
 
         let (item_height, radius) = match self.size {
             Size::Small => (px(20.), options.radius.half()),
+            _ if cx.theme().native_glass_menus => (px(28.), px(10.)),
             _ => (px(26.), options.radius),
         };
 
@@ -1214,8 +1308,12 @@ impl PopupMenu {
                 .h_auto()
                 .p_0()
                 .my_0p5()
-                .mx_neg_1()
-                .border_b(px(2.))
+                .when(!cx.theme().native_glass_menus, |this| this.mx_neg_1())
+                .border_b(if cx.theme().native_glass_menus {
+                    px(1.)
+                } else {
+                    px(2.)
+                })
                 .border_color(cx.theme().border)
                 .disabled(true),
             PopupMenuItem::Label(label) => this.disabled(true).cursor_default().child(
@@ -1422,7 +1520,7 @@ impl Render for PopupMenu {
         let options = RenderOptions {
             has_left_icon,
             check_side: self.check_side,
-            radius: cx.theme().radius.min(px(8.)),
+            radius: cx.theme().radius_lg.min(px(8.)),
         };
 
         v_flex()
@@ -1437,7 +1535,7 @@ impl Render for PopupMenu {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::dismiss))
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
-            .popover_style(cx)
+            .menu_style(cx)
             .text_color(cx.theme().popover_foreground)
             .relative()
             .occlude()

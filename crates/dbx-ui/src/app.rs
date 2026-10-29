@@ -106,10 +106,11 @@ use crate::{
     theme::{
         Appearance, ButtonAccessibility as _, ButtonKind, FollowCorners, GLASS_INSET, Icon,
         Pressable as _, RADIUS_CONTROL, RADIUS_GLASS, RADIUS_PANEL, appearance, badge, button,
-        connection_tab, database_logo, glass, glass_icon_button, glass_raised, glass_shadow, icon,
-        panel_header, segment, segmented_track, set_appearance, set_reduce_transparency,
-        set_system_appearance, settings_group, settings_row, settings_switch, shortcut,
-        sync_component_theme, theme, tip, window_background,
+        connection_tab, content_shadow, database_logo, glass, glass_icon_button, glass_raised,
+        glass_shadow, glass_sub_tab, glass_tab, icon, panel_header, segment, segmented_track,
+        set_appearance, set_reduce_transparency, set_system_appearance, settings_group,
+        settings_row, settings_switch, shortcut, sync_component_theme, theme, tip,
+        window_background,
     },
     vault::{VaultError, VaultState},
 };

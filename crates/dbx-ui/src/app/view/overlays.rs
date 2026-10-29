@@ -158,7 +158,7 @@ impl DbxApp {
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
-                    .shadow(glass_shadow(28.))
+                    .shadow(content_shadow(28.))
                     .overflow_hidden()
                     .flex()
                     .flex_col()
@@ -458,7 +458,7 @@ impl DbxApp {
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
-                    .shadow(glass_shadow(28.))
+                    .shadow(content_shadow(28.))
                     .overflow_y_scroll()
                     .child(
                         div()
@@ -743,13 +743,13 @@ impl DbxApp {
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
-                    .shadow(glass_shadow(28.))
+                    .shadow(content_shadow(28.))
                     .overflow_hidden()
                     .child(
                         div()
                             .flex_none()
                             .px(crate::theme::ui_px(16.))
-                            .py(crate::theme::ui_px(12.))
+                            .py(crate::theme::ui_px(10.))
                             .border_b_1()
                             .border_color(theme().border)
                             .flex()
@@ -759,28 +759,37 @@ impl DbxApp {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(crate::theme::text_px(15.))
+                                    .text_size(crate::theme::text_px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(theme().text)
                                     .child(title.clone()),
                             )
-                            .when(
-                                !crate::diagram::display_type(&data_type)
-                                    .eq_ignore_ascii_case(tag_label),
-                                |view| {
-                                    view.child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(crate::theme::text_px(11.))
-                                            .text_color(theme().text_muted)
-                                            .child(crate::diagram::display_type(&data_type)),
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(6.))
+                                    .when(
+                                        !crate::diagram::display_type(&data_type)
+                                            .eq_ignore_ascii_case(tag_label),
+                                        |view| {
+                                            view.child(
+                                                div()
+                                                    .text_size(crate::theme::text_px(11.))
+                                                    .text_color(theme().text_muted)
+                                                    .child(crate::diagram::display_type(
+                                                        &data_type,
+                                                    )),
+                                            )
+                                        },
                                     )
-                                },
-                            )
-                            .child(badge(tag_label, theme().text_muted))
-                            .when(read_only, |view| {
-                                view.child(badge("Read-only", theme().text_muted))
-                            }),
+                                    .child(badge(tag_label, theme().text_muted))
+                                    .when(read_only, |view| {
+                                        view.child(badge("Read-only", theme().text_muted))
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -796,7 +805,7 @@ impl DbxApp {
                         div()
                             .flex_none()
                             .px(crate::theme::ui_px(16.))
-                            .py(crate::theme::ui_px(12.))
+                            .py(crate::theme::ui_px(10.))
                             .border_t_1()
                             .border_color(theme().border)
                             .flex()
@@ -911,7 +920,7 @@ impl DbxApp {
                     .border_1()
                     .border_color(theme().hairline)
                     .bg(theme().glass_raised)
-                    .shadow(glass_shadow(28.))
+                    .shadow(content_shadow(28.))
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()

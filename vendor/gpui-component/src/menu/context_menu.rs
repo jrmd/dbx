@@ -185,6 +185,9 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                     div()
                                         .w(window.bounds().size.width)
                                         .h(window.bounds().size.height)
+                                        // A menu shields hover as well as scroll: otherwise
+                                        // rows under the popup react to pointer movement.
+                                        .occlude()
                                         .on_scroll_wheel(|_, _, cx| {
                                             cx.stop_propagation();
                                         })
@@ -315,6 +318,18 @@ impl<E: ParentElement + Styled + IntoElement + 'static> Element for ContextMenu<
                                 menu.update(cx, |menu, cx| {
                                     menu.set_previous_focus(previous_focus_handle, cx);
                                 });
+
+                                let position = shared_state.borrow().position;
+                                if super::native_context::present_native_context_menu(
+                                    menu.clone(),
+                                    position,
+                                    window,
+                                    cx,
+                                ) {
+                                    shared_state.borrow_mut().open = false;
+                                    window.refresh();
+                                    return;
+                                }
 
                                 // Set up the subscription for dismiss handling
                                 let _subscription = window.subscribe(&menu, cx, {

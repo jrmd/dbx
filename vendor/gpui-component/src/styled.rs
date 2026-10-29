@@ -123,6 +123,9 @@ pub trait ThemeStyled: Styled + Sized {
     /// drift apart. See [`popover_shadow`] for what the shadow is modelled on.
     fn popover_style(self, cx: &App) -> Self;
 
+    /// Menu surface shared by component and application-owned menus.
+    fn menu_style(self, cx: &App) -> Self;
+
     /// Round this element as far as its size allows — a circle if it is square,
     /// a pill if it is not — unless the theme squares its corners.
     ///
@@ -222,6 +225,24 @@ impl<T: Styled + Sized> ThemeStyled for T {
                 .border_color(cx.theme().ring.alpha(FOCUS_RING_OPACITY))
                 .refine_style(&ring_style),
         )
+    }
+
+    fn menu_style(self, cx: &App) -> Self {
+        let theme = cx.theme();
+        let panel = self.popover_style(cx).rounded(theme.radius_lg).border_1();
+        if theme.native_glass_menus {
+            panel
+                .rounded(px(16.))
+                .border_color(theme.foreground.alpha(0.14))
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(6.), hsla(0., 0., 0., 0.18))
+                        .blur_radius(px(12.)),
+                    BoxShadow::new(px(0.), px(1.), hsla(0., 0., 0., 0.08))
+                        .blur_radius(px(2.)),
+                ])
+        } else {
+            panel.border_color(theme.border)
+        }
     }
 
     fn popover_style(self, cx: &App) -> Self {

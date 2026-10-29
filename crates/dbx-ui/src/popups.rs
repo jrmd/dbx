@@ -284,10 +284,13 @@ fn move_popover_focus(focus: &FocusHandle, forward: bool, window: &mut Window, c
 /// explorer's) must wear the same surface and rows so the two stay identical.
 const MENU_ITEM_HEIGHT: f32 = 26.;
 
-/// The menu panel: popover surface, 4px padding and 2px between rows.
+/// The menu panel: popover fill and shadow, hairline edge, glass radius, 4px
+/// padding and 2px between rows. Keep this in step with the surface
+/// `PopupMenu` draws in gpui-component (`menu/popup_menu.rs`), so the
+/// explorer's menu and every `context_menu` render identically.
 pub(crate) fn menu_surface<T: Styled>(panel: T, cx: &gpui::App) -> T {
     panel
-        .popover_style(cx)
+        .menu_style(cx)
         .flex()
         .flex_col()
         .p_1()
@@ -307,44 +310,69 @@ pub(crate) fn menu_item<T: Styled + StatefulInteractiveElement + FluentBuilder>(
     cx: &gpui::App,
 ) -> T {
     let theme = cx.theme();
-    let background = highlight.map_or(*theme.tokens.accent, gpui::Hsla::from);
+    let background = highlight.map_or_else(
+        || {
+            if theme.native_glass_menus {
+                theme.primary.alpha(0.22)
+            } else {
+                *theme.tokens.accent
+            }
+        },
+        gpui::Hsla::from,
+    );
     let foreground = if highlight.is_some() {
         None
     } else {
-        Some(theme.accent_foreground)
-    };
-    row.h(gpui::px(MENU_ITEM_HEIGHT))
-        .flex()
-        .items_center()
-        .px_2()
-        .text_sm()
-        .rounded(theme.radius.min(gpui::px(8.)))
-        .text_color(if enabled {
+        Some(if theme.native_glass_menus {
             theme.popover_foreground
         } else {
-            theme.muted_foreground
+            theme.accent_foreground
         })
-        .when(highlighted && enabled, |row| {
-            row.bg(background)
-                .when_some(foreground, |row, color| row.text_color(color))
+    };
+    row.h(gpui::px(if theme.native_glass_menus {
+        28.
+    } else {
+        MENU_ITEM_HEIGHT
+    }))
+    .flex()
+    .items_center()
+    .px_2()
+    .text_sm()
+    .rounded(if theme.native_glass_menus {
+        gpui::px(10.)
+    } else {
+        theme.radius_lg.min(gpui::px(8.))
+    })
+    .text_color(if enabled {
+        theme.popover_foreground
+    } else {
+        theme.muted_foreground
+    })
+    .when(highlighted && enabled, |row| {
+        row.bg(background)
+            .when_some(foreground, |row, color| row.text_color(color))
+    })
+    .when(enabled, |row| {
+        row.cursor_pointer().hover(move |style| {
+            let style = style.bg(background);
+            match foreground {
+                Some(color) => style.text_color(color),
+                None => style,
+            }
         })
-        .when(enabled, |row| {
-            row.cursor_pointer().hover(move |style| {
-                let style = style.bg(background);
-                match foreground {
-                    Some(color) => style.text_color(color),
-                    None => style,
-                }
-            })
-        })
+    })
 }
 
 /// A horizontal rule between menu groups, matching `PopupMenuItem::Separator`.
 pub(crate) fn menu_separator(cx: &gpui::App) -> gpui::Div {
     gpui::div()
         .my_0p5()
-        .mx_neg_1()
-        .border_b(gpui::px(2.))
+        .when(!cx.theme().native_glass_menus, |line| line.mx_neg_1())
+        .border_b(gpui::px(if cx.theme().native_glass_menus {
+            1.
+        } else {
+            2.
+        }))
         .border_color(cx.theme().border)
 }
 

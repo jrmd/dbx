@@ -504,7 +504,7 @@ pub fn theme() -> Theme {
 
 /// Content surfaces are translucent enough for the blurred native backdrop to
 /// show through, yet dense enough that ink contrast holds on any desktop.
-const NATIVE_CANVAS_ALPHA: f32 = 0.96;
+const NATIVE_CANVAS_ALPHA: f32 = 0.90;
 const NATIVE_PANEL_ALPHA: f32 = 0.97;
 
 /// Keep this independent of global state for palette and contrast regression tests.
@@ -556,6 +556,12 @@ pub fn table_row_background(alternate: bool) -> Rgba {
     let palette = theme();
     if alternate {
         palette.grid_alternate
+    } else if native_glass_active() && !reduce_transparency() {
+        // Keep text-bearing rows stable over every desktop backdrop.
+        Rgba {
+            a: 1.,
+            ..palette.canvas
+        }
     } else {
         palette.canvas
     }
@@ -581,8 +587,11 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     let palette = theme();
     let component = gpui_component::Theme::global_mut(cx);
     component.radius = crate::theme::ui_px(RADIUS_CONTROL);
-    component.radius_lg = crate::theme::ui_px(RADIUS_PANEL);
+    // Menus, popovers, and dialogs are floating glass layers, so they take the
+    // glass radius rather than the panel radius.
+    component.radius_lg = crate::theme::ui_px(RADIUS_GLASS);
     component.shadow = true;
+    component.native_glass_menus = native_glass_active() && !reduce_transparency();
     component.colors.background = palette.canvas.into();
     component.colors.foreground = palette.text.into();
     component.colors.input = palette.input_border.into();
@@ -611,7 +620,13 @@ pub fn sync_component_theme(window: Option<&mut gpui::Window>, cx: &mut gpui::Ap
     component.colors.button_primary_hover = component.colors.primary_hover;
     component.colors.button_primary_active = component.colors.primary_active;
 
-    component.colors.table = palette.canvas.into();
+    // The workspace already paints the translucent canvas behind the grid;
+    // a second canvas fill would make that material effectively opaque.
+    component.colors.table = if native_glass_active() && !reduce_transparency() {
+        gpui::transparent_black().into()
+    } else {
+        palette.canvas.into()
+    };
     component.colors.table_active = palette.grid_active.into();
     component.colors.table_active_border = palette.focus_ring.into();
     component.colors.table_even = table_row_background(true).into();
@@ -798,20 +813,29 @@ pub fn tip(
 /// Soft ambient shadow plus a one-pixel specular rim on the top edge: the two
 /// cues that make a translucent layer read as a physical sheet of glass.
 pub fn glass_shadow(elevation: f32) -> Vec<BoxShadow> {
-    let theme = theme();
-    let rim = BoxShadow {
-        color: theme.rim.into(),
-        offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
-        blur_radius: crate::theme::ui_px(0.),
-        spread_radius: crate::theme::ui_px(0.),
-        inset: true,
-    };
     // GPUI's outer shadow also paints underneath a pane. That dark fill shows
     // through translucent content and masks the native backdrop. AppKit owns
     // the window shadow and edge highlights; avoid a second painted rim.
     if native_glass_active() && !reduce_transparency() {
         return vec![];
     }
+    painted_glass_shadow(elevation, theme().rim)
+}
+
+/// Shadow for pills that sit on the opaque content sheet (document tabs and
+/// tab-group sub-tabs). Unlike [`glass_shadow`] this paints even under native
+/// Liquid Glass: AppKit owns the highlights of chrome floating on the window's
+/// own glass, but the sheet is opaque and a pill on it must draw its own lift.
+/// The rim uses the stronger border ink, which stays visible where the native
+/// palette zeroes `rim`.
+pub fn content_shadow(elevation: f32) -> Vec<BoxShadow> {
+    painted_glass_shadow(elevation, theme().border_strong)
+}
+
+/// Soft ambient shadow plus a one-pixel specular rim on the top edge: the two
+/// cues that make a translucent layer read as a physical sheet of glass.
+fn painted_glass_shadow(elevation: f32, rim: Rgba) -> Vec<BoxShadow> {
+    let theme = theme();
     vec![
         BoxShadow {
             color: theme.shadow.into(),
@@ -820,7 +844,13 @@ pub fn glass_shadow(elevation: f32) -> Vec<BoxShadow> {
             spread_radius: crate::theme::ui_px(0.),
             inset: false,
         },
-        rim,
+        BoxShadow {
+            color: rim.into(),
+            offset: point(crate::theme::ui_px(0.), crate::theme::ui_px(1.)),
+            blur_radius: crate::theme::ui_px(0.),
+            spread_radius: crate::theme::ui_px(0.),
+            inset: true,
+        },
     ]
 }
 
@@ -857,6 +887,8 @@ pub fn glass<E: Styled>(element: E, radius: f32, elevation: f32) -> E {
 }
 
 /// Style an element as a transient glass layer (menu, popover, dialog).
+/// These float on the dimmed content, not on the window's own glass, so they
+/// paint their own lift even under native Liquid Glass.
 pub fn glass_raised<E: Styled>(element: E, radius: f32) -> E {
     let theme = theme();
     element
@@ -864,7 +896,7 @@ pub fn glass_raised<E: Styled>(element: E, radius: f32) -> E {
         .border_1()
         .border_color(theme.hairline)
         .rounded(px(radius))
-        .shadow(glass_shadow(24.))
+        .shadow(content_shadow(24.))
 }
 
 /// A compact, consistent line-icon vocabulary for navigation and actions.
@@ -944,8 +976,8 @@ pub fn icon(kind: Icon, color: Rgba) -> Svg {
 
 /// Draw the brand mark for a database engine. Like [`icon`], consumers provide
 /// the color so the logo follows the active/inactive treatment of its host.
-pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
-    let path = match kind {
+pub fn database_logo_path(kind: DatabaseKind) -> &'static str {
+    match kind {
         DatabaseKind::PostgreSQL => assets::LOGO_POSTGRESQL,
         DatabaseKind::MySQL => assets::LOGO_MYSQL,
         DatabaseKind::SQLite => assets::LOGO_SQLITE,
@@ -961,8 +993,11 @@ pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
         DatabaseKind::ClickHouse => assets::LOGO_CLICKHOUSE,
         DatabaseKind::SqlServer => assets::LOGO_SQLSERVER,
         DatabaseKind::Snowflake => assets::LOGO_SNOWFLAKE,
-    };
+    }
+}
 
+pub fn database_logo(kind: DatabaseKind, color: Rgba) -> Svg {
+    let path = database_logo_path(kind);
     svg()
         .path(path)
         .size(crate::theme::ui_px(16.))
@@ -992,31 +1027,85 @@ pub fn panel_header(title: impl Into<SharedString>, detail: impl Into<SharedStri
         )
 }
 
-/// A primary-shell connection tab: a capsule that lifts into a glass pill
-/// when selected. Add an id and interaction handler at the call site.
-pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active: bool) -> Div {
+/// The shared liquid-glass tab capsule. Connection tabs in the titlebar and
+/// document tabs on the content sheet are the same pill, so both build on
+/// this. The resting state keeps a transparent one-pixel border, so the
+/// hairline that appears when a tab is selected never shifts the strip.
+pub fn glass_tab(selected: bool) -> Div {
     let theme = theme();
     div()
         .h(crate::theme::control_height(28.))
         .pl(crate::theme::ui_px(10.))
-        .pr(crate::theme::ui_px(5.))
+        .pr(crate::theme::ui_px(4.))
         .rounded_full()
+        .border_1()
+        .border_color(gpui::transparent_black())
         .text_size(crate::theme::text_px(12.))
+        .flex_none()
         .flex()
         .items_center()
         .gap(crate::theme::ui_px(6.))
-        .when(active, |tab| {
+        .cursor_pointer()
+        .when(selected, |tab| {
             tab.bg(theme.glass_selected)
-                .border_1()
                 .border_color(theme.hairline)
-                .shadow(glass_shadow(4.))
+                // Content-sheet pills draw their own lift even under native
+                // Liquid Glass, where AppKit only owns the window's chrome.
+                .shadow(content_shadow(4.))
                 .text_color(theme.text)
                 .font_weight(gpui::FontWeight::MEDIUM)
+                .hover(|style| style.border_color(theme.border_strong))
         })
-        .when(!active, |tab| {
-            tab.text_color(theme.text_muted)
-                .hover(|style| style.bg(theme.glass_hover).text_color(theme.text))
+        .when(!selected, |tab| {
+            tab.text_color(theme.text_muted).hover(|style| {
+                style
+                    .bg(theme.glass_hover)
+                    .border_color(theme.hairline)
+                    .text_color(theme.text)
+            })
         })
+}
+
+/// A smaller pill for a document tab nested inside an expanded tab-group
+/// strip. Same glass language as [`glass_tab`], scaled down to sit in the
+/// group's track.
+pub fn glass_sub_tab(selected: bool) -> Div {
+    let theme = theme();
+    div()
+        .h(crate::theme::control_height(24.))
+        .px(crate::theme::ui_px(8.))
+        .rounded_full()
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .text_size(crate::theme::text_px(11.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(crate::theme::ui_px(5.))
+        .cursor_pointer()
+        .when(selected, |tab| {
+            tab.bg(theme.glass_selected)
+                .border_color(theme.hairline)
+                .shadow(content_shadow(3.))
+                .text_color(theme.text)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .hover(|style| style.border_color(theme.border_strong))
+        })
+        .when(!selected, |tab| {
+            tab.text_color(theme.text_muted).hover(|style| {
+                style
+                    .bg(theme.glass_hover)
+                    .border_color(theme.hairline)
+                    .text_color(theme.text)
+            })
+        })
+}
+
+/// A primary-shell connection tab: a capsule that lifts into a glass pill
+/// when selected. Add an id and interaction handler at the call site.
+pub fn connection_tab(kind: DatabaseKind, label: impl Into<SharedString>, active: bool) -> Div {
+    let theme = theme();
+    glass_tab(active)
         .child(database_logo(
             kind,
             if active {
@@ -1049,10 +1138,15 @@ pub fn segment(label: impl Into<SharedString>, selected: bool) -> Div {
                 .shadow(glass_shadow(3.))
                 .text_color(theme.text)
                 .font_weight(gpui::FontWeight::MEDIUM)
+                .hover(|style| style.border_color(theme.border_strong))
         })
         .when(!selected, |view| {
-            view.text_color(theme.text_muted)
-                .hover(|style| style.bg(theme.glass_hover).text_color(theme.text))
+            view.text_color(theme.text_muted).hover(|style| {
+                style
+                    .bg(theme.glass_hover)
+                    .border_color(theme.hairline)
+                    .text_color(theme.text)
+            })
         })
         .child(label.into())
 }
@@ -1084,18 +1178,20 @@ pub fn glass_icon_button(
         .size(crate::theme::ui_px(28.))
         .flex_none()
         .rounded_full()
+        .border_1()
+        .border_color(gpui::transparent_black())
         .flex()
         .items_center()
         .justify_center()
         .cursor_pointer()
         .when(active, |view| {
             view.bg(theme.glass_selected)
-                .border_1()
                 .border_color(theme.hairline)
                 .shadow(glass_shadow(3.))
+                .hover(|style| style.border_color(theme.border_strong))
         })
         .when(!active, |view| {
-            view.hover(|style| style.bg(theme.glass_hover))
+            view.hover(|style| style.bg(theme.glass_hover).border_color(theme.hairline))
         })
         .child(icon(
             kind,

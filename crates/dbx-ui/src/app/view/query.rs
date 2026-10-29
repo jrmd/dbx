@@ -643,30 +643,10 @@ impl DbxApp {
                             .items_center()
                             .gap(crate::theme::ui_px(7.))
                             .child(
-                        div()
+                        glass_tab(agent_open)
                             .id("describe-query")
                             .pressable("Describe query with assistant")
-                            .h(crate::theme::control_height(28.))
-                            .px(crate::theme::ui_px(10.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .gap(crate::theme::ui_px(6.))
-                            .text_size(crate::theme::text_px(12.))
-                            .cursor_pointer()
-                            .when(agent_open, |toggle| {
-                                toggle
-                                    .bg(theme().glass_selected)
-                                    .border_1()
-                                    .border_color(theme().hairline)
-                                    .text_color(theme().text)
-                                    .font_weight(FontWeight::MEDIUM)
-                            })
-                            .when(!agent_open, |toggle| {
-                                toggle.text_color(theme().text_muted).hover(|style| {
-                                    style.bg(theme().glass_hover).text_color(theme().text)
-                                })
-                            })
+                            .pr(crate::theme::ui_px(10.))
                             .tooltip(tip(format!("Query assistant ({})", shortcut("K", "K"))))
                             .child(icon(
                                 Icon::Sparkles,

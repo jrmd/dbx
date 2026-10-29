@@ -114,6 +114,9 @@ pub struct Theme {
     /// Radius for the large elements, e.g.: Dialog, Notification border radius.
     pub radius_lg: Pixels,
     pub shadow: bool,
+    /// Compact floating menu styling for native glass chrome.
+    #[serde(skip)]
+    pub native_glass_menus: bool,
     /// Whether focused controls draw a ring outside their border, default true.
     ///
     /// The ring is painted outside the element, so any ancestor that clips its
@@ -595,6 +598,7 @@ impl From<&ThemeColor> for Theme {
             radius: px(6.),
             radius_lg: px(8.),
             shadow: true,
+            native_glass_menus: false,
             focus_ring: true,
             scrollbar_mode: ScrollbarMode::default(),
             notification: NotificationSettings::default(),

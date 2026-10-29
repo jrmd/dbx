@@ -13,6 +13,14 @@ use std::{
 unsafe extern "C" {
     fn dbx_center_window(view: *mut c_void, width: f64, height: f64);
     fn dbx_native_shell_supported() -> bool;
+    fn dbx_native_context_menu(
+        view: *mut c_void,
+        bytes: *const u8,
+        count: usize,
+        id: u64,
+        x: f64,
+        y: f64,
+    ) -> bool;
     fn dbx_native_shell_create(view: *mut c_void) -> *mut c_void;
     fn dbx_native_shell_destroy(shell: *mut c_void);
     fn dbx_native_shell_sync(shell: *mut c_void, bytes: *const u8, count: usize);
@@ -153,5 +161,37 @@ impl Drop for NativeGlass {
             // weak, so closing a window before its entity is safe as well.
             unsafe { dbx_native_shell_destroy(shell.as_ptr()) };
         }
+    }
+}
+
+/// Present component context menus through the same AppKit menu as the explorer.
+pub(crate) fn present_context_menu(
+    id: u64,
+    items: &serde_json::Value,
+    position: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    _: &mut gpui::App,
+) -> bool {
+    if !crate::theme::native_glass_active() || MainThreadMarker::new().is_none() {
+        return false;
+    }
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return false;
+    };
+    let Ok(bytes) = serde_json::to_vec(items) else {
+        return false;
+    };
+    unsafe {
+        dbx_native_context_menu(
+            handle.ns_view.as_ptr(),
+            bytes.as_ptr(),
+            bytes.len(),
+            id,
+            f32::from(position.x) as f64,
+            f32::from(position.y) as f64,
+        )
     }
 }

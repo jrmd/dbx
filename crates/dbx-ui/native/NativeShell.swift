@@ -78,7 +78,7 @@ private final class TagPill: NSView {
     var text = "" { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
     var color = NSColor.clear { didSet { needsDisplay = true } }
     private var attributes: [NSAttributedString.Key: Any] {
-        [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: color]
+        [.font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.labelColor]
     }
     override var intrinsicContentSize: NSSize {
         let size = (text as NSString).size(withAttributes: attributes)
@@ -89,7 +89,7 @@ private final class TagPill: NSView {
             xRadius: (bounds.height - 1) / 2, yRadius: (bounds.height - 1) / 2)
         color.withAlphaComponent(0.12).setFill()
         outline.fill()
-        color.setStroke()
+        color.withAlphaComponent(0.75).setStroke()
         outline.stroke()
         let size = (text as NSString).size(withAttributes: attributes)
         (text as NSString).draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2),
@@ -107,9 +107,17 @@ private final class ExplorerTable: NSTableView {
 }
 
 @available(macOS 26.0, *)
+private final class WeakShell {
+    weak var value: NativeShell?
+    init(_ value: NativeShell) { self.value = value }
+}
+
+@available(macOS 26.0, *)
 private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSource,
     NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
+    static var shells: [ObjectIdentifier: WeakShell] = [:]
     let renderer: NSView
+    var nativeMenuSelection: [Int] = []
     weak var window: NSWindow?
     let originalContent: NSView
     let originalController: NSViewController?
@@ -141,6 +149,7 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
     let toolbar = NSToolbar(identifier: "dev.dbx.navigation." + UUID().uuidString)
     var sidebarItem: NSSplitViewItem!
     var model: [String: Any] = [:]
+    private var engineImages: [String: NSImage] = [:]
     var rows: [[String: Any]] = []
     var commands: [[String: Any]] = []
     var syncing = false
@@ -541,6 +550,10 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
             select.onDrag = { [weak self] button, event in self?.dragConnection(button, event) }
             select.onDragEnd = { [weak self] button, event in self?.dropConnection(button, event) }
             select.identifier = NSUserInterfaceItemIdentifier(sessionID)
+            let context = NSMenu()
+            context.identifier = NSUserInterfaceItemIdentifier("connection:" + sessionID)
+            context.delegate = self
+            select.menu = context
             select.setButtonType(.toggle)
             select.isBordered = false
             select.imagePosition = .imageLeading
@@ -558,8 +571,11 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
             tabs.orientation = .horizontal
             tabs.spacing = 6
             tabs.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 4)
+            tabs.wantsLayer = true
+            tabs.layer?.cornerRadius = 14
+            tabs.layer?.borderWidth = 1
             item.view = tabs
-            item.isBordered = true
+            item.isBordered = false
             item.visibilityPriority = .high
             item.autovalidates = false
             return item
@@ -570,6 +586,16 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
             "newQuery": ("New query", "square.and.pencil"), "refresh": ("Refresh", "arrow.clockwise"),
             "lock": ("Lock vault", "lock"), "settings": ("Settings", "gearshape")]
         guard let (label, symbol) = labels[id.rawValue] else { return nil }
+        if id.rawValue == "newConnection" {
+            // A custom compact button avoids the oversized standalone toolbar
+            // capsule while keeping the same hit area as the other actions.
+            item.view = button(label, symbol: symbol, command: id.rawValue)
+            item.isBordered = false
+            item.label = label
+            item.toolTip = label
+            item.autovalidates = false
+            return item
+        }
         item.label = label
         item.toolTip = label
         item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
@@ -579,8 +605,61 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
         return item
     }
 
+    // AppKit owns the menu window and material. The GPUI snapshot contains
+    // indices only; actions return to Rust through the existing command queue.
+    func makeContextMenu(_ entries: [[String: Any]], path: [Int] = []) -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for entry in entries {
+            if entry["separator"] as? Bool == true { menu.addItem(.separator()); continue }
+            let item = NSMenuItem(title: entry["label"] as? String ?? "", action: nil, keyEquivalent: "")
+            let itemPath = path + ((entry["index"] as? Int).map { [$0] } ?? [])
+            item.isEnabled = entry["enabled"] as? Bool ?? false
+            item.state = entry["checked"] as? Bool == true ? .on : .off
+            if let children = entry["children"] as? [[String: Any]] {
+                item.submenu = makeContextMenu(children, path: itemPath)
+            } else if !itemPath.isEmpty {
+                item.target = self
+                item.action = #selector(nativeMenuAction(_:))
+                item.representedObject = itemPath
+            }
+            menu.addItem(item)
+        }
+        return menu
+    }
+    @objc func nativeMenuAction(_ sender: NSMenuItem) {
+        nativeMenuSelection = sender.representedObject as? [Int] ?? []
+    }
+    func showContextMenu(_ entries: [[String: Any]], id: UInt64, x: Double, y: Double) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.nativeMenuSelection = []
+            if !self.modal, self.model["unlocked"] as? Bool == true, let window = self.window, let root = window.contentView {
+                let windowPoint = NSPoint(x: x, y: root.bounds.height - y)
+                let position = root.convert(windowPoint, from: nil)
+                self.makeContextMenu(entries).popUp(positioning: nil, at: position, in: root)
+            }
+            self.commands.append(["kind": "nativeContextMenu", "menuID": id, "path": self.nativeMenuSelection])
+        }
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        if let identifier = menu.identifier?.rawValue, identifier.hasPrefix("connection:") {
+            let id = String(identifier.dropFirst("connection:".count))
+            let sessions = model["connections"] as? [[String: Any]] ?? []
+            guard sessions.contains(where: { $0["id"] as? String == id }) else { return }
+            menu.autoenablesItems = false
+            for (label, command, enabled) in [("Close connection", "closeConnection", true),
+                                               ("Close other connections", "closeOtherConnections", sessions.count > 1)] {
+                let item = NSMenuItem(title: label, action: #selector(connectionMenuAction(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = ["command": command, "id": id]
+                item.isEnabled = enabled && !modal
+                menu.addItem(item)
+            }
+            return
+        }
         let row = table.clickedRow >= 0 ? table.clickedRow : table.selectedRow
         guard row >= 0, row < rows.count else { return }
         if !table.isRowSelected(row) { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
@@ -598,6 +677,10 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
             menu.addItem(item)
         }
         menu.autoenablesItems = false
+    }
+    @objc func connectionMenuAction(_ sender: NSMenuItem) {
+        guard let info = sender.representedObject as? [String: String], let command = info["command"], let id = info["id"] else { return }
+        send(command, ["id": id])
     }
     @objc func tableMenuAction(_ sender: NSMenuItem) { send("tableCommand", sender.representedObject as? [String: Any] ?? [:]) }
     @objc func explorerMenuAction(_ sender: NSMenuItem) { send(sender.representedObject as? String ?? "") }
@@ -650,6 +733,9 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
         for item in toolbar.items {
             item.isEnabled = !modal && (item.itemIdentifier.rawValue == "settings" || (unlocked && (!["data", "structure", "newQuery", "refresh", "toggleSidebar"].contains(item.itemIdentifier.rawValue) || connected)))
             if item.itemIdentifier.rawValue == "toggleSidebar" { item.isEnabled = item.isEnabled && canToggleSidebar }
+            if item.itemIdentifier.rawValue == "newConnection", let button = item.view as? NSButton {
+                button.isEnabled = item.isEnabled
+            }
             if item.itemIdentifier.rawValue.hasPrefix("connection:"),
                let stack = item.view as? NSStackView,
                let select = stack.arrangedSubviews.first as? NSButton,
@@ -659,19 +745,43 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
                 let label = session["label"] as? String ?? "Connection"
                 let active = session["id"] as? String == next["session"] as? String
                 select.state = active ? .on : .off
+                // NSToolbarItem's border is not reliably refreshed after insertion.
+                // Paint the selection on the tab view so every sync updates it.
+                let appearance = stack.effectiveAppearance
+                let fill = (dark ? NSColor.labelColor : NSColor.black)
+                    .withAlphaComponent(active ? (dark ? 0.10 : 0.16) : 0)
+                let edge = (dark ? NSColor.labelColor : NSColor.black)
+                    .withAlphaComponent(active ? (dark ? 0.16 : 0.25) : 0)
+                appearance.performAsCurrentDrawingAppearance {
+                    stack.layer?.backgroundColor = fill.cgColor
+                    stack.layer?.borderColor = edge.cgColor
+                }
                 // Explicit attributes: a borderless toggle otherwise tints its
                 // whole "on" title with the accent colour.
+                // Toolbar controls can retain the system appearance while a
+                // custom app appearance is active. Use the resolved app mode.
+                let ink = dark ? NSColor(white: 0.96, alpha: 1) : NSColor(white: 0.12, alpha: 1)
                 let title = NSMutableAttributedString(string: session["name"] as? String ?? label, attributes: [
                     .font: NSFont.systemFont(ofSize: 13, weight: active ? .semibold : .regular),
-                    .foregroundColor: active ? NSColor.labelColor : NSColor.secondaryLabelColor])
+                    .foregroundColor: ink.withAlphaComponent(active ? 1 : 0.85)])
                 if session["busy"] as? Bool == true {
                     title.append(NSAttributedString(string: " · working", attributes: [
-                        .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.tertiaryLabelColor]))
+                        .font: NSFont.systemFont(ofSize: 12), .foregroundColor: ink.withAlphaComponent(dark ? 0.7 : 0.8)]))
                 }
                 select.attributedTitle = title
                 select.attributedAlternateTitle = title
-                select.image = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: nil)
-                select.contentTintColor = active ? .labelColor : .secondaryLabelColor
+                // SVGs are the same embedded brand marks used by GPUI. Template
+                // rendering lets AppKit adapt them to the current appearance.
+                if let svg = session["logo"] as? String,
+                   let image = engineImages[svg] ?? svg.data(using: .utf8).flatMap({ NSImage(data: $0) }) {
+                    image.size = NSSize(width: 16, height: 16)
+                    image.isTemplate = true
+                    engineImages[svg] = image
+                    select.image = image
+                } else {
+                    select.image = NSImage(systemSymbolName: "externaldrive", accessibilityDescription: nil)
+                }
+                select.contentTintColor = ink.withAlphaComponent(active ? 1 : 0.85)
                 if let info = session["tag"] as? [String: Any], let name = info["name"] as? String,
                    let rgb = info["color"] as? Int {
                     tag.text = name
@@ -681,7 +791,8 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
                 } else {
                     tag.isHidden = true
                 }
-                select.setAccessibilityLabel(label)
+                let engine = session["engine"] as? String
+                select.setAccessibilityLabel(engine.map { label + ", " + $0 } ?? label)
                 select.setAccessibilityRole(.radioButton)
                 select.isEnabled = !modal
                 close.isEnabled = !modal
@@ -735,6 +846,17 @@ private final class NativeShell: NSObject, NSToolbarDelegate, NSTableViewDataSou
 }
 #endif
 
+#if DBX_NATIVE_SHELL_TESTS && compiler(>=6.2)
+@available(macOS 26.0, *)
+func testNativeContextMenu(_ pointer: UnsafeMutableRawPointer, _ entries: [[String: Any]]) -> NSMenu {
+    Unmanaged<NativeShell>.fromOpaque(pointer).takeUnretainedValue().makeContextMenu(entries)
+}
+@available(macOS 26.0, *)
+func testNativeContextSelection(_ pointer: UnsafeMutableRawPointer) -> [Int] {
+    Unmanaged<NativeShell>.fromOpaque(pointer).takeUnretainedValue().nativeMenuSelection
+}
+#endif
+
 @_cdecl("dbx_native_shell_supported")
 func shellSupported() -> Bool {
 #if compiler(>=6.2)
@@ -746,6 +868,7 @@ func shellSupported() -> Bool {
 func shellCreate(_ view: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? {
 #if compiler(>=6.2)
     if #available(macOS 26.0, *), let shell = NativeShell(renderer: Unmanaged<NSView>.fromOpaque(view).takeUnretainedValue()) {
+        NativeShell.shells[ObjectIdentifier(shell.renderer)] = WeakShell(shell)
         return Unmanaged.passRetained(shell).toOpaque()
     }
 #endif
@@ -756,6 +879,7 @@ func shellDestroy(_ pointer: UnsafeMutableRawPointer) {
 #if compiler(>=6.2)
     if #available(macOS 26.0, *) {
         let shell = Unmanaged<NativeShell>.fromOpaque(pointer).takeRetainedValue()
+        NativeShell.shells.removeValue(forKey: ObjectIdentifier(shell.renderer))
         shell.detach()
     }
 #endif
@@ -765,6 +889,21 @@ func shellSync(_ pointer: UnsafeMutableRawPointer, _ bytes: UnsafePointer<UInt8>
 #if compiler(>=6.2)
     if #available(macOS 26.0, *) { Unmanaged<NativeShell>.fromOpaque(pointer).takeUnretainedValue().sync(Data(bytes: bytes, count: count)) }
 #endif
+}
+@_cdecl("dbx_native_context_menu")
+func showNativeContextMenu(_ view: UnsafeMutableRawPointer, _ bytes: UnsafePointer<UInt8>, _ count: Int,
+                           _ id: UInt64, _ x: Double, _ y: Double) -> Bool {
+#if compiler(>=6.2)
+    if #available(macOS 26.0, *) {
+        let renderer = Unmanaged<NSView>.fromOpaque(view).takeUnretainedValue()
+        guard let shell = NativeShell.shells[ObjectIdentifier(renderer)]?.value,
+              let entries = (try? JSONSerialization.jsonObject(with: Data(bytes: bytes, count: count))) as? [[String: Any]],
+              !entries.isEmpty else { return false }
+        shell.showContextMenu(entries, id: id, x: x, y: y)
+        return true
+    }
+#endif
+    return false
 }
 @_cdecl("dbx_native_shell_drain")
 func shellDrain(_ pointer: UnsafeMutableRawPointer) -> UnsafeMutablePointer<CChar>? {

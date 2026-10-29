@@ -92,6 +92,14 @@ impl ParentElement for MenuItemElement {
 
 impl RenderOnce for MenuItemElement {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (highlight, highlight_text) = if cx.theme().native_glass_menus {
+            (
+                cx.theme().primary.alpha(0.22),
+                cx.theme().popover_foreground,
+            )
+        } else {
+            (*cx.theme().tokens.accent, cx.theme().accent_foreground)
+        };
         h_flex()
             .id(self.id)
             .role(Role::MenuItem)
@@ -112,12 +120,10 @@ impl RenderOnce for MenuItemElement {
             })
             .when(!self.disabled, |this| {
                 this.group_hover(self.group_name, |this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
+                    this.bg(highlight).text_color(highlight_text)
                 })
                 .when(self.selected, |this| {
-                    this.bg(cx.theme().tokens.accent)
-                        .text_color(cx.theme().accent_foreground)
+                    this.bg(highlight).text_color(highlight_text)
                 })
                 .when_some(self.on_click, |this, on_click| {
                     this.on_mouse_down(MouseButton::Left, move |_, _, cx| {

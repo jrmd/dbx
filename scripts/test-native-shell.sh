@@ -7,7 +7,7 @@ fi
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 qa_binary="$(mktemp -d "${TMPDIR:-/tmp}/dbx-native-shell.XXXXXX")"
 trap 'rm -rf "$qa_binary"' EXIT
-xcrun swiftc -parse-as-library \
+xcrun swiftc -D DBX_NATIVE_SHELL_TESTS -parse-as-library \
   "$repo_root/crates/dbx-ui/native/NativeShell.swift" \
   "$repo_root/crates/dbx-ui/native/NativeShellTests.swift" \
   -o "$qa_binary/native-shell-tests"

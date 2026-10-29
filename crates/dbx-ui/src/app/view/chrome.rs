@@ -440,39 +440,28 @@ impl DbxApp {
                             })
                             .children(tag_badge(tag.as_ref()))
                             .child(
-                                div()
-                                    .id(SharedString::from(format!(
+                                tab_close_button(
+                                    SharedString::from(format!(
                                         "close-connection-tab-{session_id}"
-                                    )))
-                                    .debug_selector(move || {
-                                        format!("close-connection-tab-{session_id}")
-                                    })
-                                    .pressable(format!("Close connection {label}"))
-                                    .size(crate::theme::ui_px(24.))
-                                    .rounded_full()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(theme().glass_hover))
-                                    .tooltip(tip("Close connection"))
-                                    .child(
-                                        icon(Icon::Close, theme().text_muted)
-                                            .size(crate::theme::ui_px(12.)),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, event: &gpui::ClickEvent, window, cx| {
-                                            cx.stop_propagation();
-                                            this.close_session(session_id, cx);
-                                            if event.is_keyboard()
-                                                && this.session(session_id).is_none()
-                                            {
-                                                // Walk the still-painted tab order before the removed
-                                                // close control disappears and focus falls to the root.
-                                                window.focus_next(cx);
-                                            }
-                                        },
                                     )),
+                                    format!("Close connection {label}"),
+                                    "Close connection",
+                                )
+                                .debug_selector(move || {
+                                    format!("close-connection-tab-{session_id}")
+                                })
+                                .on_click(cx.listener(
+                                    move |this, event: &gpui::ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close_session(session_id, cx);
+                                        if event.is_keyboard() && this.session(session_id).is_none()
+                                        {
+                                            // Walk the still-painted tab order before the removed
+                                            // close control disappears and focus falls to the root.
+                                            window.focus_next(cx);
+                                        }
+                                    },
+                                )),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.activate_session(session_id, cx)
@@ -1048,7 +1037,6 @@ impl DbxApp {
                 (session.active_secondary_tab, tabs, groups)
             })
             .unwrap_or_default();
-        let group_order: Vec<Option<TabGroupId>> = tabs.iter().map(|tab| tab.3).collect();
         let group_edit = self
             .tab_group_edit
             .as_ref()
@@ -1069,38 +1057,20 @@ impl DbxApp {
             .border_color(theme().border)
             .follow_top_corners(crate::theme::sheet_radius())
             .bg(crate::theme::navigation_surface())
-            .children(tabs.into_iter().enumerate().flat_map(
-                |(position, (tab_id, label, kind, group))| {
-                    let mut out: Vec<AnyElement> = Vec::new();
+            .children({
+                // One tab element on its own; group assembly happens below.
+                let build_tab = |position: usize, sub: bool, cx: &mut Context<Self>| {
+                    let (tab_id, label, kind, group) = tabs[position].clone();
                     let group_info =
                         group.and_then(|g| groups.get(&g).map(|info| (g, info.clone())));
-                    let first_of_group =
-                        group.is_some() && (position == 0 || group_order[position - 1] != group);
-                    if let (Some((group_id, (name, color, collapsed, count))), true) =
-                        (group_info.clone(), first_of_group)
-                        && let Some(session_id) = session_id
-                    {
-                        let editing = group_edit
-                            .as_ref()
-                            .filter(|(edited, _)| *edited == group_id)
-                            .map(|(_, editor)| editor.clone());
-                        out.push(tab_group_chip(
-                            group_id, name, color, collapsed, count, session_id, editing, cx,
-                        ));
-                    }
                     let selected = active_secondary_tab == Some(tab_id);
-                    // A minimised group still shows the tab in front.
-                    if let Some((_, (_, _, true, _))) = group_info
-                        && !selected
-                    {
-                        return out;
-                    }
                     let app = cx.entity().downgrade();
                     let tab = document_tab(
                         SharedString::from(format!("document-{tab_id}")),
                         kind,
                         selected,
                         label.clone(),
+                        sub,
                     )
                     .when_some(session_id, |tab, session_id| {
                         tab.on_drag(
@@ -1140,41 +1110,32 @@ impl DbxApp {
                     })
                     .child(label.clone())
                     .child(
-                        div()
-                            .id(SharedString::from(format!("close-document-{tab_id}")))
-                            .debug_selector(move || format!("close-document-{tab_id}"))
-                            .pressable(format!("Close document {label}"))
-                            .size(crate::theme::ui_px(24.))
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|style| style.bg(theme().glass_hover))
-                            .tooltip(tip("Close tab"))
-                            .child(
-                                icon(Icon::Close, theme().text_muted)
-                                    .size(crate::theme::ui_px(12.)),
-                            )
-                            .on_click(cx.listener(
-                                move |this, event: &gpui::ClickEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(session_id) = session_id {
-                                        this.request_close_secondary_tab_for(
-                                            session_id, tab_id, window, cx,
-                                        );
-                                        if event.is_keyboard()
-                                            && this.session(session_id).is_some_and(|session| {
-                                                !session
-                                                    .secondary_tabs
-                                                    .iter()
-                                                    .any(|tab| tab.id == tab_id)
-                                            })
-                                        {
-                                            window.focus_next(cx);
-                                        }
+                        tab_close_button(
+                            SharedString::from(format!("close-document-{tab_id}")),
+                            format!("Close document {label}"),
+                            "Close tab",
+                        )
+                        .debug_selector(move || format!("close-document-{tab_id}"))
+                        .on_click(cx.listener(
+                            move |this, event: &gpui::ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(session_id) = session_id {
+                                    this.request_close_secondary_tab_for(
+                                        session_id, tab_id, window, cx,
+                                    );
+                                    if event.is_keyboard()
+                                        && this.session(session_id).is_some_and(|session| {
+                                            !session
+                                                .secondary_tabs
+                                                .iter()
+                                                .any(|tab| tab.id == tab_id)
+                                        })
+                                    {
+                                        window.focus_next(cx);
                                     }
-                                },
-                            )),
+                                }
+                            },
+                        )),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(session_id) = session_id {
@@ -1259,16 +1220,82 @@ impl DbxApp {
                         menu
                     });
                     let tab = match group_info {
-                        Some((_, (_, color, _, _))) => tab.bg(Rgba {
-                            a: if selected { 0.28 } else { 0.14 },
-                            ..color
-                        }),
-                        None => tab,
+                        Some((_, (_, color, _, _))) if !crate::theme::native_glass_active() => tab
+                            .bg(Rgba {
+                                a: if selected { 0.28 } else { 0.14 },
+                                ..color
+                            }),
+                        _ => tab,
                     };
-                    out.push(tab.into_any_element());
-                    out
-                },
-            ))
+                    vec![tab.into_any_element()]
+                };
+                let mut out: Vec<AnyElement> = Vec::new();
+                let mut position = 0;
+                while position < tabs.len() {
+                    let Some(group_id) = tabs[position].3 else {
+                        out.extend(build_tab(position, false, cx));
+                        position += 1;
+                        continue;
+                    };
+                    // The group's consecutive run of tabs.
+                    let mut end = position + 1;
+                    while end < tabs.len() && tabs[end].3 == Some(group_id) {
+                        end += 1;
+                    }
+                    let Some((name, color, collapsed, count)) = groups.get(&group_id).cloned()
+                    else {
+                        for p in position..end {
+                            out.extend(build_tab(p, false, cx));
+                        }
+                        position = end;
+                        continue;
+                    };
+                    let Some(session_id) = session_id else {
+                        for p in position..end {
+                            out.extend(build_tab(p, false, cx));
+                        }
+                        position = end;
+                        continue;
+                    };
+                    let editing = group_edit
+                        .as_ref()
+                        .filter(|(edited, _)| *edited == group_id)
+                        .map(|(_, editor)| editor.clone());
+                    if collapsed {
+                        // Collapsed: the chip stands in for the group, and the
+                        // selected member still shows in front of it.
+                        out.push(
+                            tab_group_chip(
+                                group_id, name, color, true, count, session_id, editing, cx,
+                            )
+                            .into_any_element(),
+                        );
+                        if let Some(p) =
+                            (position..end).find(|&p| active_secondary_tab == Some(tabs[p].0))
+                        {
+                            out.extend(build_tab(p, false, cx));
+                        }
+                    } else {
+                        // Expanded: one long glass strip, the group chip as its
+                        // leading label and the member tabs as sub-tabs inside.
+                        let strip = segmented_track()
+                            .when(crate::theme::native_glass_active(), |strip| {
+                                strip
+                                    .rounded_full()
+                                    .bg(Rgba { a: 0.08, ..color })
+                                    .border_color(Rgba { a: 0.20, ..color })
+                            })
+                            .flex_none()
+                            .child(tab_group_chip(
+                                group_id, name, color, false, count, session_id, editing, cx,
+                            ))
+                            .children((position..end).flat_map(|p| build_tab(p, true, cx)));
+                        out.push(strip.into_any_element());
+                    }
+                    position = end;
+                }
+                out
+            })
             .child(
                 glass_icon_button("add-query-document", Icon::Add, false)
                     .aria_label("New query document")
@@ -1665,6 +1692,14 @@ fn tab_group_chip(
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .map(|chip| match label {
+            Some(label) if crate::theme::native_glass_active() => chip
+                .px(crate::theme::ui_px(8.))
+                .gap(crate::theme::ui_px(6.))
+                .rounded_full()
+                .bg(Rgba { a: 0.10, ..color })
+                .text_color(theme().text)
+                .child(div().size(crate::theme::ui_px(7.)).rounded_full().bg(color))
+                .child(label),
             Some(label) => chip.px(crate::theme::ui_px(8.)).bg(color).child(label),
             None => chip.w(crate::theme::ui_px(20.)).child(
                 div()
@@ -1742,6 +1777,7 @@ fn tab_group_chip(
                                     )
                                     .child(*color_name)
                             })
+                            .native_label(*color_name)
                             .checked(index == current_color)
                             .on_click(move |_, _, cx| {
                                 let _ = app.update(cx, |this, cx| {
@@ -1775,48 +1811,59 @@ fn tab_group_chip(
         .into_any_element()
 }
 
-/// A pill-shaped document tab on the content sheet's tab strip.
+/// The round close control inside a tab pill. Both tab kinds share it so the
+/// control looks and behaves identically on connections and documents.
+fn tab_close_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    tooltip: &'static str,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .pressable(label)
+        .size(crate::theme::ui_px(24.))
+        .rounded_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(theme().glass_hover))
+        .tooltip(tip(tooltip))
+        .child(icon(Icon::Close, theme().text_muted).size(crate::theme::ui_px(12.)))
+}
+
+/// A pill-shaped document tab on the content sheet's tab strip. Shares the
+/// liquid-glass capsule with the titlebar's connection tabs; `sub` renders
+/// the smaller pill used inside an expanded tab-group strip.
 fn document_tab(
     id: impl Into<ElementId>,
     kind: Icon,
     selected: bool,
     label: impl Into<SharedString>,
+    sub: bool,
 ) -> Stateful<Div> {
-    div()
-        .id(id)
-        .pressable(label)
-        .role(gpui::Role::Tab)
-        .aria_selected(selected)
-        .h(crate::theme::control_height(28.))
-        .pl(crate::theme::ui_px(10.))
-        .pr(crate::theme::ui_px(4.))
-        .flex_none()
-        .flex()
-        .items_center()
-        .gap(crate::theme::ui_px(6.))
-        .rounded_full()
-        .text_size(crate::theme::text_px(12.))
-        .cursor_pointer()
-        .when(selected, |tab| {
-            tab.bg(theme().glass_selected)
-                .border_1()
-                .border_color(theme().hairline)
-                .shadow(glass_shadow(3.))
-                .text_color(theme().text)
-                .font_weight(FontWeight::MEDIUM)
+    let base = if sub {
+        glass_sub_tab(selected)
+    } else {
+        glass_tab(selected)
+    };
+    base.when(crate::theme::native_glass_active(), |tab| {
+        tab.rounded_full().shadow(Vec::new()).when(selected, |tab| {
+            tab.bg(theme().glass_selected).border_color(theme().border)
         })
-        .when(!selected, |tab| {
-            tab.text_color(theme().text_muted)
-                .hover(|style| style.bg(theme().glass_hover).text_color(theme().text))
-        })
-        .child(icon(
-            kind,
-            if selected {
-                theme().accent
-            } else {
-                theme().text_muted
-            },
-        ))
+    })
+    .id(id)
+    .pressable(label)
+    .role(gpui::Role::Tab)
+    .aria_selected(selected)
+    .child(icon(
+        kind,
+        if selected {
+            theme().accent
+        } else {
+            theme().text_muted
+        },
+    ))
 }
 
 /// Drag payloads for reordering. Separate types keep a document tab from
@@ -1845,7 +1892,7 @@ fn tab_drag_ghost(label: SharedString) -> Div {
         .border_1()
         .border_color(theme().hairline)
         .bg(theme().glass_raised)
-        .shadow(glass_shadow(8.))
+        .shadow(content_shadow(8.))
         .text_size(crate::theme::text_px(12.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme().text)
