@@ -383,9 +383,8 @@ impl DbxApp {
         let (moved, mut rest): (Vec<_>, Vec<_>) = all
             .into_iter()
             .partition(|tab| session.tab_group_members.get(&tab.id) == Some(&group));
-        let removed_before = |index: usize, original: &[usize]| {
-            original.iter().filter(|&&i| i < index).count()
-        };
+        let removed_before =
+            |index: usize, original: &[usize]| original.iter().filter(|&&i| i < index).count();
         let member_indexes: Vec<usize> = {
             // Original indexes of members, reconstructed from `first`.
             let mut indexes = Vec::new();

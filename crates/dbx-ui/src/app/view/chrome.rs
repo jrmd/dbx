@@ -1013,7 +1013,12 @@ impl DbxApp {
                                 ("Database diagram".into(), Icon::Diagram)
                             }
                         };
-                        (tab.id, label, kind, session.tab_group_members.get(&tab.id).copied())
+                        (
+                            tab.id,
+                            label,
+                            kind,
+                            session.tab_group_members.get(&tab.id).copied(),
+                        )
                     })
                     .collect::<Vec<_>>();
                 let groups: HashMap<TabGroupId, (String, Rgba, bool, usize)> = session
@@ -1028,7 +1033,11 @@ impl DbxApp {
                         (
                             group.id,
                             (
-                                if group.name.is_empty() { String::new() } else { group.name.clone() },
+                                if group.name.is_empty() {
+                                    String::new()
+                                } else {
+                                    group.name.clone()
+                                },
                                 (TAB_GROUP_COLORS[group.color % TAB_GROUP_COLORS.len()].1)(),
                                 group.collapsed,
                                 count,
@@ -1060,199 +1069,206 @@ impl DbxApp {
             .border_color(theme().border)
             .follow_top_corners(crate::theme::sheet_radius())
             .bg(crate::theme::navigation_surface())
-            .children(tabs.into_iter().enumerate().flat_map(|(position, (tab_id, label, kind, group))| {
-                let mut out: Vec<AnyElement> = Vec::new();
-                let group_info = group.and_then(|g| groups.get(&g).map(|info| (g, info.clone())));
-                let first_of_group =
-                    group.is_some() && (position == 0 || group_order[position - 1] != group);
-                if let (Some((group_id, (name, color, collapsed, count))), true) =
-                    (group_info.clone(), first_of_group)
-                    && let Some(session_id) = session_id
-                {
-                    let editing = group_edit
-                        .as_ref()
-                        .filter(|(edited, _)| *edited == group_id)
-                        .map(|(_, editor)| editor.clone());
-                    out.push(tab_group_chip(group_id, name, color, collapsed, count, session_id, editing, cx));
-                }
-                let selected = active_secondary_tab == Some(tab_id);
-                // A minimised group still shows the tab in front.
-                if let Some((_, (_, _, true, _))) = group_info
-                    && !selected
-                {
-                    return out;
-                }
-                let app = cx.entity().downgrade();
-                let tab = document_tab(
-                    SharedString::from(format!("document-{tab_id}")),
-                    kind,
-                    selected,
-                    label.clone(),
-                )
-                .when_some(session_id, |tab, session_id| {
-                    tab.on_drag(
-                        DocumentTabDrag {
-                            session_id,
-                            tab_id,
-                            label: label.clone().into(),
-                        },
-                        |drag, _, _, cx| cx.new(|_| drag.clone()),
+            .children(tabs.into_iter().enumerate().flat_map(
+                |(position, (tab_id, label, kind, group))| {
+                    let mut out: Vec<AnyElement> = Vec::new();
+                    let group_info =
+                        group.and_then(|g| groups.get(&g).map(|info| (g, info.clone())));
+                    let first_of_group =
+                        group.is_some() && (position == 0 || group_order[position - 1] != group);
+                    if let (Some((group_id, (name, color, collapsed, count))), true) =
+                        (group_info.clone(), first_of_group)
+                        && let Some(session_id) = session_id
+                    {
+                        let editing = group_edit
+                            .as_ref()
+                            .filter(|(edited, _)| *edited == group_id)
+                            .map(|(_, editor)| editor.clone());
+                        out.push(tab_group_chip(
+                            group_id, name, color, collapsed, count, session_id, editing, cx,
+                        ));
+                    }
+                    let selected = active_secondary_tab == Some(tab_id);
+                    // A minimised group still shows the tab in front.
+                    if let Some((_, (_, _, true, _))) = group_info
+                        && !selected
+                    {
+                        return out;
+                    }
+                    let app = cx.entity().downgrade();
+                    let tab = document_tab(
+                        SharedString::from(format!("document-{tab_id}")),
+                        kind,
+                        selected,
+                        label.clone(),
                     )
-                    .drag_over::<DocumentTabDrag>(move |style, drag, _, _| {
-                        if drag.session_id == session_id {
-                            style.bg(theme().glass_hover)
-                        } else {
-                            style
-                        }
-                    })
-                    .on_drop(cx.listener(
-                        move |this, drag: &DocumentTabDrag, _, cx| {
+                    .when_some(session_id, |tab, session_id| {
+                        tab.on_drag(
+                            DocumentTabDrag {
+                                session_id,
+                                tab_id,
+                                label: label.clone().into(),
+                            },
+                            |drag, _, _, cx| cx.new(|_| drag.clone()),
+                        )
+                        .drag_over::<DocumentTabDrag>(move |style, drag, _, _| {
+                            if drag.session_id == session_id {
+                                style.bg(theme().glass_hover)
+                            } else {
+                                style
+                            }
+                        })
+                        .on_drop(cx.listener(move |this, drag: &DocumentTabDrag, _, cx| {
                             if drag.session_id == session_id {
                                 this.move_secondary_tab(session_id, drag.tab_id, tab_id, cx)
                             }
-                        },
-                    ))
-                    .drag_over::<DocumentTabGroupDrag>(move |style, drag, _, _| {
-                        if drag.session_id == session_id {
-                            style.bg(theme().glass_hover)
-                        } else {
-                            style
-                        }
-                    })
-                    .on_drop(cx.listener(
-                        move |this, drag: &DocumentTabGroupDrag, _, cx| {
+                        }))
+                        .drag_over::<DocumentTabGroupDrag>(move |style, drag, _, _| {
                             if drag.session_id == session_id {
-                                this.move_tab_group(session_id, drag.group_id, tab_id, cx)
+                                style.bg(theme().glass_hover)
+                            } else {
+                                style
                             }
-                        },
-                    ))
-                })
-                .child(label.clone())
-                .child(
-                    div()
-                        .id(SharedString::from(format!("close-document-{tab_id}")))
-                        .debug_selector(move || format!("close-document-{tab_id}"))
-                        .pressable(format!("Close document {label}"))
-                        .size(crate::theme::ui_px(24.))
-                        .rounded_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .hover(|style| style.bg(theme().glass_hover))
-                        .tooltip(tip("Close tab"))
-                        .child(icon(Icon::Close, theme().text_muted).size(crate::theme::ui_px(12.)))
-                        .on_click(cx.listener(
-                            move |this, event: &gpui::ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                if let Some(session_id) = session_id {
-                                    this.request_close_secondary_tab_for(
-                                        session_id, tab_id, window, cx,
-                                    );
-                                    if event.is_keyboard()
-                                        && this.session(session_id).is_some_and(|session| {
-                                            !session
-                                                .secondary_tabs
-                                                .iter()
-                                                .any(|tab| tab.id == tab_id)
-                                        })
-                                    {
-                                        window.focus_next(cx);
-                                    }
+                        })
+                        .on_drop(cx.listener(
+                            move |this, drag: &DocumentTabGroupDrag, _, cx| {
+                                if drag.session_id == session_id {
+                                    this.move_tab_group(session_id, drag.group_id, tab_id, cx)
                                 }
                             },
-                        )),
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if let Some(session_id) = session_id {
-                        this.activate_secondary_tab_for(session_id, tab_id, window, cx);
-                    }
-                }))
-                .context_menu(move |mut menu, _, cx| {
-                    use crate::app::tabs::TabCloseScope;
-                    let Some(session_id) = session_id else {
-                        return menu;
-                    };
-                    for (label, scope) in [
-                        ("Close tab", TabCloseScope::This),
-                        ("Close others", TabCloseScope::Others),
-                        ("Close right", TabCloseScope::Right),
-                    ] {
-                        let enabled = app.upgrade().is_some_and(|app| {
-                            !app.read(cx)
-                                .tabs_to_close(session_id, tab_id, scope)
-                                .is_empty()
-                        });
-                        let app = app.clone();
-                        menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                        ))
+                    })
+                    .child(label.clone())
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("close-document-{tab_id}")))
+                            .debug_selector(move || format!("close-document-{tab_id}"))
+                            .pressable(format!("Close document {label}"))
+                            .size(crate::theme::ui_px(24.))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|style| style.bg(theme().glass_hover))
+                            .tooltip(tip("Close tab"))
+                            .child(
+                                icon(Icon::Close, theme().text_muted)
+                                    .size(crate::theme::ui_px(12.)),
+                            )
+                            .on_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(session_id) = session_id {
+                                        this.request_close_secondary_tab_for(
+                                            session_id, tab_id, window, cx,
+                                        );
+                                        if event.is_keyboard()
+                                            && this.session(session_id).is_some_and(|session| {
+                                                !session
+                                                    .secondary_tabs
+                                                    .iter()
+                                                    .any(|tab| tab.id == tab_id)
+                                            })
+                                        {
+                                            window.focus_next(cx);
+                                        }
+                                    }
+                                },
+                            )),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(session_id) = session_id {
+                            this.activate_secondary_tab_for(session_id, tab_id, window, cx);
+                        }
+                    }))
+                    .context_menu(move |mut menu, _, cx| {
+                        use crate::app::tabs::TabCloseScope;
+                        let Some(session_id) = session_id else {
+                            return menu;
+                        };
+                        for (label, scope) in [
+                            ("Close tab", TabCloseScope::This),
+                            ("Close others", TabCloseScope::Others),
+                            ("Close right", TabCloseScope::Right),
+                        ] {
+                            let enabled = app.upgrade().is_some_and(|app| {
+                                !app.read(cx)
+                                    .tabs_to_close(session_id, tab_id, scope)
+                                    .is_empty()
+                            });
+                            let app = app.clone();
+                            menu =
+                                menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
+                                    move |_, window, cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.request_close_tabs_for(
+                                                session_id, tab_id, scope, window, cx,
+                                            );
+                                        });
+                                    },
+                                ));
+                        }
+                        menu = menu.separator();
+                        let (groups, current) = app
+                            .upgrade()
+                            .and_then(|app| {
+                                app.read(cx).session(session_id).map(|session| {
+                                    (
+                                        session
+                                            .tab_groups
+                                            .iter()
+                                            .map(|g| (g.id, session.tab_group_label(g)))
+                                            .collect::<Vec<_>>(),
+                                        session.tab_group_members.get(&tab_id).copied(),
+                                    )
+                                })
+                            })
+                            .unwrap_or_default();
+                        menu = menu.item(PopupMenuItem::new("Add to new group").on_click({
+                            let app = app.clone();
                             move |_, window, cx| {
                                 let _ = app.update(cx, |this, cx| {
-                                    this.request_close_tabs_for(
-                                        session_id, tab_id, scope, window, cx,
-                                    );
+                                    this.add_tab_to_new_group(session_id, tab_id, window, cx)
                                 });
-                            },
-                        ));
-                    }
-                    menu = menu.separator();
-                    let (groups, current) = app
-                        .upgrade()
-                        .and_then(|app| {
-                            app.read(cx).session(session_id).map(|session| {
-                                (
-                                    session
-                                        .tab_groups
-                                        .iter()
-                                        .map(|g| (g.id, session.tab_group_label(g)))
-                                        .collect::<Vec<_>>(),
-                                    session.tab_group_members.get(&tab_id).copied(),
-                                )
-                            })
-                        })
-                        .unwrap_or_default();
-                    menu = menu.item(PopupMenuItem::new("Add to new group").on_click({
-                        let app = app.clone();
-                        move |_, window, cx| {
-                            let _ = app.update(cx, |this, cx| {
-                                this.add_tab_to_new_group(session_id, tab_id, window, cx)
-                            });
+                            }
+                        }));
+                        for (group_id, name) in groups {
+                            if current == Some(group_id) {
+                                continue;
+                            }
+                            let app = app.clone();
+                            menu =
+                                menu.item(PopupMenuItem::new(format!("Add to {name}")).on_click(
+                                    move |_, _, cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.add_tab_to_group(session_id, tab_id, group_id, cx)
+                                        });
+                                    },
+                                ));
                         }
-                    }));
-                    for (group_id, name) in groups {
-                        if current == Some(group_id) {
-                            continue;
-                        }
-                        let app = app.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(format!("Add to {name}")).on_click(
+                        if current.is_some() {
+                            let app = app.clone();
+                            menu = menu.item(PopupMenuItem::new("Remove from group").on_click(
                                 move |_, _, cx| {
                                     let _ = app.update(cx, |this, cx| {
-                                        this.add_tab_to_group(session_id, tab_id, group_id, cx)
+                                        this.remove_tab_from_group(session_id, tab_id, cx)
                                     });
                                 },
-                            ),
-                        );
-                    }
-                    if current.is_some() {
-                        let app = app.clone();
-                        menu = menu.item(PopupMenuItem::new("Remove from group").on_click(
-                            move |_, _, cx| {
-                                let _ = app.update(cx, |this, cx| {
-                                    this.remove_tab_from_group(session_id, tab_id, cx)
-                                });
-                            },
-                        ));
-                    }
-                    menu
-                });
-                let tab = match group_info {
-                    Some((_, (_, color, _, _))) => {
-                        tab.bg(Rgba { a: if selected { 0.28 } else { 0.14 }, ..color })
-                    }
-                    None => tab,
-                };
-                out.push(tab.into_any_element());
-                out
-            }))
+                            ));
+                        }
+                        menu
+                    });
+                    let tab = match group_info {
+                        Some((_, (_, color, _, _))) => tab.bg(Rgba {
+                            a: if selected { 0.28 } else { 0.14 },
+                            ..color
+                        }),
+                        None => tab,
+                    };
+                    out.push(tab.into_any_element());
+                    out
+                },
+            ))
             .child(
                 glass_icon_button("add-query-document", Icon::Add, false)
                     .aria_label("New query document")
@@ -1580,7 +1596,11 @@ fn tab_group_chip(
     cx: &mut Context<DbxApp>,
 ) -> AnyElement {
     let app = cx.entity().downgrade();
-    let description = if name.is_empty() { "Tab group".to_owned() } else { format!("Tab group {name}") };
+    let description = if name.is_empty() {
+        "Tab group".to_owned()
+    } else {
+        format!("Tab group {name}")
+    };
     // An unnamed group is just a colored dot; text only appears when there is
     // something to say, so groups cost almost no tab-strip width.
     let label: Option<SharedString> = match (name.is_empty(), collapsed) {
@@ -1613,13 +1633,24 @@ fn tab_group_chip(
             ))
             .into_any_element();
     }
-    let current_color = TAB_GROUP_COLORS.iter().position(|(_, c)| c() == color).unwrap_or(0);
-    let drag_label: SharedString = if name.is_empty() { "Group".into() } else { name.clone().into() };
+    let current_color = TAB_GROUP_COLORS
+        .iter()
+        .position(|(_, c)| c() == color)
+        .unwrap_or(0);
+    let drag_label: SharedString = if name.is_empty() {
+        "Group".into()
+    } else {
+        name.clone().into()
+    };
     div()
         .id(SharedString::from(format!("tab-group-{group_id}")))
         .pressable(description)
         .on_drag(
-            DocumentTabGroupDrag { session_id, group_id, label: drag_label },
+            DocumentTabGroupDrag {
+                session_id,
+                group_id,
+                label: drag_label,
+            },
             |drag, _, _, cx| cx.new(|_| drag.clone()),
         )
         .h(crate::theme::control_height(GROUP_CHIP_HEIGHT))
@@ -1634,9 +1665,12 @@ fn tab_group_chip(
         .cursor_pointer()
         .map(|chip| match label {
             Some(label) => chip.px(crate::theme::ui_px(8.)).bg(color).child(label),
-            None => chip
-                .w(crate::theme::ui_px(20.))
-                .child(div().size(crate::theme::ui_px(10.)).rounded_full().bg(color)),
+            None => chip.w(crate::theme::ui_px(20.)).child(
+                div()
+                    .size(crate::theme::ui_px(10.))
+                    .rounded_full()
+                    .bg(color),
+            ),
         })
         .tooltip(tip("Click to collapse or expand, right-click for options"))
         .drag_over::<DocumentTabDrag>(move |style, drag, _, _| {
@@ -1658,21 +1692,25 @@ fn tab_group_chip(
                 style
             }
         })
-        .on_drop(cx.listener(move |this, drag: &DocumentTabGroupDrag, _, cx| {
-            if drag.session_id == session_id
-                && let Some(&first) = this.tab_group_members_of(session_id, group_id).first()
-            {
-                this.move_tab_group(session_id, drag.group_id, first, cx)
-            }
-        }))
-        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-            // Always toggles; the second click of a double-click toggles back
-            // and opens the name for editing.
-            this.toggle_tab_group(session_id, group_id, cx);
-            if event.click_count() >= 2 {
-                this.open_tab_group_edit(session_id, group_id, window, cx);
-            }
-        }))
+        .on_drop(
+            cx.listener(move |this, drag: &DocumentTabGroupDrag, _, cx| {
+                if drag.session_id == session_id
+                    && let Some(&first) = this.tab_group_members_of(session_id, group_id).first()
+                {
+                    this.move_tab_group(session_id, drag.group_id, first, cx)
+                }
+            }),
+        )
+        .on_click(
+            cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                // Always toggles; the second click of a double-click toggles back
+                // and opens the name for editing.
+                this.toggle_tab_group(session_id, group_id, cx);
+                if event.click_count() >= 2 {
+                    this.open_tab_group_edit(session_id, group_id, window, cx);
+                }
+            }),
+        )
         .context_menu(move |mut menu, window, cx| {
             menu = menu.item(PopupMenuItem::new("Rename group").on_click({
                 let app = app.clone();
@@ -1703,23 +1741,26 @@ fn tab_group_chip(
                                     )
                                     .child(*color_name)
                             })
-                                .checked(index == current_color)
-                                .on_click(move |_, _, cx| {
-                                    let _ = app.update(cx, |this, cx| {
-                                        this.set_tab_group_color(session_id, group_id, index, cx)
-                                    });
-                                }),
+                            .checked(index == current_color)
+                            .on_click(move |_, _, cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.set_tab_group_color(session_id, group_id, index, cx)
+                                });
+                            }),
                         );
                     }
                     menu
                 }
             });
-            menu = menu.separator().item(PopupMenuItem::new("Ungroup").on_click({
-                let app = app.clone();
-                move |_, _, cx| {
-                    let _ = app.update(cx, |this, cx| this.ungroup_tabs(session_id, group_id, cx));
-                }
-            }));
+            menu = menu
+                .separator()
+                .item(PopupMenuItem::new("Ungroup").on_click({
+                    let app = app.clone();
+                    move |_, _, cx| {
+                        let _ =
+                            app.update(cx, |this, cx| this.ungroup_tabs(session_id, group_id, cx));
+                    }
+                }));
             menu.item(PopupMenuItem::new("Close group").on_click({
                 let app = app.clone();
                 move |_, window, cx| {
