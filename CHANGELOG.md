@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.19.1 - 2026-10-29
+
+- Open the vault in a compact centred window, then expand and centre the workspace after unlocking.
+- Restore saved connections and their open tabs after locking and unlocking the vault.
+
 - With Liquid Glass on, opening a modal such as the value editor no longer makes the native Explorer sidebar vanish; it stays in place under the scrim tint (fading, or instant with Reduce Motion).
 - Large BLOB/binary values expand in the value popover, in their current display format (text, hex, UUID or bits) or as formatted JSON.
 - With Liquid Glass off, the Explorer and connection-list panels use the same corner radius as the content sheet and Settings panel.
