@@ -5453,7 +5453,7 @@ mod tests {
             app.update(cx, |app, cx| {
                 app.touch_id_available = true;
                 app.remember_device = true;
-                app.toggle_touch_id(cx);
+                app.apply_touch_id_preference(true, cx);
                 assert!(app.touch_id_enabled);
                 assert!(!app.remember_device);
                 app.toggle_remember_device(cx);
@@ -5462,18 +5462,41 @@ mod tests {
                 assert!(saved.touch_id_enabled);
                 assert!(!saved.remember_device);
 
-                app.vault_busy = true;
-                app.toggle_touch_id(cx);
-                assert!(app.touch_id_enabled);
-                app.vault_busy = false;
                 // Removing a fingerprint or losing the sensor must not trap
                 // the user in a preference they can no longer turn off.
+                app.apply_touch_id_preference(false, cx);
+                assert!(!app.touch_id_enabled);
+                let saved = app.settings_store.as_ref().unwrap().load().unwrap();
+                assert!(!saved.touch_id_enabled);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn settings_touch_id_toggle_requires_an_unlocked_idle_vault(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (app, cx) = cx.add_window_view(DbxApp::new);
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                app.touch_id_available = true;
+                // Locked: nothing changes.
+                app.vault_state = Some(VaultState::Locked);
+                app.set_touch_id_from_settings(true, cx);
+                assert!(!app.touch_id_enabled && !app.vault_busy);
+                // Unlocked but busy: nothing changes.
+                app.vault_state = Some(VaultState::Unlocked);
+                app.vault_busy = true;
+                app.set_touch_id_from_settings(true, cx);
+                assert!(!app.touch_id_enabled);
+                app.vault_busy = false;
+                // Unavailable hardware cannot be enrolled.
                 app.touch_id_available = false;
-                app.toggle_touch_id(cx);
-                assert!(!app.touch_id_enabled);
-                assert!(!app.remember_device);
-                app.toggle_touch_id(cx);
-                assert!(!app.touch_id_enabled);
+                app.set_touch_id_from_settings(true, cx);
+                assert!(!app.touch_id_enabled && !app.vault_busy);
+                // Tests have no keychain, so a failed enrolment stays disabled.
+                app.touch_id_available = true;
+                app.set_touch_id_from_settings(true, cx);
+                assert!(!app.touch_id_enabled && !app.vault_busy);
             });
         });
     }

@@ -712,16 +712,49 @@ impl DbxApp {
                         "Save the vault key in your system keychain to skip the passphrase on launch."
                     }),
             );
+        let touch_id_row = (self.touch_id_available || self.touch_id_enabled).then(|| {
+            let enabled = self.touch_id_enabled;
+            div()
+                .flex()
+                .flex_col()
+                .px(crate::theme::ui_px(SPACE_4))
+                .py(crate::theme::ui_px(12.))
+                .gap(crate::theme::ui_px(SPACE_2))
+                .child(
+                    gpui_component::checkbox::Checkbox::new("settings-touch-id")
+                        .label("Unlock with Touch ID")
+                        .with_size(Size::Small)
+                        .checked(enabled)
+                        .disabled(unavailable)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_touch_id_from_settings(!enabled, cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .text_size(crate::theme::text_px(11.))
+                        .text_color(theme().text_muted)
+                        .child(if enabled && !self.touch_id_available {
+                            "Touch ID isn’t available right now. Your passphrase still works."
+                        } else if enabled && !self.touch_id_enrolled {
+                            "Fingerprints changed. Turn Touch ID off and on again to re-enable it."
+                        } else {
+                            "Use your fingerprint instead of your passphrase when DBX is locked."
+                        }),
+                )
+                .into_any_element()
+        });
+        let vault_rows: Vec<AnyElement> = touch_id_row
+            .into_iter()
+            .chain([automatic_unlock.into_any_element()])
+            .collect();
         div()
             .flex()
             .flex_col()
             .gap(crate::theme::ui_px(SPACE_4))
             .child(settings_section(
                 "Vault",
-                self.scrolling_settings_group(
-                    "settings-vault-row",
-                    [automatic_unlock.into_any_element()],
-                ),
+                self.scrolling_settings_group("settings-vault-row", vault_rows),
             ))
             .child(
                 self.scrolling_settings_group(

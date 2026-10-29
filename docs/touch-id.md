@@ -1,22 +1,22 @@
 # Vault unlock with Touch ID
 
-The vault gate offers **Use Touch ID** on a Mac where biometrics are available
-and the running app has a data-protection Keychain entitlement. Select it, then
-unlock with the vault passphrase to enroll this vault. On subsequent locks or
-launches, choose **Unlock with Touch ID**. Launching DBX does not request
-biometric authentication automatically.
+On a Mac where biometrics are available and the running app has a
+data-protection Keychain entitlement, **Settings → Connections → Vault** offers
+**Unlock with Touch ID** while the vault is unlocked. Turning it on enrols this
+vault immediately; turning it off removes the saved key immediately. Once
+enabled, the lock screen offers **Unlock with Touch ID** as its primary action.
+Launching DBX does not request biometric authentication automatically.
 
 The passphrase remains available. Cancelling Touch ID leaves the vault locked.
 Changing the enrolled fingerprints can invalidate the saved key; unlock with
-the passphrase to enroll again. Turning off **Use Touch ID** takes effect on
-the next successful passphrase unlock.
+the passphrase and DBX enrols again, or turn Touch ID off and on in Settings.
 
 Touch ID and **Unlock automatically on this device** are separate options.
 Automatic unlock lives in **Settings → Connections → Vault**; changing it
 updates the system keychain immediately while the vault is unlocked.
 Enabling Touch ID switches off automatic unlock. Before enrolling the protected
-key, DBX removes its ordinary remembered key; if removal fails, enrollment fails.
-The passphrase unlock still succeeds and a toast reports the device-key failure.
+key, DBX removes its ordinary remembered key; if removal fails, enrollment fails
+and a toast reports it.
 
 ## Key protection
 
@@ -114,11 +114,11 @@ Use a disposable vault under `DBX_CONFIG_DIR`, never a user's real vault.
 Tests do not request fingerprints or operate on the system Keychain.
 On an appropriately provisioned build with enrolled Touch ID, verify:
 
-1. Opt in, unlock with a passphrase, lock, and unlock with Touch ID.
+1. Turn on Touch ID in Settings → Connections → Vault, lock, and unlock with Touch ID.
 2. Lock again and confirm a new authentication is required.
 3. Cancel the prompt and unlock using the passphrase.
 4. Relaunch and confirm no authentication prompt appears until requested.
-5. Disable Touch ID and unlock with a passphrase; confirm the protected item
+5. Turn Touch ID off in Settings; confirm the protected item
    is removed and automatic unlock remains off unless separately selected.
 6. Confirm missing/invalidated items and unavailable biometrics return to the
    passphrase path without unlocking.
