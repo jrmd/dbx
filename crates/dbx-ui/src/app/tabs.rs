@@ -19,7 +19,261 @@ pub(super) fn move_to_slot<T>(items: &mut Vec<T>, from: usize, to: usize) -> boo
     true
 }
 
+pub(super) struct TabGroupEdit {
+    pub(super) session_id: SessionId,
+    pub(super) group_id: TabGroupId,
+    pub(super) name: Entity<TextEditor>,
+    return_focus: Option<FocusHandle>,
+    _subscription: Subscription,
+    _blur: Subscription,
+}
+
+impl ConnectionSession {
+    /// Drops memberships of closed tabs and groups left without members.
+    pub(super) fn prune_tab_groups(&mut self) {
+        let open: HashSet<_> = self.secondary_tabs.iter().map(|tab| tab.id).collect();
+        self.tab_group_members.retain(|tab, _| open.contains(tab));
+        let used: HashSet<_> = self.tab_group_members.values().copied().collect();
+        self.tab_groups.retain(|group| used.contains(&group.id));
+    }
+
+    /// Moves `tab_id` to sit directly after the last member of `group`.
+    fn place_after_group(&mut self, tab_id: SecondaryTabId, group: TabGroupId) {
+        let Some(from) = self.secondary_tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let tab = self.secondary_tabs.remove(from);
+        let end = self
+            .secondary_tabs
+            .iter()
+            .rposition(|t| self.tab_group_members.get(&t.id) == Some(&group))
+            .map_or(self.secondary_tabs.len(), |index| index + 1);
+        self.secondary_tabs.insert(end, tab);
+    }
+
+    /// Groups as saved: members are positions in `secondary_tabs`.
+    pub(super) fn saved_tab_groups(&self) -> Vec<crate::workspace::SavedTabGroup> {
+        self.tab_groups
+            .iter()
+            .map(|group| crate::workspace::SavedTabGroup {
+                name: group.name.clone(),
+                color: group.color,
+                collapsed: group.collapsed,
+                members: self
+                    .secondary_tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| self.tab_group_members.get(&tab.id) == Some(&group.id))
+                    .map(|(index, _)| index)
+                    .collect(),
+            })
+            .collect()
+    }
+
+    pub(super) fn tab_group_label(&self, group: &TabGroup) -> String {
+        if group.name.trim().is_empty() {
+            "Group".into()
+        } else {
+            group.name.clone()
+        }
+    }
+}
+
 impl DbxApp {
+    /// Saves group changes with the connection's tab layout.
+    pub(super) fn persist_tab_layout(&mut self, session_id: SessionId, cx: &mut Context<Self>) {
+        self.persist_startup_workspace(cx);
+        self.persist_query_workspace_for(session_id, cx);
+    }
+
+    pub(super) fn add_tab_to_new_group(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let id = session.next_tab_group;
+        session.next_tab_group += 1;
+        let color = (id as usize - 1) % TAB_GROUP_COLORS.len();
+        session.tab_groups.push(TabGroup {
+            id,
+            name: String::new(),
+            color,
+            collapsed: false,
+        });
+        session.tab_group_members.insert(tab_id, id);
+        session.place_after_group(tab_id, id);
+        session.prune_tab_groups();
+        self.persist_tab_layout(session_id, cx);
+        self.open_tab_group_edit(session_id, id, window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn add_tab_to_group(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        group: TabGroupId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        if !session.tab_groups.iter().any(|g| g.id == group) {
+            return;
+        }
+        session.tab_group_members.insert(tab_id, group);
+        session.place_after_group(tab_id, group);
+        session.prune_tab_groups();
+        self.persist_tab_layout(session_id, cx);
+        cx.notify();
+    }
+
+    pub(super) fn remove_tab_from_group(
+        &mut self,
+        session_id: SessionId,
+        tab_id: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let Some(group) = session.tab_group_members.remove(&tab_id) else {
+            return;
+        };
+        // Leaving from the middle would split the group, so step past its end.
+        session.place_after_group(tab_id, group);
+        session.prune_tab_groups();
+        self.persist_tab_layout(session_id, cx);
+        cx.notify();
+    }
+
+    pub(super) fn ungroup_tabs(
+        &mut self,
+        session_id: SessionId,
+        group: TabGroupId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(session) = self.session_mut(session_id) {
+            session.tab_group_members.retain(|_, g| *g != group);
+            session.prune_tab_groups();
+            self.persist_tab_layout(session_id, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn toggle_tab_group(
+        &mut self,
+        session_id: SessionId,
+        group: TabGroupId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self
+            .session_mut(session_id)
+            .and_then(|s| s.tab_groups.iter_mut().find(|g| g.id == group))
+        {
+            entry.collapsed = !entry.collapsed;
+            self.persist_tab_layout(session_id, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn set_tab_group_color(
+        &mut self,
+        session_id: SessionId,
+        group: TabGroupId,
+        color: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self
+            .session_mut(session_id)
+            .and_then(|s| s.tab_groups.iter_mut().find(|g| g.id == group))
+        {
+            entry.color = color % TAB_GROUP_COLORS.len();
+            self.persist_tab_layout(session_id, cx);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn tab_group_members_of(
+        &self,
+        session_id: SessionId,
+        group: TabGroupId,
+    ) -> Vec<SecondaryTabId> {
+        self.session(session_id)
+            .map(|session| {
+                session
+                    .secondary_tabs
+                    .iter()
+                    .filter(|tab| session.tab_group_members.get(&tab.id) == Some(&group))
+                    .map(|tab| tab.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn open_tab_group_edit(
+        &mut self,
+        session_id: SessionId,
+        group_id: TabGroupId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .session(session_id)
+            .and_then(|s| s.tab_groups.iter().find(|g| g.id == group_id))
+            .map(|g| g.name.clone())
+            .unwrap_or_default();
+        let name =
+            cx.new(|cx| TextEditor::empty(false, window, cx).accessibility_label("Group name"));
+        name.update(cx, |editor, cx| editor.set_text(current, cx));
+        let subscription = cx.observe(&name, |_, _, cx| cx.notify());
+        let return_focus = window.focused(cx);
+        let focus = name.read(cx).focus_handle();
+        focus.focus(window, cx);
+        let blur = cx.on_blur(&focus, window, |this, window, cx| {
+            this.submit_tab_group_edit(window, cx)
+        });
+        self.tab_group_edit = Some(TabGroupEdit {
+            session_id,
+            group_id,
+            name,
+            return_focus,
+            _subscription: subscription,
+            _blur: blur,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn close_tab_group_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.tab_group_edit.take() {
+            if let Some(focus) = prompt.return_focus {
+                focus.focus(window, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn submit_tab_group_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = &self.tab_group_edit else {
+            return;
+        };
+        let name = prompt.name.read(cx).text(cx).trim().to_owned();
+        let (session_id, group_id) = (prompt.session_id, prompt.group_id);
+        if let Some(entry) = self
+            .session_mut(session_id)
+            .and_then(|s| s.tab_groups.iter_mut().find(|g| g.id == group_id))
+        {
+            entry.name = name;
+        }
+        self.close_tab_group_edit(window, cx);
+        self.persist_tab_layout(session_id, cx);
+    }
+
     /// Reorders a connection tab. Order is part of the startup workspace.
     pub(super) fn move_session(
         &mut self,
@@ -65,9 +319,95 @@ impl DbxApp {
         if let (Some(from), Some(to)) = (from, to)
             && move_to_slot(&mut session.secondary_tabs, from, to)
         {
-            self.persist_startup_workspace(cx);
+            // Dropping on a grouped tab joins its group; dropping on a loose
+            // tab leaves any group. Members stay adjacent either way.
+            match session.tab_group_members.get(&target).copied() {
+                Some(group) => session.tab_group_members.insert(tab_id, group),
+                None => session.tab_group_members.remove(&tab_id),
+            };
+            session.prune_tab_groups();
+            self.persist_tab_layout(session_id, cx);
             cx.notify();
         }
+    }
+
+    /// Moves a whole group so it lands beside `target`, after it when moving
+    /// right and before it when moving left, never splitting another group.
+    pub(super) fn move_tab_group(
+        &mut self,
+        session_id: SessionId,
+        group: TabGroupId,
+        target: SecondaryTabId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session_mut(session_id) else {
+            return;
+        };
+        let in_group = |session: &ConnectionSession, id: SecondaryTabId, g: TabGroupId| {
+            session.tab_group_members.get(&id) == Some(&g)
+        };
+        if in_group(session, target, group) {
+            return;
+        }
+        let Some(first) = session
+            .secondary_tabs
+            .iter()
+            .position(|tab| in_group(session, tab.id, group))
+        else {
+            return;
+        };
+        let Some(target_index) = session.secondary_tabs.iter().position(|t| t.id == target) else {
+            return;
+        };
+        let moving_right = first < target_index;
+        let target_group = session.tab_group_members.get(&target).copied();
+        let span = |session: &ConnectionSession| match target_group {
+            Some(g) => {
+                let positions = session
+                    .secondary_tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| in_group(session, tab.id, g))
+                    .map(|(index, _)| index);
+                (
+                    positions.clone().min().unwrap_or(target_index),
+                    positions.max().unwrap_or(target_index),
+                )
+            }
+            None => (target_index, target_index),
+        };
+        let (start, end) = span(session);
+        // Pull the members out, then insert at the boundary recomputed
+        // against the shortened list.
+        let all = std::mem::take(&mut session.secondary_tabs);
+        let (moved, mut rest): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|tab| session.tab_group_members.get(&tab.id) == Some(&group));
+        let removed_before = |index: usize, original: &[usize]| {
+            original.iter().filter(|&&i| i < index).count()
+        };
+        let member_indexes: Vec<usize> = {
+            // Original indexes of members, reconstructed from `first`.
+            let mut indexes = Vec::new();
+            let mut cursor = first;
+            while indexes.len() < moved.len() {
+                indexes.push(cursor);
+                cursor += 1;
+            }
+            indexes
+        };
+        let at = if moving_right {
+            end + 1 - removed_before(end + 1, &member_indexes)
+        } else {
+            start - removed_before(start, &member_indexes)
+        };
+        let at = at.min(rest.len());
+        for (offset, tab) in moved.into_iter().enumerate() {
+            rest.insert(at + offset, tab);
+        }
+        session.secondary_tabs = rest;
+        self.persist_tab_layout(session_id, cx);
+        cx.notify();
     }
 
     pub(super) fn tabs_to_close(
@@ -110,6 +450,16 @@ impl DbxApp {
         cx: &mut Context<Self>,
     ) {
         let tab_ids = self.tabs_to_close(session_id, tab_id, scope);
+        self.request_close_tab_ids_for(session_id, tab_ids, window, cx);
+    }
+
+    pub(super) fn request_close_tab_ids_for(
+        &mut self,
+        session_id: SessionId,
+        tab_ids: Vec<SecondaryTabId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if tab_ids.is_empty() {
             return;
         }
@@ -1284,6 +1634,7 @@ impl DbxApp {
             return;
         };
         let tab = session.secondary_tabs.remove(index);
+        session.prune_tab_groups();
         match tab.kind {
             SecondaryTabKind::Query(mut query) => {
                 query.invalidate_request();

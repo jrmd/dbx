@@ -248,7 +248,11 @@ impl Render for DbxApp {
                 this.run_palette_command("dbx_ui::ExportFullTableXlsx", window, cx)
             }))
             .on_action(cx.listener(|this, _: &SubmitTableName, window, cx| {
-                this.submit_table_name_prompt(window, cx)
+                if this.tab_group_edit.is_some() {
+                    this.submit_tab_group_edit(window, cx)
+                } else {
+                    this.submit_table_name_prompt(window, cx)
+                }
             }))
             .on_action(cx.listener(|this, _: &ConfirmAction, window, cx| {
                 this.confirm_pending_action(window, cx)

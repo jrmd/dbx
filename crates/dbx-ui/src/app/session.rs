@@ -1063,6 +1063,28 @@ impl SecondaryTabKind {
     }
 }
 
+pub(super) type TabGroupId = u64;
+
+/// A named, colored run of adjacent document tabs, like a browser tab group.
+pub(super) struct TabGroup {
+    pub(super) id: TabGroupId,
+    pub(super) name: String,
+    /// Index into [`TAB_GROUP_COLORS`].
+    pub(super) color: usize,
+    pub(super) collapsed: bool,
+}
+
+pub(super) const TAB_GROUP_COLORS: [(&str, fn() -> Rgba); 8] = [
+    ("Blue", || theme().accent),
+    ("Green", || theme().success),
+    ("Orange", || theme().warning),
+    ("Red", || theme().danger),
+    ("Purple", || theme().sql_keyword),
+    ("Teal", || theme().sql_string),
+    ("Pink", || theme().sql_type),
+    ("Yellow", || theme().sql_number),
+];
+
 pub(super) struct SecondaryTab {
     pub(super) id: SecondaryTabId,
     pub(super) kind: SecondaryTabKind,
@@ -1102,6 +1124,11 @@ pub(super) struct ConnectionSession {
     pub(super) editors: SessionEditors,
     pub(super) pane: Pane,
     pub(super) secondary_tabs: Vec<SecondaryTab>,
+    /// Tab groups and their members. Members of a group are always adjacent
+    /// in `secondary_tabs`.
+    pub(super) tab_groups: Vec<TabGroup>,
+    pub(super) tab_group_members: HashMap<SecondaryTabId, TabGroupId>,
+    pub(super) next_tab_group: TabGroupId,
     pub(super) active_secondary_tab: Option<SecondaryTabId>,
     /// The data tab viewed most recently, even while another kind of tab is
     /// in front. Query completion and the Data/Structure rail use it.
@@ -1165,6 +1192,9 @@ impl ConnectionSession {
             editors: SessionEditors::new(window, cx),
             pane: Pane::Data,
             secondary_tabs: Vec::new(),
+            tab_groups: Vec::new(),
+            tab_group_members: HashMap::new(),
+            next_tab_group: 1,
             active_secondary_tab: None,
             recent_data_tab: None,
             closed_queries: Vec::new(),

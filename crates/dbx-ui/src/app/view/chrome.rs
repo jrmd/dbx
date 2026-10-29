@@ -972,7 +972,7 @@ impl DbxApp {
 
     fn render_tabs(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let session_id = self.active_session_id();
-        let (active_secondary_tab, tabs) = self
+        let (active_secondary_tab, tabs, groups) = self
             .active_session()
             .map(|session| {
                 let mut query_sequences: Vec<u64> = session
@@ -1013,12 +1013,37 @@ impl DbxApp {
                                 ("Database diagram".into(), Icon::Diagram)
                             }
                         };
-                        (tab.id, label, kind)
+                        (tab.id, label, kind, session.tab_group_members.get(&tab.id).copied())
                     })
                     .collect::<Vec<_>>();
-                (session.active_secondary_tab, tabs)
+                let groups: HashMap<TabGroupId, (String, Rgba, bool, usize)> = session
+                    .tab_groups
+                    .iter()
+                    .map(|group| {
+                        let count = session
+                            .tab_group_members
+                            .values()
+                            .filter(|g| **g == group.id)
+                            .count();
+                        (
+                            group.id,
+                            (
+                                if group.name.is_empty() { String::new() } else { group.name.clone() },
+                                (TAB_GROUP_COLORS[group.color % TAB_GROUP_COLORS.len()].1)(),
+                                group.collapsed,
+                                count,
+                            ),
+                        )
+                    })
+                    .collect();
+                (session.active_secondary_tab, tabs, groups)
             })
             .unwrap_or_default();
+        let group_order: Vec<Option<TabGroupId>> = tabs.iter().map(|tab| tab.3).collect();
+        let group_edit = self
+            .tab_group_edit
+            .as_ref()
+            .map(|edit| (edit.group_id, edit.name.clone()));
         div()
             .id("document-tabs")
             .role(gpui::Role::TabList)
@@ -1035,10 +1060,30 @@ impl DbxApp {
             .border_color(theme().border)
             .follow_top_corners(crate::theme::sheet_radius())
             .bg(crate::theme::navigation_surface())
-            .children(tabs.into_iter().map(|(tab_id, label, kind)| {
+            .children(tabs.into_iter().enumerate().flat_map(|(position, (tab_id, label, kind, group))| {
+                let mut out: Vec<AnyElement> = Vec::new();
+                let group_info = group.and_then(|g| groups.get(&g).map(|info| (g, info.clone())));
+                let first_of_group =
+                    group.is_some() && (position == 0 || group_order[position - 1] != group);
+                if let (Some((group_id, (name, color, collapsed, count))), true) =
+                    (group_info.clone(), first_of_group)
+                    && let Some(session_id) = session_id
+                {
+                    let editing = group_edit
+                        .as_ref()
+                        .filter(|(edited, _)| *edited == group_id)
+                        .map(|(_, editor)| editor.clone());
+                    out.push(tab_group_chip(group_id, name, color, collapsed, count, session_id, editing, cx));
+                }
                 let selected = active_secondary_tab == Some(tab_id);
+                // A minimised group still shows the tab in front.
+                if let Some((_, (_, _, true, _))) = group_info
+                    && !selected
+                {
+                    return out;
+                }
                 let app = cx.entity().downgrade();
-                document_tab(
+                let tab = document_tab(
                     SharedString::from(format!("document-{tab_id}")),
                     kind,
                     selected,
@@ -1064,6 +1109,20 @@ impl DbxApp {
                         move |this, drag: &DocumentTabDrag, _, cx| {
                             if drag.session_id == session_id {
                                 this.move_secondary_tab(session_id, drag.tab_id, tab_id, cx)
+                            }
+                        },
+                    ))
+                    .drag_over::<DocumentTabGroupDrag>(move |style, drag, _, _| {
+                        if drag.session_id == session_id {
+                            style.bg(theme().glass_hover)
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop(cx.listener(
+                        move |this, drag: &DocumentTabGroupDrag, _, cx| {
+                            if drag.session_id == session_id {
+                                this.move_tab_group(session_id, drag.group_id, tab_id, cx)
                             }
                         },
                     ))
@@ -1134,8 +1193,65 @@ impl DbxApp {
                             },
                         ));
                     }
+                    menu = menu.separator();
+                    let (groups, current) = app
+                        .upgrade()
+                        .and_then(|app| {
+                            app.read(cx).session(session_id).map(|session| {
+                                (
+                                    session
+                                        .tab_groups
+                                        .iter()
+                                        .map(|g| (g.id, session.tab_group_label(g)))
+                                        .collect::<Vec<_>>(),
+                                    session.tab_group_members.get(&tab_id).copied(),
+                                )
+                            })
+                        })
+                        .unwrap_or_default();
+                    menu = menu.item(PopupMenuItem::new("Add to new group").on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ = app.update(cx, |this, cx| {
+                                this.add_tab_to_new_group(session_id, tab_id, window, cx)
+                            });
+                        }
+                    }));
+                    for (group_id, name) in groups {
+                        if current == Some(group_id) {
+                            continue;
+                        }
+                        let app = app.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("Add to {name}")).on_click(
+                                move |_, _, cx| {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.add_tab_to_group(session_id, tab_id, group_id, cx)
+                                    });
+                                },
+                            ),
+                        );
+                    }
+                    if current.is_some() {
+                        let app = app.clone();
+                        menu = menu.item(PopupMenuItem::new("Remove from group").on_click(
+                            move |_, _, cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.remove_tab_from_group(session_id, tab_id, cx)
+                                });
+                            },
+                        ));
+                    }
                     menu
-                })
+                });
+                let tab = match group_info {
+                    Some((_, (_, color, _, _))) => {
+                        tab.bg(Rgba { a: if selected { 0.28 } else { 0.14 }, ..color })
+                    }
+                    None => tab,
+                };
+                out.push(tab.into_any_element());
+                out
             }))
             .child(
                 glass_icon_button("add-query-document", Icon::Add, false)
@@ -1450,6 +1566,173 @@ impl DbxApp {
     }
 }
 
+const GROUP_CHIP_HEIGHT: f32 = 24.;
+
+/// The colored label that opens a tab group, like Chrome's group chip.
+fn tab_group_chip(
+    group_id: TabGroupId,
+    name: String,
+    color: Rgba,
+    collapsed: bool,
+    count: usize,
+    session_id: SessionId,
+    editing: Option<Entity<TextEditor>>,
+    cx: &mut Context<DbxApp>,
+) -> AnyElement {
+    let app = cx.entity().downgrade();
+    let description = if name.is_empty() { "Tab group".to_owned() } else { format!("Tab group {name}") };
+    // An unnamed group is just a colored dot; text only appears when there is
+    // something to say, so groups cost almost no tab-strip width.
+    let label: Option<SharedString> = match (name.is_empty(), collapsed) {
+        (true, false) => None,
+        (true, true) => Some(format!("{count}").into()),
+        (false, false) => Some(name.clone().into()),
+        (false, true) => Some(format!("{name} · {count}").into()),
+    };
+    if let Some(editor) = editing {
+        let focus = editor.read(cx).focus_handle();
+        // Sized to the text so finishing the edit doesn't make the strip jump.
+        let width = editor.read(cx).text(cx).chars().count().max(4) as f32 * 7.0 + 22.0;
+        return div()
+            .id(SharedString::from(format!("tab-group-{group_id}")))
+            .h(crate::theme::control_height(GROUP_CHIP_HEIGHT))
+            .w(crate::theme::ui_px(width))
+            .px(crate::theme::ui_px(10.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .rounded_full()
+            .bg(Rgba { a: 0.3, ..color })
+            .key_context("DbxTableName")
+            .child(editor::bare_input(
+                editor,
+                focus,
+                crate::theme::control_height(GROUP_CHIP_HEIGHT),
+                cx,
+            ))
+            .into_any_element();
+    }
+    let current_color = TAB_GROUP_COLORS.iter().position(|(_, c)| c() == color).unwrap_or(0);
+    let drag_label: SharedString = if name.is_empty() { "Group".into() } else { name.clone().into() };
+    div()
+        .id(SharedString::from(format!("tab-group-{group_id}")))
+        .pressable(description)
+        .on_drag(
+            DocumentTabGroupDrag { session_id, group_id, label: drag_label },
+            |drag, _, _, cx| cx.new(|_| drag.clone()),
+        )
+        .h(crate::theme::control_height(GROUP_CHIP_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .text_color(theme().accent_foreground)
+        .text_size(crate::theme::text_px(12.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .map(|chip| match label {
+            Some(label) => chip.px(crate::theme::ui_px(8.)).bg(color).child(label),
+            None => chip
+                .w(crate::theme::ui_px(20.))
+                .child(div().size(crate::theme::ui_px(10.)).rounded_full().bg(color)),
+        })
+        .tooltip(tip("Click to collapse or expand, right-click for options"))
+        .drag_over::<DocumentTabDrag>(move |style, drag, _, _| {
+            if drag.session_id == session_id {
+                style.bg(theme().glass_hover)
+            } else {
+                style
+            }
+        })
+        .on_drop(cx.listener(move |this, drag: &DocumentTabDrag, _, cx| {
+            if drag.session_id == session_id {
+                this.add_tab_to_group(session_id, drag.tab_id, group_id, cx)
+            }
+        }))
+        .drag_over::<DocumentTabGroupDrag>(move |style, drag, _, _| {
+            if drag.session_id == session_id && drag.group_id != group_id {
+                style.bg(theme().glass_hover)
+            } else {
+                style
+            }
+        })
+        .on_drop(cx.listener(move |this, drag: &DocumentTabGroupDrag, _, cx| {
+            if drag.session_id == session_id
+                && let Some(&first) = this.tab_group_members_of(session_id, group_id).first()
+            {
+                this.move_tab_group(session_id, drag.group_id, first, cx)
+            }
+        }))
+        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+            // Always toggles; the second click of a double-click toggles back
+            // and opens the name for editing.
+            this.toggle_tab_group(session_id, group_id, cx);
+            if event.click_count() >= 2 {
+                this.open_tab_group_edit(session_id, group_id, window, cx);
+            }
+        }))
+        .context_menu(move |mut menu, window, cx| {
+            menu = menu.item(PopupMenuItem::new("Rename group").on_click({
+                let app = app.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        this.open_tab_group_edit(session_id, group_id, window, cx)
+                    });
+                }
+            }));
+            menu = menu.submenu("Color", window, cx, {
+                let app = app.clone();
+                move |mut menu, _, _| {
+                    for (index, (color_name, swatch)) in TAB_GROUP_COLORS.iter().enumerate() {
+                        let app = app.clone();
+                        let swatch = swatch();
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_, _| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(crate::theme::ui_px(8.))
+                                    .child(
+                                        div()
+                                            .size(crate::theme::ui_px(12.))
+                                            .flex_none()
+                                            .rounded_full()
+                                            .bg(swatch),
+                                    )
+                                    .child(*color_name)
+                            })
+                                .checked(index == current_color)
+                                .on_click(move |_, _, cx| {
+                                    let _ = app.update(cx, |this, cx| {
+                                        this.set_tab_group_color(session_id, group_id, index, cx)
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            });
+            menu = menu.separator().item(PopupMenuItem::new("Ungroup").on_click({
+                let app = app.clone();
+                move |_, _, cx| {
+                    let _ = app.update(cx, |this, cx| this.ungroup_tabs(session_id, group_id, cx));
+                }
+            }));
+            menu.item(PopupMenuItem::new("Close group").on_click({
+                let app = app.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| {
+                        let ids = this.tab_group_members_of(session_id, group_id);
+                        this.request_close_tab_ids_for(session_id, ids, window, cx)
+                    });
+                }
+            }))
+        })
+        .into_any_element()
+}
+
 /// A pill-shaped document tab on the content sheet's tab strip.
 fn document_tab(
     id: impl Into<ElementId>,
@@ -1528,6 +1811,19 @@ fn tab_drag_ghost(label: SharedString) -> Div {
 }
 
 impl Render for ConnectionTabDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        tab_drag_ghost(self.label.clone())
+    }
+}
+
+#[derive(Clone)]
+struct DocumentTabGroupDrag {
+    session_id: SessionId,
+    group_id: TabGroupId,
+    label: SharedString,
+}
+
+impl Render for DocumentTabGroupDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         tab_drag_ghost(self.label.clone())
     }

@@ -911,6 +911,7 @@ pub struct DbxApp {
     /// Physical Control state, before macOS rewrites Control-click as right-click.
     explorer_control_held: bool,
     table_name_prompt: Option<table_commands::TableNamePrompt>,
+    tab_group_edit: Option<tabs::TabGroupEdit>,
     nonrelational_editor: Option<nonrelational::NonrelationalEditor>,
     nonrelational_generation: u64,
     database_export_dialog: Option<DatabaseExportDialog>,
@@ -1105,6 +1106,7 @@ impl DbxApp {
             table_context_menu: None,
             explorer_control_held: false,
             table_name_prompt: None,
+            tab_group_edit: None,
             nonrelational_editor: None,
             nonrelational_generation: 0,
             database_export_dialog: None,
@@ -1691,6 +1693,9 @@ impl DbxApp {
             true
         } else if self.table_name_prompt.is_some() {
             self.close_table_name_prompt(window, cx);
+            true
+        } else if self.tab_group_edit.is_some() {
+            self.close_tab_group_edit(window, cx);
             true
         } else if self.workspace_screen_drawn() && self.cancel_database_export(window, cx) {
             true

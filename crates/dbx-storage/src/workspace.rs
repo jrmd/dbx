@@ -123,6 +123,8 @@ pub struct WorkspaceDocument {
     #[serde(default)]
     pub active_tab: Option<usize>,
     #[serde(default)]
+    pub tab_groups: Vec<SavedTabGroup>,
+    #[serde(default)]
     pub current_database: Option<String>,
 }
 impl Default for WorkspaceDocument {
@@ -138,12 +140,22 @@ impl Default for WorkspaceDocument {
             open_tables: Vec::new(),
             tabs: Vec::new(),
             active_tab: None,
+            tab_groups: Vec::new(),
             current_database: None,
         }
     }
 }
 fn default_history_retention() -> usize {
     100
+}
+
+/// A tab group; `members` index into the saved tab list that sits beside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SavedTabGroup {
+    pub name: String,
+    pub color: usize,
+    pub collapsed: bool,
+    pub members: Vec<usize>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -159,6 +171,8 @@ pub struct StartupConnection {
     pub tabs: Option<Vec<SavedTab>>,
     #[serde(default)]
     pub active_tab: Option<usize>,
+    #[serde(default)]
+    pub tab_groups: Vec<SavedTabGroup>,
 }
 pub fn connection_key(connection: &QueryHistoryConnection) -> String {
     let identity = serde_json::to_vec(connection).unwrap_or_default();
@@ -289,6 +303,7 @@ mod tests {
                 SavedTab::Data(dbx_core::TableRef::new("items")),
             ]),
             active_tab: Some(1),
+            tab_groups: Vec::new(),
         };
         store
             .save_startup(&StartupWorkspace {

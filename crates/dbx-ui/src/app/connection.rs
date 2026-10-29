@@ -902,6 +902,7 @@ impl DbxApp {
         }
         self.invalidate_nonrelational_for(None);
         self.table_name_prompt = None;
+        self.tab_group_edit = None;
         self.table_confirmation_input = None;
         self.vault_state = Some(VaultState::Locked);
         self.reset_folder_creation(cx);
@@ -1511,6 +1512,7 @@ impl DbxApp {
                         for session in &mut this.sessions {
                             if session.profile_id == Some(profile.id) {
                                 session.tag = profile.tag.clone();
+                                session.name = profile.name.clone();
                             }
                         }
                         if unchanged {

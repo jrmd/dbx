@@ -68,6 +68,7 @@ impl DbxApp {
                                 .secondary_tabs
                                 .iter()
                                 .position(|tab| Some(tab.id) == session.active_secondary_tab),
+                            tab_groups: session.saved_tab_groups(),
                         }
                     }),
                 ))
@@ -309,6 +310,7 @@ impl DbxApp {
                 .secondary_tabs
                 .iter()
                 .position(|tab| Some(tab.id) == session.active_secondary_tab);
+            document.tab_groups = session.saved_tab_groups();
         }
         self.workspace_documents
             .insert(key.clone(), document.clone());
@@ -673,13 +675,17 @@ impl DbxApp {
             .as_ref()
             .and_then(|connection| connection.active_tab)
             .or(document.active_tab);
+        let tab_groups = match &startup {
+            Some(connection) if connection.tabs.is_some() => connection.tab_groups.clone(),
+            _ => document.tab_groups.clone(),
+        };
         if let Some(session) = self.session_mut(session_id) {
             session.closed_queries = document.closed.clone();
             session.schema_baseline = document.schema_baseline.clone();
         }
         self.workspace_documents.insert(key, document);
         if !has_queries {
-            self.restore_workspace_tabs_for(session_id, tabs, active_tab, window, cx);
+            self.restore_workspace_tabs_for(session_id, tabs, active_tab, tab_groups, window, cx);
         } else {
             self.persist_query_workspace_for(session_id, cx);
         }
@@ -690,6 +696,7 @@ impl DbxApp {
         session_id: SessionId,
         tabs: Vec<SavedTab>,
         active_tab: Option<usize>,
+        tab_groups: Vec<crate::workspace::SavedTabGroup>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -723,7 +730,9 @@ impl DbxApp {
                 if !session.secondary_tabs.is_empty() {
                     return;
                 }
-                this.restore_workspace_tab_layout_for(session_id, tabs, active_tab, window, cx);
+                this.restore_workspace_tab_layout_for(
+                    session_id, tabs, active_tab, tab_groups, window, cx,
+                );
             })?;
             Ok::<(), anyhow::Error>(())
         })
@@ -735,6 +744,7 @@ impl DbxApp {
         session_id: SessionId,
         tabs: Vec<SavedTab>,
         active_tab: Option<usize>,
+        tab_groups: Vec<crate::workspace::SavedTabGroup>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -745,6 +755,7 @@ impl DbxApp {
         let tables = session.tables.clone();
         let mut active = None;
         let mut first = None;
+        let mut opened: HashMap<usize, SecondaryTabId> = HashMap::new();
         for (index, tab) in tabs.into_iter().enumerate() {
             let previous_count = self
                 .session(session_id)
@@ -829,6 +840,9 @@ impl DbxApp {
                 && session.secondary_tabs.len() > previous_count
             {
                 first = first.or(session.active_secondary_tab);
+                if let Some(id) = session.active_secondary_tab {
+                    opened.insert(index, id);
+                }
                 if Some(index) == active_tab {
                     active = session.active_secondary_tab;
                 }
@@ -836,6 +850,28 @@ impl DbxApp {
         }
         if let Some(session) = self.session_mut(session_id) {
             session.restoring_workspace = false;
+            for saved in tab_groups {
+                let members: Vec<_> = saved
+                    .members
+                    .iter()
+                    .filter_map(|index| opened.get(index).copied())
+                    .collect();
+                if members.is_empty() {
+                    continue;
+                }
+                let id = session.next_tab_group;
+                session.next_tab_group += 1;
+                session.tab_groups.push(TabGroup {
+                    id,
+                    name: saved.name,
+                    color: saved.color % TAB_GROUP_COLORS.len(),
+                    collapsed: saved.collapsed,
+                });
+                for member in members {
+                    session.tab_group_members.insert(member, id);
+                }
+            }
+            session.prune_tab_groups();
         }
         if let Some(active) = active.or(first) {
             self.activate_secondary_tab_for(session_id, active, window, cx);
@@ -985,6 +1021,13 @@ mod tests {
                 let document = crate::workspace::WorkspaceDocument {
                     tabs,
                     active_tab: Some(2),
+                    tab_groups: vec![crate::workspace::SavedTabGroup {
+                        name: "Reports".into(),
+                        color: 3,
+                        collapsed: true,
+                        // Saved positions 1 and 2 shift down past the missing table.
+                        members: vec![0, 1],
+                    }],
                     ..Default::default()
                 };
                 let revision = workspace.register(&key);
@@ -994,11 +1037,21 @@ mod tests {
                     session_id,
                     loaded.tabs,
                     loaded.active_tab,
+                    loaded.tab_groups,
                     window,
                     cx,
                 );
                 let session = app.session(session_id).unwrap();
                 assert_eq!(session.secondary_tabs.len(), 4);
+                assert_eq!(
+                    session.saved_tab_groups(),
+                    vec![crate::workspace::SavedTabGroup {
+                        name: "Reports".into(),
+                        color: 3,
+                        collapsed: true,
+                        members: vec![1, 2],
+                    }]
+                );
                 assert!(matches!(
                     session.secondary_tabs[0].kind,
                     SecondaryTabKind::Structure(_)
