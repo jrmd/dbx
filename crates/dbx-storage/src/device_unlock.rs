@@ -8,8 +8,11 @@
 //! one vault; a recreated vault gets a new salt and a new key.
 //!
 //! [`TouchId`] is the stricter, separate alternative: the same key behind a
-//! biometry-gated Keychain item that prompts on every read. Callers must not
-//! keep both: enabling Touch ID should `DeviceUnlock::forget` first.
+//! biometry-gated Keychain item that prompts on every read. They are
+//! independent and may both be enabled: DBX tries the device key silently at
+//! launch and falls back to Touch ID (and uses Touch ID after a manual lock).
+//! The trade-off is that a remembered device key stays readable by this
+//! signed app without a fingerprint, so enabling only Touch ID is stricter.
 
 use std::path::Path;
 

@@ -500,6 +500,7 @@ impl DbxApp {
                 }
                 this.touch_id_available = available;
                 this.touch_id_enrolled = enrolled;
+                this.touch_id_probed = true;
                 this.maybe_auto_prompt_touch_id(cx);
                 cx.notify();
             })?;
@@ -510,10 +511,6 @@ impl DbxApp {
 
     pub(super) fn apply_touch_id_preference(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.touch_id_enabled = enabled;
-        if enabled {
-            // Biometric and silent unlock are mutually exclusive.
-            self.remember_device = false;
-        }
         self.persist_settings(cx);
     }
 
@@ -530,7 +527,6 @@ impl DbxApp {
         let Some(touch_id) = self.touch_id() else {
             return;
         };
-        let device = self.device_unlock();
         let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
             return;
         };
@@ -546,11 +542,6 @@ impl DbxApp {
             let outcome = runtime
                 .spawn_blocking(move || -> Result<(), String> {
                     if enabled {
-                        // Remove the unprotected copy FIRST. If that fails,
-                        // never claim that biometric enrollment succeeded.
-                        if let Some(device) = device {
-                            device.forget()?;
-                        }
                         let key = vault.key().map_err(|error| error.to_string())?;
                         touch_id.store(&key).map_err(|error| error.to_string())
                     } else {
@@ -588,15 +579,17 @@ impl DbxApp {
     /// it ready. Later probes (after a manual lock, a cancel or a failure) never
     /// prompt on their own. Returns whether an attempt was started.
     pub(super) fn maybe_auto_prompt_touch_id(&mut self, cx: &mut Context<Self>) -> bool {
-        if !std::mem::take(&mut self.touch_id_launch_prompt_pending) {
+        // Wait while the launch device unlock is in flight, and until the
+        // first probe has said whether Touch ID is usable.
+        if !self.touch_id_launch_prompt_pending || self.vault_busy || !self.touch_id_probed {
             return false;
         }
+        self.touch_id_launch_prompt_pending = false;
         let typing = !self.vault_editors.passphrase.read(cx).is_empty();
         let ready = self.vault_state == Some(VaultState::Locked)
             && self.touch_id_enabled
             && self.touch_id_available
             && self.touch_id_enrolled
-            && !self.vault_busy
             && !typing;
         if ready {
             self.unlock_with_touch_id(cx);
@@ -619,6 +612,7 @@ impl DbxApp {
         ) else {
             return;
         };
+        self.touch_id_launch_prompt_pending = false;
         self.clear_vault_inputs(cx);
         self.error = None;
         self.vault_busy = true;
@@ -673,14 +667,17 @@ impl DbxApp {
         .detach();
     }
 
+    /// Silent device unlock runs at launch, whether or not Touch ID is also on;
+    /// Touch ID is the fallback when it fails and the way back in after a lock.
+    pub(super) fn wants_device_unlock(&self) -> bool {
+        self.vault_state == Some(VaultState::Locked) && self.remember_device
+    }
+
     /// Unlock with the key this device remembered, if any. The passphrase
     /// gate stays up (showing "Unlocking…") until the keychain answers, and
     /// remains the fallback when it has nothing or refuses.
     pub(super) fn try_device_unlock(&mut self, cx: &mut Context<Self>) {
-        if self.vault_state != Some(VaultState::Locked)
-            || !self.remember_device
-            || self.touch_id_enabled
-        {
+        if !self.wants_device_unlock() {
             return;
         }
         let (Some(vault), Some(device)) = (
@@ -716,10 +713,7 @@ impl DbxApp {
                 if this.vault_generation != generation {
                     return;
                 }
-                this.vault_busy = false;
-                if unlocked {
-                    this.vault_state = Some(VaultState::Unlocked);
-                }
+                this.finish_device_unlock(unlocked, cx);
                 cx.notify();
             })?;
             Ok::<(), anyhow::Error>(())
@@ -727,12 +721,21 @@ impl DbxApp {
         .detach();
     }
 
+    /// Launch device unlock answered. Success leaves nothing to prompt for;
+    /// otherwise fall back to the once-per-launch Touch ID prompt.
+    pub(super) fn finish_device_unlock(&mut self, unlocked: bool, cx: &mut Context<Self>) {
+        self.vault_busy = false;
+        if unlocked {
+            self.vault_state = Some(VaultState::Unlocked);
+            self.touch_id_launch_prompt_pending = false;
+        } else {
+            self.maybe_auto_prompt_touch_id(cx);
+        }
+    }
+
     /// Apply the Settings choice to the keychain while the vault is unlocked.
     pub(super) fn toggle_remember_device(&mut self, cx: &mut Context<Self>) {
-        if self.vault_busy
-            || self.touch_id_enabled
-            || self.vault_state != Some(VaultState::Unlocked)
-        {
+        if self.vault_busy || self.vault_state != Some(VaultState::Unlocked) {
             return;
         }
         let enabled = !self.remember_device;
@@ -748,7 +751,6 @@ impl DbxApp {
             self.remember_device = false;
             self.persist_settings(cx);
         }
-        let touch_id = self.touch_id();
         let runtime = self.runtime.clone();
         self.vault_busy = true;
         cx.notify();
@@ -756,9 +758,6 @@ impl DbxApp {
             let outcome = runtime
                 .spawn_blocking(move || -> Result<(), String> {
                     if enabled {
-                        if let Some(touch_id) = touch_id {
-                            touch_id.forget()?;
-                        }
                         let key = vault.key().map_err(|error| error.to_string())?;
                         device.store(&key)
                     } else {
@@ -813,6 +812,7 @@ impl DbxApp {
         }
         confirmation.zeroize();
         let passphrase = SecretString::from(std::mem::take(&mut passphrase));
+        self.touch_id_launch_prompt_pending = false;
         self.clear_vault_inputs(cx);
         self.vault_busy = true;
         self.vault_generation += 1;
@@ -836,30 +836,39 @@ impl DbxApp {
                     // unlock itself; a keychain failure is only reported.
                     let device_error = if result.is_ok() {
                         (|| -> Result<(), String> {
-                            if touch_id_enabled {
-                                // Remove the unprotected copy FIRST. If that fails,
-                                // never claim that biometric enrollment succeeded.
-                                if let Some(device) = device {
-                                    device.forget()?;
+                            // Each setting is honoured on its own; one failing
+                            // never skips the other.
+                            let mut first_error = None;
+                            if let Some(touch_id) = touch_id {
+                                let outcome = if touch_id_enabled {
+                                    vault
+                                        .key()
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|key| {
+                                            touch_id.store(&key).map_err(|error| {
+                                                format!("Touch ID wasn’t set up. Use your passphrase next time. {error}")
+                                            })
+                                        })
+                                } else {
+                                    touch_id.forget()
+                                };
+                                first_error = outcome.err();
+                            }
+                            if let Some(device) = device {
+                                let outcome = if remember_device {
+                                    vault
+                                        .key()
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|key| device.store(&key))
+                                } else {
+                                    device.forget()
+                                };
+                                if first_error.is_none() {
+                                    first_error = outcome.err();
                                 }
-                                if let Some(touch_id) = touch_id {
-                                    let key = vault.key().map_err(|error| error.to_string())?;
-                                    touch_id.store(&key).map_err(|error| {
-                                        format!("Touch ID wasn’t set up. Use your passphrase next time. {error}")
-                                    })?;
-                                }
-                            } else {
-                                if let Some(touch_id) = touch_id {
-                                    touch_id.forget()?;
-                                }
-                                if let Some(device) = device {
-                                    if remember_device {
-                                        let key = vault.key().map_err(|error| error.to_string())?;
-                                        device.store(&key)?;
-                                    } else {
-                                        device.forget()?;
-                                    }
-                                }
+                            }
+                            if let Some(error) = first_error {
+                                return Err(error);
                             }
                             Ok(())
                         })()
@@ -990,6 +999,8 @@ impl DbxApp {
         self.tab_group_edit = None;
         self.table_confirmation_input = None;
         self.vault_state = Some(VaultState::Locked);
+        // A manual lock never re-prompts automatically.
+        self.touch_id_launch_prompt_pending = false;
         self.reset_folder_creation(cx);
         self.workspace_documents.clear();
         // Use the normal teardown so queries, connection attempts, and tab

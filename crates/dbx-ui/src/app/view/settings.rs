@@ -699,18 +699,14 @@ impl DbxApp {
                     .label("Unlock automatically on this device")
                     .with_size(Size::Small)
                     .checked(self.remember_device)
-                    .disabled(unavailable || self.touch_id_enabled)
+                    .disabled(unavailable)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_remember_device(cx))),
             )
             .child(
                 div()
                     .text_size(crate::theme::text_px(11.))
                     .text_color(theme().text_muted)
-                    .child(if self.touch_id_enabled {
-                        "Automatic unlock is unavailable while Touch ID is enabled."
-                    } else {
-                        "Save the vault key in your system keychain to skip the passphrase on launch."
-                    }),
+                    .child("Save the vault key in your system keychain to skip the passphrase on launch."),
             );
         let touch_id_row = (self.touch_id_available || self.touch_id_enabled).then(|| {
             let enabled = self.touch_id_enabled;
@@ -744,10 +740,25 @@ impl DbxApp {
                 )
                 .into_any_element()
         });
-        let vault_rows: Vec<AnyElement> = touch_id_row
+        let mut vault_rows: Vec<AnyElement> = touch_id_row
             .into_iter()
             .chain([automatic_unlock.into_any_element()])
             .collect();
+        if self.touch_id_enabled && self.remember_device {
+            // The trade-off, stated plainly and without alarm.
+            vault_rows.push(
+                div()
+                    .px(crate::theme::ui_px(SPACE_4))
+                    .py(crate::theme::ui_px(10.))
+                    .text_size(crate::theme::text_px(11.))
+                    .text_color(theme().text_muted)
+                    .child(
+                        "DBX unlocks automatically when it opens, and Touch ID is used after you lock it. \
+                         Automatic unlock keeps a key in your keychain without fingerprint protection.",
+                    )
+                    .into_any_element(),
+            );
+        }
         div()
             .flex()
             .flex_col()
