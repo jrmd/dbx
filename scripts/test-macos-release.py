@@ -19,6 +19,11 @@ elif name=='security':
  if args[0]=='create-keychain': pathlib.Path(args[-1]).touch()
  if args[0]=='find-identity': print('1) '+('A'*40)+' "Developer ID Application: Fixture ('+os.environ.get('IDENTITY_TEAM','TESTTEAM01')+')"')
  if args==['list-keychains','-d','user']: print('    "/fixture/login.keychain-db"\\n    "/fixture/other keychain.keychain-db"')
+elif name=='codesign' and '--entitlements' in args and '-d' in args:
+ import plistlib
+ team='TESTTEAM01'; app=team+'.dev.jrmd.dbx'
+ groups=json.loads(os.environ.get('ENT_GROUPS','null')) if os.environ.get('ENT_GROUPS') else [app]
+ sys.stdout.buffer.write(plistlib.dumps({'com.apple.application-identifier':os.environ.get('ENT_APP',app),'keychain-access-groups':groups}))
 elif name=='codesign' and '-dv' in args:
  print('TeamIdentifier=TESTTEAM01',file=sys.stderr)
  print('Authority=Developer ID Application: Fixture (TESTTEAM01)',file=sys.stderr)
@@ -39,7 +44,7 @@ class ReleaseTests(unittest.TestCase):
         shutil.copy(Path(__file__).with_name("release-macos.sh"), self.root / "scripts")
         (self.root / "Cargo.toml").write_text('[workspace.package]\nversion="0.1.0"\n')
         (self.root / "scripts/build-macos-app.sh").write_text(
-            '#!/usr/bin/env bash\nset -eu\nprintf "build\\n" >> "$CALL_LOG"\nprintf "profile=%s\\n" "${DBX_CARGO_PROFILE-unset}" >> "$CALL_LOG"\nmkdir -p "$DBX_APP_DIR/Contents/MacOS"\n')
+            '#!/usr/bin/env bash\nset -eu\nprintf "build\\n" >> "$CALL_LOG"\nprintf "profile=%s\\n" "${DBX_CARGO_PROFILE-unset}" >> "$CALL_LOG"\nprintf "noprofile=%s\\n" "${DBX_NO_PROVISIONING_PROFILE-unset}" >> "$CALL_LOG"\nmkdir -p "$DBX_APP_DIR/Contents/MacOS"\n')
         self.bin = self.root / "bin"
         self.bin.mkdir()
         for name in ("uname", "openssl", "security", "codesign", "xcrun", "spctl", "ditto", "shasum"):
@@ -83,6 +88,11 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("profile=release\n", (self.root / "calls.log").read_text())
 
+    def test_release_build_never_uses_the_local_default_profile(self):
+        result = self.release("unsigned")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("noprofile=1\n", (self.root / "calls.log").read_text())
+
     def test_intel_archive_uses_its_own_asset_name(self):
         self.environment["FIXTURE_ARCH"] = "x86_64"
         result = self.release()
@@ -100,6 +110,51 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotEqual(self.release().returncode, 0)
         self.assertNotIn("\nbuild\n", (self.root / "calls.log").read_text())
         self.assertEqual(self.archives(), [])
+
+    def test_profile_secret_is_decoded_and_checked_after_signing(self):
+        self.environment["APPLE_PROVISIONING_PROFILE_BASE64"] = "Zml4dHVyZQ=="
+        (self.root / "scripts/build-macos-app.sh").write_text(
+            '#!/usr/bin/env bash\nset -eu\necho "profile=$(cat "$DBX_PROVISIONING_PROFILE")" >> "$CALL_LOG"\n'
+            'mkdir -p "$DBX_APP_DIR/Contents/MacOS"\ncp "$DBX_PROVISIONING_PROFILE" "$DBX_APP_DIR/Contents/embedded.provisionprofile"\n')
+        result = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = (self.root / "calls.log").read_text()
+        self.assertIn("profile=fixture", calls)
+        self.assertLess(calls.index("profile=fixture"), calls.index("codesign -d --entitlements :-"))
+        self.assertEqual([p.name for p in self.archives()], ["DBX-0.1.0-macos-arm64.zip"])
+
+    def signed_with_profile(self, copy=True, **env):
+        self.environment["APPLE_PROVISIONING_PROFILE_BASE64"] = "Zml4dHVyZQ=="
+        self.environment.update(env)
+        install = 'cp "$DBX_PROVISIONING_PROFILE"' if copy else 'echo different >'
+        (self.root / "scripts/build-macos-app.sh").write_text(
+            '#!/usr/bin/env bash\nmkdir -p "$DBX_APP_DIR/Contents/MacOS"\n'
+            + install + ' "$DBX_APP_DIR/Contents/embedded.provisionprofile"\n')
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.archives(), [])
+        self.assertNotIn("notarytool submit", (self.root / "calls.log").read_text())
+        return result
+
+    def test_bad_signed_entitlements_block_the_archive(self):
+        cases = {
+            "empty group array": ({"ENT_GROUPS": "[]"}, "keychain-access-groups"),
+            "wrong first group": ({"ENT_GROUPS": '["TESTTEAM01.other", "TESTTEAM01.dev.jrmd.dbx"]'}, "First signed"),
+            "wrong app id": ({"ENT_APP": "TESTTEAM01.other"}, "application-identifier"),
+        }
+        for name, (env, message) in cases.items():
+            with self.subTest(name=name):
+                self.assertIn(message, self.signed_with_profile(**env).stderr)
+                for key in env:
+                    del self.environment[key]
+                (self.root / "calls.log").unlink()
+
+    def test_embedded_profile_must_match_validated_profile(self):
+        self.assertIn("differs", self.signed_with_profile(copy=False).stderr)
+
+    def test_no_profile_skips_entitlement_check(self):
+        self.assertEqual(self.release().returncode, 0)
+        self.assertNotIn("--entitlements", (self.root / "calls.log").read_text())
 
     def test_unsigned_archive_is_explicitly_labelled(self):
         for name in list(self.environment):

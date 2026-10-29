@@ -22,6 +22,7 @@ pub const ICON_RESTORE: &str = "icons/restore.svg";
 pub const ICON_SIDEBAR: &str = "icons/sidebar.svg";
 pub const ICON_APPEARANCE: &str = "icons/appearance.svg";
 pub const ICON_LOCK: &str = "icons/lock.svg";
+pub const ICON_FINGERPRINT: &str = "icons/fingerprint.svg";
 pub const ICON_SPARKLES: &str = "icons/sparkles.svg";
 pub const ICON_TRASH: &str = "icons/trash.svg";
 pub const ICON_PENCIL: &str = "icons/pencil.svg";
@@ -74,6 +75,7 @@ impl AssetSource for Assets {
             ICON_SIDEBAR => include_bytes!("../assets/icons/sidebar.svg").as_slice(),
             ICON_APPEARANCE => include_bytes!("../assets/icons/appearance.svg").as_slice(),
             ICON_LOCK => include_bytes!("../assets/icons/lock.svg").as_slice(),
+            ICON_FINGERPRINT => include_bytes!("../assets/icons/fingerprint.svg").as_slice(),
             ICON_SPARKLES => include_bytes!("../assets/icons/sparkles.svg").as_slice(),
             ICON_TRASH => include_bytes!("../assets/icons/trash.svg").as_slice(),
             ICON_PENCIL => include_bytes!("../assets/icons/pencil.svg").as_slice(),
