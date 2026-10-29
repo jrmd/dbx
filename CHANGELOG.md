@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.19.0 - 2026-10-29
+
+- Group document tabs into named, coloured groups to keep related queries and tables together.
+- Edit multiline text directly in table cells.
+
 ## 0.18.2 - 2026-10-28
 
 - Show a draggable scrollbar for multiline row values, making long values easier to navigate.
