@@ -1585,6 +1585,7 @@ impl DbxApp {
 const GROUP_CHIP_HEIGHT: f32 = 24.;
 
 /// The colored label that opens a tab group, like Chrome's group chip.
+#[allow(clippy::too_many_arguments)]
 fn tab_group_chip(
     group_id: TabGroupId,
     name: String,

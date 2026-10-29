@@ -1074,7 +1074,9 @@ pub(super) struct TabGroup {
     pub(super) collapsed: bool,
 }
 
-pub(super) const TAB_GROUP_COLORS: [(&str, fn() -> Rgba); 8] = [
+type TabGroupColor = (&'static str, fn() -> Rgba);
+
+pub(super) const TAB_GROUP_COLORS: [TabGroupColor; 8] = [
     ("Blue", || theme().accent),
     ("Green", || theme().success),
     ("Orange", || theme().warning),
