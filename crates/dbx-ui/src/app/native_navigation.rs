@@ -530,7 +530,7 @@ mod native_logo_tests {
             gpui_component::init(cx);
             install_native_context_presenter(capture, cx);
         });
-        let (_, cx) = cx.add_window_view(|window, cx| DbxApp::new(window, cx));
+        let (_, cx) = cx.add_window_view(DbxApp::new);
         let calls = Rc::new(Cell::new(0));
         cx.update(|window, cx| {
             let calls_for_menu = calls.clone();
