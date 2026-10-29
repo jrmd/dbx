@@ -1026,7 +1026,7 @@ mod tests {
                         color: 3,
                         collapsed: true,
                         // Saved positions 1 and 2 shift down past the missing table.
-                        members: vec![0, 1],
+                        members: vec![1, 2],
                     }],
                     ..Default::default()
                 };
@@ -1049,7 +1049,7 @@ mod tests {
                         name: "Reports".into(),
                         color: 3,
                         collapsed: true,
-                        members: vec![1, 2],
+                        members: vec![0, 1],
                     }]
                 );
                 assert!(matches!(
