@@ -507,16 +507,80 @@ impl DbxApp {
         .detach();
     }
 
-    /// Selecting biometrics always turns off silent unlock. Enrollment (or
-    /// removal) happens only after a successful passphrase authentication.
-    pub(super) fn toggle_touch_id(&mut self, cx: &mut Context<Self>) {
-        if self.vault_busy || (!self.touch_id_available && !self.touch_id_enabled) {
+    pub(super) fn apply_touch_id_preference(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.touch_id_enabled = enabled;
+        if enabled {
+            // Biometric and silent unlock are mutually exclusive.
+            self.remember_device = false;
+        }
+        self.persist_settings(cx);
+    }
+
+    /// Settings → Connections → Vault: enrol or remove Touch ID right away,
+    /// while the vault is unlocked and its key is available.
+    pub(super) fn set_touch_id_from_settings(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.vault_busy
+            || self.vault_state != Some(VaultState::Unlocked)
+            || self.touch_id_enabled == enabled
+            || (enabled && !self.touch_id_available)
+        {
             return;
         }
-        self.touch_id_enabled = !self.touch_id_enabled;
-        self.remember_device = false;
-        self.persist_settings(cx);
+        let Some(touch_id) = self.touch_id() else {
+            return;
+        };
+        let device = self.device_unlock();
+        let Some(vault) = self.profile_store.as_ref().and_then(ProfileStore::vault) else {
+            return;
+        };
+        // Persist opting out before attempting deletion, so a keychain error
+        // cannot leave Touch ID enabled on the next launch.
+        if !enabled {
+            self.apply_touch_id_preference(false, cx);
+        }
+        let runtime = self.runtime.clone();
+        self.vault_busy = true;
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = runtime
+                .spawn_blocking(move || -> Result<(), String> {
+                    if enabled {
+                        // Remove the unprotected copy FIRST. If that fails,
+                        // never claim that biometric enrollment succeeded.
+                        if let Some(device) = device {
+                            device.forget()?;
+                        }
+                        let key = vault.key().map_err(|error| error.to_string())?;
+                        touch_id.store(&key).map_err(|error| error.to_string())
+                    } else {
+                        touch_id.forget()
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.vault_busy = false;
+                match outcome {
+                    Ok(Ok(())) => {
+                        if enabled {
+                            this.apply_touch_id_preference(true, cx);
+                        }
+                    }
+                    _ => this.show_toast(
+                        ToastKind::Error,
+                        if enabled {
+                            "Couldn’t set up Touch ID. Your passphrase still works."
+                        } else {
+                            "Couldn’t remove Touch ID from the system keychain."
+                        },
+                        cx,
+                    ),
+                }
+                this.refresh_touch_id(cx);
+                cx.notify();
+            })?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     pub(super) fn unlock_with_touch_id(&mut self, cx: &mut Context<Self>) {

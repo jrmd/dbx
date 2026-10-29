@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Make opt-in Touch ID vault unlock available in signed Mac builds by embedding a Developer ID provisioning profile; builds without a profile are unchanged.
-- Redesign the vault unlock screen: Touch ID becomes the primary action with the passphrase as a fallback, the opt-in explains itself, and status messages no longer shift the layout.
+- Redesign the vault unlock screen: Touch ID becomes the primary action with the passphrase as a fallback, Touch ID is turned on in Settings → Connections → Vault, and status messages no longer shift the layout.
 
 ## 0.19.0 - 2026-10-29
 
